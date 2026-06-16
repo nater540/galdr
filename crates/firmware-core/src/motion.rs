@@ -261,6 +261,82 @@ impl StepTiming {
   }
 }
 
+/// Live machine position in step space, advanced one [`StepEvent`] at a time as the motion executor
+/// drives the [`StepSink`], so the status reporter can publish a *live* (interpolated) MPos rather than
+/// the planner's end-of-look-ahead position. It is the firmware bin's counterpart to the generator: the
+/// generator decides the per-tick step mask and the executor latches one [`DirState`] per block, then
+/// feeds both here so each stepping axis advances `+1` or `−1` per its latched direction.
+///
+/// This is pure, allocation-free, and host-tested — the executor that owns it lives in the (Xtensa-only)
+/// firmware bin, so the conversion logic is decoupled here where it can run under `cargo test`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct StepCounter {
+  /// Signed live position in whole steps per axis, `[X, Y, Z]`. Advanced by [`advance`](StepCounter::advance);
+  /// reset to the origin by [`reset`](StepCounter::reset) on a soft reset.
+  position: [i32; AXES],
+  /// The current per-axis step direction, latched from the active block's [`DirState`]; `true` = positive
+  /// (a stepping axis advances `+1`), `false` = negative (`−1`). Set by [`set_direction`](StepCounter::set_direction).
+  dir: [bool; AXES],
+}
+
+impl StepCounter {
+  /// A counter at the origin with both axes latched positive. The first block's `set_direction` overrides
+  /// the latched direction before any step is counted, so the initial direction is immaterial.
+  pub const fn new() -> Self {
+    StepCounter { position: [0; AXES], dir: [true; AXES] }
+  }
+
+  /// Latch the per-axis direction from the active block's [`DirState`], so subsequent [`advance`](StepCounter::advance)
+  /// calls move each stepping axis the correct way. Called once per block, mirroring `StepSink::set_direction`.
+  pub fn set_direction(&mut self, dir: DirState) {
+    self.dir = dir.dir;
+  }
+
+  /// Advance the live position by one [`StepEvent`]: each axis whose `step` mask is set moves `+1` in the
+  /// latched positive direction or `−1` in the negative direction. Axes that do not step are unchanged.
+  /// Uses saturating arithmetic so a pathological step train can never wrap the position (it pins at
+  /// `i32::MAX`/`MIN` instead), keeping the published MPos monotone rather than aliasing.
+  pub fn advance(&mut self, event: &StepEvent) {
+    for axis in 0..AXES {
+      if event.step[axis] {
+        let delta = if self.dir[axis] { 1 } else { -1 };
+        self.position[axis] = self.position[axis].saturating_add(delta);
+      }
+    }
+  }
+
+  /// The live position in whole steps per axis, `[X, Y, Z]`.
+  pub fn position_steps(&self) -> [i32; AXES] {
+    self.position
+  }
+
+  /// The live position converted to millimeters per axis using `steps_per_mm` (the same `$100..102`
+  /// resolution the planner rounds with). A non-positive `steps_per_mm[axis]` yields `0.0` for that axis
+  /// rather than a NaN/inf, so a degenerate setting cannot poison the status report.
+  pub fn position_mm(&self, steps_per_mm: &[f32; AXES]) -> [f32; AXES] {
+    let mut out = [0.0f32; AXES];
+    for axis in 0..AXES {
+      if steps_per_mm[axis] > 0.0 {
+        out[axis] = self.position[axis] as f32 / steps_per_mm[axis];
+      }
+    }
+    out
+  }
+
+  /// Reset the live position to the origin (steps zeroed) on a soft reset / pipeline reset, leaving the
+  /// latched direction untouched — the next block re-latches it before stepping.
+  pub fn reset(&mut self) {
+    self.position = [0; AXES];
+  }
+}
+
+impl Default for StepCounter {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// A ceiling on the step period (in ticks) for a velocity that has collapsed to zero, so a momentary
 /// `v = 0` at the boundary of a rest-to-rest block emits a finite, very slow step instead of dividing by
 /// zero or saturating the 15-bit RMT duration field. One tick of motion at this rate is harmless because
@@ -810,5 +886,94 @@ mod tests {
     // X3 Y4 at 100 steps/mm: 300 X steps, 400 Y steps; Y dominates so 400 ticks, steps conserved.
     assert_eq!(emitted, 400);
     assert_eq!(sink.step_totals(), [300, 400, 0]);
+  }
+
+  // ---- StepCounter: live position tracking ------------------------------------------------------
+
+  /// A single positive event advances each stepping axis by `+1` and leaves silent axes untouched.
+  #[test]
+  fn step_counter_advances_positive_axes() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [true, true, true] });
+    counter.advance(&StepEvent { step: [true, false, true], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [1, 0, 1]);
+  }
+
+  /// A negative latched direction makes a stepping axis advance `−1`; mixed signs are honored per axis.
+  #[test]
+  fn step_counter_honors_latched_direction_sign() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [false, true, false] });
+    counter.advance(&StepEvent { step: [true, true, true], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-1, 1, -1]);
+  }
+
+  /// Re-latching direction mid-stream (as the executor does once per block) changes the sign of
+  /// subsequent steps without disturbing the accumulated position.
+  #[test]
+  fn step_counter_relatches_direction_per_block() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [true, true, true] });
+    for _ in 0..5 {
+      counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    }
+    assert_eq!(counter.position_steps(), [5, 0, 0]);
+    // Next block reverses X: three steps back toward the origin.
+    counter.set_direction(DirState { dir: [false, true, true] });
+    for _ in 0..3 {
+      counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    }
+    assert_eq!(counter.position_steps(), [2, 0, 0]);
+  }
+
+  /// `position_mm` divides the live step count by `steps_per_mm` per axis (the same resolution the
+  /// planner rounds with), and a non-positive `steps_per_mm` yields a finite `0.0`, never NaN/inf.
+  #[test]
+  fn step_counter_converts_steps_to_mm() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [true, false, true] });
+    for _ in 0..250 {
+      counter.advance(&StepEvent { step: [true, true, false], period_ticks: 12 });
+    }
+    // X +250 steps at 250 steps/mm = +1.0 mm; Y −250 steps at 100 steps/mm = −2.5 mm; Z untouched.
+    let mm = counter.position_mm(&[250.0, 100.0, 0.0]);
+    assert!((mm[0] - 1.0).abs() < 1e-6);
+    assert!((mm[1] + 2.5).abs() < 1e-6);
+    // A zero steps/mm axis is reported as 0.0, not a division blow-up.
+    assert_eq!(mm[2], 0.0);
+  }
+
+  /// A reset zeroes the live step position (so MPos returns to the origin) without disturbing the
+  /// latched direction — the next block re-latches it before any step.
+  #[test]
+  fn step_counter_reset_returns_to_origin() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [false, false, false] });
+    counter.advance(&StepEvent { step: [true, true, true], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-1, -1, -1]);
+    counter.reset();
+    assert_eq!(counter.position_steps(), [0, 0, 0]);
+    // Direction is retained: a subsequent step still goes negative until a block re-latches it.
+    counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-1, 0, 0]);
+  }
+
+  /// Saturating arithmetic pins the position at `i32::MAX` rather than wrapping, so a pathological step
+  /// train keeps the published MPos monotone instead of aliasing to a negative value.
+  #[test]
+  fn step_counter_saturates_at_i32_bounds() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [true, true, true] });
+    // Seed near the ceiling, then step past it; the axis must clamp, not wrap.
+    for _ in 0..3 {
+      counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    }
+    // Manually drive X to the ceiling via a direct check: advance cannot reach i32::MAX in a test loop,
+    // so assert the saturating contract at the boundary by constructing the edge case in steps.
+    let mut edge = StepCounter::new();
+    edge.set_direction(DirState { dir: [true, true, true] });
+    edge.position = [i32::MAX, 0, 0];
+    edge.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    assert_eq!(edge.position_steps()[0], i32::MAX);
   }
 }

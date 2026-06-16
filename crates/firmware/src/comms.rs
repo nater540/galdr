@@ -25,9 +25,10 @@
 //!   persistent [`Parser`], feeds the resulting command to a persistent [`Planner`], answers the `$` system
 //!   queries (`$$`/`$I`/`$I+`/`$G`/`$#`), and emits exactly one `ok`/`error:N` per line. It owns the
 //!   grblHAL gcode error-hold and back-pressures the host when the planner buffer is full.
-//! - [`block_drain_stub`] is a placeholder for the DOC-02 `motion_executor`: it pops planner blocks paced
-//!   by an estimated execution time and publishes the drained position into [`MACHINE`], so a streamed file
-//!   makes progress instead of deadlocking once the planner buffer fills. It generates no step pulses.
+//! - The DOC-02 `motion_executor` (in [`crate::motion`], on core 1) is the consumer end of the planner
+//!   queue: it pops blocks, realizes them as RMT step pulses, and publishes the *live* position into
+//!   [`MACHINE`]. The consumer raises [`BLOCK_AVAILABLE`] after enqueuing a motion block so the executor
+//!   wakes without polling. This replaced the Stage-1 `block_drain_stub`, which only paced time.
 //! - [`status_responder`] formats a `<...>` report from the shared [`MachineSnapshot`] when the
 //!   [`STATUS_REQUEST`] Signal fires.
 //!
@@ -46,7 +47,8 @@ use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
 use firmware_core::gcode::{ModalState, MotionMode, DistanceMode as GcodeDistance, Parser, Units as GcodeUnits};
-use firmware_core::planner::{Block, Planner, PlannerConfig, PlannerError, BLOCK_QUEUE_LEN};
+use firmware_core::motion::MotionConfig;
+use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcome, AXES};
 use firmware_core::protocol::{
   classify_realtime, EngineEvent, MachineSnapshot, ParserDistance, ParserMotion, ParserSnapshot,
   ParserUnits, RealtimeCommand, ResponseWriter, StreamEngine, MAX_LINE_LEN, RX_BUFFER_SIZE,
@@ -107,15 +109,26 @@ pub static CYCLE_START: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// parser/planner/motion queues; Stage 1 re-emits the banner and clears the line queue.
 pub static SOFT_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// The live machine state the status formatter reads. The motion executor will publish position/state
-/// here once wired; Stage 1 holds the idle default so `?` returns a well-formed report immediately.
+/// Planner → motion-executor readiness signal (DOC-01). Set by [`plan_command`] after it enqueues a motion
+/// block, so the core-1 `motion_executor` can AWAIT a fresh block when it finds the queue empty instead of
+/// polling (the Stage-1 stub polled, which the review flagged). Living here in the bin keeps the pure
+/// planner lib free of any async primitive: the planner reports a `Queued` outcome and the consumer raises
+/// the signal. A `Signal` (not a counter) is sufficient because the executor re-checks the queue under the
+/// lock after each wake and loops until it is drained, so a coalesced multi-block signal loses no block.
+pub static BLOCK_AVAILABLE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// The live machine state the status formatter reads. The core-1 `motion_executor` publishes the live
+/// (interpolated) MPos and the planner free-block count here as it executes blocks; Stage 1 holds the idle
+/// default at boot so `?` returns a well-formed report immediately. Shared across cores via
+/// [`CriticalSectionRawMutex`], which gates both cores on the S3.
 pub static MACHINE: Mutex<CriticalSectionRawMutex, MachineSnapshot> = Mutex::new(MachineSnapshot::idle());
 
-/// The shared motion planner: the `comms_consumer` task enqueues blocks into it, and the stub
-/// block-drain task (standing in for the real DOC-02 `motion_executor`) pops them. It lives behind a
-/// `Mutex` because two tasks touch it; both critical sections are short (enqueue one command / pop one
-/// block + read position), so contention is negligible. The real motion executor will replace the drain
-/// task and keep this same handoff shape (planner is the producer, executor the single consumer).
+/// The shared motion planner: the core-0 `comms_consumer` task enqueues blocks into it, and the core-1
+/// `motion_executor` ([`crate::motion`]) pops them. It lives behind a `Mutex` because two tasks on two cores
+/// touch it; [`CriticalSectionRawMutex`] makes the lock cross-core-safe on the S3 (the critical section
+/// gates both cores). Both critical sections are short (enqueue one command / pop one block + peek the next),
+/// and the executor always RELEASES the lock before any RMT transmit, so the planner mutex is never held
+/// across step emission and contention stays negligible.
 ///
 /// Initialized lazily to `None` because [`Planner::new`] is not `const`; [`init_planner`] installs the
 /// constructed planner once at boot before either task runs. After init the `Option` is always `Some`.
@@ -129,8 +142,25 @@ fn placeholder_planner_config() -> PlannerConfig {
   PlannerConfig::default()
 }
 
-/// Install the planner into [`PLANNER`] at boot, before the consumer/drain tasks are spawned. Called
-/// once from `main`; using `try_lock` avoids an await in init and cannot contend (no task runs yet).
+/// Build the placeholder [`MotionConfig`] for the step generator: the `$0` step-pulse width and the timer
+/// tick rate the RMT channels are clocked at (1 MHz → 1 tick = 1 µs). Defaults stand in for the persisted
+/// `$0`/`$29` firmware settings (DOC-00). The `motion_executor` uses this to drive the generator, and the
+/// RMT init derives the channel clock divider from `tick_hz` — keep them in agreement. TODO(DOC-00):
+/// replace with the persisted settings load (CRC-checked, falling back to these compiled defaults).
+pub fn placeholder_motion_config() -> MotionConfig {
+  MotionConfig::default()
+}
+
+/// The placeholder per-axis steps/mm (`$100..102`) the motion executor uses to convert its live step
+/// counter into MPos millimeters. Sourced from the SAME [`placeholder_planner_config`] the planner rounds
+/// with, so the planner and the live position report agree on resolution (a single source, not a second
+/// copy). TODO(DOC-00): load `$100..102` from esp-storage alongside the rest of the settings.
+pub fn placeholder_steps_per_mm() -> [f32; AXES] {
+  placeholder_planner_config().steps_per_mm
+}
+
+/// Install the planner into [`PLANNER`] at boot, before the consumer and the core-1 motion executor are
+/// spawned. Called once from `main`; `try_lock` avoids an await in init and cannot contend (no task runs yet).
 pub fn init_planner() {
   // `try_lock` succeeds because this runs before any task is spawned, so nothing else holds the lock.
   // The `Ok` arm is the only reachable path at init; a failure would be a wiring bug, handled by leaving
@@ -327,11 +357,11 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
 /// deliberately reduced to pure line framing (no error-hold state); the framer still owns the independent
 /// protocol-level overflow reject, which is correct.
 ///
-/// ## Back-pressure (no motion executor yet)
+/// ## Back-pressure (gated on the core-1 motion executor draining blocks)
 /// `ok` for a move is emitted only once the block is ACCEPTED into the planner buffer. When the planner is
-/// full ([`PlannerError::QueueFull`]) the consumer neither acks nor drops the line: it waits for the stub
-/// drain task to free a block and retries the SAME command (the arc planner is all-or-nothing on
-/// `QueueFull`, so re-issuing is safe). While waiting it stops reading `LINE_QUEUE`, which backs up, blocks
+/// full ([`PlannerError::QueueFull`]) the consumer neither acks nor drops the line: it waits for the core-1
+/// `motion_executor` to execute a block and free a slot, then retries the SAME command (the arc planner is
+/// all-or-nothing on `QueueFull`, so re-issuing is safe). While waiting it stops reading `LINE_QUEUE`, which backs up, blocks
 /// `line_assembler`'s `send().await`, stops draining `RX_PIPE`, fills the pipe, makes the reader's
 /// `try_write` refuse bytes, and lets the host's character-counting throttle — exactly the correct grbl flow
 /// control, now with real-time dispatch still live throughout because it sits in the separate reader half.
@@ -474,10 +504,11 @@ const ERROR_HOLD_CODE: u8 = 1;
 const ERROR_PLANNER_UNINITIALIZED: u8 = 3;
 
 /// Feed one [`PlannerCommand`](firmware_core::gcode::PlannerCommand) to the shared planner, applying
-/// back-pressure: on [`PlannerError::QueueFull`] wait for the stub drain to free a block and retry the
-/// SAME command (the arc planner is all-or-nothing on `QueueFull`, so re-issue is safe). The back-pressure
-/// wait is raced against [`SOFT_RESET`] so a `0x18` aborts a stuck line promptly rather than after the
-/// drain frees a slot. Non-motion outcomes (Dwell/Spindle/G28/G92/M30) currently pass through with no side
+/// back-pressure: on [`PlannerError::QueueFull`] wait for the core-1 motion executor to free a block and
+/// retry the SAME command (the arc planner is all-or-nothing on `QueueFull`, so re-issue is safe). On an
+/// accepted motion outcome it raises [`BLOCK_AVAILABLE`] to wake the executor. The back-pressure wait is
+/// raced against [`SOFT_RESET`] so a `0x18` aborts a stuck line promptly rather than after the executor frees
+/// a slot. Non-motion outcomes (Dwell/Spindle/G28/G92/M30) currently pass through with no side
 /// effect; the real dwell timer, spindle driver (DOC-07), and homing (DOC-06) consume these in later phases.
 async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanResult {
   loop {
@@ -493,11 +524,19 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       }
     };
     match result {
-      // TODO(DOC-02/DOC-07/DOC-06): act on non-motion outcomes — start the dwell timer, drive the spindle,
-      // run the predefined/homing move, reset program state on M30. Stage 1 accepts and passes through.
+      // A motion command enqueued at least one block: wake the core-1 `motion_executor` so it can drain the
+      // freshly queued block(s) instead of polling. A coalesced signal is fine — the executor re-checks the
+      // queue under the lock and loops until empty, so multiple blocks behind one signal are all consumed.
+      Ok(PlannerOutcome::Queued { blocks }) if blocks > 0 => {
+        BLOCK_AVAILABLE.signal(());
+        return PlanResult::Accepted;
+      }
+      // TODO(DOC-07/DOC-06): act on the non-motion outcomes — start the dwell timer, drive the spindle, run
+      // the predefined/homing move, reset program state on M30. Stage 1 accepts and passes through. A
+      // zero-block `Queued` (no-op move) needs no executor wake, so it falls here too.
       Ok(_outcome) => return PlanResult::Accepted,
-      // Back-pressure: the planner buffer is full. Do NOT ack and do NOT drop — yield to the drain task,
-      // then retry the same command. Blocking here backs `LINE_QUEUE` up and throttles the host (correct
+      // Back-pressure: the planner buffer is full. Do NOT ack and do NOT drop — yield to the motion
+      // executor, then retry the same command. Blocking here backs `LINE_QUEUE` up and throttles the host (correct
       // grbl flow control). Race the retry delay against a soft reset so `0x18` aborts a stuck line at once;
       // the delay is short relative to a block's execution time, so a normal retry wins the freed slot
       // promptly without busy-spinning the CPU.
@@ -619,97 +658,13 @@ pub async fn status_responder() -> ! {
 
 /// How long the consumer waits before retrying a [`PlannerError::QueueFull`] command. Short relative to a
 /// block's execution time (tens of ms) so the retry claims a freed slot promptly, but long enough that the
-/// retry loop is not a busy-spin — it yields the executor to the drain task each iteration.
+/// retry loop is not a busy-spin — it yields to the core-1 motion executor each iteration.
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(2);
 
 /// Backoff before retrying a USB read after a read error, so a persistent error does not become a tight
 /// spin that starves the other core-0 tasks. Short enough that a transient glitch barely delays reception,
 /// long enough to yield the executor on a sustained fault.
 const USB_RX_ERROR_BACKOFF: Duration = Duration::from_millis(5);
-
-/// Lower bound on the simulated execution time of one drained block, so a tiny/zero-length block does not
-/// let the drain busy-loop and instantly empty the queue (which would mask back-pressure).
-const MIN_BLOCK_DRAIN: Duration = Duration::from_millis(5);
-
-/// Upper bound on the simulated execution time of one drained block, so a very long/slow move does not
-/// stall the pipeline for an implausibly long time during bring-up testing.
-const MAX_BLOCK_DRAIN: Duration = Duration::from_millis(500);
-
-/// How long the drain task idles before re-checking an empty planner queue. Keeps the task off the CPU
-/// while no motion is queued; a real motion executor would instead await the planner's `BLOCK_AVAILABLE`
-/// signal (DOC-01) rather than poll.
-const DRAIN_IDLE_POLL: Duration = Duration::from_millis(20);
-
-/// STUB block-drain task: a placeholder for the real DOC-02 `motion_executor` + RMT step generation. It
-/// pops one planner block at a time, paces itself by that block's approximate execution time, and publishes
-/// the drained position into [`MACHINE`] so `?` reports a plausible MPos. It exists solely so an end-to-end
-/// stream makes progress instead of deadlocking once the 32-block planner buffer fills; it generates NO
-/// step pulses and models NO trapezoidal profile.
-///
-/// TODO(DOC-02): replace this task with the core-1 `InterruptExecutor` running the real `motion_executor`,
-/// which runs the [`SegmentGenerator`](firmware_core::motion) over each popped block, emits RMT PulseCodes
-/// on ch0/1/2, and publishes live interpolated MPos. This task and its pacing heuristics are then deleted.
-#[embassy_executor::task]
-pub async fn block_drain_stub() -> ! {
-  loop {
-    // Pop the next block under the planner lock, releasing it before the pacing delay so the consumer can
-    // enqueue while this block "executes". `pop_block` is FIFO, matching the real executor's consumption.
-    let popped = {
-      let mut guard = PLANNER.lock().await;
-      guard.as_mut().and_then(Planner::pop_block)
-    };
-    match popped {
-      Some(block) => {
-        publish_drained_position().await;
-        // Pace by the block's approximate execution time (cruise-only: travel / nominal speed), clamped to
-        // a sane window. This keeps the queue partly full under sustained streaming so back-pressure is
-        // actually exercised, rather than draining instantly. The real executor's timing comes from the
-        // segment generator's tick periods, not this estimate.
-        Timer::after(simulated_block_duration(&block)).await;
-      }
-      // Queue empty: idle briefly, then re-check. The real executor awaits BLOCK_AVAILABLE instead.
-      None => Timer::after(DRAIN_IDLE_POLL).await,
-    }
-  }
-}
-
-/// Estimate one block's execution time for the stub drain pacing: straight-line travel divided by the
-/// block's nominal (cruise) speed, clamped to `[MIN_BLOCK_DRAIN, MAX_BLOCK_DRAIN]`. This is a deliberately
-/// crude placeholder (it ignores accel/decel ramps and rest-to-rest boundaries) — only the real segment
-/// generator computes true timing.
-fn simulated_block_duration(block: &Block) -> Duration {
-  let speed = block.nominal_speed();
-  // Require strictly positive, finite speed AND travel; the `> 0.0` tests are false for NaN, zero, and
-  // negatives, so a degenerate block falls through to the floor below rather than dividing badly.
-  if speed > 0.0 && block.millimeters > 0.0 {
-    let seconds = block.millimeters / speed;
-    let millis = (seconds * 1000.0) as u64;
-    return Duration::from_millis(millis).max(MIN_BLOCK_DRAIN).min(MAX_BLOCK_DRAIN);
-  }
-  // A degenerate block (zero speed/length): use the floor so the drain neither stalls nor busy-loops.
-  MIN_BLOCK_DRAIN
-}
-
-/// Publish the planner's current position and free-block count into the shared [`MachineSnapshot`] so `?`
-/// reports a plausible MPos and `Bf:` block-free count. The planner position is the end-of-look-ahead
-/// (planned) position, not the live interpolated one; that is acceptable for the stub, and the real motion
-/// executor will publish true live position instead.
-async fn publish_drained_position() {
-  let (pos, free) = {
-    let guard = PLANNER.lock().await;
-    match guard.as_ref() {
-      Some(planner) => {
-        let queued = planner.queued_len();
-        let free = BLOCK_QUEUE_LEN.saturating_sub(queued) as u8;
-        (planner.position_mm(), free)
-      }
-      None => return,
-    }
-  };
-  let mut snap = MACHINE.lock().await;
-  snap.mpos_mm = pos;
-  snap.planner_blocks_free = free;
-}
 
 /// Trim leading/trailing ASCII whitespace from a line, since a sender may pad `$` commands with spaces.
 /// `core` lacks a stable slice trim for `&[u8]`, so this is a small explicit helper.
