@@ -225,6 +225,12 @@ pub struct Planner {
   /// Nominal speed squared of the most recently planned block, (mm/s)². Caps the junction speed so a
   /// corner never exceeds either adjoining block's cruise speed.
   prev_nominal_speed_sq: f32,
+  /// True once the executor has popped a block and committed to the current queue head as the block it
+  /// will enter next (grbl's "busy block"). While set, [`recalculate`](Planner::recalculate)'s reverse
+  /// pass must not rewrite the head block's `entry_speed_sq`: the executor already read it as the popped
+  /// block's exit speed and shaped that block's deceleration to it, so changing it now would create a
+  /// velocity discontinuity / missed steps at the junction. Cleared when the queue drains empty.
+  head_busy: bool,
 }
 
 impl Planner {
@@ -238,6 +244,7 @@ impl Planner {
       work_offset_mm: [0.0; AXES],
       prev_unit_vec: [0.0; AXES],
       prev_nominal_speed_sq: 0.0,
+      head_busy: false,
     }
   }
 
@@ -265,11 +272,22 @@ impl Planner {
     self.queue.is_empty()
   }
 
-  /// Pop the oldest planned block for the motion executor (FIFO). Popping a block hands ownership of
-  /// the realized motion to the segment generator; the planner's trailing junction state is unchanged
-  /// because look-ahead is computed across the still-queued blocks.
+  /// Pop the oldest planned block for the motion executor (FIFO). Popping a block hands ownership of the
+  /// realized motion to the segment generator; the planner's trailing junction state is unchanged because
+  /// look-ahead is computed across the still-queued blocks.
+  ///
+  /// Popping also arms grbl's busy-block protection: the executor reads the *new* head as the popped
+  /// block's exit speed (via [`peek_block`](Planner::peek_block)) and shapes that block's deceleration to
+  /// it, so the new head's planned entry is now committed. A subsequent [`recalculate`](Planner::recalculate)
+  /// (triggered by enqueuing more motion behind it) must not rewrite that committed entry — see
+  /// [`head_busy`](Planner::head_busy). The flag clears when the queue drains so a fresh program re-optimizes
+  /// its head freely.
   pub fn pop_block(&mut self) -> Option<Block> {
-    self.queue.pop_front()
+    let block = self.queue.pop_front()?;
+    // A block remaining after the pop is the committed next block to execute → freeze its entry. An emptied
+    // queue commits nothing, so the next head (whenever it arrives) is freely optimizable again.
+    self.head_busy = !self.queue.is_empty();
+    Some(block)
   }
 
   /// Peek the oldest queued block without removing it (for the executor's planning glance).
@@ -503,9 +521,27 @@ impl Planner {
   /// Walks the ring buffer back-to-front via the `Deque`'s double-ended iterator (O(n), no indexing or
   /// fallible access), carrying the next (downstream) block's entry speed as the exit ceiling. The exit
   /// of the newest block is zero: the program may end at any block, so it must be able to stop.
+  ///
+  /// ## Busy-block protection (Finding #4)
+  /// When [`head_busy`](Planner::head_busy) is set, the executor has already committed to the front (oldest)
+  /// block's entry speed as the previously-popped block's exit. The reverse pass therefore FREEZES the front
+  /// block: it leaves that block's `entry_speed_sq` exactly as the executor read it, but still carries that
+  /// committed value forward as the deceleration ceiling for the block behind it — so the rest of the queue
+  /// stays consistent with the committed junction without the executor ever seeing its head exit change.
   fn reverse_pass(&mut self) {
+    // The front block is the last one the reverse iterator visits; when the head is busy it must not be
+    // rewritten. `remaining` counts down so the final (front) block is recognized without indexing.
+    let mut remaining = self.queue.len();
     let mut next_entry_sq = 0.0f32;
     for block in self.queue.iter_mut().rev() {
+      remaining -= 1;
+      let is_busy_head = self.head_busy && remaining == 0;
+      if is_busy_head {
+        // Frozen: keep the committed entry the executor already read, and carry it as the exit ceiling for
+        // the block behind it (already handled by `next_entry_sq` below using this unchanged value).
+        next_entry_sq = block.entry_speed_sq;
+        continue;
+      }
       // Maximum entry that still allows decelerating to `next_entry_sq` over this block's travel, capped
       // by the block's own cornering/nominal ceiling.
       let reachable = next_entry_sq + 2.0 * block.acceleration * block.millimeters;
@@ -958,6 +994,89 @@ mod tests {
     assert!(first.entry_speed_sq < 1e-3);
     // Second block's entry is capped by acceleration over the first block: 0 + 2·1000·0.05 = 100.
     assert!((second.entry_speed_sq - 100.0).abs() < 1.0);
+  }
+
+  // ---- Busy-block protection: a popped head's committed exit is frozen (Finding #4) -------------
+
+  #[test]
+  fn popping_a_block_freezes_the_new_head_entry_speed() {
+    // The executor pops block N and reads the new head (N+1) `entry_speed_sq` as N's *exit* speed. If a
+    // later enqueue runs `recalculate()` and its reverse pass lowers that head entry, N would have
+    // decelerated to the wrong exit — a velocity discontinuity / missed steps. grbl's busy-block rule
+    // freezes the head once the executor has committed to it; this test pins that contract.
+    //
+    // To be sensitive to the bug, the chain must be SHORT collinear blocks: short enough that the stop-at-rest
+    // ramp forced on the newest block spans many blocks. 0.1 mm blocks at accel 1000 mm/s² add only
+    // 2·a·d = 200 (mm/s)² of reachable speed each, so the head sits partway up a multi-block deceleration
+    // envelope — and EXTENDING that envelope (enqueuing more blocks) shifts where the stop is and rewrites the
+    // head's entry. The freeze must pin the head once the executor has committed to it, whichever way the
+    // unprotected recalculate would move it.
+    let mut planner = Planner::new(test_config());
+    // Build a short initial look-ahead so the head's committed entry is partway up the stop ramp (not yet at
+    // nominal, not at rest): three 0.1 mm collinear moves. The reverse pass forces the newest to stop, so the
+    // head enters at a modest, non-trivial speed that a longer runway would later raise.
+    let mut x = 0.0;
+    for _ in 0..3 {
+      x += 0.1;
+      planner.plan_command(&mm_move(Some(x), None, None, 12000.0, false)).expect("queued");
+    }
+    // The executor pops N; the new head (N+1) is the committed next block. Record its entry — the value the
+    // executor has already used to shape N's deceleration to this exit.
+    let _n = planner.pop_block().expect("first block");
+    let committed_exit_sq = planner.peek_block().expect("head").entry_speed_sq;
+    assert!(committed_exit_sq > 1.0, "the committed head must enter above rest for a meaningful test");
+    // Now core 0 streams more short collinear moves. Each enqueue runs `recalculate()`; the extended runway
+    // would, unprotected, RAISE the head's entry (more room to keep speed up before the new final stop) — a
+    // change to a value the executor already committed to. The freeze must keep it constant.
+    for _ in 0..12 {
+      x += 0.1;
+      planner.plan_command(&mm_move(Some(x), None, None, 12000.0, false)).expect("queued");
+    }
+    let after = planner.peek_block().expect("head").entry_speed_sq;
+    assert!(
+      (after - committed_exit_sq).abs() < 1e-3,
+      "the committed head entry must stay frozen: was {committed_exit_sq}, became {after}",
+    );
+  }
+
+  #[test]
+  fn unpopped_queue_still_optimizes_the_front_block() {
+    // Before the executor pops anything, no block is committed, so the front is freely optimizable: a fresh
+    // queue must still run full look-ahead across the head (the freeze only arms after a pop).
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(0.05), None, None, 12000.0, false)).expect("queued");
+    planner.plan_command(&mm_move(Some(20.0), None, None, 12000.0, false)).expect("queued");
+    // The lone-head reverse-pass invariant: the FRONT (oldest) block still starts at rest (no previous
+    // block), and the SECOND is forward-capped by accel over the first — i.e. look-ahead ran across the head.
+    let first = planner.queue.iter().next().expect("first").entry_speed_sq;
+    let second = planner.queue.iter().nth(1).expect("second").entry_speed_sq;
+    assert!(first < 1e-3, "an un-committed front block still solves to rest at program start");
+    assert!((second - 100.0).abs() < 1.0, "second is forward-capped by accel over the first (look-ahead ran)");
+  }
+
+  #[test]
+  fn freeze_releases_when_the_busy_head_is_itself_popped() {
+    // Freezing must track the head: when the busy head is popped, the NEXT block becomes the committed one,
+    // and the previously-frozen value is gone. Popping twice must leave the new head frozen at its own
+    // committed entry, never resurrect the old frozen block.
+    let mut planner = Planner::new(test_config());
+    for n in 1..=4 {
+      planner.plan_command(&mm_move(Some(n as f32 * 10.0), None, None, 12000.0, false)).expect("queued");
+    }
+    planner.pop_block().expect("pop N");
+    let head_after_first_pop = planner.peek_block().expect("head").entry_speed_sq;
+    planner.pop_block().expect("pop N+1 (the previously frozen head)");
+    let new_head = planner.peek_block().expect("new head").entry_speed_sq;
+    // The new head is a different block; its committed entry is its own, independent of the old frozen one.
+    assert!(new_head > 0.0, "the new committed head enters above rest in a continuous chain");
+    // Enqueue more and recalculate: the new head must now be the frozen one and stay put.
+    let committed = new_head;
+    for n in 5..=10 {
+      planner.plan_command(&mm_move(Some(n as f32 * 10.0), None, None, 12000.0, false)).expect("queued");
+    }
+    let after = planner.peek_block().expect("head").entry_speed_sq;
+    assert!((after - committed).abs() < 1e-3, "the new head freezes at its own committed entry");
+    let _ = head_after_first_pop;
   }
 
   // ---- Arc subdivision: segment count, chord tolerance, direction ------------------------------

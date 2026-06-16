@@ -10,11 +10,14 @@
 
 use crate::planner::AXES;
 
-/// The maximum number of [`StepEvent`]s (RMT PulseCode symbols) a single burst may carry. DOC-02: the
-/// ESP32-S3 RMT block holds 48 symbols (`SOC_RMT_MEM_WORDS_PER_CHANNEL`); a burst larger than one block
-/// forces the driver to borrow the adjacent channel's memory and breaks the all-three-axes-at-once
-/// allocation. Bursts are capped at one block so the interrupt ping-pong refill path is avoided.
-pub const MAX_SYMBOLS_PER_BURST: usize = 48;
+/// The maximum number of [`StepEvent`]s (RMT PulseCode symbols) a single burst may carry. The ESP32-S3 RMT
+/// memory block holds 48 symbols (`SOC_RMT_MEM_WORDS_PER_CHANNEL`), but the firmware bin appends one
+/// mandatory `end_marker` symbol after the events, so an N-event burst encodes to N+1 symbols. Capping at
+/// 47 events makes a full burst exactly 47 + 1 = 48 symbols — precisely one memory block (`memsize = 1`).
+/// This keeps every burst inside a single block so the driver never borrows the adjacent channel's memory
+/// and the interrupt-priority streaming-refill (ping-pong) path is never relied upon (DOC-02). A burst
+/// larger than this is rejected with [`StepError::BurstTooLong`].
+pub const MAX_SYMBOLS_PER_BURST: usize = 47;
 
 /// The direction state latched onto the three axis DIR outputs before a burst. One `bool` per axis,
 /// indexed `[X, Y, Z]`: `true` is the positive (increasing-step) direction, `false` is negative. The
@@ -99,3 +102,18 @@ pub trait StepSink {
 // `crate::drivers::tmc2209`.
 // TODO(DOC-03): pub trait TmcBus { fn write_reg(&mut self, node: u8, reg: u8, val: u32) -> Result<(), TmcError>;
 //                                   fn read_reg(&mut self, node: u8, reg: u8) -> Result<u32, TmcError>; }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// The ESP32-S3 RMT memory block holds 48 symbols. The firmware bin appends one `end_marker` after the
+  /// events of a burst, so a full burst of [`MAX_SYMBOLS_PER_BURST`] events encodes to
+  /// `MAX_SYMBOLS_PER_BURST + 1` symbols, which must fit one block exactly — otherwise the burst spills into
+  /// the adjacent channel's memory or relies on the interrupt-priority streaming refill (Finding #7).
+  #[test]
+  fn full_burst_plus_end_marker_fits_one_rmt_block() {
+    const RMT_BLOCK_SYMBOLS: usize = 48;
+    assert_eq!(MAX_SYMBOLS_PER_BURST + 1, RMT_BLOCK_SYMBOLS, "events + end marker must equal one RMT block");
+  }
+}

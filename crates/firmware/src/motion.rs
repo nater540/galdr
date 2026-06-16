@@ -28,6 +28,8 @@
 //! - `$0`/`$29` and `steps_per_mm` come from the in-memory placeholder settings; esp-storage persistence is
 //!   DOC-00. Feed-hold deceleration is per-block (Stage 1); smooth ramp-down is a later refinement.
 
+use core::sync::atomic::Ordering;
+
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_hal::rmt::{Channel, PulseCode, Tx, TxChannelConfig, TxChannelCreator};
@@ -35,12 +37,12 @@ use esp_hal::Blocking;
 use embassy_futures::select::{select, Either};
 
 use firmware_core::hal_traits::{DirState, StepError, StepEvent, StepSink, MAX_SYMBOLS_PER_BURST};
-use firmware_core::motion::{MotionConfig, SegmentGenerator, StepCounter};
+use firmware_core::motion::{silent_symbol_halves, MotionConfig, SegmentGenerator, StepCounter};
 use firmware_core::planner::{Block, Planner, AXES};
 
 use crate::comms::{
-  placeholder_motion_config, placeholder_steps_per_mm, BLOCK_AVAILABLE, CYCLE_START, FEED_HOLD, MACHINE,
-  PLANNER, SOFT_RESET,
+  placeholder_motion_config, BLOCK_AVAILABLE, CYCLE_START, FEED_HOLD, LIVE_POSITION, MOTION_RESET,
+  MOTION_RESET_PENDING, PLANNER,
 };
 
 /// One RMT TX channel per axis, indexed `[X, Y, Z]`. The blocking transmit API consumes the channel and
@@ -67,6 +69,11 @@ pub struct RmtStepSink {
   /// A blocking delay source for the `$29` setup hold. Cheap to hold (zero-sized) and avoids reaching for
   /// the lower-level ROM delay; the busy-wait runs on the dedicated core where blocking is intended.
   delay: Delay,
+  /// The direction last latched onto the DIR outputs, or `None` before the first latch. The `$29` setup
+  /// delay is applied only when [`set_direction`](RmtStepSink::set_direction) actually CHANGES the latched
+  /// direction (Finding #9): a run of same-direction blocks re-drives the identical GPIO levels with no
+  /// real setup transition, so paying the delay every block would needlessly stall motion.
+  last_dir: Option<DirState>,
   /// Scratch per-channel PulseCode buffer reused across bursts to keep the sink allocation-free. Sized to
   /// the burst cap plus one for the mandatory `end_marker`. Indexed `[channel][symbol]`.
   scratch: [[PulseCode; MAX_SYMBOLS_PER_BURST + 1]; AXES],
@@ -83,33 +90,45 @@ impl RmtStepSink {
       step_pulse_ticks: config.step_pulse_ticks,
       dir_setup_us,
       delay: Delay::new(),
+      last_dir: None,
       scratch: [[PulseCode::end_marker(); MAX_SYMBOLS_PER_BURST + 1]; AXES],
     }
   }
 
-  /// Encode one channel's burst into its scratch buffer: one PulseCode per [`StepEvent`], then the
-  /// mandatory `end_marker`. A stepping axis gets a HIGH(`$0`)/LOW(`period − $0`) pulse; a silent axis gets
-  /// a full-period LOW (`PulseCode::new(Low, period, Low, 0)`) so all three channels stay the same length
-  /// and sample-aligned. Returns the number of symbols written (events + 1 for the end marker). Periods and
-  /// the `$0` width are already bounded by the 15-bit RMT field: the generator floors the period at
-  /// `min_period_ticks` (≥ `$0` + min-low) and `$0` is a small constant, so `period − $0` cannot underflow
-  /// and neither half exceeds [`PulseCode::MAX_LEN`]; `new_clamped` guards the residual edge defensively.
+  /// Encode one channel's burst into its scratch buffer: one PulseCode per [`StepEvent`], then the mandatory
+  /// `end_marker`. A stepping axis gets a HIGH(`$0`)/LOW(`period − $0`) pulse; a silent axis gets the period
+  /// split into TWO non-zero LOW sub-intervals so all three channels stay the same length and sample-aligned.
+  /// Returns the number of symbols written (events + 1 for the end marker).
+  ///
+  /// ## Why the silent symbol is two LOW halves, not `LOW(period) / LOW(0)` (Finding #1, the showstopper)
+  /// An RMT pulse code with EITHER length field zero is an end marker (`is_end_marker() == length1()==0 ||
+  /// length2()==0`), and the hardware STOPS transmission at the first end marker. A silent axis is idle on
+  /// tick 0 of any coordinated (Bresenham) move, so a `LOW(period) / LOW(0)` symbol would terminate that
+  /// channel immediately and drop every remaining step on the subordinate axis. We therefore split the period
+  /// into two non-zero halves via [`silent_symbol_halves`], guaranteeing neither field is zero. The split is
+  /// host-tested in firmware-core. The stepping symbol's halves are both non-zero too: `$0 ≥ 1` and the
+  /// generator clamps the period to `[min_period, RMT_MAX_FIELD_LEN + $0]` so `period − $0 ≥ min_low ≥ 1`
+  /// and `period − $0 ≤ RMT_MAX_FIELD_LEN`; `new_clamped` is a final defensive guard on the field width.
   fn encode_channel(&mut self, axis: usize, ticks: &[StepEvent]) -> usize {
     let pulse = self.step_pulse_ticks;
     for (slot, event) in self.scratch[axis].iter_mut().zip(ticks.iter()) {
       let period = event.period_ticks.max(pulse + 1);
       *slot = if event.step[axis] {
-        // A real step: HIGH for `$0` ticks, then LOW for the remainder of the period.
+        // A real step: HIGH for `$0` ticks, then LOW for the remainder of the period. Both halves are
+        // non-zero (see the method doc), so this is never an accidental end marker.
         let high = clamp_len(pulse);
         let low = clamp_len(period - pulse);
         PulseCode::new_clamped(Level::High, high, Level::Low, low)
       } else {
-        // A silent tick: stay LOW for the whole period so this channel advances in lock-step with the
-        // stepping channels without emitting an edge.
-        PulseCode::new_clamped(Level::Low, clamp_len(period), Level::Low, 0)
+        // A silent tick: stay LOW for the whole period, but split across TWO non-zero halves so the symbol
+        // is never an end marker (Finding #1). The channel advances in lock-step with the stepping channels
+        // without emitting an edge.
+        let (a, b) = silent_symbol_halves(period);
+        PulseCode::new_clamped(Level::Low, clamp_len(a), Level::Low, clamp_len(b))
       };
     }
-    // Terminate the buffer; transmission hangs without an end marker (both lengths zero).
+    // Terminate the buffer with the explicit end marker; this is the ONLY symbol that may carry a zero
+    // length, and it must be last so transmission stops exactly at the end of the encoded ticks.
     self.scratch[axis][ticks.len()] = PulseCode::end_marker();
     ticks.len() + 1
   }
@@ -127,18 +146,23 @@ fn clamp_len(ticks: u32) -> u16 {
 
 impl StepSink for RmtStepSink {
   /// Latch the per-axis DIR outputs, then honor the `$29` direction-setup delay before the first following
-  /// step may rise. Because the sink method is synchronous (the generator calls it inline), the delay is a
-  /// short blocking busy-spin rather than an await — a few microseconds on the dedicated core, negligible.
+  /// step may rise — but ONLY when the direction actually changed (Finding #9). Because the sink method is
+  /// synchronous (the generator calls it inline), the delay is a short blocking busy-spin rather than an
+  /// await — a few microseconds on the dedicated core, negligible, and now skipped entirely across a run of
+  /// same-direction blocks where re-driving the identical GPIO levels needs no setup transition.
   fn set_direction(&mut self, dir: DirState) -> Result<(), StepError> {
+    let changed = self.last_dir != Some(dir);
     for axis in 0..AXES {
       // `true` is the positive (increasing-step) direction → drive the DIR GPIO high; `false` → low. The
       // physical polarity is set by wiring; the planner/generator agree on this sign convention (DOC-02).
       self.dir[axis].set_level(if dir.dir[axis] { Level::High } else { Level::Low });
     }
-    if self.dir_setup_us > 0 {
-      // Hold off the first step for the `$29` setup delay. A blocking busy-delay is correct here: the sink
-      // method is synchronous (the generator calls it inline) so it cannot await, and core 1 is dedicated to
-      // motion, so a few-microsecond spin per block (not per step) is negligible.
+    self.last_dir = Some(dir);
+    if changed && self.dir_setup_us > 0 {
+      // Hold off the first step for the `$29` setup delay, only on a real direction change. A blocking
+      // busy-delay is correct here: the sink method is synchronous (the generator calls it inline) so it
+      // cannot await, and core 1 is dedicated to motion, so a few-microsecond spin (now only when DIR
+      // genuinely flips, not every block) is negligible.
       self.delay.delay_micros(self.dir_setup_us);
     }
     Ok(())
@@ -173,8 +197,15 @@ impl StepSink for RmtStepSink {
       match channel.transmit(&self.scratch[axis][..len]) {
         Ok(txn) => *slot = Some(txn),
         Err(_) => {
-          // The transmit failed to start; the channel is lost from this transaction, so we cannot restore
-          // it. Surface a transport error — the executor abandons the block and the next reset re-inits RMT.
+          // `Channel::transmit` takes the channel BY VALUE and, on the start error path (esp-hal 1.0.0),
+          // returns only the `Error` — the channel is moved in and not handed back, so this axis's channel
+          // is genuinely lost and its `Option` slot stays `None`; that axis cannot transmit again. This is a
+          // hardware fault (a mis-sized buffer / missing end marker is excluded by construction here), so it
+          // should escalate to an ALARM that re-inits the RMT peripheral. The executor has no alarm state
+          // yet (Stage 1), so for now we surface a transport error (which abandons the current block) and the
+          // channel remains down until reboot. TODO(DOC-06 alarm path): on this error raise an alarm and
+          // re-run `motion::init`'s RMT bring-up to reclaim the channel. The previous comment claiming "the
+          // next reset re-inits RMT" was FALSE — nothing currently re-inits RMT — and is corrected here.
           return Err(StepError::Transport);
         }
       }
@@ -203,44 +234,48 @@ impl StepSink for RmtStepSink {
 /// It drains the shared [`PLANNER`] queue and realizes each block as RMT step pulses through `sink`, tracks
 /// the live machine position, and honors feed-hold / soft-reset at block boundaries. It replaces the
 /// Stage-1 `block_drain_stub`: where the stub only paced time and published the planner's *planned*
-/// position, this publishes the true *live* (interpolated) MPos from the executed step counter.
+/// position, this publishes the true *live* (interpolated) MPos straight from the executed step counter.
 ///
 /// ## Loop shape
-/// 1. Pop the next block under the planner lock, peeking the following block's `entry_speed_sq` as this
+/// 1. Service a pending soft reset (dedicated [`MOTION_RESET`] / [`MOTION_RESET_PENDING`], NOT the shared
+///    `SOFT_RESET` — an embassy `Signal` wakes one waiter, so the executor needs its own — Finding #3):
+///    zero the live position so MPos returns to the origin in step with the consumer's pipeline reset.
+/// 2. At each block boundary (never mid-burst), honor a feed-hold: if [`FEED_HOLD`](crate::comms::FEED_HOLD)
+///    is set, drain any stale latched [`CYCLE_START`](crate::comms::CYCLE_START) (Finding #8) then await a
+///    fresh one before running the block. A reset releases the hold.
+/// 3. Pop the next block under the planner lock, peeking the following block's `entry_speed_sq` as this
 ///    block's `exit_speed_sq` (0.0 when the queue holds only this block, so it stops at rest). Release the
 ///    lock BEFORE any RMT transmit — the planner mutex is never held across step emission.
-/// 2. If the queue was empty, await [`BLOCK_AVAILABLE`](crate::comms::BLOCK_AVAILABLE) (set by the consumer
-///    after it enqueues a motion block) rather than polling — racing [`SOFT_RESET`](crate::comms::SOFT_RESET)
-///    so a `0x18` wakes the executor promptly.
-/// 3. At each block boundary (never mid-burst), honor a feed-hold: if [`FEED_HOLD`](crate::comms::FEED_HOLD)
-///    is set, pause and await [`CYCLE_START`](crate::comms::CYCLE_START) before running the block (Stage-1
-///    granularity is per-block; smooth deceleration is a later refinement).
-/// 4. Run the block synchronously through the [`SegmentGenerator`], advancing the live [`StepCounter`] from
-///    each emitted [`StepEvent`], then publish the live MPos and free-block count into [`MACHINE`].
-///
-/// A soft reset abandons the in-flight loop, zeroes the live position, and waits for the next block; the
-/// consumer's `reset_pipeline` reconstructs the planner, so the executor simply observes an emptied queue.
+/// 4. If the queue was empty, await [`BLOCK_AVAILABLE`](crate::comms::BLOCK_AVAILABLE) rather than polling,
+///    racing [`MOTION_RESET`] so a `0x18` wakes the executor promptly.
+/// 5. Run the block synchronously through the [`SegmentGenerator`], advancing the live [`StepCounter`] and
+///    publishing the live step position into the [`LIVE_POSITION`] atomics after EACH burst (so MPos is live
+///    within a long block, not frozen until the block ends — Finding #5). A reset pending between bursts
+///    aborts the block early via a sink error, then the next loop iteration zeroes the position.
 pub async fn run(sink: &mut RmtStepSink) -> ! {
   let generator = SegmentGenerator::new(placeholder_motion_config());
-  let steps_per_mm = placeholder_steps_per_mm();
   let mut counter = StepCounter::new();
   loop {
-    // A soft reset at the top of the loop drops the live position so MPos returns to the origin in step with
-    // the consumer's pipeline reset. The signal may also have been consumed by the consumer; observing it
-    // here (non-blocking) and zeroing the counter keeps the published position consistent either way.
-    if SOFT_RESET.try_take().is_some() {
-      counter.reset();
-      publish_position(&counter, &steps_per_mm).await;
+    // Service a pending soft reset at the top of the loop: drop the live position so MPos returns to the
+    // origin in step with the consumer's pipeline reset. `MOTION_RESET_PENDING` is the poll-able flag the
+    // sink also tests mid-block; clearing it AND draining the `MOTION_RESET` signal here keeps the two in
+    // sync so a reset is serviced exactly once.
+    if MOTION_RESET_PENDING.swap(false, Ordering::AcqRel) {
+      MOTION_RESET.try_take();
+      reset_live_position(&mut counter);
     }
 
     // Honor a feed-hold at the block boundary: pause until cycle-start. Checking here (never mid-block)
-    // matches DOC-02 step 4 — a burst in flight is never split. A soft reset also releases the hold.
+    // matches DOC-02 — a burst in flight is never split. Drain any STALE latched cycle-start first (Finding
+    // #8): a `~` that arrived while no hold was pending must not auto-release this fresh hold, so we clear it
+    // before awaiting a genuinely new one. A soft reset also releases the hold.
     if FEED_HOLD.try_take().is_some() {
-      match select(CYCLE_START.wait(), SOFT_RESET.wait()).await {
+      CYCLE_START.try_take();
+      match select(CYCLE_START.wait(), MOTION_RESET.wait()).await {
         Either::First(()) => {}
         Either::Second(()) => {
-          counter.reset();
-          publish_position(&counter, &steps_per_mm).await;
+          MOTION_RESET_PENDING.store(false, Ordering::Release);
+          reset_live_position(&mut counter);
           continue;
         }
       }
@@ -257,17 +292,14 @@ pub async fn run(sink: &mut RmtStepSink) -> ! {
     };
 
     match popped {
-      Some((block, exit_speed_sq)) => {
-        run_block(&generator, &block, exit_speed_sq, sink, &mut counter);
-        publish_position(&counter, &steps_per_mm).await;
-      }
-      // Queue empty: await a freshly enqueued block instead of polling, racing a soft reset so a reset
-      // arriving while idle is still observed promptly (it zeroes the position on the next iteration).
-      None => match select(BLOCK_AVAILABLE.wait(), SOFT_RESET.wait()).await {
+      Some((block, exit_speed_sq)) => run_block(&generator, &block, exit_speed_sq, sink, &mut counter),
+      // Queue empty: await a freshly enqueued block instead of polling, racing the dedicated motion reset so
+      // a reset arriving while idle is observed promptly (it zeroes the position on the next iteration).
+      None => match select(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait()).await {
         Either::First(()) => {}
         Either::Second(()) => {
-          counter.reset();
-          publish_position(&counter, &steps_per_mm).await;
+          MOTION_RESET_PENDING.store(false, Ordering::Release);
+          reset_live_position(&mut counter);
         }
       },
     }
@@ -276,7 +308,8 @@ pub async fn run(sink: &mut RmtStepSink) -> ! {
 
 /// Pop the next block and compute its exit speed from the *following* block's planned entry speed (squared),
 /// or `0.0` when this is the only queued block (it must stop at rest). Peeking after the pop reads the new
-/// head, which is the block that will run next — exactly the exit-speed semantics the generator expects.
+/// head, which is the block that will run next — exactly the exit-speed semantics the generator expects, and
+/// the block whose entry the planner now FREEZES (busy-block protection, Finding #4) so this exit stays valid.
 fn take_block(planner: &mut Planner) -> Option<(Block, f32)> {
   let block = planner.pop_block()?;
   let exit_speed_sq = planner.peek_block().map(|next| next.entry_speed_sq).unwrap_or(0.0);
@@ -285,8 +318,10 @@ fn take_block(planner: &mut Planner) -> Option<(Block, f32)> {
 
 /// Realize one block through the generator while advancing the live step counter. The counter is fed in
 /// lock-step with the sink: `set_direction` latches the per-axis sign from the block, and each emitted
-/// [`StepEvent`] advances the counter — so the live MPos mirrors exactly what the RMT channels emit. A
-/// generator/sink error abandons the block (the next status report still reflects the steps emitted so far).
+/// [`StepEvent`] advances the counter and publishes the live position into [`LIVE_POSITION`] per burst — so
+/// the live MPos mirrors exactly what the RMT channels emit, updated within the block rather than only at its
+/// end. A generator/sink error (including a soft-reset abort tested between bursts) abandons the block; the
+/// next status report still reflects the steps published so far.
 fn run_block(generator: &SegmentGenerator, block: &Block, exit_speed_sq: f32, sink: &mut RmtStepSink, counter: &mut StepCounter) {
   // Latch the live counter's direction from the same step signs the generator latches onto the sink, so the
   // counter advances each axis the correct way. A zero-length block never steps, so this is harmless then.
@@ -296,13 +331,16 @@ fn run_block(generator: &SegmentGenerator, block: &Block, exit_speed_sq: f32, si
   let mut tracking = CountingSink { inner: sink, counter };
   // The generator returns the tick count or a recoverable error; on error we simply stop emitting this
   // block. The error is not surfaced upward because Stage 1 has no alarm state machine yet (DOC-06/Stage 2);
-  // the abandoned block leaves the machine where the last successful burst put it, which the live MPos shows.
+  // the abandoned block leaves the machine where the last published burst put it, which the live MPos shows.
   let _ = generator.run_block(block, exit_speed_sq, &mut tracking);
 }
 
-/// A [`StepSink`] decorator that advances a [`StepCounter`] as bursts pass through to the real RMT sink, so
-/// the live position is derived from exactly the events the hardware emits (not re-derived from the block).
-/// It forwards `set_direction`/`emit_burst` to the inner sink and tallies steps on the way through.
+/// A [`StepSink`] decorator that advances a [`StepCounter`] and publishes the live position as bursts pass
+/// through to the real RMT sink, so MPos is derived from exactly the events the hardware emits (not
+/// re-derived from the block) and stays live WITHIN a block. It forwards `set_direction`/`emit_burst` to the
+/// inner sink, tallies steps, pushes the running step position into [`LIVE_POSITION`], and — between bursts —
+/// aborts the block early on a pending soft reset (Finding #3) so a reset during a multi-second block zeroes
+/// the position within one burst rather than after the whole block.
 struct CountingSink<'a> {
   inner: &'a mut RmtStepSink,
   counter: &'a mut StepCounter,
@@ -316,35 +354,41 @@ impl StepSink for CountingSink<'_> {
   }
 
   fn emit_burst(&mut self, ticks: &[StepEvent]) -> Result<(), StepError> {
+    // Abort BETWEEN bursts on a pending soft reset (never mid-burst — a burst in flight is never split):
+    // returning a sink error stops `run_block` early, and the executor's next iteration zeroes the position.
+    // This bounds reset latency to one burst even inside a long block (Finding #3).
+    if MOTION_RESET_PENDING.load(Ordering::Acquire) {
+      return Err(StepError::Transport);
+    }
     // Emit first, then count: only count the steps that actually reached the hardware, so a transport
     // failure mid-burst does not advance the live position past what was physically emitted.
     self.inner.emit_burst(ticks)?;
     for event in ticks {
       self.counter.advance(event);
     }
+    // Publish the running step position after the burst, decoupled from the executor's block-level `.await`
+    // so `?` reflects motion as it happens. `Release` stores pair with the reader's `Acquire` loads.
+    publish_live_position(self.counter);
     Ok(())
   }
 }
 
-/// Publish the live machine position (steps → mm) and the planner free-block count into the shared
-/// [`MACHINE`] snapshot, so the status reporter answers `?` with the *live* MPos and a truthful `Bf:`. This
-/// replaces the stub's planned-position publish (review finding #7: live vs planned position).
-async fn publish_position(counter: &StepCounter, steps_per_mm: &[f32; AXES]) {
-  let mpos = counter.position_mm(steps_per_mm);
-  let free = {
-    let guard = PLANNER.lock().await;
-    match guard.as_ref() {
-      Some(planner) => {
-        let queued = planner.queued_len();
-        firmware_core::planner::BLOCK_QUEUE_LEN.saturating_sub(queued) as u8
-      }
-      // No planner installed (init wiring bug, unreachable in a wired build): report the full queue free.
-      None => firmware_core::planner::BLOCK_QUEUE_LEN as u8,
-    }
-  };
-  let mut snap = MACHINE.lock().await;
-  snap.mpos_mm = mpos;
-  snap.planner_blocks_free = free;
+/// Zero the live step counter and the published [`LIVE_POSITION`] atomics together, so a soft reset returns
+/// MPos to the origin atomically from the reader's view. The executor is the SINGLE owner of the live
+/// position (Finding #3): the consumer's `reset_pipeline` never writes it, so there is no cross-core race.
+fn reset_live_position(counter: &mut StepCounter) {
+  counter.reset();
+  publish_live_position(counter);
+}
+
+/// Publish the step counter's current position into the cross-core [`LIVE_POSITION`] atomics. `Release`
+/// stores so a [`status_responder`](crate::comms::status_responder) `Acquire` read on core 0 sees a coherent
+/// per-axis value. Steps→mm conversion is deferred to the reader's host-tested `steps_to_mm` (Finding #5).
+fn publish_live_position(counter: &StepCounter) {
+  let position = counter.position_steps();
+  for axis in 0..AXES {
+    LIVE_POSITION[axis].store(position[axis], Ordering::Release);
+  }
 }
 
 /// Configure the three RMT TX step channels (ch0/1/2 on GPIO1/2/4) and the three DIR outputs (GPIO5/6/7),
@@ -352,8 +396,10 @@ async fn publish_position(counter: &StepCounter, steps_per_mm: &[f32; AXES]) {
 ///
 /// The RMT source clock is 80 MHz; with `clk_divider = 80` one tick is exactly 1 µs, matching the default
 /// `MotionConfig.tick_hz = 1_000_000` the generator assumes (so a `period_ticks` value is a microsecond
-/// count). The default `memsize` is one block (48 symbols), exactly the burst cap — no adjacent-channel
-/// borrowing. `STEP_EN` is returned so its lifetime is held for the program duration (dropping it would
+/// count). The default `memsize` is one block (48 symbols); a full burst is `MAX_SYMBOLS_PER_BURST` (47)
+/// events plus one `end_marker` = exactly 48 symbols, so it fits one block with no adjacent-channel
+/// borrowing and no reliance on the interrupt-priority streaming refill (Finding #7). `STEP_EN` is returned
+/// so its lifetime is held for the program duration (dropping it would
 /// release the pin); the full enable/disable policy is a later refinement.
 ///
 /// # Panics

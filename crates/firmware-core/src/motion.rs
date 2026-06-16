@@ -218,6 +218,10 @@ struct StepTiming {
   max_rate_hz: f32,
   /// The minimum (fastest) step period in ticks; every computed period floors at this.
   min_period_ticks: u32,
+  /// The maximum (slowest) representable step period in ticks; every computed period caps at this so the
+  /// LOW half of the encoded step symbol (`period − $0`) never overflows the 15-bit RMT field. A feed slow
+  /// enough to want a longer period runs at this floor rate instead (see [`StepTiming::for_block`]).
+  max_period_ticks: u32,
   /// The period used when velocity collapses to zero: the slowest representable step, but never faster
   /// than the minimum period.
   floor_period_ticks: u32,
@@ -231,12 +235,20 @@ impl StepTiming {
     let dom_steps = block.steps[dominant].unsigned_abs();
     let dom_mm_per_step = block.millimeters / dom_steps as f32;
     let min_period_ticks = config.min_period_ticks();
+    // The slowest representable period: the step symbol's LOW half is `period − $0` in a single 15-bit RMT
+    // field, so `period − $0 ≤ RMT_MAX_FIELD_LEN`, i.e. `period ≤ RMT_MAX_FIELD_LEN + $0`. Never let the
+    // cap fall below the minimum period (a degenerate `$0` larger than the field would otherwise invert the
+    // bounds); `max(min_period_ticks)` keeps the `[min, max]` interval well-formed. TODO(DOC-02): feeds
+    // slower than `tick_hz / max_period_ticks` step rate currently floor at this rate — true sub-floor slow
+    // stepping (needed for very slow Z-probing) requires multi-symbol periods, which is out of scope now.
+    let max_period_ticks = (RMT_MAX_FIELD_LEN + config.step_pulse_ticks).max(min_period_ticks);
     Self {
       dom_mm_per_step,
       tick_hz: config.tick_hz,
       max_rate_hz: config.max_step_rate_hz(),
       min_period_ticks,
-      floor_period_ticks: SLOWEST_PERIOD_TICKS.max(min_period_ticks),
+      max_period_ticks,
+      floor_period_ticks: SLOWEST_PERIOD_TICKS.clamp(min_period_ticks, max_period_ticks),
     }
   }
 
@@ -255,9 +267,11 @@ impl StepTiming {
       return self.floor_period_ticks;
     }
     let period = self.tick_hz / clamped;
-    // Round to the nearest whole tick, then floor at the minimum period to respect the pulse timing.
+    // Round to the nearest whole tick, then clamp into the representable `[min, max]` interval: the floor
+    // respects the fastest pulse timing, the ceiling keeps the step symbol's LOW half (`period − $0`) inside
+    // the 15-bit RMT field so a very slow feed cannot overflow it and silently run faster than commanded.
     let rounded = libm::roundf(period) as u32;
-    rounded.max(self.min_period_ticks)
+    rounded.clamp(self.min_period_ticks, self.max_period_ticks)
   }
 }
 
@@ -315,13 +329,7 @@ impl StepCounter {
   /// resolution the planner rounds with). A non-positive `steps_per_mm[axis]` yields `0.0` for that axis
   /// rather than a NaN/inf, so a degenerate setting cannot poison the status report.
   pub fn position_mm(&self, steps_per_mm: &[f32; AXES]) -> [f32; AXES] {
-    let mut out = [0.0f32; AXES];
-    for axis in 0..AXES {
-      if steps_per_mm[axis] > 0.0 {
-        out[axis] = self.position[axis] as f32 / steps_per_mm[axis];
-      }
-    }
-    out
+    steps_to_mm(&self.position, steps_per_mm)
   }
 
   /// Reset the live position to the origin (steps zeroed) on a soft reset / pipeline reset, leaving the
@@ -337,11 +345,52 @@ impl Default for StepCounter {
   }
 }
 
+/// Convert a live step position to millimeters per axis using `steps_per_mm` (the `$100..102` resolution the
+/// planner rounds with). A non-positive `steps_per_mm[axis]` yields `0.0` for that axis rather than a
+/// NaN/inf, so a degenerate setting cannot poison the status report. Shared by [`StepCounter::position_mm`]
+/// and the firmware bin's status reporter, which reads the live position from cross-core atomics (Finding
+/// #5) and converts it here so the steps→mm math stays in one host-tested place.
+pub fn steps_to_mm(position: &[i32; AXES], steps_per_mm: &[f32; AXES]) -> [f32; AXES] {
+  let mut out = [0.0f32; AXES];
+  for axis in 0..AXES {
+    if steps_per_mm[axis] > 0.0 {
+      out[axis] = position[axis] as f32 / steps_per_mm[axis];
+    }
+  }
+  out
+}
+
+/// The maximum value an RMT pulse-length field can hold: the duration is a single 15-bit field, so one
+/// LOW (or HIGH) sub-interval cannot exceed `0x7FFF` ticks. The firmware bin encodes a stepping tick as a
+/// HIGH(`$0`)/LOW(`period − $0`) pair, so the binding limit on a step period is that its LOW half stay
+/// within this field — see [`StepTiming::max_period_ticks`]. Single-sourced here so the host-tested clamp
+/// and the on-target PulseCode encoder agree on the hardware limit (the bin re-exposes it as
+/// `PulseCode::MAX_LEN`, which is the same `0x7FFF`).
+pub const RMT_MAX_FIELD_LEN: u32 = 0x7FFF;
+
 /// A ceiling on the step period (in ticks) for a velocity that has collapsed to zero, so a momentary
 /// `v = 0` at the boundary of a rest-to-rest block emits a finite, very slow step instead of dividing by
 /// zero or saturating the 15-bit RMT duration field. One tick of motion at this rate is harmless because
 /// such ticks only occur at the extreme ends of a ramp. Chosen well below the RMT 15-bit max (32767).
 const SLOWEST_PERIOD_TICKS: u32 = 30_000;
+
+/// Split a silent (no-step) tick's full LOW period into two non-zero RMT sub-interval lengths `(a, b)` with
+/// `a + b == period`, each within the 15-bit field. The firmware bin encodes a silent axis as
+/// `LOW(a) / LOW(b)`: BOTH halves MUST be non-zero, because an RMT pulse code with either length zero is an
+/// END MARKER that stops the channel mid-burst — which would drop every remaining step on any axis idle on a
+/// tick (Finding #1, the showstopper). Splitting near the middle keeps both halves well inside the field for
+/// any period the generator emits (`period ≤ RMT_MAX_FIELD_LEN + $0`, so each half ≤ ~16 K). For a degenerate
+/// `period < 2` the function still returns `(1, 1)`, never a zero half; the generator never emits such a
+/// period (its minimum is `step_pulse_ticks + min_low_ticks ≥ 2`), so the floor is purely defensive.
+///
+/// This pure split is host-tested here so the critical no-end-marker invariant is guarded under `cargo test`;
+/// the bin clamps each half into the hardware field with `PulseCode::new_clamped` as a final guard.
+pub fn silent_symbol_halves(period: u32) -> (u32, u32) {
+  let p = period.max(2);
+  let a = (p / 2).max(1);
+  let b = p - a;
+  (a, b)
+}
 
 /// The index of the dominant axis: the axis with the largest absolute step count. Ties resolve to the
 /// lowest index (X before Y before Z), which is deterministic and matches grbl's stable selection.
@@ -807,6 +856,33 @@ mod tests {
     assert_eq!(sink.all_ticks()[0].period_ticks, min, "saturates at the min period under the cap");
   }
 
+  #[test]
+  fn period_caps_at_max_representable_for_a_very_slow_feed() {
+    // A feed slow enough to want a period longer than the 15-bit RMT field must clamp to the representable
+    // maximum, never overflow it: the step symbol's LOW half is `period − $0`, so the period must stay
+    // within `RMT_MAX_FIELD_LEN + $0`. Without the cap a tiny velocity would round to a huge period that, on
+    // target, truncates to a 15-bit value and steps FASTER than commanded — a silent over-speed (Finding #2).
+    let cfg = test_config();
+    let generator = SegmentGenerator::new(cfg);
+    // 100 steps over a very long 1000 mm block at a crawling nominal speed (v = 0.01 mm/s, v² = 1e-4). The
+    // dominant-axis step rate is far below `tick_hz / max_period_ticks`, so every period saturates the cap.
+    let block = make_block([100, 0, 0], 1000.0, 1.0, 1.0e-4, 1.0e-4);
+    let mut sink = RecordingSink::new();
+    generator.run_block(&block, 1.0e-4, &mut sink).expect("runs");
+    let max_period = RMT_MAX_FIELD_LEN + cfg.step_pulse_ticks;
+    assert!(
+      sink.all_ticks().iter().all(|e| e.period_ticks <= max_period),
+      "no period exceeds the representable max ({max_period} ticks)",
+    );
+    // The LOW half of the encoded step symbol (`period − $0`) must fit the 15-bit field on every tick.
+    assert!(
+      sink.all_ticks().iter().all(|e| e.period_ticks - cfg.step_pulse_ticks <= RMT_MAX_FIELD_LEN),
+      "the step symbol's LOW half stays within the 15-bit RMT field",
+    );
+    // At this crawl the period genuinely saturates the cap (the floor would be unreachable otherwise).
+    assert_eq!(sink.all_ticks()[0].period_ticks, max_period, "saturates at the max period for a slow feed");
+  }
+
   // ---- Degenerate cases -------------------------------------------------------------------------
 
   #[test]
@@ -956,6 +1032,41 @@ mod tests {
     // Direction is retained: a subsequent step still goes negative until a block re-latches it.
     counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
     assert_eq!(counter.position_steps(), [-1, 0, 0]);
+  }
+
+  /// `steps_to_mm` (the standalone conversion the bin's status reporter uses against the live atomics)
+  /// divides each axis by its `$100..102` resolution, and a non-positive resolution yields a finite `0.0`.
+  #[test]
+  fn steps_to_mm_converts_with_degenerate_axis_safe() {
+    let mm = steps_to_mm(&[250, -250, 7], &[250.0, 100.0, 0.0]);
+    assert!((mm[0] - 1.0).abs() < 1e-6);
+    assert!((mm[1] + 2.5).abs() < 1e-6);
+    // A zero steps/mm axis is reported as 0.0, never a division blow-up.
+    assert_eq!(mm[2], 0.0);
+  }
+
+  // ---- Silent-symbol half split: never an RMT end marker (Finding #1) ---------------------------
+
+  /// The silent (no-step) symbol must split a full LOW period into two NON-ZERO halves: a zero-length RMT
+  /// field is an end marker that would terminate the channel mid-burst and drop a subordinate axis's
+  /// remaining steps. Across every representable period (and a degenerate tiny one), both halves are ≥ 1, fit
+  /// the 15-bit field, and (for non-degenerate periods) sum to the period exactly.
+  #[test]
+  fn silent_symbol_halves_are_never_an_end_marker() {
+    // Sweep the representable period range plus the degenerate edges. `max_period` is the slowest period the
+    // generator can emit (`RMT_MAX_FIELD_LEN + $0`) with the default 10-tick pulse.
+    let max_period = RMT_MAX_FIELD_LEN + 10;
+    for period in [2u32, 3, 12, 13, 1000, 30_000, max_period - 1, max_period] {
+      let (a, b) = silent_symbol_halves(period);
+      assert!(a >= 1 && b >= 1, "neither half may be zero (period {period}): got ({a}, {b})");
+      assert!(a <= RMT_MAX_FIELD_LEN && b <= RMT_MAX_FIELD_LEN, "both halves fit the 15-bit field");
+      assert_eq!(a + b, period, "the two halves reconstruct the full period exactly (period {period})");
+    }
+    // Degenerate sub-minimum periods still never produce a zero half (defensive floor, never hit in practice).
+    for period in [0u32, 1] {
+      let (a, b) = silent_symbol_halves(period);
+      assert!(a >= 1 && b >= 1, "a degenerate period still yields two non-zero halves: ({a}, {b})");
+    }
   }
 
   /// Saturating arithmetic pins the position at `i32::MAX` rather than wrapping, so a pathological step

@@ -35,6 +35,8 @@
 //! Real-time bytes are intercepted in [`usb_rx`] before they ever reach the byte buffer and never receive
 //! an `ok`, exactly matching the firmware-core contract.
 
+use core::sync::atomic::{AtomicI32, Ordering};
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
@@ -47,7 +49,7 @@ use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
 use firmware_core::gcode::{ModalState, MotionMode, DistanceMode as GcodeDistance, Parser, Units as GcodeUnits};
-use firmware_core::motion::MotionConfig;
+use firmware_core::motion::{steps_to_mm, MotionConfig};
 use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcome, AXES};
 use firmware_core::protocol::{
   classify_realtime, EngineEvent, MachineSnapshot, ParserDistance, ParserMotion, ParserSnapshot,
@@ -99,15 +101,47 @@ pub static RESPONSE: Channel<CriticalSectionRawMutex, Response, RESPONSE_QUEUE_D
 /// `?` (status report request) — set by `usb_rx`, consumed by `status_responder`.
 pub static STATUS_REQUEST: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// `!` (feed hold) — set by `usb_rx`. Stage-1 consumer is a documented stub (no motion yet).
+/// `!` (feed hold) — set by `usb_rx`, consumed by the core-1 motion executor at the next block boundary
+/// (Stage-1 granularity is per-block; smooth ramp-down is a later refinement).
 pub static FEED_HOLD: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// `~` (cycle start / resume) — set by `usb_rx`. Stage-1 consumer is a documented stub.
+/// `~` (cycle start / resume) — set by `usb_rx`, awaited by the motion executor to release a feed-hold. The
+/// executor drains a stale latch before awaiting so a `~` arriving with no hold pending cannot auto-release
+/// the next hold (Finding #8).
 pub static CYCLE_START: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// `0x18` (soft reset) — set by `usb_rx`. The reset handler re-emits the banner and (later) flushes the
-/// parser/planner/motion queues; Stage 1 re-emits the banner and clears the line queue.
+/// `0x18` (soft reset) — set by `usb_rx`, consumed by `comms_consumer` (it rebuilds the parser/planner and
+/// emits the banner) and by `plan_command`'s back-pressure retry. The CORE-1 motion executor does NOT share
+/// this Signal — it has its own [`MOTION_RESET`] — because an embassy `Signal` wakes only one waiter
+/// (Finding #3).
 pub static SOFT_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Dedicated soft-reset notification for the CORE-1 motion executor (Finding #3). An embassy `Signal` wakes
+/// exactly ONE waiter, so the single [`SOFT_RESET`] cannot be shared by the consumer, the back-pressure
+/// retry, AND the cross-core executor — whichever waiter happens to win consumes it and the others miss the
+/// reset. The `0x18` dispatch fires this in addition to [`SOFT_RESET`], giving the executor its own guaranteed
+/// wake (the same "dedicated Signal per waiter" rule [`LINE_RESET`] follows). The executor races it between
+/// blocks AND tests it between bursts (via [`MOTION_RESET_PENDING`]) so an in-flight block aborts promptly,
+/// then zeroes the live step position.
+pub static MOTION_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// A poll-able "a soft reset is pending for the executor" flag, set alongside [`MOTION_RESET`] by the `0x18`
+/// dispatch. The motion executor's step sink tests this BETWEEN bursts (not mid-burst — a burst in flight is
+/// never split) and returns a [`StepError`] to abort the current `run_block` early, so a reset during a long
+/// (multi-second) block zeroes the position within one burst rather than after the whole block (Finding #3).
+/// It is a separate `AtomicBool` rather than a second `Signal` read so the sink can peek it WITHOUT consuming
+/// the wake that the executor's between-block `select` also needs. The executor clears it when it services
+/// the reset. `AcqRel`/`Acquire` ordering publishes the flag across cores on the S3.
+pub static MOTION_RESET_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The live machine position in whole steps per axis, `[X, Y, Z]`, published by the core-1 motion executor's
+/// counting sink after EACH burst (decoupled from the executor's block-level `.await`) and read by
+/// [`status_responder`] to render a genuinely live MPos (Finding #5). 32-bit atomics are native single-cycle
+/// loads/stores on the S3, so the cross-core publish is lock-free. This is the SINGLE owner of the live
+/// position: the executor zeroes it on a soft reset, and nothing else writes it — so there is no stale
+/// overwrite race with the consumer's pipeline reset (which no longer touches MPos). Steps→mm conversion for
+/// the report stays in the host-tested [`steps_to_mm`].
+pub static LIVE_POSITION: [AtomicI32; AXES] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
 
 /// Planner → motion-executor readiness signal (DOC-01). Set by [`plan_command`] after it enqueues a motion
 /// block, so the core-1 `motion_executor` can AWAIT a fresh block when it finds the queue empty instead of
@@ -305,12 +339,18 @@ fn dispatch_realtime(cmd: RealtimeCommand) {
     RealtimeCommand::CycleStart => CYCLE_START.signal(()),
     RealtimeCommand::SoftReset | RealtimeCommand::Stop => {
       // Drop every buffered RX byte and every framed-but-unconsumed line so post-reset modal state is not
-      // contaminated by anything that arrived before the reset. Both Signals are set so the assembler drops
-      // its partial line and the consumer rebuilds the parser/planner and re-emits the banner.
+      // contaminated by anything that arrived before the reset. Dedicated Signals are set for each waiter so
+      // the assembler drops its partial line, the consumer rebuilds the parser/planner and re-emits the
+      // banner, and the core-1 motion executor aborts its block + zeroes the live position — one Signal per
+      // waiter because an embassy `Signal` wakes only ONE task (Finding #3).
       RX_PIPE.clear();
       while LINE_QUEUE.try_receive().is_ok() {}
       LINE_RESET.signal(());
       SOFT_RESET.signal(());
+      // Wake the executor (idle case) and raise the poll-able mid-block abort flag (running case). Set the
+      // flag with `Release` before the `Signal` so the executor, on its wake, observes the flag set.
+      MOTION_RESET_PENDING.store(true, core::sync::atomic::Ordering::Release);
+      MOTION_RESET.signal(());
       // Best-effort immediate readiness banner; the consumer's reset emits the guaranteed one. Dropping
       // this (full RESPONSE) is harmless and keeps the reader non-blocking on the real-time path.
       try_send_banner();
@@ -391,10 +431,15 @@ pub async fn comms_consumer() -> ! {
 }
 
 /// Reset the parser/planner pipeline state this task owns on a soft reset (`0x18`): restore the parser to
-/// default modal state, clear the gcode error-hold, flush the planner queue and machine position, and emit
-/// the guaranteed readiness banner. The `RX_PIPE`, the `line_assembler`'s partial line, and `LINE_QUEUE`
-/// were already cleared by `usb_rx`; this completes the warm reset for the downstream half so a fresh stream
-/// starts from defaults at the origin.
+/// default modal state, clear the gcode error-hold, flush the planner queue, reset the non-position snapshot
+/// fields to idle, and emit the guaranteed readiness banner. The `RX_PIPE`, the `line_assembler`'s partial
+/// line, and `LINE_QUEUE` were already cleared by `usb_rx`; this completes the warm reset for the downstream
+/// half so a fresh stream starts from defaults at the origin.
+///
+/// The LIVE MACHINE POSITION is deliberately NOT touched here: the core-1 motion executor is its single owner
+/// (it zeroes the [`LIVE_POSITION`] atomics on [`MOTION_RESET`]), so the consumer writing it too would be a
+/// cross-core stale-overwrite race (Finding #3). Resetting `MACHINE` to idle here only restores the fields
+/// the executor does not own (run-state / feed / spindle / RX-free); `status_responder` reads MPos live.
 async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   // `Parser` exposes no in-place reset; reconstructing it restores the documented power-on modal defaults
   // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state.
@@ -402,7 +447,8 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   state.error_hold = false;
   // Reconstruct the planner to clear the block queue, machine position, work offset, and junction state in
   // one step (it has no public flush). The placeholder config is re-applied; once esp-storage settings are
-  // wired the reset will re-load them. Reset the published snapshot to idle so `?` reports the origin.
+  // wired the reset will re-load them. Reset the published snapshot's non-position fields to idle; the live
+  // MPos atomics are zeroed by the executor on `MOTION_RESET`, not here (single-owner, no race).
   {
     let mut guard = PLANNER.lock().await;
     *guard = Some(Planner::new(placeholder_planner_config()));
@@ -641,18 +687,53 @@ async fn error(code: u8) {
   }
 }
 
-/// The status reporter: format a `<...>` report from the shared [`MachineSnapshot`] whenever the
-/// [`STATUS_REQUEST`] Signal fires (set by `usb_rx` on `?`/`0x80`/`0x87`). Stage 1 reports the shared
-/// snapshot (idle/origin until the motion executor publishes live data).
+/// The status reporter: format a `<...>` report whenever the [`STATUS_REQUEST`] Signal fires (set by
+/// `usb_rx` on `?`/`0x80`/`0x87`). It starts from the shared [`MachineSnapshot`] (run-state / feed / spindle
+/// / RX free — the fields the executor does not own) and OVERWRITES the two genuinely-live fields at report
+/// time: the MPos from the [`LIVE_POSITION`] atomics (Finding #5 — no longer frozen for a whole block), and
+/// the planner free-block count from the live queue depth (Finding #10 — accurate while idle or streaming).
+/// Reading these live, rather than from a periodically-published copy, keeps `?` truthful between publishes.
 #[embassy_executor::task]
 pub async fn status_responder() -> ! {
+  let steps_per_mm = placeholder_steps_per_mm();
   loop {
     STATUS_REQUEST.wait().await;
-    let snap = *MACHINE.lock().await;
+    let mut snap = *MACHINE.lock().await;
+    // Live MPos: read the executor's per-burst step atomics and convert via the host-tested `steps_to_mm`.
+    let position = read_live_position();
+    snap.mpos_mm = steps_to_mm(&position, &steps_per_mm);
+    // Live `Bf:` free-block count, read from the planner queue under its lock so it is accurate whether the
+    // machine is idle, streaming, or back-pressured — consistent with the advertised `BLOCK_QUEUE_LEN`.
+    snap.planner_blocks_free = planner_blocks_free().await;
     let mut s = Response::new();
     if ResponseWriter::status_report(&mut s, &snap).is_ok() {
       enqueue(s).await;
     }
+  }
+}
+
+/// Read the live machine position (whole steps per axis) from the cross-core [`LIVE_POSITION`] atomics. Uses
+/// `Acquire` loads so a reader on either core sees a coherent per-axis value the executor's sink published.
+fn read_live_position() -> [i32; AXES] {
+  let mut pos = [0i32; AXES];
+  for (axis, slot) in pos.iter_mut().enumerate() {
+    *slot = LIVE_POSITION[axis].load(Ordering::Acquire);
+  }
+  pos
+}
+
+/// The number of planner blocks currently free, read live from the shared planner queue and clamped to the
+/// advertised [`BLOCK_QUEUE_LEN`](firmware_core::planner::BLOCK_QUEUE_LEN) so `Bf:` always stays consistent
+/// with the buffer size reported in `[OPT:]` (Finding #10). A missing planner (init wiring bug, unreachable
+/// in a wired build) reports the full queue free.
+async fn planner_blocks_free() -> u8 {
+  let guard = PLANNER.lock().await;
+  match guard.as_ref() {
+    Some(planner) => {
+      let queued = planner.queued_len();
+      firmware_core::planner::BLOCK_QUEUE_LEN.saturating_sub(queued) as u8
+    }
+    None => firmware_core::planner::BLOCK_QUEUE_LEN as u8,
   }
 }
 
