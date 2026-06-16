@@ -1,0 +1,43 @@
+[package]
+name    = "firmware"
+version = "0.1.0"
+edition = "2024"
+
+# This crate only ever builds for `xtensa-esp32s3-none-elf`. The Xtensa target is selected by this
+# crate's `.cargo/config.toml` `[build] target` (effective when cargo is invoked from within this
+# directory). It is also kept OUT of the workspace `default-members`, so a plain `cargo build`/
+# `cargo test` at the repo root stays on the host's stock toolchain and never tries to compile
+# esp-hal for the host. Build/flash with the Espressif Rust fork (espup); see CLAUDE.md.
+# NOTE: `package.forced-target` would be the ideal pin but is nightly-only (`per-package-target`),
+# and its mere presence fails manifest parsing on the stable host toolchain — so we use the
+# `.cargo/config.toml` + `default-members` exclusion mechanism instead, which works on stable.
+
+# esp-hal is exact-pinned and esp-rtos is exact-pinned: esp-rtos 0.2 is tightly coupled to a specific
+# esp-hal API surface, and esp-hal must stay at 1.0.0 (1.1.x needs esp-rtos 0.3.x). Pinning both keeps
+# the runtime family from floating apart on `cargo update`. Reproducibility also relies on committing
+# Cargo.lock, which carries the exact embassy-* minors esp-rtos was resolved against.
+[dependencies]
+firmware-core     = { path = "../firmware-core", default-features = false }
+esp-hal           = { version = "=1.0.0", features = ["esp32s3", "unstable"] }
+esp-rtos          = { version = "=0.2.0", features = ["esp32s3", "embassy"] }
+embassy-executor  = { version = "0.9.1",  features = ["executor-interrupt", "executor-thread"] }
+embassy-time      = "0.5.0"
+embassy-sync      = "0.7"
+embassy-futures   = "0.1"
+esp-backtrace     = { version = "0.18.1", features = ["esp32s3", "panic-handler", "println"] }
+esp-println       = { version = "0.16.1", features = ["esp32s3"] }
+esp-storage       = { version = "0.8.1",  features = ["esp32s3"] }
+embedded-storage  = "0.3"
+embedded-io-async = "0.7"
+heapless          = "0.9"
+libm              = "0.2"
+defmt             = { version = "1", optional = true }
+static_cell       = "2"
+
+[dev-dependencies]
+embedded-hal-mock = "0.11"
+
+[features]
+# Opt-in defmt logging. Forwards to firmware-core so the no-defmt path stays the default; build a
+# logging image with `--features defmt`. Keeps a defmt-free release build available.
+defmt = ["dep:defmt", "firmware-core/defmt"]

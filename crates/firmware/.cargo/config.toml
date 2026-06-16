@@ -1,0 +1,17 @@
+# Firmware-local cargo config. Scoped to this crate so it never forces the Xtensa target onto the
+# workspace root: a plain `cargo build`/`cargo test` at the repo root stays on the host's stock
+# toolchain for firmware-core and skirnir. This config only takes effect for commands invoked from
+# within crates/firmware (or with this directory's config merged in).
+
+[build]
+target = "xtensa-esp32s3-none-elf"
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+
+[unstable]
+# build-std is required: the Xtensa bare-metal target has no precompiled `core` in the toolchain, so
+# cargo must build it from source. The Espressif (espup) toolchain ships the Xtensa rust-src. Only
+# `core` is listed — nothing in the tree uses `alloc` and no global allocator is registered; add
+# `alloc` here (and an allocator) if a dependency or our own code later needs heap allocation.
+build-std = ["core"]

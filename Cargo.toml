@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/firmware-core", "crates/firmware", "crates/skirnir"]
+# `firmware` targets Xtensa (esp-hal) and cannot compile on the host. Excluding it from
+# `default-members` means a plain `cargo build`/`cargo test` at the repo root operates only on the
+# host-buildable crates (firmware-core + skirnir) and never tries to compile esp-hal for the host.
+# Build firmware explicitly with the Espressif toolchain from within crates/firmware (see CLAUDE.md).
+# NOTE: `--workspace`/`--all` override `default-members` and WILL try to build firmware on the host
+# (which fails); from the repo root use `--exclude firmware` with those flags, or build firmware on
+# its own from within crates/firmware.
+default-members = ["crates/firmware-core", "crates/skirnir"]
+resolver = "2"
+
+# esp-hal firmware at opt-level 0 is large and slow: unoptimized debug builds can overflow IRAM and
+# miss real-time RMT step timing. Optimize dependencies for size in dev so the firmware image fits
+# and runs, while keeping our own crates unoptimized for debugging. Profiles only take effect in the
+# workspace-root manifest, so this also lightly applies to the host crates (acceptable).
+[profile.dev.package."*"]
+opt-level = "s"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"

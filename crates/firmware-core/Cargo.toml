@@ -1,0 +1,18 @@
+[package]
+name = "firmware-core"
+version = "0.1.0"
+edition = "2024"
+
+# Pure-logic, no_std library with NO esp-hal dependency. It compiles and unit-tests on the host with
+# stock Rust, and is also consumed by the firmware bin on Xtensa. All hardware access lives behind
+# traits in `hal_traits`; only the firmware wiring layer touches esp-hal.
+[dependencies]
+heapless          = "0.9"
+libm              = "0.2"
+defmt             = { version = "1", optional = true }
+
+[dev-dependencies]
+embedded-hal-mock = "0.11"
+
+[features]
+defmt = ["dep:defmt"]

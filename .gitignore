@@ -1,0 +1,9 @@
+/target
+
+# Firmware build artifacts. Xtensa builds land under the shared workspace `/target` (in the
+# `xtensa-esp32s3-none-elf/` subdir), which is already ignored above; these patterns also catch any
+# flashed images / linker maps / espflash intermediates produced outside it.
+**/*.rs.bk
+*.elf
+*.bin
+*.map
