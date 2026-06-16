@@ -370,9 +370,10 @@ pub enum EngineEvent<'a> {
   /// single `ok` (or a deferred `error:N`) is emitted once the line is consumed downstream. The slice
   /// borrows the engine's line buffer and is valid until the next [`StreamEngine::ingest`].
   AcceptLine(&'a [u8]),
-  /// A blank line (empty or whitespace-only). The driver emits a bare `ok` directly without forwarding;
-  /// a blank line also clears any error-hold (the grblHAL recovery trigger), which the engine has
-  /// already applied. One `ok` per consumed line is preserved.
+  /// A blank line (empty or whitespace-only). A blank line is a grblHAL error-hold recovery trigger, which
+  /// the engine has already applied to its own hold. The driver must emit exactly one bare `ok` for it,
+  /// either directly or by routing the blank line through its own line consumer when the driver owns a
+  /// separate downstream error-hold that the blank must also clear.
   Acknowledge,
   /// A complete line is rejected at the protocol layer (over-length, or held by the error state). The
   /// driver emits `error:N` immediately and does not forward the line.
@@ -718,10 +719,7 @@ mod tests {
 
   #[test]
   fn overlong_line_reports_overflow_once_then_recovers() {
-    let mut input = StdVec::new();
-    for _ in 0..(MAX_LINE_LEN + 50) {
-      input.push(b'G');
-    }
+    let mut input = std::vec![b'G'; MAX_LINE_LEN + 50];
     input.push(b'\n');
     input.extend_from_slice(b"G0\n");
     let framed = frame_lines(&input);

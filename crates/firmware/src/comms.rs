@@ -12,10 +12,13 @@
 //!   rejections.
 //! - [`usb_tx`] is the single writer to the USB peripheral: it drains the [`RESPONSE`] channel so no two
 //!   tasks ever write the USB endpoint concurrently (DOC-08).
-//! - [`comms_consumer`] is a Stage-1 STUB standing in for the gcode_parser → planner pipeline. It drains
-//!   accepted lines, answers the `$` system queries (`$$`/`$I`/`$I+`/`$G`/`$#`) via the firmware-core
-//!   formatters, and acknowledges every other line with a single `ok`. It performs no motion. Wiring the
-//!   real parser/planner/motion pipeline replaces this task (see the TODOs in `main.rs`).
+//! - [`comms_consumer`] is the real gcode parser → planner pipeline. It parses each accepted line through a
+//!   persistent [`Parser`], feeds the resulting command to a persistent [`Planner`], answers the `$` system
+//!   queries (`$$`/`$I`/`$I+`/`$G`/`$#`), and emits exactly one `ok`/`error:N` per line. It owns the
+//!   grblHAL gcode error-hold and back-pressures the host when the planner buffer is full.
+//! - [`block_drain_stub`] is a placeholder for the DOC-02 `motion_executor`: it pops planner blocks paced
+//!   by an estimated execution time and publishes the drained position into [`MACHINE`], so a streamed file
+//!   makes progress instead of deadlocking once the planner buffer fills. It generates no step pulses.
 //! - [`status_responder`] formats a `<...>` report from the shared [`MachineSnapshot`] when the
 //!   [`STATUS_REQUEST`] Signal fires.
 //!
@@ -26,10 +29,14 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Timer};
+use embassy_futures::select::{select, Either};
 use embedded_io_async::{Read, Write};
 use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
+use firmware_core::gcode::Parser;
+use firmware_core::planner::{Block, Planner, PlannerConfig, PlannerError, PlannerOutcome, BLOCK_QUEUE_LEN};
 use firmware_core::protocol::{
   EngineEvent, MachineSnapshot, RealtimeCommand, ResponseWriter, StreamEngine, MAX_LINE_LEN,
   RESPONSE_CAPACITY,
@@ -75,6 +82,36 @@ pub static SOFT_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// The live machine state the status formatter reads. The motion executor will publish position/state
 /// here once wired; Stage 1 holds the idle default so `?` returns a well-formed report immediately.
 pub static MACHINE: Mutex<CriticalSectionRawMutex, MachineSnapshot> = Mutex::new(MachineSnapshot::idle());
+
+/// The shared motion planner: the `comms_consumer` task enqueues blocks into it, and the stub
+/// block-drain task (standing in for the real DOC-02 `motion_executor`) pops them. It lives behind a
+/// `Mutex` because two tasks touch it; both critical sections are short (enqueue one command / pop one
+/// block + read position), so contention is negligible. The real motion executor will replace the drain
+/// task and keep this same handoff shape (planner is the producer, executor the single consumer).
+///
+/// Initialized lazily to `None` because [`Planner::new`] is not `const`; [`init_planner`] installs the
+/// constructed planner once at boot before either task runs. After init the `Option` is always `Some`.
+pub static PLANNER: Mutex<CriticalSectionRawMutex, Option<Planner>> = Mutex::new(None);
+
+/// Build the placeholder [`PlannerConfig`]. These are grbl-like defaults standing in for the real
+/// `$`-settings the firmware will load from esp-storage (DOC-00) once persistence is wired: 250 steps/mm,
+/// 500 mm/min max rate, 10 mm/s² accel, `$11`=0.01 mm, `$12`=0.002 mm per axis. TODO(DOC-00): replace
+/// with the persisted settings load (CRC-checked, falling back to these compiled defaults).
+fn placeholder_planner_config() -> PlannerConfig {
+  PlannerConfig::default()
+}
+
+/// Install the planner into [`PLANNER`] at boot, before the consumer/drain tasks are spawned. Called
+/// once from `main`; using `try_lock` avoids an await in init and cannot contend (no task runs yet).
+pub fn init_planner() {
+  // `try_lock` succeeds because this runs before any task is spawned, so nothing else holds the lock.
+  // The `Ok` arm is the only reachable path at init; a failure would be a wiring bug, handled by leaving
+  // the planner uninitialized (the consumer then treats every line as an internal error rather than
+  // panicking), but in practice this never fails.
+  if let Ok(mut guard) = PLANNER.try_lock() {
+    *guard = Some(Planner::new(placeholder_planner_config()));
+  }
+}
 
 /// Enqueue a response for the USB writer, dropping it if the queue is momentarily full. Dropping a
 /// response rather than blocking the RX path keeps real-time latency bounded; under simple send-response
@@ -125,11 +162,11 @@ pub async fn usb_rx(mut rx: UsbSerialJtagRx<'static, Async>) -> ! {
           LINE_QUEUE.send(owned).await;
         }
         EngineEvent::Acknowledge => {
-          // A blank line: acknowledge directly with a bare `ok`, no parser round-trip.
-          let mut s = Response::new();
-          if ResponseWriter::ok(&mut s).is_ok() {
-            enqueue(s).await;
-          }
+          // A blank line: the grblHAL recovery trigger that clears a gcode error-hold. Forward it through
+          // LINE_QUEUE (empty) rather than acking here, so the single in-order consumer owns both the bare
+          // `ok` and the hold-clear, keeping recovery race-free with the lines queued around it. This also
+          // back-pressures identically to a real line if the consumer is briefly behind.
+          LINE_QUEUE.send(Line::new()).await;
         }
         EngineEvent::Reject(code) => {
           let mut s = Response::new();
@@ -184,30 +221,185 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
   }
 }
 
-/// Stage-1 STUB consumer standing in for the gcode_parser → planner → motion pipeline. It drains accepted
-/// lines, answers the `$` system queries with firmware-core formatters, and acknowledges every other line
-/// with a single `ok` so the streaming contract (one `ok` per line) is exercisable end-to-end without the
-/// full machine. Replacing this task with the real parser/planner is the next subsystem.
+/// The real parser → planner consumer (replaces the Stage-1 stub). It is the SINGLE, in-order consumer of
+/// [`LINE_QUEUE`], so it is the natural owner of the grblHAL gcode error-hold (see [`ConsumerState`]). Per
+/// line it: routes `$` system commands to their handlers; parses GCode through a persistent [`Parser`];
+/// and feeds the resulting [`PlannerCommand`](firmware_core::gcode::PlannerCommand) to a persistent
+/// [`Planner`]. It emits exactly one `ok`/`error:N` per consumed line, preserving the one-response-per-line
+/// contract end to end (`usb_rx` only ever responds for protocol-level rejects it handles itself, so there
+/// is no double-response or gap at the boundary).
+///
+/// ## Error-hold ownership (race-free by construction)
+/// The grblHAL contract holds all subsequent lines in an error state after a GCode line errors, until a
+/// reset / empty line / `$` command. That hold lives HERE, in [`ConsumerState::error_hold`], not in the
+/// `StreamEngine`: the engine runs in `usb_rx` and forwards lines asynchronously, so it cannot know a line
+/// errored downstream, and any back-channel from here to `usb_rx` would race the lines already in flight in
+/// `LINE_QUEUE`. Because this task is the only reader of `LINE_QUEUE` and sees parse/plan results strictly
+/// in queue order, owning the hold here is inherently in-order and race-free. The engine's
+/// `note_line_error()` mechanism is therefore deliberately NOT driven on this path (it is reserved/unused);
+/// the engine still owns the independent protocol-level overflow rejects, which is correct.
+///
+/// ## Back-pressure (no motion executor yet)
+/// `ok` for a move is emitted only once the block is ACCEPTED into the planner buffer. When the planner is
+/// full ([`PlannerError::QueueFull`]) the consumer neither acks nor drops the line: it waits for the stub
+/// drain task to free a block and retries the SAME command (the arc planner is all-or-nothing on
+/// `QueueFull`, so re-issuing is safe). While waiting it stops reading `LINE_QUEUE`, which backs up,
+/// blocks `usb_rx`'s `send().await`, stops the byte scanner, and lets the host's character-counting throttle
+/// — exactly the correct grbl flow control.
 #[embassy_executor::task]
 pub async fn comms_consumer() -> ! {
+  let mut parser = Parser::new();
+  let mut state = ConsumerState::default();
   loop {
-    let line = LINE_QUEUE.receive().await;
-    handle_line(line.as_slice()).await;
+    // Race a soft reset against the next line so a `0x18` arriving mid-stream resets the parser modal
+    // state, clears the error-hold, and flushes the planner queue BEFORE the next line is parsed. `usb_rx`
+    // already flushed `LINE_QUEUE` and re-emitted the banner when it fired the signal; here we reset the
+    // pipeline state this task owns. A line that lost the race is dropped (it predates the reset), matching
+    // grbl's warm-reset semantics.
+    match select(LINE_QUEUE.receive(), SOFT_RESET.wait()).await {
+      Either::First(line) => handle_line(line.as_slice(), &mut parser, &mut state).await,
+      Either::Second(()) => reset_pipeline(&mut parser, &mut state).await,
+    }
   }
 }
 
-/// Route one accepted line: `$` system commands get their report responses; everything else is a GCode
-/// line the stub simply acknowledges. The single `ok` for a line is emitted exactly here, preserving the
-/// one-ok-per-line contract end to end.
-async fn handle_line(line: &[u8]) {
+/// Reset the parser/planner pipeline state this task owns on a soft reset (`0x18`): restore the parser to
+/// default modal state, clear the gcode error-hold, and flush the planner queue and machine position. The
+/// `StreamEngine` line buffer and `LINE_QUEUE` were already cleared by `usb_rx`; this completes the warm
+/// reset for the downstream half so a fresh stream starts from defaults at the origin.
+async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
+  // `Parser` exposes no in-place reset; reconstructing it restores the documented power-on modal defaults
+  // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state.
+  *parser = Parser::new();
+  state.error_hold = false;
+  // Reconstruct the planner to clear the block queue, machine position, work offset, and junction state in
+  // one step (it has no public flush). The placeholder config is re-applied; once esp-storage settings are
+  // wired the reset will re-load them. Reset the published snapshot to idle so `?` reports the origin.
+  {
+    let mut guard = PLANNER.lock().await;
+    *guard = Some(Planner::new(placeholder_planner_config()));
+  }
+  let mut snap = MACHINE.lock().await;
+  *snap = MachineSnapshot::idle();
+}
+
+/// The consumer's persistent control state across lines: the gcode error-hold flag. Held locally in the
+/// single consumer task so it is mutated only in line order.
+#[derive(Default)]
+struct ConsumerState {
+  /// True once a GCode line errored and no recovery trigger (blank line / `$` command / soft reset) has
+  /// cleared it yet. While set, GCode lines are rejected without parsing, per grblHAL safety behavior.
+  error_hold: bool,
+}
+
+/// Route one accepted line. `$` system commands are dispatched to their report handlers and clear the
+/// error-hold (a recovery trigger). Otherwise the line is parsed and planned. Exactly one `ok`/`error:N`
+/// is emitted per call, preserving the one-response-per-line contract.
+async fn handle_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerState) {
   let trimmed = trim_ascii(line);
-  if let Some(rest) = trimmed.strip_prefix(b"$") {
+  if trimmed.is_empty() {
+    // A blank line (forwarded by `usb_rx`) is a grblHAL error-hold recovery trigger: clear the hold and
+    // acknowledge with a bare `ok`. Handling it here, in queue order, keeps recovery race-free with the
+    // surrounding lines, since the hold lives in this task, the sole in-order reader of `LINE_QUEUE`.
+    state.error_hold = false;
+    ack().await;
+  } else if let Some(rest) = trimmed.strip_prefix(b"$") {
+    // A `$` system command is the other grblHAL recovery trigger and is answered by its handler. Both
+    // recovery triggers (an empty line and a `$` command) and a soft reset clear the hold; nothing else.
+    state.error_hold = false;
     handle_system_command(rest).await;
   } else {
-    // A GCode line. The stub does no parsing/motion; it acknowledges so a host stream advances. The real
-    // parser will instead emit `ok` on success or `error:N` (and call `engine.note_line_error()` on the
-    // RX side via a feedback path) on failure.
-    ack().await;
+    plan_gcode_line(trimmed, parser, state).await;
+  }
+}
+
+/// Parse and plan one GCode line, emitting exactly one `ok`/`error:N`. Honors the error-hold: while held,
+/// a GCode line is rejected without parsing. On a parse or planner error the hold is armed; on acceptance
+/// (including modal-only `Ok(None)` lines) a single `ok` is emitted.
+async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerState) {
+  if state.error_hold {
+    // Held by a prior error: reject without parsing until a recovery trigger. Reuse the generic
+    // "expected command letter" code, matching how a sender already in error-recovery treats any further
+    // rejection — it halts the stream regardless of the specific code (mirrors the engine's hold code).
+    error(ERROR_HOLD_CODE).await;
+    return;
+  }
+  match parser.parse_line(line) {
+    // A blank/comment-only/modal-only line carries no action; acknowledge with a single `ok`.
+    Ok(None) => ack().await,
+    Ok(Some(command)) => match plan_command(&command).await {
+      // The command was accepted into the planner (a move enqueued, or a non-motion outcome passed
+      // through); emit the single `ok`.
+      PlanResult::Accepted => ack().await,
+      // The planner reported a non-back-pressure error (bad arc geometry); reject and arm the hold.
+      PlanResult::Error(code) => {
+        error(code).await;
+        state.error_hold = true;
+      }
+      // A soft reset arrived while this command was back-pressured: abort it (the host discards pending
+      // acks on `0x18`), emit no response, and run the pipeline reset whose signal was consumed here.
+      PlanResult::Aborted => reset_pipeline(parser, state).await,
+    },
+    Err(e) => {
+      // A parse error: emit `error:N` and arm the gcode error-hold so subsequent GCode lines are held.
+      error(e.code()).await;
+      state.error_hold = true;
+    }
+  }
+}
+
+/// The result of attempting to plan one command (collapsing the planner's back-pressure retry loop and the
+/// soft-reset abort into one outcome the line handler acts on).
+enum PlanResult {
+  /// The command was accepted into the planner buffer (move enqueued or non-motion outcome passed through).
+  Accepted,
+  /// A non-back-pressure planner error; carries the grblHAL `error:N` code (bad arc geometry).
+  Error(u8),
+  /// A soft reset preempted the command while it was back-pressured; the consumed signal must be honored.
+  Aborted,
+}
+
+/// The `error:N` code used to reject a GCode line that is held in the post-error state. Matches the
+/// engine's `ERROR_HOLD_CODE` (grbl's generic "expected command letter" code 1): a sender already in
+/// error-recovery halts the stream regardless of the specific code.
+const ERROR_HOLD_CODE: u8 = 1;
+
+/// Feed one [`PlannerCommand`](firmware_core::gcode::PlannerCommand) to the shared planner, applying
+/// back-pressure: on [`PlannerError::QueueFull`] wait for the stub drain to free a block and retry the
+/// SAME command (the arc planner is all-or-nothing on `QueueFull`, so re-issue is safe). The back-pressure
+/// wait is raced against [`SOFT_RESET`] so a `0x18` aborts a stuck line promptly rather than after the
+/// drain frees a slot. Non-motion outcomes (Dwell/Spindle/G28/G92/M30) currently pass through with no side
+/// effect; the real dwell timer, spindle driver (DOC-07), and homing (DOC-06) consume these in later phases.
+async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanResult {
+  loop {
+    // Scope the lock so it is released before any await: hold the planner mutex only for the plan call.
+    let result = {
+      let mut guard = PLANNER.lock().await;
+      match guard.as_mut() {
+        Some(planner) => planner.plan_command(command),
+        // The planner was never installed (an init wiring bug). Surface as a generic error rather than
+        // panicking; this is unreachable in a correctly wired build (see `init_planner`).
+        None => Ok(PlannerOutcome::Queued { blocks: 0 }),
+      }
+    };
+    match result {
+      // TODO(DOC-02/DOC-07/DOC-06): act on non-motion outcomes — start the dwell timer, drive the spindle,
+      // run the predefined/homing move, reset program state on M30. Stage 1 accepts and passes through.
+      Ok(_outcome) => return PlanResult::Accepted,
+      // Back-pressure: the planner buffer is full. Do NOT ack and do NOT drop — yield to the drain task,
+      // then retry the same command. Blocking here backs `LINE_QUEUE` up and throttles the host (correct
+      // grbl flow control). Race the retry delay against a soft reset so `0x18` aborts a stuck line at once;
+      // the delay is short relative to a block's execution time, so a normal retry wins the freed slot
+      // promptly without busy-spinning the CPU.
+      Err(PlannerError::QueueFull) => {
+        match select(Timer::after(QUEUE_FULL_RETRY), SOFT_RESET.wait()).await {
+          Either::First(()) => {}
+          Either::Second(()) => return PlanResult::Aborted,
+        }
+      }
+      // A genuine geometry error (bad arc): surface the grblHAL code to the caller.
+      Err(other) => return PlanResult::Error(other.code()),
+    }
   }
 }
 
@@ -265,6 +457,15 @@ async fn ack() {
   }
 }
 
+/// Queue a single `error:N` for a rejected line. Mirrors [`ack`]; the consumer emits exactly one of the
+/// two per consumed GCode line, preserving the one-response-per-line contract.
+async fn error(code: u8) {
+  let mut s = Response::new();
+  if ResponseWriter::error(&mut s, code).is_ok() {
+    enqueue(s).await;
+  }
+}
+
 /// The status reporter: format a `<...>` report from the shared [`MachineSnapshot`] whenever the
 /// [`STATUS_REQUEST`] Signal fires (set by `usb_rx` on `?`/`0x80`/`0x87`). Stage 1 reports the shared
 /// snapshot (idle/origin until the motion executor publishes live data).
@@ -278,6 +479,95 @@ pub async fn status_responder() -> ! {
       enqueue(s).await;
     }
   }
+}
+
+/// How long the consumer waits before retrying a [`PlannerError::QueueFull`] command. Short relative to a
+/// block's execution time (tens of ms) so the retry claims a freed slot promptly, but long enough that the
+/// retry loop is not a busy-spin — it yields the executor to the drain task each iteration.
+const QUEUE_FULL_RETRY: Duration = Duration::from_millis(2);
+
+/// Lower bound on the simulated execution time of one drained block, so a tiny/zero-length block does not
+/// let the drain busy-loop and instantly empty the queue (which would mask back-pressure).
+const MIN_BLOCK_DRAIN: Duration = Duration::from_millis(5);
+
+/// Upper bound on the simulated execution time of one drained block, so a very long/slow move does not
+/// stall the pipeline for an implausibly long time during bring-up testing.
+const MAX_BLOCK_DRAIN: Duration = Duration::from_millis(500);
+
+/// How long the drain task idles before re-checking an empty planner queue. Keeps the task off the CPU
+/// while no motion is queued; a real motion executor would instead await the planner's `BLOCK_AVAILABLE`
+/// signal (DOC-01) rather than poll.
+const DRAIN_IDLE_POLL: Duration = Duration::from_millis(20);
+
+/// STUB block-drain task: a placeholder for the real DOC-02 `motion_executor` + RMT step generation. It
+/// pops one planner block at a time, paces itself by that block's approximate execution time, and publishes
+/// the drained position into [`MACHINE`] so `?` reports a plausible MPos. It exists solely so an end-to-end
+/// stream makes progress instead of deadlocking once the 32-block planner buffer fills; it generates NO
+/// step pulses and models NO trapezoidal profile.
+///
+/// TODO(DOC-02): replace this task with the core-1 `InterruptExecutor` running the real `motion_executor`,
+/// which runs the [`SegmentGenerator`](firmware_core::motion) over each popped block, emits RMT PulseCodes
+/// on ch0/1/2, and publishes live interpolated MPos. This task and its pacing heuristics are then deleted.
+#[embassy_executor::task]
+pub async fn block_drain_stub() -> ! {
+  loop {
+    // Pop the next block under the planner lock, releasing it before the pacing delay so the consumer can
+    // enqueue while this block "executes". `pop_block` is FIFO, matching the real executor's consumption.
+    let popped = {
+      let mut guard = PLANNER.lock().await;
+      guard.as_mut().and_then(Planner::pop_block)
+    };
+    match popped {
+      Some(block) => {
+        publish_drained_position().await;
+        // Pace by the block's approximate execution time (cruise-only: travel / nominal speed), clamped to
+        // a sane window. This keeps the queue partly full under sustained streaming so back-pressure is
+        // actually exercised, rather than draining instantly. The real executor's timing comes from the
+        // segment generator's tick periods, not this estimate.
+        Timer::after(simulated_block_duration(&block)).await;
+      }
+      // Queue empty: idle briefly, then re-check. The real executor awaits BLOCK_AVAILABLE instead.
+      None => Timer::after(DRAIN_IDLE_POLL).await,
+    }
+  }
+}
+
+/// Estimate one block's execution time for the stub drain pacing: straight-line travel divided by the
+/// block's nominal (cruise) speed, clamped to `[MIN_BLOCK_DRAIN, MAX_BLOCK_DRAIN]`. This is a deliberately
+/// crude placeholder (it ignores accel/decel ramps and rest-to-rest boundaries) — only the real segment
+/// generator computes true timing.
+fn simulated_block_duration(block: &Block) -> Duration {
+  let speed = block.nominal_speed();
+  // Require strictly positive, finite speed AND travel; the `> 0.0` tests are false for NaN, zero, and
+  // negatives, so a degenerate block falls through to the floor below rather than dividing badly.
+  if speed > 0.0 && block.millimeters > 0.0 {
+    let seconds = block.millimeters / speed;
+    let millis = (seconds * 1000.0) as u64;
+    return Duration::from_millis(millis).max(MIN_BLOCK_DRAIN).min(MAX_BLOCK_DRAIN);
+  }
+  // A degenerate block (zero speed/length): use the floor so the drain neither stalls nor busy-loops.
+  MIN_BLOCK_DRAIN
+}
+
+/// Publish the planner's current position and free-block count into the shared [`MachineSnapshot`] so `?`
+/// reports a plausible MPos and `Bf:` block-free count. The planner position is the end-of-look-ahead
+/// (planned) position, not the live interpolated one; that is acceptable for the stub, and the real motion
+/// executor will publish true live position instead.
+async fn publish_drained_position() {
+  let (pos, free) = {
+    let guard = PLANNER.lock().await;
+    match guard.as_ref() {
+      Some(planner) => {
+        let queued = planner.queued_len();
+        let free = BLOCK_QUEUE_LEN.saturating_sub(queued) as u8;
+        (planner.position_mm(), free)
+      }
+      None => return,
+    }
+  };
+  let mut snap = MACHINE.lock().await;
+  snap.mpos_mm = pos;
+  snap.planner_blocks_free = free;
 }
 
 /// Trim leading/trailing ASCII whitespace from a line, since a sender may pad `$` commands with spaces.

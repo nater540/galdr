@@ -21,14 +21,17 @@
 //!   RX/TX halves.
 //! - A core-0 thread-mode executor hosting the streaming tasks in [`comms`]: `usb_rx` (drives the
 //!   firmware-core protocol state machine, dispatches real-time bytes via Signals), `usb_tx` (the single
-//!   USB writer), `comms_consumer` (a Stage-1 stub for the parser/planner that acks lines and answers
-//!   `$` queries), and `status_responder`.
+//!   USB writer), `comms_consumer` (the real gcode parser -> planner pipeline that emits `ok`/`error:N`,
+//!   owns the gcode error-hold, and back-pressures on a full planner), `block_drain_stub` (a placeholder
+//!   for the DOC-02 motion executor that drains planner blocks so a stream makes progress), and
+//!   `status_responder`.
 //! - The welcome banner on boot and on every soft reset (`0x18`), so a host detects readiness on a
 //!   native-USB link that cannot be hard-reset.
 //!
-//! ## What is deliberately still stubbed (out of scope for the comms phase)
-//! - The core-1 `InterruptExecutor` + `motion_executor` and RMT step encoding (DOC-02): the planner →
-//!   motion pipeline is not wired into the executor yet; accepted lines flow only to the stub consumer.
+//! ## What is deliberately still stubbed (out of scope for this phase)
+//! - The core-1 `InterruptExecutor` + `motion_executor` and RMT step encoding (DOC-02): planner blocks are
+//!   currently consumed by `block_drain_stub`, which paces them by an estimated duration and publishes the
+//!   planned position into `MACHINE` but generates no step pulses. The real executor replaces it.
 //! - TMC2209 manager / UART1 (DOC-03), LEDC spindle PWM (DOC-07), limit/control GPIO + homing (DOC-06),
 //!   and esp-storage `$`-settings persistence (DOC-00): in-memory defaults are used; settings writes are
 //!   not yet persisted. Each is a documented TODO below.
@@ -68,20 +71,29 @@ async fn main(spawner: Spawner) {
   let (usb_rx, usb_tx) = usb.split();
 
   // TODO(DOC-00): esp-storage init + load persisted `$`-settings (fall back to compiled defaults on CRC
-  // failure); build the MotionConfig from `$0`/`$29`. Stage 1 uses in-memory protocol defaults.
+  // failure); build the MotionConfig from `$0`/`$29` and the PlannerConfig from `$100..`. Stage 1 uses the
+  // in-memory `placeholder_planner_config` defaults installed by `init_planner` below.
   // TODO(DOC-03): configure UART1 for the TMC2209 single-wire bus and run the tmc_manager init sequence.
-  // TODO(DOC-02): configure RMT TX ch0/1/2 (X/Y/Z step), start the core-1 InterruptExecutor, and spawn
-  //   motion_executor; wire the planner BlockQueue + BLOCK_AVAILABLE Signal between planner and executor.
-  // TODO(DOC-07): configure LEDC ch0 on GPIO13 for spindle PWM + SPIN_EN/SPIN_DIR GPIO.
-  // TODO(DOC-06): configure limit/control GPIO (pull-ups, rising-edge IRQ) and spawn the homing task.
-  // TODO(DOC-01): replace `comms_consumer` with the real gcode_parser -> planner -> motion pipeline; add
-  //   the parser->RX error-feedback path that calls `engine.note_line_error()` on a downstream `error:N`.
+  // TODO(DOC-02): replace `block_drain_stub` with the core-1 InterruptExecutor + real `motion_executor`:
+  //   configure RMT TX ch0/1/2 (X/Y/Z step), run the SegmentGenerator over popped planner blocks, and
+  //   publish live MPos. The planner queue handoff (shared `comms::PLANNER`) stays; only the consumer changes.
+  // TODO(DOC-07): configure LEDC ch0 on GPIO13 for spindle PWM + SPIN_EN/SPIN_DIR GPIO (act on the
+  //   planner's Spindle outcome, currently passed through).
+  // TODO(DOC-06): configure limit/control GPIO (pull-ups, rising-edge IRQ) and spawn the homing task (act
+  //   on the planner's GoToPredefined outcome, currently passed through).
 
-  // 4. Spawn the comms tasks on the core-0 thread-mode executor. `must_spawn` is appropriate at init: a
+  // 4. Install the motion planner before spawning the tasks that share it (the consumer enqueues, the
+  //    drain stub pops). `Planner::new` is not `const`, so the static holds an `Option` filled here.
+  comms::init_planner();
+
+  // 5. Spawn the comms tasks on the core-0 thread-mode executor. `must_spawn` is appropriate at init: a
   //    spawn failure (token already used) is a static, unrecoverable wiring bug, not a runtime condition.
+  //    `comms_consumer` is the real parser -> planner pipeline; `block_drain_stub` stands in for the
+  //    DOC-02 motion executor so a streamed file makes progress instead of deadlocking at block 33.
   spawner.must_spawn(comms::usb_rx(usb_rx));
   spawner.must_spawn(comms::usb_tx(usb_tx));
   spawner.must_spawn(comms::comms_consumer());
+  spawner.must_spawn(comms::block_drain_stub());
   spawner.must_spawn(comms::status_responder());
 
   // 5. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
