@@ -41,8 +41,7 @@ use firmware_core::motion::{silent_symbol_halves, MotionConfig, SegmentGenerator
 use firmware_core::planner::{Block, Planner, AXES};
 
 use crate::comms::{
-  placeholder_motion_config, BLOCK_AVAILABLE, CYCLE_START, FEED_HOLD, LIVE_POSITION, MOTION_RESET,
-  MOTION_RESET_PENDING, PLANNER,
+  BLOCK_AVAILABLE, CYCLE_START, FEED_HOLD, LIVE_POSITION, MOTION_RESET, MOTION_RESET_PENDING, PLANNER,
 };
 
 /// One RMT TX channel per axis, indexed `[X, Y, Z]`. The blocking transmit API consumes the channel and
@@ -252,8 +251,8 @@ impl StepSink for RmtStepSink {
 ///    publishing the live step position into the [`LIVE_POSITION`] atomics after EACH burst (so MPos is live
 ///    within a long block, not frozen until the block ends — Finding #5). A reset pending between bursts
 ///    aborts the block early via a sink error, then the next loop iteration zeroes the position.
-pub async fn run(sink: &mut RmtStepSink) -> ! {
-  let generator = SegmentGenerator::new(placeholder_motion_config());
+pub async fn run(sink: &mut RmtStepSink, config: MotionConfig) -> ! {
+  let generator = SegmentGenerator::new(config);
   let mut counter = StepCounter::new();
   loop {
     // Service a pending soft reset at the top of the loop: drop the live position so MPos returns to the
@@ -420,12 +419,13 @@ pub fn init(
     esp_hal::peripherals::GPIO7<'static>,
   ),
   step_enable_pin: esp_hal::peripherals::GPIO8<'static>,
+  config: &MotionConfig,
 ) -> (RmtStepSink, Output<'static>) {
   use esp_hal::rmt::Rmt;
   use esp_hal::time::Rate;
 
-  let config = placeholder_motion_config();
-  // 80 MHz source / clk_divider 80 = 1 MHz = 1 tick per microsecond, matching `MotionConfig.tick_hz`.
+  // 80 MHz source / clk_divider 80 = 1 MHz = 1 tick per microsecond, matching `MotionConfig.tick_hz` (1 MHz,
+  // a fixed firmware constant — only the `$0` step-pulse width inside `config` varies with settings).
   let rmt = Rmt::new(rmt, Rate::from_mhz(80)).expect("RMT peripheral init");
   let tx_config = TxChannelConfig::default()
     .with_clk_divider(80)
@@ -449,7 +449,7 @@ pub fn init(
 
   // `$29` direction-setup delay in ticks (= microseconds at this divider). Placeholder default until
   // esp-storage settings are loaded; DOC-02 cites a 2 µs practical minimum (5–15 µs for opto drivers).
-  let sink = RmtStepSink::new([ch_x, ch_y, ch_z], [dir_x, dir_y, dir_z], &config, DIR_SETUP_US);
+  let sink = RmtStepSink::new([ch_x, ch_y, ch_z], [dir_x, dir_y, dir_z], config, DIR_SETUP_US);
   (sink, step_enable)
 }
 

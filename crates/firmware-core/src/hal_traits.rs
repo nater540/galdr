@@ -4,10 +4,12 @@
 //! planner, parser, and driver logic stay host-testable with recording/mock implementations. Only
 //! the `firmware` binary implements them against esp-hal peripherals.
 //!
-//! Status: trait surface is sketched per DOC-09. Concrete error types and method bodies land with
-//! their owning subsystems. The TMC2209 register codec in [`crate::drivers::tmc2209`] does not
-//! depend on a `TmcBus` trait; the transport trait is wired up when the `tmc_manager` task is built.
+//! Status: [`StepSink`] (DOC-02) and [`TmcBus`] (DOC-03) are implemented; the remaining traits land
+//! with their owning subsystems. [`TmcBus`] carries the TMC2209 single-wire datagrams whose byte-level
+//! codec lives in [`crate::drivers::tmc2209`] and whose register orchestration lives in
+//! [`crate::drivers::tmc2209::manager`].
 
+use crate::drivers::tmc2209::TmcError;
 use crate::planner::AXES;
 
 /// The maximum number of [`StepEvent`]s (RMT PulseCode symbols) a single burst may carry. The ESP32-S3 RMT
@@ -97,11 +99,79 @@ pub trait StepSink {
 // DigitalOut: digital output (stepper enable, spindle enable/direction).
 // TODO(DOC-05): pub trait DigitalOut { fn set(&mut self, level: bool) -> Result<(), ()>; }
 
-// TmcBus: half-duplex TMC2209 single-wire UART transport; implemented over UART1 on target, byte
-// buffer in host tests. The byte-level datagram encode/decode it relies on lives in
-// `crate::drivers::tmc2209`.
-// TODO(DOC-03): pub trait TmcBus { fn write_reg(&mut self, node: u8, reg: u8, val: u32) -> Result<(), TmcError>;
-//                                   fn read_reg(&mut self, node: u8, reg: u8) -> Result<u32, TmcError>; }
+/// Half-duplex TMC2209 single-wire UART transport (DOC-03). Implemented over UART1 on target (one bus
+/// shared by all three driver nodes) and as a byte-buffer mock in host tests. The byte-level datagram
+/// encode/decode this relies on lives in [`crate::drivers::tmc2209`]; the register-level orchestration
+/// that drives it lives in [`crate::drivers::tmc2209::manager`].
+///
+/// ## Contract
+/// - [`write_reg`](TmcBus::write_reg) sends one write-access datagram and consumes the half-duplex echo
+///   of the bytes it just drove onto the shared line. It returns once the write is on the wire; the
+///   TMC2209 sends no reply to a write, so acceptance is confirmed out-of-band by reading `IFCNT`.
+/// - [`read_reg`](TmcBus::read_reg) sends one read-request datagram, consumes the request echo, then
+///   reads and validates the 8-byte reply, returning the 32-bit register value. A node that never
+///   answers (absent / standalone VREF mode / broken bus) surfaces as [`TmcError::Timeout`].
+/// - `node` is the 0..=3 driver address; `reg` is the 7-bit register address (the write flag is added
+///   by the codec). Implementations must discard the single-wire loopback echo so it is never mistaken
+///   for a reply.
+///
+/// The methods are `async` so the on-target UART1 transport can `.await` the half-duplex exchange (drive the
+/// frame, await the echo/reply) directly instead of busy-spinning a `delay_micros` poll loop, which on the
+/// single core-0 executor would stall every other task for the bus turn-around window. firmware-core itself
+/// needs no async runtime: the [`manager`](crate::drivers::tmc2209::manager) only `.await`s these futures from
+/// its own `async fn` init/poll methods, and the host mock's futures are immediately ready.
+///
+/// The `async fn`-in-trait lint (auto-trait bounds like `Send` cannot be named on the returned future) is
+/// deliberately allowed, mirroring [`SettingsStore`]: firmware-core only ever drives these futures via static
+/// dispatch (`TmcManager<B: TmcBus>`) from its own single-task `async fn` methods — exactly the "use the trait
+/// only in your own code" case the lint calls out, so no boxing or `Send` bound is needed.
+#[allow(async_fn_in_trait)]
+pub trait TmcBus {
+  /// Send a write-access datagram setting `reg = val` on `node`, discarding the half-duplex echo.
+  async fn write_reg(&mut self, node: u8, reg: u8, val: u32) -> Result<(), TmcError>;
+
+  /// Send a read-request datagram for `reg` on `node` and return the decoded 32-bit register value.
+  async fn read_reg(&mut self, node: u8, reg: u8) -> Result<u32, TmcError>;
+}
+
+/// Errors a [`SettingsStore`] may return. The store deals only in opaque framed bytes (DOC-04 persistence);
+/// the [`crate::settings::wire`] layer owns the framing/CRC/version, so these are purely about the storage
+/// medium, not the record contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum StoreError {
+  /// No settings record has been persisted yet (a fresh device). The loader treats this as "use defaults".
+  NotFound,
+  /// The underlying storage medium failed (on target: a flash read/write/erase error).
+  Io,
+  /// The record is larger than the caller's buffer (load) or the store's capacity (save).
+  TooLarge,
+}
+
+/// Persistence backend for the settings record (DOC-04). Implemented over `sequential-storage` on the NVS
+/// flash partition on target, and as an in-memory buffer in host tests — mirroring how [`TmcBus`]/[`StepSink`]
+/// abstract their hardware. The store moves only opaque framed bytes: all protobuf encode/decode, the
+/// magic/version header, and the CRC live in [`crate::settings::wire`], so a store impl carries zero settings
+/// knowledge and the whole load/save/versioning policy stays host-testable.
+///
+/// The methods are `async` so the firmware can `.await` the (interrupt-driven, erase-before-write) flash
+/// transport directly instead of busy-spinning a `block_on`, which on a single-executor target risks a
+/// same-executor deadlock. firmware-core itself needs no async runtime: it only `.await`s these futures from
+/// its own `async fn` loaders, and the host mock's futures are immediately ready.
+///
+/// The `async fn`-in-trait lint (auto-trait bounds like `Send` cannot be named on the returned future) is
+/// deliberately allowed: firmware-core only ever drives these futures via static dispatch from its own
+/// single-task `async fn` loaders — exactly the "use the trait only in your own code" case the lint calls out.
+#[allow(async_fn_in_trait)]
+pub trait SettingsStore {
+  /// Read the persisted settings frame into `buf`, returning its length. [`StoreError::NotFound`] if nothing
+  /// has been stored yet; [`StoreError::TooLarge`] if the record does not fit `buf`.
+  async fn load(&mut self, buf: &mut [u8]) -> Result<usize, StoreError>;
+
+  /// Persist `frame` (a complete, already-framed settings record) to the backing store, replacing any prior
+  /// record.
+  async fn save(&mut self, frame: &[u8]) -> Result<(), StoreError>;
+}
 
 #[cfg(test)]
 mod tests {

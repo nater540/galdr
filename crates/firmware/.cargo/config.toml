@@ -7,7 +7,10 @@
 target = "xtensa-esp32s3-none-elf"
 
 [target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor"
+# Flash with the project partition table (DOC-04 settings persistence) so the `storage` NVS region the
+# settings subsystem reads/writes is reserved at 0x320000. The path is relative to this crate dir, which is
+# the cwd when cargo invokes the runner. Keep it in sync with src/storage.rs `NVS_OFFSET`/`NVS_SIZE`.
+runner = "espflash flash --monitor --partition-table partitions.csv"
 # esp-hal 1.0 provides the chip linker scripts (memory/alias/esp32s3/hal-defaults + the generated
 # `device.x` interrupt-vector symbol table) in its build-script OUT_DIR and adds that dir to the link
 # search path. The application must pull them in via `-Tlinkall.x` (the master script that INCLUDEs the

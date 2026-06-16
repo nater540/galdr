@@ -18,3 +18,4 @@ pub mod hal_traits;
 pub mod motion;
 pub mod planner;
 pub mod protocol;
+pub mod settings;

@@ -18,6 +18,7 @@ edition = "2024"
 # Cargo.lock, which carries the exact embassy-* minors esp-rtos was resolved against.
 [dependencies]
 firmware-core     = { path = "../firmware-core", default-features = false }
+galdr-proto       = { path = "../galdr-proto", default-features = false }
 esp-hal           = { version = "=1.0.0", features = ["esp32s3", "unstable"] }
 esp-rtos          = { version = "=0.2.0", features = ["esp32s3", "embassy"] }
 embassy-executor  = { version = "0.9.1",  features = ["executor-interrupt", "executor-thread"] }
@@ -29,6 +30,12 @@ esp-println       = { version = "0.16.1", features = ["esp32s3"] }
 esp-storage       = { version = "0.8.1",  features = ["esp32s3"] }
 embedded-storage  = "0.3"
 embedded-io-async = "0.7"
+# `sequential-storage` is the wear-leveled key/value flash store for the settings record (DOC-04). It is
+# async-only, so esp-storage's blocking flash is bridged with `embassy-embedded-hal`'s `BlockingAsync`
+# (pinned exactly to 0.5.0 — already in the graph via esp-hal — to avoid the 0.6 bump that pulls
+# embassy-hal-internal). `heapless-09` matches the workspace heapless.
+sequential-storage   = { version = "7.2.0", default-features = false, features = ["heapless-09"] }
+embassy-embedded-hal = { version = "=0.5.0", default-features = false }
 heapless          = "0.9"
 libm              = "0.2"
 defmt             = { version = "1", optional = true }
@@ -39,5 +46,7 @@ embedded-hal-mock = "0.11"
 
 [features]
 # Opt-in defmt logging. Forwards to firmware-core so the no-defmt path stays the default; build a
-# logging image with `--features defmt`. Keeps a defmt-free release build available.
-defmt = ["dep:defmt", "firmware-core/defmt"]
+# logging image with `--features defmt`. Keeps a defmt-free release build available. `esp-println`'s
+# `defmt-espflash` feature supplies the `#[defmt::global_logger]` sink (over the espflash/RTT channel,
+# separate from the grbl USB stream), so a defmt build links — required now that `tmc` emits defmt logs.
+defmt = ["dep:defmt", "firmware-core/defmt", "esp-println/defmt-espflash"]

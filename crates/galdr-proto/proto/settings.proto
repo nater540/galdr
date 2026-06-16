@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+// galdr machine settings schema (DOC-04). This single message is the source of truth for BOTH the on-flash
+// persisted settings record AND the `$PBX` host-sync channel. No `package` is declared so micropb generates
+// the types at the top level of the include, keeping the Rust re-export trivial.
+//
+// Field-number policy: grbl `$n` settings occupy the low numbers grouped by decade; TMC2209 driver settings
+// (which are not classic grbl `$n`) live in a reserved high range (40+) so future grbl `$n` additions never
+// collide. Per-axis values are flat `_x/_y/_z` triples rather than `repeated`, so the generated struct has
+// plain scalar fields (no heapless container, no Option) and is ergonomic to convert to the firmware's
+// fixed-3-axis `*Config` structs.
+
+// The full persisted settings record. All fields are proto3 singular scalars => plain (non-optional) Rust
+// fields. A reader applies defaults BEFORE decoding, so an absent field decodes to its grbl default, not zero.
+message Settings {
+  // --- grbl $0..$12 (step + general) ---
+  uint32 step_pulse_us         = 1;   // $0  step pulse time, microseconds.
+  uint32 step_idle_delay_ms    = 2;   // $1  stepper idle lock delay, milliseconds (255 = always on).
+  uint32 step_invert_mask      = 3;   // $2  step port invert bitmask.
+  uint32 dir_invert_mask       = 4;   // $3  direction port invert bitmask.
+  uint32 status_report_mask    = 5;   // $10 status report field bitmask.
+  float  junction_deviation_mm = 6;   // $11 junction deviation, mm.
+  float  arc_tolerance_mm      = 7;   // $12 arc chord tolerance, mm.
+
+  // --- grbl $20..$27 (limits + homing) ---
+  bool   soft_limits_enable    = 8;   // $20 soft limits enable.
+  bool   hard_limits_enable    = 9;   // $21 hard limits enable.
+  bool   homing_enable         = 10;  // $22 homing cycle enable.
+  uint32 homing_dir_invert_mask = 11; // $23 homing direction invert bitmask.
+  float  homing_feed_mm_min    = 12;  // $24 homing feed (locate) rate, mm/min.
+  float  homing_seek_mm_min    = 13;  // $25 homing seek rate, mm/min.
+  uint32 homing_debounce_ms    = 14;  // $26 homing switch debounce, milliseconds.
+  float  homing_pulloff_mm     = 15;  // $27 homing pull-off distance, mm.
+
+  // --- grbl $30..$31 (spindle) ---
+  float  spindle_rpm_max       = 16;  // $30 maximum spindle speed, RPM.
+  float  spindle_rpm_min       = 17;  // $31 minimum spindle speed, RPM.
+
+  // --- grbl $100..$132 (per-axis kinematics, X/Y/Z) ---
+  float  steps_per_mm_x        = 18;  // $100 steps per mm, X.
+  float  steps_per_mm_y        = 19;  // $101 steps per mm, Y.
+  float  steps_per_mm_z        = 20;  // $102 steps per mm, Z.
+  float  max_rate_mm_min_x     = 21;  // $110 maximum rate, X (mm/min).
+  float  max_rate_mm_min_y     = 22;  // $111 maximum rate, Y (mm/min).
+  float  max_rate_mm_min_z     = 23;  // $112 maximum rate, Z (mm/min).
+  float  accel_mm_s2_x         = 24;  // $120 acceleration, X (mm/s^2).
+  float  accel_mm_s2_y         = 25;  // $121 acceleration, Y (mm/s^2).
+  float  accel_mm_s2_z         = 26;  // $122 acceleration, Z (mm/s^2).
+  float  max_travel_mm_x       = 27;  // $130 maximum travel, X (mm).
+  float  max_travel_mm_y       = 28;  // $131 maximum travel, Y (mm).
+  float  max_travel_mm_z       = 29;  // $132 maximum travel, Z (mm).
+
+  // --- TMC2209 driver settings (not grbl $n; reserved range 40+) ---
+  uint32 run_current_ma_x      = 40;  // RMS run current, X (mA).
+  uint32 run_current_ma_y      = 41;
+  uint32 run_current_ma_z      = 42;
+  uint32 hold_current_ma_x     = 43;  // RMS hold current, X (mA).
+  uint32 hold_current_ma_y     = 44;
+  uint32 hold_current_ma_z     = 45;
+  uint32 microsteps_x          = 46;  // microsteps per full step, X (power of two 1..=256).
+  uint32 microsteps_y          = 47;
+  uint32 microsteps_z          = 48;
+  uint32 tmc_ihold_delay       = 49;  // IHOLD_IRUN.IHOLDDELAY.
+  uint32 tmc_tpowerdown        = 50;  // TPOWERDOWN.
+  uint32 tmc_tpwmthrs          = 51;  // TPWMTHRS StealthChop->SpreadCycle threshold.
+  uint32 tmc_send_delay        = 52;  // SLAVECONF.SENDDELAY (units of 8 bit-times).
+  float  tmc_r_sense_ohms      = 53;  // sense-resistor value, ohms.
+}
+
+// Note: the `$PBX` host-sync channel transfers a FULL `Settings` message in both directions (the host does a
+// read-modify-write of the whole record). Single-field edits go through the grbl `$x=val` text path instead,
+// so no partial-update/patch message is needed. If partial updates are wanted later, add an explicit-presence
+// `SettingsPatch` here and a merge step in `firmware-core::settings`.

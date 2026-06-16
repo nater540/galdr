@@ -1,0 +1,26 @@
+[package]
+name = "galdr-proto"
+version = "0.1.0"
+edition = "2024"
+
+# The shared Protocol Buffers schema for galdr settings (DOC-04 persistence). This crate holds ONLY the
+# `.proto` and the code micropb generates from it, plus thin encode/decode helpers — no business logic. It
+# is `no_std`, no-alloc (heapless-backed containers), and has NO esp-hal dependency, so it compiles both for
+# the Xtensa firmware target AND on the host, and is shared by `firmware-core` (and later `skirnir`) as the
+# single source of truth for the on-flash and host-sync settings wire format.
+[dependencies]
+# `container-heapless-0-9` matches the workspace heapless 0.9; `encode`/`decode` are the wire codecs. No
+# `enable-64bit` because the schema uses only 32-bit scalars (uint32/float/bool). `default-features = false`
+# keeps `std`/`alloc` off so the generated code stays no-alloc.
+micropb  = { version = "0.6.0", default-features = false, features = ["encode", "decode", "container-heapless-0-9"] }
+heapless = "0.9"
+defmt    = { version = "1", optional = true }
+
+# `micropb-gen` runs `protoc` at build time to turn `proto/settings.proto` into Rust. It is a host-only
+# build tool, never linked into the firmware image. CI must have `protoc` on PATH.
+[build-dependencies]
+micropb-gen = "0.6.0"
+
+[features]
+# defmt only gates `derive(defmt::Format)` on this crate's own error type; micropb has no defmt feature.
+defmt = ["dep:defmt"]

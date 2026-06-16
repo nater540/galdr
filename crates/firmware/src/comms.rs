@@ -35,7 +35,7 @@
 //! Real-time bytes are intercepted in [`usb_rx`] before they ever reach the byte buffer and never receive
 //! an `ok`, exactly matching the firmware-core contract.
 
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -43,19 +43,22 @@ use embassy_sync::mutex::Mutex;
 use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_io_async::{Read, Write};
 use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
 use firmware_core::gcode::{ModalState, MotionMode, DistanceMode as GcodeDistance, Parser, Units as GcodeUnits};
-use firmware_core::motion::{steps_to_mm, MotionConfig};
+use firmware_core::motion::steps_to_mm;
 use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcome, AXES};
 use firmware_core::protocol::{
   classify_realtime, EngineEvent, MachineSnapshot, ParserDistance, ParserMotion, ParserSnapshot,
   ParserUnits, RealtimeCommand, ResponseWriter, StreamEngine, MAX_LINE_LEN, RX_BUFFER_SIZE,
   RESPONSE_CAPACITY,
 };
+use firmware_core::settings::{self, PbChunkResult, PbReceiver, SettingError, Settings};
+
+use crate::storage::{FlashSettingsStore, SharedFlash};
 
 /// A single assembled input line handed from `usb_rx` to the parser stub, capped to the protocol line
 /// length. Owned (not borrowed) so it can cross the channel without referencing the RX task's buffer.
@@ -168,40 +171,51 @@ pub static MACHINE: Mutex<CriticalSectionRawMutex, MachineSnapshot> = Mutex::new
 /// constructed planner once at boot before either task runs. After init the `Option` is always `Some`.
 pub static PLANNER: Mutex<CriticalSectionRawMutex, Option<Planner>> = Mutex::new(None);
 
-/// Build the placeholder [`PlannerConfig`]. These are grbl-like defaults standing in for the real
-/// `$`-settings the firmware will load from esp-storage (DOC-00) once persistence is wired: 250 steps/mm,
-/// 500 mm/min max rate, 10 mm/s² accel, `$11`=0.01 mm, `$12`=0.002 mm per axis. TODO(DOC-00): replace
-/// with the persisted settings load (CRC-checked, falling back to these compiled defaults).
-fn placeholder_planner_config() -> PlannerConfig {
-  PlannerConfig::default()
+/// The live machine settings (DOC-04): the persisted `$`-settings plus TMC parameters, loaded from flash at
+/// boot. Shared so the consumer mutates them on `$x=val`, the status reporter reads steps/mm for the live
+/// MPos conversion, and the soft-reset path rebuilds the planner from them. Held as an `Option` because
+/// [`Settings::default`] is not `const`; [`init_settings`] seeds it once at boot (after which it is always
+/// `Some`). Shared across cores via [`CriticalSectionRawMutex`].
+pub static SETTINGS: Mutex<CriticalSectionRawMutex, Option<Settings>> = Mutex::new(None);
+
+/// "The live [`SETTINGS`] differ from what is persisted in flash" flag, the heart of the write-coalescing
+/// (Finding #14b). Every `$n=val` / `$PBX` change applies to the in-RAM [`SETTINGS`] and sets this; the actual
+/// flash write happens ONCE per burst, not per line. Without coalescing a `$$`-bulk restore (~36 `$n=val`
+/// lines back to back) would append the WHOLE settings blob to the wear-leveled flash log ~36 times, thrashing
+/// the NVS region. The single [`comms_consumer`] task is the sole owner of the flush: it persists the live
+/// settings and clears this flag when its input has drained (the line queue is empty — a burst boundary), on a
+/// safety interval, and on soft reset, so a change is coalesced with its burst yet never lost. `AcqRel`/
+/// `Acquire` ordering publishes the flag against the `SETTINGS` mutex release on the same core-0 executor.
+pub static SETTINGS_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Mark the live [`SETTINGS`] as changed-but-not-yet-persisted. Called after a `$n=val` / `$PBX` write has been
+/// applied to the in-RAM [`SETTINGS`]; the consumer's coalesced flush picks it up at the next burst boundary.
+fn mark_settings_dirty() {
+  SETTINGS_DIRTY.store(true, Ordering::Release);
 }
 
-/// Build the placeholder [`MotionConfig`] for the step generator: the `$0` step-pulse width and the timer
-/// tick rate the RMT channels are clocked at (1 MHz → 1 tick = 1 µs). Defaults stand in for the persisted
-/// `$0`/`$29` firmware settings (DOC-00). The `motion_executor` uses this to drive the generator, and the
-/// RMT init derives the channel clock divider from `tick_hz` — keep them in agreement. TODO(DOC-00):
-/// replace with the persisted settings load (CRC-checked, falling back to these compiled defaults).
-pub fn placeholder_motion_config() -> MotionConfig {
-  MotionConfig::default()
+/// Seed [`SETTINGS`] at boot with the settings loaded from flash (or defaults). Called once from `main`
+/// before any task runs; `try_lock` cannot contend yet.
+pub fn init_settings(settings: Settings) {
+  if let Ok(mut guard) = SETTINGS.try_lock() {
+    *guard = Some(settings);
+  }
 }
 
-/// The placeholder per-axis steps/mm (`$100..102`) the motion executor uses to convert its live step
-/// counter into MPos millimeters. Sourced from the SAME [`placeholder_planner_config`] the planner rounds
-/// with, so the planner and the live position report agree on resolution (a single source, not a second
-/// copy). TODO(DOC-00): load `$100..102` from esp-storage alongside the rest of the settings.
-pub fn placeholder_steps_per_mm() -> [f32; AXES] {
-  placeholder_planner_config().steps_per_mm
+/// A copy of the live settings (or [`Settings::default`] if somehow unseeded). Copies out under a brief lock
+/// so a caller reads fields without holding the mutex across `.await`s. `Settings` is `Copy`, so this is cheap.
+async fn settings_snapshot() -> Settings {
+  let guard = SETTINGS.lock().await;
+  (*guard).unwrap_or_default()
 }
 
-/// Install the planner into [`PLANNER`] at boot, before the consumer and the core-1 motion executor are
-/// spawned. Called once from `main`; `try_lock` avoids an await in init and cannot contend (no task runs yet).
-pub fn init_planner() {
-  // `try_lock` succeeds because this runs before any task is spawned, so nothing else holds the lock.
-  // The `Ok` arm is the only reachable path at init; a failure would be a wiring bug, handled by leaving
-  // the planner uninitialized (the consumer then treats every line as an internal error rather than
-  // panicking), but in practice this never fails.
+/// Install the planner into [`PLANNER`] at boot from `config` (derived from the loaded settings). Called once
+/// from `main`; `try_lock` avoids an await in init and cannot contend (no task runs yet). A `try_lock` failure
+/// would be a wiring bug, handled by leaving the planner uninitialized (the consumer then fails lines loudly
+/// rather than panicking), but in practice it never fails.
+pub fn init_planner(config: PlannerConfig) {
   if let Ok(mut guard) = PLANNER.try_lock() {
-    *guard = Some(Planner::new(placeholder_planner_config()));
+    *guard = Some(Planner::new(config));
   }
 }
 
@@ -406,15 +420,23 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
 /// `try_write` refuse bytes, and lets the host's character-counting throttle — exactly the correct grbl flow
 /// control, now with real-time dispatch still live throughout because it sits in the separate reader half.
 #[embassy_executor::task]
-pub async fn comms_consumer() -> ! {
+pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
   let mut parser = Parser::new();
   let mut state = ConsumerState::default();
   loop {
-    // Race a soft reset against the next line so a `0x18` arriving mid-stream resets the parser modal
-    // state, clears the error-hold, and flushes the planner queue BEFORE the next line is parsed. `usb_rx`
-    // already cleared `RX_PIPE` + `LINE_QUEUE` and signalled the line assembler when it fired the reset;
-    // here we reset the pipeline state this task owns AND emit the guaranteed readiness banner. A line that
-    // lost the race is dropped (it predates the reset), matching grbl's warm-reset semantics.
+    // Coalesced settings persist (Finding #14b): if a `$n=val`/`$PBX` change is pending and the input has
+    // drained (no more lines queued), this is a burst boundary — flush the live settings to flash ONCE for
+    // the whole burst before blocking for the next event, instead of writing per line. The flush yields the
+    // executor while the flash op runs; `is_empty` is the cheap "host paused" signal the brief specifies.
+    if SETTINGS_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
+      flush_settings(flash).await;
+    }
+    // Race the next line against a soft reset AND a periodic safety flush. A `0x18` resets the parser modal
+    // state, clears the error-hold, and flushes the planner queue (and persists any pending settings) BEFORE
+    // the next line is parsed; `usb_rx` already cleared `RX_PIPE` + `LINE_QUEUE` and signalled the line
+    // assembler. The safety-flush timer guarantees a dirty change is persisted within [`SETTINGS_FLUSH_SAFETY`]
+    // even if the queue never observably empties (e.g. a slow trickle that always has one line in flight). A
+    // line that lost the reset race is dropped (it predates the reset), matching grbl's warm-reset semantics.
     //
     // Known window (Finding #6, accepted): the select only observes the reset at the loop boundary. If a
     // `0x18` lands while `handle_line` is already mid-flight for a non-back-pressured line, that line can
@@ -423,10 +445,41 @@ pub async fn comms_consumer() -> ! {
     // remaining window for an in-flight non-back-pressured line would require cancelling `handle_line`
     // mid-await; that is deferred to the alarm-state machine (Stage 2), which is where grbl gates response
     // emission during an abort. The stray response is benign: the host discards pending acks on `0x18`.
-    match select(LINE_QUEUE.receive(), SOFT_RESET.wait()).await {
-      Either::First(line) => handle_line(line.as_slice(), &mut parser, &mut state).await,
-      Either::Second(()) => reset_pipeline(&mut parser, &mut state).await,
+    match select3(LINE_QUEUE.receive(), SOFT_RESET.wait(), Timer::after(SETTINGS_FLUSH_SAFETY)).await {
+      Either3::First(line) => handle_line(line.as_slice(), &mut parser, &mut state).await,
+      // A soft reset must not lose a pending settings change: persist before rebuilding the pipeline (grbl
+      // applies most settings on the next reset, so they MUST be on flash by the time the reset takes them).
+      Either3::Second(()) => {
+        flush_settings(flash).await;
+        reset_pipeline(&mut parser, &mut state).await;
+      }
+      // Safety-interval tick: persist any pending change even if the queue never observably drained. When
+      // nothing is dirty this is a cheap no-op and the loop simply re-arms the timer on the next iteration.
+      Either3::Third(()) => flush_settings(flash).await,
     }
+  }
+}
+
+/// Persist the live [`SETTINGS`] to flash IF a change is pending, clearing [`SETTINGS_DIRTY`]. This is the
+/// single coalesced write path (Finding #14b): callers mark settings dirty per `$n=val`/`$PBX` line, and this
+/// performs the actual flash append once per burst (queue-empty), on the safety interval, and on soft reset.
+///
+/// The dirty flag is cleared BEFORE the write so a change landing during the (awaited) flash op re-marks dirty
+/// and is caught by the next flush — never silently coalesced away. A failed flush is logged via `defmt` (a
+/// no-op in the default build) and otherwise swallowed: the in-RAM value already applied and the line was
+/// already `ok`'d, matching the existing best-effort `store_settings` error handling — a stalled persist must
+/// never wedge a character-counting sender. (The change is not re-marked on failure: the next dirty write or
+/// the soft-reset flush will re-attempt persistence; re-marking here would spin the failing write every loop.)
+async fn flush_settings(flash: &'static SharedFlash) {
+  // Clear first so a concurrent `$n=val` applied during the await re-sets the flag and is not lost.
+  if !SETTINGS_DIRTY.swap(false, Ordering::AcqRel) {
+    return;
+  }
+  let snapshot = settings_snapshot().await;
+  let mut store = FlashSettingsStore::new(flash);
+  if settings::store_settings(&mut store, &snapshot).await.is_err() {
+    #[cfg(feature = "defmt")]
+    defmt::warn!("settings: failed to flush settings to flash");
   }
 }
 
@@ -445,13 +498,18 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state.
   *parser = Parser::new();
   state.error_hold = false;
+  // Drop any partially accumulated `$PBX=` import so a frame begun before the reset cannot bleed into one after.
+  state.pb.reset();
   // Reconstruct the planner to clear the block queue, machine position, work offset, and junction state in
-  // one step (it has no public flush). The placeholder config is re-applied; once esp-storage settings are
-  // wired the reset will re-load them. Reset the published snapshot's non-position fields to idle; the live
-  // MPos atomics are zeroed by the executor on `MOTION_RESET`, not here (single-owner, no race).
+  // one step (it has no public flush), rebuilding it from the LIVE settings so any `$x=val` changes made
+  // before the reset take effect now (grbl applies most settings on the next reset). Snapshot the settings
+  // first so the `SETTINGS` lock is released before the `PLANNER` lock is taken. Reset the published
+  // snapshot's non-position fields to idle; the live MPos atomics are zeroed by the executor on
+  // `MOTION_RESET`, not here (single-owner, no race).
+  let planner_config = settings_snapshot().await.planner_config();
   {
     let mut guard = PLANNER.lock().await;
-    *guard = Some(Planner::new(placeholder_planner_config()));
+    *guard = Some(Planner::new(planner_config));
   }
   {
     let mut snap = MACHINE.lock().await;
@@ -469,6 +527,9 @@ struct ConsumerState {
   /// True once a GCode line errored and no recovery trigger (blank line / `$` command / soft reset) has
   /// cleared it yet. While set, GCode lines are rejected without parsing, per grblHAL safety behavior.
   error_hold: bool,
+  /// Reassembly state for a chunked `$PBX=<hex>` bulk settings import (a full frame spans several lines).
+  /// Lives here so it persists across the per-line `handle_line` calls; reset on a soft reset.
+  pb: PbReceiver,
 }
 
 /// Route one accepted line. `$` system commands are dispatched to their report handlers and clear the
@@ -485,9 +546,10 @@ async fn handle_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerState
   } else if let Some(rest) = trimmed.strip_prefix(b"$") {
     // A `$` system command is the other grblHAL recovery trigger and is answered by its handler. Both
     // recovery triggers (an empty line and a `$` command) and a soft reset clear the hold; nothing else.
-    // The parser is passed so `$G` can report the live modal state rather than a hardcoded default.
+    // The parser is passed so `$G` can report the live modal state rather than a hardcoded default. A
+    // `$x=val`/`$PBX` setting write applies to RAM and is marked dirty for the consumer's coalesced flush.
     state.error_hold = false;
-    handle_system_command(rest, parser).await;
+    handle_system_command(rest, parser, state).await;
   } else {
     plan_gcode_line(trimmed, parser, state).await;
   }
@@ -598,14 +660,18 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
   }
 }
 
-/// Answer a `$<rest>` system command. Stage 1 implements the connect-critical subset: `$$` settings dump
-/// (stub: header + `ok`), `$I`/`$I+` build info, `$G` parser state, `$#` NGC parameters (stub). Each
+/// Answer a `$<rest>` system command: `$` help (bare ack), `$$` settings dump, `$x=val` setting write
+/// (validated + persisted), `$I`/`$I+` build info, `$G` parser state, `$#` NGC parameters (stub). Each
 /// multi-line response ends with `ok`. An unrecognized `$` command is acknowledged so the stream advances.
-async fn handle_system_command(rest: &[u8], parser: &Parser) {
+async fn handle_system_command(rest: &[u8], parser: &Parser, state: &mut ConsumerState) {
   match rest {
-    b"" | b"$" => {
-      // `$` (help) / `$$` dump. Stage 1 returns an empty dump plus `ok`; real settings land with
-      // esp-storage persistence (TODO). This keeps `$$` from stalling a sender that probes settings.
+    b"" => {
+      // Bare `$` (help). Acknowledge so a sender's help probe advances; a help-text dump is not needed.
+      ack().await;
+    }
+    b"$" => {
+      // `$$` settings dump: one `$n=value` line per supported setting, then the terminating `ok`.
+      dump_settings().await;
       ack().await;
     }
     b"I" => {
@@ -621,10 +687,128 @@ async fn handle_system_command(rest: &[u8], parser: &Parser) {
       ack().await;
     }
     b"#" => {
-      // NGC parameters dump. Stage 1 has no stored offsets; acknowledge so `$#` does not stall.
+      // NGC parameters dump. No stored offsets yet (TLO scope); acknowledge so `$#` does not stall.
       ack().await;
     }
-    _ => ack().await,
+    b"PBX" => {
+      // `$PBX` bulk settings export (DOC-04 host-sync): emit the live settings as hex-encoded protobuf frame
+      // chunks, then the terminating `ok`. skirnir reassembles and decodes via the shared `galdr-proto` schema.
+      export_pb().await;
+      ack().await;
+    }
+    other if other.starts_with(b"PBX=") => {
+      // `$PBX=<hex>` bulk settings import: one hex chunk of the protobuf frame. Accumulated across lines until
+      // the self-describing frame is complete (see `PbReceiver`), then applied to RAM and marked dirty for the
+      // coalesced flush.
+      handle_pb_write(&other[b"PBX=".len()..], state).await;
+    }
+    _ => write_setting_command(rest).await,
+  }
+}
+
+/// Number of frame BYTES hex-encoded per `[PB:...]` export line. 48 bytes → 96 hex chars; with the `[PB:`/`]`
+/// wrapper and CRLF that is ~103 chars, comfortably under [`RESPONSE_CAPACITY`].
+const PB_CHUNK_BYTES: usize = 48;
+
+/// Emit the `$PBX` bulk export: encode the live settings into a storage frame and stream it as hex-encoded
+/// `[PB:<hex>]` lines (chunked to fit the line length). The terminating `ok` is emitted by the caller; the
+/// host concatenates the chunk payloads in order, hex-decodes, and decodes the frame with the shared schema.
+async fn export_pb() {
+  let snapshot = settings_snapshot().await;
+  let mut frame: heapless::Vec<u8, { settings::wire::FRAME_MAX_LEN }> = heapless::Vec::new();
+  // Encoding the live settings cannot fail (the buffer is sized for the largest frame); on the impossible
+  // error, emit nothing and let the caller's `ok` close the (empty) export so the host can retry.
+  if settings::wire::encode(&snapshot, &mut frame).is_err() {
+    return;
+  }
+  for chunk in frame.chunks(PB_CHUNK_BYTES) {
+    let mut line = Response::new();
+    if line.push_str("[PB:").is_ok() && settings::write_hex(chunk, &mut line) && line.push_str("]\r\n").is_ok() {
+      enqueue(line).await;
+    }
+  }
+}
+
+/// Handle one `$PBX=<hex>` import chunk: feed it to the reassembly receiver. A non-final chunk acknowledges
+/// and waits; the final chunk completes the frame, which is applied to the live [`SETTINGS`] and marked DIRTY
+/// (the coalesced flush persists it once the burst drains — Finding #14b) before acknowledging; malformed
+/// input resets the receiver and returns `error:N` so the host can retry from the first chunk.
+async fn handle_pb_write(hex: &[u8], state: &mut ConsumerState) {
+  let Ok(hex) = core::str::from_utf8(hex) else {
+    state.pb.reset();
+    error(SettingError::BadValue.code()).await;
+    return;
+  };
+  match state.pb.accept_hex(hex.trim()) {
+    PbChunkResult::NeedMore => ack().await,
+    PbChunkResult::Complete(new_settings) => {
+      {
+        let mut guard = SETTINGS.lock().await;
+        *guard = Some(new_settings);
+      }
+      // Apply to RAM and mark dirty; the consumer flushes once the burst drains (or on soft reset / safety
+      // interval), so a `$PBX` import that arrives split across many lines is persisted with a SINGLE flash
+      // append rather than one per chunk. Planner-affecting fields take effect on the next soft reset, as with
+      // `$x=val`. Acknowledge immediately — the in-RAM value already applied.
+      mark_settings_dirty();
+      ack().await;
+    }
+    PbChunkResult::Error => error(SettingError::BadValue.code()).await,
+  }
+}
+
+/// Emit the `$$` settings dump: one `$n=value` line (CRLF-terminated) per number in
+/// [`settings::SETTING_NUMBERS`], rendered from a snapshot of the live settings. The closing `ok` is emitted
+/// by the caller. Each line is enqueued through the single USB writer, preserving in-order delivery.
+async fn dump_settings() {
+  let snapshot = settings_snapshot().await;
+  for &n in settings::SETTING_NUMBERS {
+    let mut line = Response::new();
+    // Render `$n=value`, then append the line terminator; a formatting/capacity failure simply skips the line
+    // (it never trips — `Response` is sized well above the longest setting line).
+    if snapshot.write_setting_line(n, &mut line) && line.push_str("\r\n").is_ok() {
+      enqueue(line).await;
+    }
+  }
+}
+
+/// Handle a `$x=val` setting write. Parses `<number>=<value>`; anything else is treated as an unrecognized
+/// `$` command and leniently acknowledged (matching prior behavior) so a sender probing an unsupported
+/// command advances. A recognized write is validated and applied to the live [`SETTINGS`], then marked DIRTY
+/// for the coalesced flush (Finding #14b); the line is acknowledged once the in-RAM value applies, or
+/// `error:N` is returned on a bad number/value. The actual flash append is deferred to the consumer's
+/// burst-boundary flush, so a `$$`-bulk restore is one flash write, not one per `$n=val` line.
+async fn write_setting_command(rest: &[u8]) {
+  // Only `$<number>=<value>` is a setting write.
+  let parsed = core::str::from_utf8(rest)
+    .ok()
+    .and_then(|text| text.split_once('='))
+    .and_then(|(number, value)| number.trim().parse::<u16>().ok().map(|n| (n, value.trim())));
+  let Some((n, value)) = parsed else {
+    ack().await;
+    return;
+  };
+
+  // Apply under the lock; the validated change goes to the in-RAM settings, the flush persists it later.
+  let outcome = {
+    let mut guard = SETTINGS.lock().await;
+    match guard.as_mut() {
+      Some(settings) => settings.set_command(n, value),
+      // Unseeded settings is an init wiring bug (unreachable after boot); reject as an unknown setting.
+      None => Err(SettingError::UnknownSetting),
+    }
+  };
+
+  match outcome {
+    Ok(()) => {
+      // Apply-and-mark: the in-RAM value already applied, so acknowledge immediately. The coalesced flush
+      // persists it once the burst drains (or on soft reset / safety interval). Deferring avoids re-appending
+      // the WHOLE settings blob to flash for every `$n=val` line in a bulk restore (grbl semantics — a
+      // stalled `ok` would wedge a character-counting sender; here the `ok` never waits on flash at all).
+      mark_settings_dirty();
+      ack().await;
+    }
+    Err(error_code) => error(error_code.code()).await,
   }
 }
 
@@ -695,9 +879,11 @@ async fn error(code: u8) {
 /// Reading these live, rather than from a periodically-published copy, keeps `?` truthful between publishes.
 #[embassy_executor::task]
 pub async fn status_responder() -> ! {
-  let steps_per_mm = placeholder_steps_per_mm();
   loop {
     STATUS_REQUEST.wait().await;
+    // Read steps/mm live from the settings each report so a `$100..102` change is reflected immediately in
+    // the MPos conversion (cheap: a brief lock + a `Copy`).
+    let steps_per_mm = settings_snapshot().await.steps_per_mm();
     let mut snap = *MACHINE.lock().await;
     // Live MPos: read the executor's per-burst step atomics and convert via the host-tested `steps_to_mm`.
     let position = read_live_position();
@@ -741,6 +927,13 @@ async fn planner_blocks_free() -> u8 {
 /// block's execution time (tens of ms) so the retry claims a freed slot promptly, but long enough that the
 /// retry loop is not a busy-spin — it yields to the core-1 motion executor each iteration.
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(2);
+
+/// Safety interval for the coalesced settings flush (Finding #14b): an upper bound on how long a pending
+/// `$n=val`/`$PBX` change can sit un-persisted when the line queue never observably empties (a slow trickle
+/// that always keeps one line in flight). The primary trigger is the burst boundary (queue empty); this is the
+/// backstop so a dirty change is never indefinitely deferred. One second is far longer than a normal burst yet
+/// short enough that a power loss after a paused write loses at most a second of un-flushed edits.
+const SETTINGS_FLUSH_SAFETY: Duration = Duration::from_secs(1);
 
 /// Backoff before retrying a USB read after a read error, so a persistent error does not become a tight
 /// spin that starves the other core-0 tasks. Short enough that a transient glitch barely delays reception,

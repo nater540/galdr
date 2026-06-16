@@ -14,6 +14,17 @@
 //! All multi-byte data words are big-endian (D3 is the most significant byte). The CRC8-ATM uses
 //! polynomial x⁸+x²+x+1 (0x07), init 0x00, processing each byte LSB-first over every byte except
 //! the trailing CRC byte itself.
+//!
+//! The byte-level codec here is paired with two layers built on top of it: [`registers`] holds the
+//! per-register field codecs and the RMS-current→current-scale math, and [`manager`] orchestrates the
+//! startup register sequence, write verification, and runtime status polling over the [`TmcBus`] trait
+//! ([`crate::hal_traits`]). Both of those layers are pure and host-tested; only the firmware binary's
+//! UART1 wiring implements the transport.
+//!
+//! [`TmcBus`]: crate::hal_traits::TmcBus
+
+pub mod manager;
+pub mod registers;
 
 /// Datagram sync nibble/byte that opens every TMC2209 UART frame (the low nibble 0x5 is the sync;
 /// the upper bits are reserved/zero in practice, so the first byte reads as 0x05).
@@ -41,7 +52,14 @@ pub const READ_REQUEST_LEN: usize = 4;
 /// Length in bytes of a read-reply datagram.
 pub const READ_REPLY_LEN: usize = 8;
 
-/// Errors produced when decoding a TMC2209 read-reply datagram.
+/// Errors produced when talking to a TMC2209 over the single-wire UART.
+///
+/// The first group are *decode* failures raised by [`decode_read_reply`] when a reply datagram is
+/// malformed; they are pure-logic and host-tested. The last two are *transport* failures the
+/// [`TmcBus`](crate::hal_traits::TmcBus) implementation raises on target when the underlying UART
+/// cannot complete a datagram exchange — a driver that never answers (standalone VREF mode, broken
+/// bus) yields [`Timeout`](TmcError::Timeout), and a UART peripheral error yields [`Io`](TmcError::Io).
+/// They live on the same enum so the codec, the bus trait, and the manager all speak one error type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TmcError {
@@ -55,6 +73,14 @@ pub enum TmcError {
   RegisterMismatch,
   /// The trailing CRC byte did not match the CRC computed over the reply contents.
   BadCrc,
+  /// The expected reply (or write echo) did not arrive within the bus turn-around window. Raised by
+  /// the on-target [`TmcBus`](crate::hal_traits::TmcBus); the host codec never produces it. A node that
+  /// is absent or wired for standalone VREF operation simply never answers, so this is the normal
+  /// "driver not present" signal the manager treats as flag-and-skip during init (DOC-03).
+  Timeout,
+  /// The underlying UART peripheral reported an error (framing/overflow/glitch) during the exchange.
+  /// Raised by the on-target [`TmcBus`](crate::hal_traits::TmcBus) only.
+  Io,
 }
 
 /// Compute the TMC2209 CRC8-ATM over `data` (every datagram byte except the trailing CRC byte).

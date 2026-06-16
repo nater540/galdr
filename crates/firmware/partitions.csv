@@ -1,0 +1,10 @@
+# ESP32-S3 partition table for galdr (DOC-04 settings persistence).
+# espflash applies this when flashing (see espflash.toml). The `storage` partition is the dedicated NVS
+# region the settings subsystem uses; its offset/size MUST match `NVS_OFFSET`/`NVS_SIZE` in src/storage.rs.
+# Offsets and sizes are sector-aligned (4 KiB). The factory app gets 3 MiB starting at 0x10000, and the
+# settings region sits above it at 0x320000 (fits parts >= 4 MiB; S3 devkits are typically 8-16 MiB).
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x6000
+phy_init,   data, phy,     0xf000,   0x1000
+factory,    app,  factory, 0x10000,  0x300000
+storage,    data, nvs,     0x320000, 0x10000

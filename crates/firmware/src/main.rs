@@ -31,9 +31,13 @@
 //!   This REPLACES the Stage-1 `block_drain_stub`; the `PLANNER`/`MACHINE` handoff is unchanged.
 //!
 //! ## What is deliberately still stubbed (out of scope for this phase)
-//! - TMC2209 manager / UART1 (DOC-03), LEDC spindle PWM (DOC-07), limit/control GPIO + homing (DOC-06),
-//!   and esp-storage `$`-settings persistence (DOC-00): in-memory defaults are used; the `$0`/`$29`/steps-mm
-//!   the motion executor needs come from the `comms` placeholder accessors. Each is a documented TODO below.
+//! - LEDC spindle PWM (DOC-07), limit/control GPIO + homing (DOC-06), and esp-storage `$`-settings
+//!   persistence (DOC-00): in-memory defaults are used; the `$0`/`$29`/steps-mm the motion executor needs
+//!   come from the `comms` placeholder accessors, and the TMC2209 currents/microstepping from `TmcConfig`
+//!   defaults. Each is a documented TODO below.
+//! - The TMC2209 manager (DOC-03) IS now brought up: UART1 on GPIO9 carries the single-wire bus and the
+//!   `tmc_manager` task configures each driver and polls `DRV_STATUS`. A driver fault does not yet raise a
+//!   machine ALARM — that waits on the shared alarm-state machine (DOC-06), a documented TODO in `tmc`.
 //! - Feed-hold deceleration is per-block (Stage 1): a hold pauses at the next block boundary and resumes on
 //!   cycle-start; smooth ramp-down within a block is a later refinement.
 
@@ -44,6 +48,7 @@ use esp_backtrace as _;
 use esp_println as _;
 
 use embassy_executor::Spawner;
+use embassy_sync::mutex::Mutex;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::Priority;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
@@ -51,10 +56,26 @@ use esp_hal::system::Stack;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use esp_rtos::embassy::InterruptExecutor;
+use esp_storage::FlashStorage;
 use static_cell::StaticCell;
+
+use firmware_core::motion::MotionConfig;
 
 mod comms;
 mod motion;
+mod storage;
+mod tmc;
+
+/// The step-generator timer tick rate, Hz. A fixed firmware constant (the RMT channels are clocked to 1 MHz
+/// = 1 tick/µs by `motion::init`'s clock divider); the persisted `$0` step-pulse time is converted to ticks
+/// at this rate. Not a user setting — keep it in agreement with the divider in `motion::init`.
+const MOTION_TICK_HZ: f32 = 1_000_000.0;
+
+// Provide the defmt timestamp source required to link a defmt logging build (the `defmt` feature wires
+// esp-println as the global logger; defmt still requires the application to supply a timestamp). Uses the
+// embassy-time monotonic clock so log lines carry a microsecond stamp. Compiled out of the default build.
+#[cfg(feature = "defmt")]
+defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
 
 /// Stack arena for the core-1 main thread (the esp-rtos second-core scheduler thread). The motion executor
 /// itself runs in interrupt context off this thread, so this only backs the brief second-core bring-up and
@@ -75,13 +96,19 @@ static STEP_SINK: StaticCell<motion::RmtStepSink> = StaticCell::new();
 /// (dropping the `Output` would release the pin and let the drivers float). Driven enabled (low) at init.
 static STEP_ENABLE: StaticCell<esp_hal::gpio::Output<'static>> = StaticCell::new();
 
+/// The single flash instance plus its persistent pointer cache ([`storage::FlashState`]) behind its
+/// cross-core mutex, parked in a `StaticCell` so it lives for the program and can be shared as `&'static` with
+/// the settings store at boot and the coalesced persist path. `esp_storage::FlashStorage::new` panics if
+/// constructed twice, so there is exactly one, created here.
+static FLASH: StaticCell<storage::SharedFlash> = StaticCell::new();
+
 /// The core-1 `motion_executor` task: the single task on the high-priority interrupt executor. It borrows
 /// the `'static` RMT step sink and runs the real-time step-generation loop forever (DOC-02). Defined here
 /// (not in `motion`) because `#[embassy_executor::task]` must own its `'static` argument; the loop body
 /// lives in [`motion::run`].
 #[embassy_executor::task]
-async fn motion_executor(sink: &'static mut motion::RmtStepSink) -> ! {
-  motion::run(sink).await
+async fn motion_executor(sink: &'static mut motion::RmtStepSink, config: MotionConfig) -> ! {
+  motion::run(sink, config).await
 }
 
 /// Async entry point. `#[esp_rtos::main]` expands to an `#[esp_hal::main]` reset handler that builds the
@@ -105,10 +132,22 @@ async fn main(spawner: Spawner) {
   let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
   let (usb_rx, usb_tx) = usb.split();
 
-  // TODO(DOC-00): esp-storage init + load persisted `$`-settings (fall back to compiled defaults on CRC
-  // failure); build the MotionConfig from `$0`/`$29` and the PlannerConfig from `$100..`. Stage 1 uses the
-  // in-memory `placeholder_*` defaults in `comms` (planner config, motion config, steps/mm).
-  // TODO(DOC-03): configure UART1 for the TMC2209 single-wire bus and run the tmc_manager init sequence.
+  // 3b. Settings persistence (DOC-04). Construct the single flash instance, load the persisted `$`-settings
+  //     record — the loader is INFALLIBLE: absence, corruption, or schema skew silently yields compiled
+  //     defaults, so a bad flash region can never wedge boot — seed the live `SETTINGS`, and derive the
+  //     planner / motion / TMC configs from it. The flash is shared `&'static` so the consumer can persist
+  //     `$x=val` writes at runtime.
+  let flash: &'static storage::SharedFlash =
+    FLASH.init(Mutex::new(storage::FlashState::new(FlashStorage::new(peripherals.FLASH))));
+  let settings = {
+    let mut store = storage::FlashSettingsStore::new(flash);
+    firmware_core::settings::load_or_default(&mut store).await
+  };
+  let planner_config = settings.planner_config();
+  let motion_config = settings.motion_config(MOTION_TICK_HZ);
+  let tmc_config = settings.tmc_config();
+  comms::init_settings(settings);
+
   // TODO(DOC-07): configure LEDC ch0 on GPIO13 for spindle PWM + SPIN_EN/SPIN_DIR GPIO (act on the
   //   planner's Spindle outcome, currently passed through).
   // TODO(DOC-06): configure limit/control GPIO (pull-ups, rising-edge IRQ) and spawn the homing task (act
@@ -122,13 +161,20 @@ async fn main(spawner: Spawner) {
     (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4),
     (peripherals.GPIO5, peripherals.GPIO6, peripherals.GPIO7),
     peripherals.GPIO8,
+    &motion_config,
   );
   let sink: &'static mut motion::RmtStepSink = STEP_SINK.init(sink);
   let _: &'static mut _ = STEP_ENABLE.init(step_enable);
 
-  // 5. Install the motion planner before spawning the tasks that share it (the consumer enqueues, the
-  //    core-1 executor pops). `Planner::new` is not `const`, so the static holds an `Option` filled here.
-  comms::init_planner();
+  // 4b. Bring up UART1 as the single-wire TMC2209 bus on GPIO9 (DOC-03). The bus is owned by the
+  //     `tmc_manager` task (spawned below), which runs the per-driver init sequence and then polls
+  //     `DRV_STATUS`. Built here so its peripherals (UART1 + GPIO9) are claimed alongside the others.
+  let tmc_bus = tmc::init(peripherals.UART1, peripherals.GPIO9);
+
+  // 5. Install the motion planner (built from the loaded settings) before spawning the tasks that share it
+  //    (the consumer enqueues, the core-1 executor pops). `Planner::new` is not `const`, so the static holds
+  //    an `Option` filled here.
+  comms::init_planner(planner_config);
 
   // 6. Start core 1 and its high-priority interrupt executor, then spawn `motion_executor` on it. On Xtensa
   //    `start_second_core` consumes software interrupts 0 and 1 for the esp-rtos SMP scheduler; the motion
@@ -147,7 +193,7 @@ async fn main(spawner: Spawner) {
       let motion_spawner = executor.start(Priority::Priority3);
       // `must_spawn` is appropriate at init: a spawn failure (token already used) is a static, unrecoverable
       // wiring bug, not a runtime condition. The task takes the `'static` sink by mutable borrow.
-      motion_spawner.must_spawn(motion_executor(sink));
+      motion_spawner.must_spawn(motion_executor(sink, motion_config));
     },
   );
 
@@ -159,8 +205,13 @@ async fn main(spawner: Spawner) {
   spawner.must_spawn(comms::usb_rx(usb_rx));
   spawner.must_spawn(comms::line_assembler());
   spawner.must_spawn(comms::usb_tx(usb_tx));
-  spawner.must_spawn(comms::comms_consumer());
+  // The consumer takes the shared flash so a `$x=val` setting write is persisted to the NVS region (DOC-04).
+  spawner.must_spawn(comms::comms_consumer(flash));
   spawner.must_spawn(comms::status_responder());
+  // The TMC2209 manager runs the driver init sequence at startup (from the loaded settings), then polls
+  // DRV_STATUS for faults. It owns the UART1 bus by value (a `'static` peripheral handle), so no `StaticCell`
+  // is needed (DOC-03).
+  spawner.must_spawn(tmc::tmc_manager(tmc_bus, tmc_config));
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
