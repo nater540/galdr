@@ -153,6 +153,13 @@ impl SegmentGenerator {
     ];
     let dom_count = abs_steps[dominant];
 
+    // Hoist every per-block, loop-invariant timing quantity out of the hot loop: the dominant-axis travel
+    // per step, the pulse-timing rate/period limits, and the tick rate. These were previously recomputed
+    // (two divisions plus the min-period add) on every tick inside `period_ticks`; computing them once here
+    // leaves only the per-tick sqrt + one divide in the loop. Behavior is identical — the same formula, the
+    // same clamps, the same rounding — only the redundant recomputation is removed.
+    let timing = StepTiming::for_block(&self.config, block, dominant);
+
     let mut burst: Vec<StepEvent, MAX_SYMBOLS_PER_BURST> = Vec::new();
     let mut emitted = 0u32;
 
@@ -178,7 +185,7 @@ impl SegmentGenerator {
       // segment's average rate); travel is measured along the block in mm.
       let traveled_mm = profile.travel_at_step(tick, total);
       let v_sq = profile.velocity_sq_at(traveled_mm);
-      let period = self.period_ticks(v_sq, block, dominant);
+      let period = timing.period_ticks(v_sq);
       let event = StepEvent { step, period_ticks: period };
 
       // `push` only fails when the Vec is full; we flush before pushing into a full burst, so the push is
@@ -196,29 +203,61 @@ impl SegmentGenerator {
     }
     Ok(emitted)
   }
+}
 
-  /// Convert an instantaneous squared velocity (mm/s)² into the dominant-axis step period in timer
-  /// ticks. The dominant axis emits one step per `dom_mm_per_step` of travel, so its step rate is
-  /// `v / dom_mm_per_step` steps/s; the period is `tick_hz / step_rate`, floored at the minimum period
-  /// so the pulse timing is always realizable. A non-positive velocity floors the rate at the slowest
-  /// representable step (the period saturates rather than dividing by zero).
-  fn period_ticks(&self, v_sq: f32, block: &Block, dominant: usize) -> u32 {
+/// The loop-invariant timing constants for one block's step generation, computed once before the per-tick
+/// loop so the hot path does not recompute them. Holds the dominant-axis travel per step, the maximum step
+/// rate and minimum/slowest periods imposed by the pulse timing, and the tick rate — everything
+/// [`period_ticks`](StepTiming::period_ticks) needs to turn an instantaneous velocity into a step period.
+struct StepTiming {
+  /// Millimeters of block travel per dominant-axis step (`block.millimeters / |dom steps|`).
+  dom_mm_per_step: f32,
+  /// The timer tick rate (ticks/second).
+  tick_hz: f32,
+  /// The maximum step rate (steps/second) the pulse timing permits.
+  max_rate_hz: f32,
+  /// The minimum (fastest) step period in ticks; every computed period floors at this.
+  min_period_ticks: u32,
+  /// The period used when velocity collapses to zero: the slowest representable step, but never faster
+  /// than the minimum period.
+  floor_period_ticks: u32,
+}
+
+impl StepTiming {
+  /// Derive the timing constants for `block`'s dominant axis under `config`. The dominant axis has ≥ 1
+  /// step for any block that reaches the generator (`step_event_count > 0`), so `dom_mm_per_step` is a
+  /// well-defined finite value.
+  fn for_block(config: &MotionConfig, block: &Block, dominant: usize) -> Self {
     let dom_steps = block.steps[dominant].unsigned_abs();
-    // `dom_steps` is ≥ 1 for any block that reaches here (step_event_count > 0 and `dominant` is the max
-    // axis), so this division is safe; mm-per-dominant-step is the block length over the dominant count.
     let dom_mm_per_step = block.millimeters / dom_steps as f32;
+    let min_period_ticks = config.min_period_ticks();
+    Self {
+      dom_mm_per_step,
+      tick_hz: config.tick_hz,
+      max_rate_hz: config.max_step_rate_hz(),
+      min_period_ticks,
+      floor_period_ticks: SLOWEST_PERIOD_TICKS.max(min_period_ticks),
+    }
+  }
+
+  /// Convert an instantaneous squared velocity (mm/s)² into the dominant-axis step period in timer ticks.
+  /// The dominant axis emits one step per `dom_mm_per_step` of travel, so its step rate is
+  /// `v / dom_mm_per_step` steps/s; the period is `tick_hz / step_rate`, clamped to the pulse-timing
+  /// limits. A non-positive velocity floors the rate at the slowest representable step (the period
+  /// saturates rather than dividing by zero). Identical math to the previous per-tick computation, now
+  /// over the pre-hoisted constants.
+  fn period_ticks(&self, v_sq: f32) -> u32 {
     let v = libm::sqrtf(v_sq.max(0.0));
-    let step_rate = if dom_mm_per_step > 0.0 { v / dom_mm_per_step } else { 0.0 };
-    let max_rate = self.config.max_step_rate_hz();
-    let clamped = step_rate.min(max_rate);
+    let step_rate = if self.dom_mm_per_step > 0.0 { v / self.dom_mm_per_step } else { 0.0 };
+    let clamped = step_rate.min(self.max_rate_hz);
     if clamped <= 0.0 {
       // Velocity collapsed to (or below) zero; emit the slowest representable step rather than diverge.
-      return SLOWEST_PERIOD_TICKS.max(self.config.min_period_ticks());
+      return self.floor_period_ticks;
     }
-    let period = self.config.tick_hz / clamped;
+    let period = self.tick_hz / clamped;
     // Round to the nearest whole tick, then floor at the minimum period to respect the pulse timing.
     let rounded = libm::roundf(period) as u32;
-    rounded.max(self.config.min_period_ticks())
+    rounded.max(self.min_period_ticks)
   }
 }
 
@@ -256,8 +295,10 @@ struct TrapezoidProfile {
   cruise_sq: f32,
   /// Squared exit speed (mm/s)² — the next block's entry speed (or 0 at a stop).
   exit_sq: f32,
-  /// Block acceleration magnitude in mm/s² (same for accel and decel; grbl's symmetric model).
-  accel: f32,
+  /// Twice the block acceleration magnitude (`2·a`) in mm/s², precomputed because every `v² = v₀² ± 2·a·d`
+  /// evaluation in [`velocity_sq_at`](TrapezoidProfile::velocity_sq_at) needs it; hoisting it out of the
+  /// per-tick velocity sampling avoids a multiply on every step.
+  two_a: f32,
   /// Total block travel in mm.
   length: f32,
   /// Distance from the start at which acceleration ends (cruise begins), in mm.
@@ -294,7 +335,7 @@ impl TrapezoidProfile {
         entry_sq,
         cruise_sq: nominal_sq,
         exit_sq,
-        accel,
+        two_a,
         length,
         accel_end: accel_dist,
         decel_start: length - decel_dist,
@@ -313,7 +354,7 @@ impl TrapezoidProfile {
         entry_sq,
         cruise_sq: peak_sq,
         exit_sq,
-        accel,
+        two_a,
         length,
         accel_end,
         // No cruise plateau: deceleration begins immediately where acceleration ends.
@@ -337,17 +378,18 @@ impl TrapezoidProfile {
   /// decelerate toward `exit_sq`. Each region uses `v² = v₀² ± 2·a·Δd`. The result is clamped to the
   /// region's bounds so f32 round-off cannot push a sample past cruise or below exit.
   fn velocity_sq_at(&self, d: f32) -> f32 {
-    let two_a = 2.0 * self.accel;
+    // `two_a` is precomputed in `plan`; the per-step velocity sampling reuses it rather than recomputing
+    // `2·a` on every call.
     if d <= self.accel_end {
       // Accelerating: rises from entry, capped at the cruise peak.
-      (self.entry_sq + two_a * d).min(self.cruise_sq).max(0.0)
+      (self.entry_sq + self.two_a * d).min(self.cruise_sq).max(0.0)
     } else if d <= self.decel_start {
       // Cruising at the peak speed.
       self.cruise_sq
     } else {
       // Decelerating: falls from cruise toward exit over the remaining travel, floored at exit.
       let remaining = (self.length - d).max(0.0);
-      (self.exit_sq + two_a * remaining).min(self.cruise_sq).max(self.exit_sq.min(self.cruise_sq))
+      (self.exit_sq + self.two_a * remaining).min(self.cruise_sq).max(self.exit_sq.min(self.cruise_sq))
     }
   }
 }

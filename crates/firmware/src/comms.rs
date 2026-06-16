@@ -6,10 +6,19 @@
 //! and is exercised by host tests; here we only move bytes between the USB peripheral and that state
 //! machine, dispatch real-time commands through `embassy-sync` Signals, and emit responses.
 //!
-//! ## Task topology (core 0, thread-mode executor — DOC-01)
-//! - [`usb_rx`] reads USB bytes, feeds each into a [`StreamEngine`], dispatches real-time commands via
-//!   Signals, forwards accepted lines to the parser [`Channel`], and emits `error:N` for protocol-level
-//!   rejections.
+//! ## RX split: real-time dispatch never blocks behind line back-pressure (DOC-08, grbl ISR model)
+//! The receive path is split into two tasks around a real byte buffer ([`RX_PIPE`], sized to the advertised
+//! [`RX_BUFFER_SIZE`]), mirroring grbl's ISR-ring-buffer architecture:
+//! - [`usb_rx`] (the *reader half*) reads USB bytes and, per byte, runs [`classify_realtime`]: a real-time
+//!   command (`?`/`!`/`~`/`0x18`/…) is dispatched through its Signal *immediately* (non-blocking); any other
+//!   byte is pushed into [`RX_PIPE`]. The reader never blocks on line flow control, so a feed-hold or soft
+//!   reset arriving during sustained streaming is acted on at once, never stalled behind a full line queue.
+//! - [`line_assembler`] (the *line-assembly half*) drains [`RX_PIPE`] through a [`StreamEngine`] line framer
+//!   and forwards completed lines (blank lines included) to [`LINE_QUEUE`]. Blocking here on planner
+//!   back-pressure is correct: it stops draining the byte buffer, which fills, and the host's
+//!   character-counting throttles. Because the host counts outstanding *non-real-time* bytes against
+//!   [`RX_BUFFER_SIZE`] and [`RX_PIPE`] is sized to exactly that, the pipe can always absorb every byte a
+//!   compliant host is permitted to have in flight — so the reader half's pipe write never blocks.
 //! - [`usb_tx`] is the single writer to the USB peripheral: it drains the [`RESPONSE`] channel so no two
 //!   tasks ever write the USB endpoint concurrently (DOC-08).
 //! - [`comms_consumer`] is the real gcode parser → planner pipeline. It parses each accepted line through a
@@ -22,12 +31,13 @@
 //! - [`status_responder`] formats a `<...>` report from the shared [`MachineSnapshot`] when the
 //!   [`STATUS_REQUEST`] Signal fires.
 //!
-//! Real-time bytes are intercepted in [`usb_rx`] before line assembly and never receive an `ok`, exactly
-//! matching the firmware-core contract.
+//! Real-time bytes are intercepted in [`usb_rx`] before they ever reach the byte buffer and never receive
+//! an `ok`, exactly matching the firmware-core contract.
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
+use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use embassy_futures::select::{select, Either};
@@ -35,10 +45,11 @@ use embedded_io_async::{Read, Write};
 use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
-use firmware_core::gcode::Parser;
-use firmware_core::planner::{Block, Planner, PlannerConfig, PlannerError, PlannerOutcome, BLOCK_QUEUE_LEN};
+use firmware_core::gcode::{ModalState, MotionMode, DistanceMode as GcodeDistance, Parser, Units as GcodeUnits};
+use firmware_core::planner::{Block, Planner, PlannerConfig, PlannerError, BLOCK_QUEUE_LEN};
 use firmware_core::protocol::{
-  EngineEvent, MachineSnapshot, RealtimeCommand, ResponseWriter, StreamEngine, MAX_LINE_LEN,
+  classify_realtime, EngineEvent, MachineSnapshot, ParserDistance, ParserMotion, ParserSnapshot,
+  ParserUnits, RealtimeCommand, ResponseWriter, StreamEngine, MAX_LINE_LEN, RX_BUFFER_SIZE,
   RESPONSE_CAPACITY,
 };
 
@@ -59,8 +70,25 @@ pub const LINE_QUEUE_DEPTH: usize = 4;
 /// several lines at once, so 8 keeps multi-line replies from blocking the producer.
 pub const RESPONSE_QUEUE_DEPTH: usize = 8;
 
-/// Accepted GCode/`$` lines awaiting the parser stub.
+/// Capacity of the RX byte buffer, in bytes. Sized to exactly the advertised [`RX_BUFFER_SIZE`] so the
+/// number reported to the host (in `[OPT:]` and `Bf:`) is truthfully backed by real buffer space, and so a
+/// compliant host's character-counting send-ahead window can never overrun it. This is the invariant that
+/// lets the reader half's pipe write be non-blocking: a host is only permitted `RX_BUFFER_SIZE` outstanding
+/// non-real-time bytes, and the pipe can hold exactly that many.
+pub const RX_PIPE_CAPACITY: usize = RX_BUFFER_SIZE;
+
+/// The real RX byte buffer between the reader half ([`usb_rx`]) and the line-assembly half
+/// ([`line_assembler`]). The reader pushes every non-real-time byte here; the assembler drains it through
+/// the line framer. Its capacity is the advertised RX buffer size, making that advertisement truthful.
+pub static RX_PIPE: Pipe<CriticalSectionRawMutex, RX_PIPE_CAPACITY> = Pipe::new();
+
+/// Accepted GCode/`$` lines awaiting the consumer.
 pub static LINE_QUEUE: Channel<CriticalSectionRawMutex, Line, LINE_QUEUE_DEPTH> = Channel::new();
+
+/// Soft-reset notification for the line-assembly half: set by [`usb_rx`] on `0x18`/`0x19` so the assembler
+/// drops any partially framed line (the consumer's pipeline reset is signalled separately via
+/// [`SOFT_RESET`]). A dedicated Signal per waiter avoids two tasks racing to consume one Signal.
+pub static LINE_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Outgoing responses awaiting the single USB writer. Every task that needs to emit bytes enqueues here
 /// so the USB endpoint has exactly one writer (DOC-08).
@@ -113,18 +141,19 @@ pub fn init_planner() {
   }
 }
 
-/// Enqueue a response for the USB writer, dropping it if the queue is momentarily full. Dropping a
-/// response rather than blocking the RX path keeps real-time latency bounded; under simple send-response
-/// streaming the queue is effectively never full. A dropped `ok` would stall a host, so the queue depth
-/// is sized so this does not happen in normal operation — this is a safety valve, not a routine path.
+/// Enqueue a response for the USB writer, blocking until it is accepted so a `ok`/`error:N`/report is
+/// NEVER dropped — the one-`ok`-per-line contract that drives host flow control depends on guaranteed
+/// delivery (a lost `ok` permanently stalls a character-counting host). Blocking here is safe because every
+/// caller of this function runs OFF the real-time path: real-time command dispatch lives entirely in the
+/// reader half ([`usb_rx`]), which never enqueues responses, so a momentarily full [`RESPONSE`] channel can
+/// only back-pressure the response producers (consumer / status reporter), never delay a real-time byte.
 async fn enqueue(resp: Response) {
-  // `try_send` never blocks; on a full queue we drop. `send().await` is avoided so a stuck writer can
-  // never back-pressure the byte scanner and delay real-time command dispatch.
-  let _ = RESPONSE.try_send(resp);
+  RESPONSE.send(resp).await;
 }
 
-/// Render a banner into a fresh [`Response`] and queue it. Emitted on boot and on every soft reset so a
-/// host detects controller readiness (DOC-08 / the native-USB no-hard-reset rule).
+/// Render a banner into a fresh [`Response`] and queue it, blocking until accepted. Emitted on boot so a
+/// host detects controller readiness (DOC-08 / the native-USB no-hard-reset rule). The soft-reset banner is
+/// emitted by the consumer's pipeline reset, not here, so this never runs on the reader half.
 pub async fn send_banner() {
   let mut s = Response::new();
   if ResponseWriter::banner(&mut s).is_ok() {
@@ -132,70 +161,129 @@ pub async fn send_banner() {
   }
 }
 
-/// The USB receive task: scan every incoming byte through the [`StreamEngine`], dispatch real-time
-/// commands via Signals, forward accepted lines, and emit `error:N` for protocol-level rejections. This
-/// is the only place real-time bytes are intercepted; they never enter a line and never get an `ok`.
+/// Emit the banner WITHOUT blocking, for the reader half's `0x18` handler: the reader must never block (it
+/// has to stay free to dispatch the next real-time byte), so a momentarily full [`RESPONSE`] drops this
+/// banner. A dropped reset-banner is harmless — the host re-probes readiness with `$I`/`?`, and the
+/// consumer's pipeline reset also emits a banner through the guaranteed-delivery path — so the reset is
+/// still observable. This is the one response emission that is allowed to drop, precisely because it is on
+/// the real-time path.
+fn try_send_banner() {
+  let mut s = Response::new();
+  if ResponseWriter::banner(&mut s).is_ok() {
+    let _ = RESPONSE.try_send(s);
+  }
+}
+
+/// The USB receive task — the *reader half*. It reads USB bytes and, per byte, intercepts real-time
+/// commands ([`classify_realtime`]) and dispatches them through their Signals IMMEDIATELY; every other byte
+/// is pushed into [`RX_PIPE`] for the [`line_assembler`] to frame. This task NEVER blocks on line flow
+/// control: real-time dispatch is non-blocking, and the pipe write is non-blocking (and, for a compliant
+/// host, never full — see [`RX_PIPE_CAPACITY`]). So a feed-hold / soft-reset arriving during sustained
+/// streaming is acted on within one byte, not after a whole move's worth of back-pressure clears.
 #[embassy_executor::task]
 pub async fn usb_rx(mut rx: UsbSerialJtagRx<'static, Async>) -> ! {
-  let mut engine = StreamEngine::new();
-  // A modest read chunk: the USB Serial/JTAG FIFO is 64 bytes, so reads return promptly and we scan the
-  // returned bytes one at a time through the state machine.
+  // A modest read chunk: the USB Serial/JTAG FIFO is 64 bytes, so reads return promptly.
   let mut buf = [0u8; 64];
   loop {
     let n = match rx.read(&mut buf).await {
       Ok(n) => n,
-      // A transient USB read error: yield and retry. The connection persists across host reopen on
-      // native USB, so we do not tear down state here.
-      Err(_) => continue,
+      // A persistent USB read error must not become a tight spin that starves the other core-0 tasks: back
+      // off briefly before retrying. The connection persists across host reopen on native USB, so we do not
+      // tear down state here.
+      Err(_) => {
+        Timer::after(USB_RX_ERROR_BACKOFF).await;
+        continue;
+      }
     };
     for &byte in &buf[..n] {
-      match engine.ingest(byte) {
-        EngineEvent::None => {}
-        EngineEvent::Realtime(cmd) => dispatch_realtime(cmd, &mut engine).await,
-        EngineEvent::AcceptLine(line) => {
-          // Copy the borrowed line into an owned buffer for the channel. A line longer than the buffer
-          // cannot occur: the engine already enforced MAX_LINE_LEN, so this never truncates.
-          let mut owned = Line::new();
-          let _ = owned.extend_from_slice(line);
-          // Block here if the parser stub is briefly behind: this back-pressures the host stream (which
-          // is correct flow control) without dropping a line. Real-time bytes already bypassed this.
-          LINE_QUEUE.send(owned).await;
-        }
-        EngineEvent::Acknowledge => {
-          // A blank line: the grblHAL recovery trigger that clears a gcode error-hold. Forward it through
-          // LINE_QUEUE (empty) rather than acking here, so the single in-order consumer owns both the bare
-          // `ok` and the hold-clear, keeping recovery race-free with the lines queued around it. This also
-          // back-pressures identically to a real line if the consumer is briefly behind.
-          LINE_QUEUE.send(Line::new()).await;
-        }
-        EngineEvent::Reject(code) => {
-          let mut s = Response::new();
-          if ResponseWriter::error(&mut s, code).is_ok() {
-            enqueue(s).await;
-          }
+      match classify_realtime(byte) {
+        // A real-time byte: dispatch its action and do NOT let it enter a line or the byte buffer.
+        Some(cmd) => dispatch_realtime(cmd),
+        // An ordinary line byte: hand it to the line-assembly half. `try_write` never blocks, keeping the
+        // reader free for the next real-time byte; for a compliant host the pipe (sized to the advertised
+        // RX buffer) is never full, so no byte is lost. If a misbehaving host overruns its character-count
+        // window the overflowing byte is dropped — the resulting framed line errors, which is the correct
+        // push-back for a host that ignored flow control, and real-time dispatch stays alive throughout.
+        None => {
+          let _ = RX_PIPE.try_write(&[byte]);
         }
       }
     }
   }
 }
 
-/// Map a classified real-time command onto its Signal / immediate action. Status requests fire the
-/// reporter Signal; feed-hold / cycle-start / reset fire their Signals; the reset path also re-emits the
-/// banner and clears the line queue so a host sees readiness and no stale line survives. Override and
-/// the Stage-2/3 commands are accepted and currently ignored (documented stubs).
-async fn dispatch_realtime(cmd: RealtimeCommand, engine: &mut StreamEngine) {
+/// The line-assembly half: drain [`RX_PIPE`] one byte at a time through the [`StreamEngine`] line framer
+/// and forward each completed line (blank lines included, as an empty [`Line`]) to [`LINE_QUEUE`]. Blocking
+/// on a full `LINE_QUEUE` is CORRECT back-pressure: it stops draining the pipe, the pipe fills, the reader's
+/// `try_write` starts refusing bytes, and the host's character-counting throttles. A soft reset
+/// ([`LINE_RESET`]) drops any partially framed line so a fresh stream is not contaminated by a half-line
+/// from before the reset. Reading a single byte per iteration keeps the reset cancellation point exact (no
+/// pre-buffered chunk to discard) and is not a throughput concern — the assembler is bounded by the USB
+/// byte rate, not by per-byte overhead.
+#[embassy_executor::task]
+pub async fn line_assembler() -> ! {
+  let mut engine = StreamEngine::new();
+  let mut byte = [0u8; 1];
+  loop {
+    // Race the next byte against a soft reset so a `0x18` mid-line drops the partial line promptly. `read`
+    // is cancel-safe (it consumes from the pipe only on completion), so losing this race loses no byte.
+    match select(RX_PIPE.read(&mut byte), LINE_RESET.wait()).await {
+      Either::First(0) => {}
+      Either::First(_) => frame_byte(byte[0], &mut engine).await,
+      Either::Second(()) => engine.soft_reset(),
+    }
+  }
+}
+
+/// Feed one byte to the line framer and act on the resulting [`EngineEvent`]: forward a completed line
+/// (blank included) to the single in-order consumer, or emit `error:15` immediately for an over-length
+/// line. The framer performs no real-time classification or error-hold — those live in the reader half and
+/// the consumer respectively (see [`StreamEngine`]).
+async fn frame_byte(byte: u8, engine: &mut StreamEngine) {
+  match engine.ingest(byte) {
+    EngineEvent::None => {}
+    EngineEvent::AcceptLine(line) => {
+      // Copy the borrowed line into an owned buffer for the channel. A line longer than the buffer cannot
+      // occur: the framer already enforced MAX_LINE_LEN, so this never truncates. A blank line is forwarded
+      // as an empty `Line`, so the consumer owns both its bare `ok` and the error-hold recovery.
+      let mut owned = Line::new();
+      let _ = owned.extend_from_slice(line);
+      // Block here if the consumer is briefly behind: this back-pressures the host stream (correct flow
+      // control) without dropping a line. Real-time bytes already bypassed this path entirely.
+      LINE_QUEUE.send(owned).await;
+    }
+    EngineEvent::Reject(code) => {
+      let mut s = Response::new();
+      if ResponseWriter::error(&mut s, code).is_ok() {
+        enqueue(s).await;
+      }
+    }
+  }
+}
+
+/// Map a classified real-time command onto its Signal / immediate action — all NON-BLOCKING so the reader
+/// half is never delayed. Status requests fire the reporter Signal; feed-hold / cycle-start fire theirs; a
+/// soft reset / stop clears the byte buffer, flushes any framed-but-unconsumed lines, and signals both the
+/// line assembler ([`LINE_RESET`], drop the partial line) and the consumer ([`SOFT_RESET`], reset the
+/// parser/planner pipeline and re-emit the banner). The reset-banner is emitted here only on a best-effort
+/// basis (`try_send`); the consumer's guaranteed banner is the authoritative one. Override and the
+/// Stage-2/3 commands are accepted and currently ignored (documented stubs).
+fn dispatch_realtime(cmd: RealtimeCommand) {
   match cmd {
     RealtimeCommand::StatusReport | RealtimeCommand::FullStatusReport => STATUS_REQUEST.signal(()),
     RealtimeCommand::FeedHold => FEED_HOLD.signal(()),
     RealtimeCommand::CycleStart => CYCLE_START.signal(()),
     RealtimeCommand::SoftReset | RealtimeCommand::Stop => {
-      // The engine already dropped any partial line and lifted the error-hold on `0x18`; for `0x19`
-      // (Stop) we mirror the line-buffer reset so a fresh stream starts clean.
-      engine.soft_reset();
-      SOFT_RESET.signal(());
-      // Flush any not-yet-consumed accepted lines so post-reset modal state is not contaminated.
+      // Drop every buffered RX byte and every framed-but-unconsumed line so post-reset modal state is not
+      // contaminated by anything that arrived before the reset. Both Signals are set so the assembler drops
+      // its partial line and the consumer rebuilds the parser/planner and re-emits the banner.
+      RX_PIPE.clear();
       while LINE_QUEUE.try_receive().is_ok() {}
-      send_banner().await;
+      LINE_RESET.signal(());
+      SOFT_RESET.signal(());
+      // Best-effort immediate readiness banner; the consumer's reset emits the guaranteed one. Dropping
+      // this (full RESPONSE) is harmless and keeps the reader non-blocking on the real-time path.
+      try_send_banner();
     }
     // Parser-state-on-demand, safety door, jog cancel, auto-report toggle, and overrides are accepted but
     // not yet acted on (Stage 2/3). They correctly produce no `ok`.
@@ -226,26 +314,27 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
 /// line it: routes `$` system commands to their handlers; parses GCode through a persistent [`Parser`];
 /// and feeds the resulting [`PlannerCommand`](firmware_core::gcode::PlannerCommand) to a persistent
 /// [`Planner`]. It emits exactly one `ok`/`error:N` per consumed line, preserving the one-response-per-line
-/// contract end to end (`usb_rx` only ever responds for protocol-level rejects it handles itself, so there
-/// is no double-response or gap at the boundary).
+/// contract end to end (`line_assembler` only ever responds for the protocol-level overflow reject it
+/// handles itself, so there is no double-response or gap at the boundary).
 ///
 /// ## Error-hold ownership (race-free by construction)
 /// The grblHAL contract holds all subsequent lines in an error state after a GCode line errors, until a
 /// reset / empty line / `$` command. That hold lives HERE, in [`ConsumerState::error_hold`], not in the
-/// `StreamEngine`: the engine runs in `usb_rx` and forwards lines asynchronously, so it cannot know a line
-/// errored downstream, and any back-channel from here to `usb_rx` would race the lines already in flight in
+/// `StreamEngine`: the framer runs in `line_assembler` and forwards lines asynchronously, so it cannot know
+/// a line errored downstream, and any back-channel to it would race the lines already in flight in
 /// `LINE_QUEUE`. Because this task is the only reader of `LINE_QUEUE` and sees parse/plan results strictly
-/// in queue order, owning the hold here is inherently in-order and race-free. The engine's
-/// `note_line_error()` mechanism is therefore deliberately NOT driven on this path (it is reserved/unused);
-/// the engine still owns the independent protocol-level overflow rejects, which is correct.
+/// in queue order, owning the hold here is inherently in-order and race-free. The `StreamEngine` was
+/// deliberately reduced to pure line framing (no error-hold state); the framer still owns the independent
+/// protocol-level overflow reject, which is correct.
 ///
 /// ## Back-pressure (no motion executor yet)
 /// `ok` for a move is emitted only once the block is ACCEPTED into the planner buffer. When the planner is
 /// full ([`PlannerError::QueueFull`]) the consumer neither acks nor drops the line: it waits for the stub
 /// drain task to free a block and retries the SAME command (the arc planner is all-or-nothing on
-/// `QueueFull`, so re-issuing is safe). While waiting it stops reading `LINE_QUEUE`, which backs up,
-/// blocks `usb_rx`'s `send().await`, stops the byte scanner, and lets the host's character-counting throttle
-/// — exactly the correct grbl flow control.
+/// `QueueFull`, so re-issuing is safe). While waiting it stops reading `LINE_QUEUE`, which backs up, blocks
+/// `line_assembler`'s `send().await`, stops draining `RX_PIPE`, fills the pipe, makes the reader's
+/// `try_write` refuse bytes, and lets the host's character-counting throttle — exactly the correct grbl flow
+/// control, now with real-time dispatch still live throughout because it sits in the separate reader half.
 #[embassy_executor::task]
 pub async fn comms_consumer() -> ! {
   let mut parser = Parser::new();
@@ -253,9 +342,17 @@ pub async fn comms_consumer() -> ! {
   loop {
     // Race a soft reset against the next line so a `0x18` arriving mid-stream resets the parser modal
     // state, clears the error-hold, and flushes the planner queue BEFORE the next line is parsed. `usb_rx`
-    // already flushed `LINE_QUEUE` and re-emitted the banner when it fired the signal; here we reset the
-    // pipeline state this task owns. A line that lost the race is dropped (it predates the reset), matching
-    // grbl's warm-reset semantics.
+    // already cleared `RX_PIPE` + `LINE_QUEUE` and signalled the line assembler when it fired the reset;
+    // here we reset the pipeline state this task owns AND emit the guaranteed readiness banner. A line that
+    // lost the race is dropped (it predates the reset), matching grbl's warm-reset semantics.
+    //
+    // Known window (Finding #6, accepted): the select only observes the reset at the loop boundary. If a
+    // `0x18` lands while `handle_line` is already mid-flight for a non-back-pressured line, that line can
+    // still emit its `ok`/`error` after the reset signal — a single stray response. Back-pressured lines do
+    // observe the reset (they race `SOFT_RESET` inside `plan_command` and return `Aborted`). Closing the
+    // remaining window for an in-flight non-back-pressured line would require cancelling `handle_line`
+    // mid-await; that is deferred to the alarm-state machine (Stage 2), which is where grbl gates response
+    // emission during an abort. The stray response is benign: the host discards pending acks on `0x18`.
     match select(LINE_QUEUE.receive(), SOFT_RESET.wait()).await {
       Either::First(line) => handle_line(line.as_slice(), &mut parser, &mut state).await,
       Either::Second(()) => reset_pipeline(&mut parser, &mut state).await,
@@ -264,9 +361,10 @@ pub async fn comms_consumer() -> ! {
 }
 
 /// Reset the parser/planner pipeline state this task owns on a soft reset (`0x18`): restore the parser to
-/// default modal state, clear the gcode error-hold, and flush the planner queue and machine position. The
-/// `StreamEngine` line buffer and `LINE_QUEUE` were already cleared by `usb_rx`; this completes the warm
-/// reset for the downstream half so a fresh stream starts from defaults at the origin.
+/// default modal state, clear the gcode error-hold, flush the planner queue and machine position, and emit
+/// the guaranteed readiness banner. The `RX_PIPE`, the `line_assembler`'s partial line, and `LINE_QUEUE`
+/// were already cleared by `usb_rx`; this completes the warm reset for the downstream half so a fresh stream
+/// starts from defaults at the origin.
 async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   // `Parser` exposes no in-place reset; reconstructing it restores the documented power-on modal defaults
   // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state.
@@ -279,8 +377,13 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
     let mut guard = PLANNER.lock().await;
     *guard = Some(Planner::new(placeholder_planner_config()));
   }
-  let mut snap = MACHINE.lock().await;
-  *snap = MachineSnapshot::idle();
+  {
+    let mut snap = MACHINE.lock().await;
+    *snap = MachineSnapshot::idle();
+  }
+  // The authoritative reset banner, delivered guaranteed (the reader half's best-effort `try_send` may have
+  // dropped its copy under a momentarily full RESPONSE channel). A host treats this as "reset and ready".
+  send_banner().await;
 }
 
 /// The consumer's persistent control state across lines: the gcode error-hold flag. Held locally in the
@@ -306,8 +409,9 @@ async fn handle_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerState
   } else if let Some(rest) = trimmed.strip_prefix(b"$") {
     // A `$` system command is the other grblHAL recovery trigger and is answered by its handler. Both
     // recovery triggers (an empty line and a `$` command) and a soft reset clear the hold; nothing else.
+    // The parser is passed so `$G` can report the live modal state rather than a hardcoded default.
     state.error_hold = false;
-    handle_system_command(rest).await;
+    handle_system_command(rest, parser).await;
   } else {
     plan_gcode_line(trimmed, parser, state).await;
   }
@@ -364,6 +468,11 @@ enum PlanResult {
 /// error-recovery halts the stream regardless of the specific code.
 const ERROR_HOLD_CODE: u8 = 1;
 
+/// The `error:N` code surfaced when the shared planner was never installed (an init wiring bug). grblHAL's
+/// "setting disabled" code 3 is reused as a distinct, loud failure so a misconfigured build fails the line
+/// instead of fabricating an `ok` for motion that will never run. Unreachable in a correctly wired build.
+const ERROR_PLANNER_UNINITIALIZED: u8 = 3;
+
 /// Feed one [`PlannerCommand`](firmware_core::gcode::PlannerCommand) to the shared planner, applying
 /// back-pressure: on [`PlannerError::QueueFull`] wait for the stub drain to free a block and retry the
 /// SAME command (the arc planner is all-or-nothing on `QueueFull`, so re-issue is safe). The back-pressure
@@ -372,14 +481,15 @@ const ERROR_HOLD_CODE: u8 = 1;
 /// effect; the real dwell timer, spindle driver (DOC-07), and homing (DOC-06) consume these in later phases.
 async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanResult {
   loop {
-    // Scope the lock so it is released before any await: hold the planner mutex only for the plan call.
+    // Scope the lock so it is released before any await: hold the planner mutex only for the plan call. A
+    // missing planner (an init wiring bug, unreachable in a correctly wired build — see `init_planner`) is
+    // surfaced as a distinct internal `error:N` rather than a fabricated `ok`: a silent accepted-but-un-run
+    // move would hide the bug, so we fail the line loudly instead.
     let result = {
       let mut guard = PLANNER.lock().await;
       match guard.as_mut() {
         Some(planner) => planner.plan_command(command),
-        // The planner was never installed (an init wiring bug). Surface as a generic error rather than
-        // panicking; this is unreachable in a correctly wired build (see `init_planner`).
-        None => Ok(PlannerOutcome::Queued { blocks: 0 }),
+        None => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
       }
     };
     match result {
@@ -406,7 +516,7 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
 /// Answer a `$<rest>` system command. Stage 1 implements the connect-critical subset: `$$` settings dump
 /// (stub: header + `ok`), `$I`/`$I+` build info, `$G` parser state, `$#` NGC parameters (stub). Each
 /// multi-line response ends with `ok`. An unrecognized `$` command is acknowledged so the stream advances.
-async fn handle_system_command(rest: &[u8]) {
+async fn handle_system_command(rest: &[u8], parser: &Parser) {
   match rest {
     b"" | b"$" => {
       // `$` (help) / `$$` dump. Stage 1 returns an empty dump plus `ok`; real settings land with
@@ -422,7 +532,7 @@ async fn handle_system_command(rest: &[u8]) {
       ack().await;
     }
     b"G" => {
-      send_parser_state().await;
+      send_parser_state(parser).await;
       ack().await;
     }
     b"#" => {
@@ -441,11 +551,37 @@ async fn send_build_info(extended: bool) {
   }
 }
 
-/// Queue the `$G` parser-state line.
-async fn send_parser_state() {
+/// Queue the `$G` parser-state line, rendered from the consumer's live parser modal state so the host sees
+/// the real motion/units/distance/feed/spindle words rather than a constant default.
+async fn send_parser_state(parser: &Parser) {
   let mut s = Response::new();
-  if ResponseWriter::parser_state(&mut s).is_ok() {
+  if ResponseWriter::parser_state(&mut s, &parser_snapshot(parser.state())).is_ok() {
     enqueue(s).await;
+  }
+}
+
+/// Translate the gcode parser's [`ModalState`] into the protocol layer's [`ParserSnapshot`] for `$G`
+/// formatting. This is the one place the firmware bin bridges the parser's modal enums to the protocol's
+/// rendering enums, keeping `firmware-core::protocol` free of any GCode-parsing coupling.
+fn parser_snapshot(state: &ModalState) -> ParserSnapshot {
+  ParserSnapshot {
+    motion: match state.motion {
+      MotionMode::Rapid => ParserMotion::Rapid,
+      MotionMode::Linear => ParserMotion::Linear,
+      MotionMode::ArcCw => ParserMotion::ArcCw,
+      MotionMode::ArcCcw => ParserMotion::ArcCcw,
+    },
+    units: match state.units {
+      GcodeUnits::Inch => ParserUnits::Inch,
+      GcodeUnits::Millimeter => ParserUnits::Millimeter,
+    },
+    distance: match state.distance {
+      GcodeDistance::Absolute => ParserDistance::Absolute,
+      GcodeDistance::Incremental => ParserDistance::Incremental,
+    },
+    feed: state.feed,
+    // The parser tracks spindle speed as f32 RPM; the snapshot reports whole RPM (grbl's `$G` S word).
+    spindle_rpm: state.spindle_speed.max(0.0) as u16,
   }
 }
 
@@ -485,6 +621,11 @@ pub async fn status_responder() -> ! {
 /// block's execution time (tens of ms) so the retry claims a freed slot promptly, but long enough that the
 /// retry loop is not a busy-spin — it yields the executor to the drain task each iteration.
 const QUEUE_FULL_RETRY: Duration = Duration::from_millis(2);
+
+/// Backoff before retrying a USB read after a read error, so a persistent error does not become a tight
+/// spin that starves the other core-0 tasks. Short enough that a transient glitch barely delays reception,
+/// long enough to yield the executor on a sustained fault.
+const USB_RX_ERROR_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Lower bound on the simulated execution time of one drained block, so a tiny/zero-length block does not
 /// let the drain busy-loop and instantly empty the queue (which would mask back-pressure).

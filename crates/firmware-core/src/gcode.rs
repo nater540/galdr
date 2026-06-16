@@ -397,10 +397,10 @@ impl GroupGuard {
 
 /// Accumulates the meaningful words of a single line before they are folded into a command. Modal
 /// words land in `pending_*`; parameter words land in their fields. This fixed struct replaces any
-/// need for a growable word buffer.
+/// need for a growable word buffer. The active motion mode is read from the staged `ModalState`
+/// (`next_state.motion`) at emit time, so it is not duplicated here.
 #[derive(Default)]
 struct LineAccumulator {
-  pending_motion: Option<MotionMode>,
   pending_predefined: Option<bool>, // Some(true) = G28, Some(false) = G30.
   pending_dwell: bool,
   pending_set_offset: bool,
@@ -515,25 +515,21 @@ impl Parser {
     match g_code(value)? {
       0 => {
         guard.claim(Group::Motion)?;
-        acc.pending_motion = Some(MotionMode::Rapid);
         next_state.motion = MotionMode::Rapid;
         Ok(())
       }
       1 => {
         guard.claim(Group::Motion)?;
-        acc.pending_motion = Some(MotionMode::Linear);
         next_state.motion = MotionMode::Linear;
         Ok(())
       }
       2 => {
         guard.claim(Group::Motion)?;
-        acc.pending_motion = Some(MotionMode::ArcCw);
         next_state.motion = MotionMode::ArcCw;
         Ok(())
       }
       3 => {
         guard.claim(Group::Motion)?;
-        acc.pending_motion = Some(MotionMode::ArcCcw);
         next_state.motion = MotionMode::ArcCcw;
         Ok(())
       }

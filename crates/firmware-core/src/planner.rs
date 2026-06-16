@@ -353,6 +353,21 @@ impl Planner {
   /// look-ahead, and advances the planner position. Returns 1 if a block was enqueued, 0 for a no-op
   /// move (target equals current position).
   fn plan_line(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool) -> Result<usize, PlannerError> {
+    let enqueued = self.enqueue_move(target, feed, units, rapid)?;
+    if enqueued == 1 {
+      // A single move runs the full look-ahead immediately, so its planned entry speeds are final the
+      // moment the command returns (the arc path defers this to one recalculate after the whole sweep).
+      self.recalculate();
+    }
+    Ok(enqueued)
+  }
+
+  /// Build and enqueue one straight-line move WITHOUT running look-ahead, advancing the per-segment
+  /// position and junction state (`prev_unit_vec`/`prev_nominal_speed_sq`) so a following segment corners
+  /// against this one correctly. Returns 1 if a block was enqueued, 0 for a no-op move. Separated from the
+  /// `recalculate()` pass so an arc can enqueue all its segments first and recalculate exactly once — the
+  /// per-block reverse+forward passes are O(n), so calling them per segment makes arc planning O(n²).
+  fn enqueue_move(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool) -> Result<usize, PlannerError> {
     let block = match self.build_block(target, feed, units, rapid) {
       Some(block) => block,
       None => return Ok(0),
@@ -361,7 +376,6 @@ impl Planner {
     self.position_steps = target;
     self.prev_unit_vec = block.unit_vec;
     self.prev_nominal_speed_sq = block.nominal_speed_sq;
-    self.recalculate();
     Ok(1)
   }
 
@@ -575,10 +589,17 @@ impl Planner {
       let y = center[1] + radius * libm::sinf(theta);
       let z = z_start + z_delta * (seg as f32 / segments as f32);
       let seg_target = self.mm_target_to_steps(&[x, y, z]);
-      // Each segment is a linear feed move; the arc feed applies (already in active units). Subdivided
-      // segments share the requested feed; cornering between them keeps the path smooth via look-ahead.
-      enqueued += self.plan_line(seg_target, request.feed, request.units, false)?;
+      // Each segment is a linear feed move; the arc feed applies (already in active units). Enqueue without
+      // look-ahead — the all-or-nothing pre-check above guaranteed the queue has room for every segment, so
+      // this cannot hit `QueueFull` mid-arc, and the per-segment junction state still advances so adjacent
+      // segments corner against each other. The single `recalculate()` below then resolves all entry speeds
+      // in one O(n) reverse+forward pass instead of one pass per segment (which would be O(n²)).
+      enqueued += self.enqueue_move(seg_target, request.feed, request.units, false)?;
     }
+    // Resolve look-ahead once across the whole arc. This is exactly equivalent to recalculating after each
+    // segment, because the reverse/forward passes always sweep the entire queue — only the final state of
+    // the queue matters, and it is identical either way.
+    self.recalculate();
     Ok(enqueued)
   }
 
@@ -1046,6 +1067,55 @@ mod tests {
     .expect("queued");
     let first_cw = cw.peek_block().expect("a block");
     assert!(first_cw.steps[0] < 0); // CW curves toward −X immediately.
+  }
+
+  #[test]
+  fn recalculate_once_equals_recalculate_per_segment() {
+    // The arc refactor enqueues every segment first and runs look-ahead exactly once, rather than once
+    // per segment. This is only valid if a single trailing `recalculate()` yields the SAME final entry
+    // speeds as recalculating after each enqueue — because the reverse/forward passes always sweep the
+    // whole queue, only the final queue contents matter. Prove it on a representative cornering chain.
+    //
+    // A chain of short collinear-ish moves with direction changes, sized to fit the 32-block queue. The
+    // direction changes engage the junction limiter so the entry speeds are non-trivial (not all clamped
+    // to nominal), making this a meaningful equivalence check rather than a degenerate one.
+    let chain: [[i32; AXES]; 6] = [
+      [200, 0, 0],
+      [400, 50, 0],
+      [600, 0, 0],
+      [800, 80, 0],
+      [1000, 0, 0],
+      [1200, 40, 0],
+    ];
+    let feed = 12000.0;
+
+    // Path A: recalculate after every segment (the pre-refactor behavior).
+    let mut per_segment = Planner::new(test_config());
+    for &target in &chain {
+      let n = per_segment.enqueue_move(target, feed, Units::Millimeter, false).expect("enqueued");
+      assert_eq!(n, 1, "each chain step is a real move");
+      per_segment.recalculate();
+    }
+
+    // Path B: enqueue every segment, then recalculate exactly once (the refactored arc behavior).
+    let mut once = Planner::new(test_config());
+    for &target in &chain {
+      once.enqueue_move(target, feed, Units::Millimeter, false).expect("enqueued");
+    }
+    once.recalculate();
+
+    // The two queues must be block-for-block identical, most importantly in the planned entry speeds.
+    assert_eq!(per_segment.queued_len(), once.queued_len());
+    for (a, b) in per_segment.queue.iter().zip(once.queue.iter()) {
+      assert!(
+        (a.entry_speed_sq - b.entry_speed_sq).abs() < 1e-3,
+        "entry speed mismatch: per-segment {} vs once {}",
+        a.entry_speed_sq,
+        b.entry_speed_sq,
+      );
+      assert!((a.max_entry_speed_sq - b.max_entry_speed_sq).abs() < 1e-3);
+      assert_eq!(a.steps, b.steps);
+    }
   }
 
   #[test]

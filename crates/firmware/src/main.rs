@@ -89,15 +89,20 @@ async fn main(spawner: Spawner) {
   // 5. Spawn the comms tasks on the core-0 thread-mode executor. `must_spawn` is appropriate at init: a
   //    spawn failure (token already used) is a static, unrecoverable wiring bug, not a runtime condition.
   //    `comms_consumer` is the real parser -> planner pipeline; `block_drain_stub` stands in for the
-  //    DOC-02 motion executor so a streamed file makes progress instead of deadlocking at block 33.
+  //    DOC-02 motion executor so a streamed file makes progress instead of deadlocking at block 33. The RX
+  //    path is split: `usb_rx` (reader half) extracts real-time bytes and buffers the rest into `RX_PIPE`,
+  //    while `line_assembler` frames lines from that buffer — so real-time commands never block behind line
+  //    back-pressure (DOC-08 grbl ISR model).
   spawner.must_spawn(comms::usb_rx(usb_rx));
+  spawner.must_spawn(comms::line_assembler());
   spawner.must_spawn(comms::usb_tx(usb_tx));
   spawner.must_spawn(comms::comms_consumer());
   spawner.must_spawn(comms::block_drain_stub());
   spawner.must_spawn(comms::status_responder());
 
   // 5. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
-  //    hard-reset by the host). The banner is also re-emitted on every soft reset from `usb_rx`.
+  //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
+  //    pipeline reset, with a best-effort copy from the reader half).
   comms::send_banner().await;
 
   // The executor keeps the spawned tasks running; this initial task has nothing left to do. Awaiting a

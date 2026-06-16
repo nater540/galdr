@@ -10,15 +10,19 @@
 //! - **Line framing.** Accumulate printable bytes into a fixed line buffer; treat `CR`, `LF`, `CRLF`,
 //!   and `LFCR` as a *single* terminator (no legacy double-`ok`); surface an over-length line as
 //!   `error:15` rather than truncating silently.
-//! - **Real-time byte interception.** Classify single-byte real-time commands (`?`/`!`/`~`/`0x18`, the
-//!   grblHAL `0x80`–`0x8C` top-bit forms, `0x19` stop, override bytes) *before* the line buffer; they
-//!   never enter a line and never receive an `ok`.
-//! - **Flow-control contract.** The orchestrator yields exactly one accept/reject decision per consumed
-//!   line so the driver can emit exactly one `ok`/`error:N` — the only signal driving host flow control.
-//! - **Persistent error state.** After a GCode line errors, hold subsequent GCode lines in an error
-//!   state until a soft reset, an empty line, or a `$` system command (grblHAL safety behavior).
+//! - **Real-time classification.** Provide [`classify_realtime`] so the driver can intercept single-byte
+//!   real-time commands (`?`/`!`/`~`/`0x18`, the grblHAL `0x80`–`0x8C` top-bit forms, `0x19` stop, override
+//!   bytes) ahead of line assembly; the driver dispatches them and they never enter a line nor receive an
+//!   `ok`. The interception itself lives in the bin's reader half, not in the framer, so a real-time byte
+//!   is never delayed behind line back-pressure.
+//! - **Flow-control contract.** The framer yields exactly one accept/reject decision per consumed line so
+//!   the driver can emit exactly one `ok`/`error:N` — the only signal driving host flow control.
 //! - **Response formatting.** Banner, `ok`/`error:N`, `<...>` status report, `$I`/`$I+` build info,
 //!   `$G` parser state, `$$` settings dump — all rendered into caller buffers.
+//!
+//! The grblHAL gcode error-hold is intentionally *not* here: the framer cannot know a forwarded line will
+//! error downstream, so the hold is owned by the bin's single in-order consumer (which sees parse/plan
+//! results in line order). This module frames lines and formats responses; it holds no error state.
 //!
 //! ## Out of scope here (Stage 2/3, left as clean extension points)
 //! Alarm state machine, full status element set (`Pn:`/`Ov:`/`WCO:` refresh rules), runtime
@@ -27,14 +31,19 @@
 //! implementing them yet.
 //!
 //! ## Driving contract (how the `firmware` bin uses this)
+//! The bin's USB reader half extracts real-time bytes with [`classify_realtime`] *before* line assembly,
+//! dispatching them through Signals so they never block behind line back-pressure. Non-real-time bytes are
+//! buffered and drained through the line framer by a separate task:
 //! ```ignore
+//! // Reader half, per received byte:
+//! if let Some(cmd) = classify_realtime(byte) { dispatch_signal(cmd); } else { rx_pipe.write(byte); }
+//!
+//! // Line-assembly half, draining the pipe one byte at a time:
 //! let mut engine = StreamEngine::new();
-//! // For each received byte:
 //! match engine.ingest(byte) {
-//!   EngineEvent::None              => {}                       // mid-line, nothing to do yet.
-//!   EngineEvent::Realtime(cmd)     => dispatch_signal(cmd),    // set the matching embassy Signal.
-//!   EngineEvent::AcceptLine(line)  => forward_to_parser(line), // `ok` is emitted once consumed.
-//!   EngineEvent::Reject(code)      => respond_error(code),     // emit `error:N` immediately.
+//!   EngineEvent::None             => {}                         // mid-line, nothing to do yet.
+//!   EngineEvent::AcceptLine(line) => forward_to_consumer(line), // `ok` is emitted once consumed.
+//!   EngineEvent::Reject(code)     => respond_error(code),       // emit `error:15` immediately.
 //! }
 //! ```
 
@@ -51,8 +60,10 @@ use heapless::{String, Vec};
 pub const RX_BUFFER_SIZE: usize = 1024;
 
 /// The advertised planner block-buffer depth, reported as the second field of `[OPT:...]` and the first
-/// field of `Bf:`. Mirrors the planner's `BLOCK_QUEUE_LEN`; a host reads it to size look-ahead.
-pub const BLOCK_BUFFER_SIZE: usize = 16;
+/// field of `Bf:`. This is the single source of truth — the planner's [`BLOCK_QUEUE_LEN`](crate::planner::
+/// BLOCK_QUEUE_LEN) — so the advertised depth, the idle snapshot's free count, and the live `Bf:` value the
+/// `firmware` bin computes from the real queue can never drift apart. A host reads it to size look-ahead.
+pub const BLOCK_BUFFER_SIZE: usize = crate::planner::BLOCK_QUEUE_LEN;
 
 /// The maximum length of a single assembled GCode line, in bytes, excluding the terminator. A line that
 /// would exceed this is rejected with `error:15` (line length exceeded) rather than silently truncated,
@@ -64,7 +75,9 @@ pub const MAX_LINE_LEN: usize = 256;
 pub const ERROR_LINE_OVERFLOW: u8 = 15;
 
 /// The number of motion axes reported in build info and status (`[AXS:3:XYZ]`, three `MPos` fields).
-pub const AXIS_COUNT: usize = 3;
+/// References the planner's [`AXES`](crate::planner::AXES) so the protocol layer cannot disagree with the
+/// kinematics about how many axes exist.
+pub const AXIS_COUNT: usize = crate::planner::AXES;
 
 /// The firmware version string reported in the banner and the `[VER:]` build-info line. grblHAL reports
 /// a grbl-1.1f-compatible version so senders compliant with grbl 1.1f recognize the controller.
@@ -336,165 +349,165 @@ impl LineReader {
     }
   }
 
-  /// The most recently completed line, borrowing the internal buffer. Valid only immediately after a
-  /// `feed` returned [`LineEvent::Line`] and before the next `feed`.
-  fn line(&self) -> &[u8] {
-    self.buf.as_slice()
-  }
 }
 
-/// The persistent stream-level state of the connection: whether a prior GCode line has put the stream
-/// into the grblHAL error-hold state. While held, subsequent GCode lines are rejected without parsing
-/// until a recovery trigger (soft reset, empty line, or a `$` system command) clears the hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum StreamState {
-  /// Normal streaming; lines are forwarded to the parser.
-  #[default]
-  Ready,
-  /// A GCode line errored; hold further GCode lines until a recovery trigger.
-  ErrorHold,
-}
-
-/// The decision the orchestrator surfaces to the driver for one consumed byte. Exactly one of
+/// The decision the line framer surfaces to the driver for one consumed byte. Exactly one of
 /// [`AcceptLine`](EngineEvent::AcceptLine) or [`Reject`](EngineEvent::Reject) is produced per completed
-/// GCode line so the driver emits exactly one `ok`/`error:N` — the sole host flow-control signal.
+/// line so the driver emits exactly one `ok`/`error:N` — the sole host flow-control signal.
+///
+/// Note: this engine performs *only* line framing. Real-time byte interception is no longer done here —
+/// the `firmware` bin's USB reader half extracts real-time bytes with [`classify_realtime`] before any
+/// byte reaches this framer (the realtime path must never block behind line back-pressure). Likewise the
+/// grblHAL gcode error-hold lives downstream in the single in-order consumer, not here, because the framer
+/// cannot know a forwarded line will error. Blank lines are therefore forwarded as an empty
+/// [`AcceptLine`], not acknowledged here: the consumer owns both the bare `ok` and the blank-line
+/// hold-recovery, keeping recovery in strict line order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineEvent<'a> {
   /// Mid-line, or a swallowed terminator half: nothing for the driver to do.
   None,
-  /// A real-time command was intercepted; the driver dispatches the matching action/Signal and emits no
-  /// `ok`.
-  Realtime(RealtimeCommand),
-  /// A complete GCode line is accepted for execution. The driver forwards it to the parser/planner; the
-  /// single `ok` (or a deferred `error:N`) is emitted once the line is consumed downstream. The slice
-  /// borrows the engine's line buffer and is valid until the next [`StreamEngine::ingest`].
+  /// A complete line is accepted for framing. The driver forwards it (including an empty line) to the
+  /// single in-order consumer; the one `ok`/`error:N` is emitted once the line is consumed downstream. The
+  /// slice borrows the engine's line buffer and is valid until the next [`StreamEngine::ingest`].
   AcceptLine(&'a [u8]),
-  /// A blank line (empty or whitespace-only). A blank line is a grblHAL error-hold recovery trigger, which
-  /// the engine has already applied to its own hold. The driver must emit exactly one bare `ok` for it,
-  /// either directly or by routing the blank line through its own line consumer when the driver owns a
-  /// separate downstream error-hold that the blank must also clear.
-  Acknowledge,
-  /// A complete line is rejected at the protocol layer (over-length, or held by the error state). The
-  /// driver emits `error:N` immediately and does not forward the line.
+  /// A complete line is rejected at the protocol layer (over-length). The driver emits `error:15`
+  /// immediately and does not forward the line.
   Reject(u8),
 }
 
-/// The streaming orchestrator: composes a [`LineReader`] with the [`StreamState`] error-hold logic and
-/// the real-time classifier into the single entry point the `usb_rx` task drives. It owns no I/O; the
-/// driver feeds it bytes and acts on each [`EngineEvent`].
-///
-/// The error-hold transition is *not* decided here on accept — the protocol layer does not parse GCode,
-/// so it cannot know a line will error. The driver calls [`note_line_error`](StreamEngine::note_line_error)
-/// when the downstream parser/planner reports an error for a forwarded line, which arms the hold; the next
-/// recovery trigger (empty line / `$` command / [`soft_reset`](StreamEngine::soft_reset)) clears it.
+/// The line framer the `firmware` bin's line-assembly half drives. It wraps a [`LineReader`] and surfaces
+/// one [`EngineEvent`] per byte: nothing mid-line, an [`AcceptLine`](EngineEvent::AcceptLine) on each
+/// completed line (blank lines included, as an empty slice), or a [`Reject`](EngineEvent::Reject) on an
+/// over-length line. It owns no I/O, no real-time classification, and no error-hold — those concerns moved
+/// to the reader half and the downstream consumer respectively (see [`EngineEvent`]).
 #[derive(Debug, Default)]
 pub struct StreamEngine {
   reader: LineReader,
-  state: StreamState,
 }
 
 impl StreamEngine {
-  /// Construct a fresh engine in the ready state with an empty line buffer.
+  /// Construct a fresh engine with an empty line buffer.
   pub const fn new() -> Self {
-    Self {
-      reader: LineReader::new(),
-      state: StreamState::Ready,
-    }
+    Self { reader: LineReader::new() }
   }
 
-  /// The current persistent stream state (ready vs. error-hold), for diagnostics/tests.
-  pub fn state(&self) -> StreamState {
-    self.state
-  }
-
-  /// Feed one received byte and get the driver's action. Real-time bytes are intercepted first and never
-  /// enter the line buffer; otherwise the byte is framed and, on a completed line, accepted or rejected.
+  /// Frame one received byte. Returns [`AcceptLine`](EngineEvent::AcceptLine) on a completed line (an empty
+  /// slice for a bare/blank line), [`Reject`](EngineEvent::Reject) with `error:15` on overflow, or
+  /// [`None`](EngineEvent::None) mid-line. Real-time bytes never reach here — the reader half diverts them.
   pub fn ingest(&mut self, byte: u8) -> EngineEvent<'_> {
-    if let Some(cmd) = classify_realtime(byte) {
-      // A soft reset clears the partial line and lifts any error-hold; the driver still receives the
-      // command so it can flush downstream queues and re-emit the banner.
-      if cmd == RealtimeCommand::SoftReset {
-        self.reader.reset();
-        self.state = StreamState::Ready;
-      }
-      return EngineEvent::Realtime(cmd);
-    }
-
     match self.reader.feed(byte) {
       LineEvent::Pending => EngineEvent::None,
       LineEvent::Overflow => EngineEvent::Reject(ERROR_LINE_OVERFLOW),
-      LineEvent::Line(_) => self.decide_line(),
+      LineEvent::Line(line) => EngineEvent::AcceptLine(line),
     }
   }
 
-  /// Decide accept/reject for a freshly completed line, applying the error-hold rules. Splitting this out
-  /// keeps the borrow of the reader's buffer scoped correctly for the returned slice.
-  fn decide_line(&mut self) -> EngineEvent<'_> {
-    let line = self.reader.line();
-    let is_blank = line_is_blank(line);
-    let is_system = line_is_system_command(line);
-
-    // Recovery triggers always clear an error-hold: an empty/blank line or a `$` system command. Apply
-    // this before the dispatch below so a recovery line is itself acted on, not rejected.
-    if is_blank || is_system {
-      self.state = StreamState::Ready;
-    }
-
-    if self.state == StreamState::ErrorHold {
-      // Held by a prior error and not a recovery line: reject without forwarding. grblHAL holds the
-      // stream in error after a bad line until a recovery trigger.
-      return EngineEvent::Reject(ERROR_HOLD_CODE);
-    }
-
-    if is_blank {
-      // A blank line is acknowledged directly (bare `ok`) and never forwarded to the parser.
-      return EngineEvent::Acknowledge;
-    }
-
-    // Forward the line for execution (`$` system commands included; the driver routes those to the
-    // settings/report handlers). The single `ok`/`error:N` is emitted downstream when consumed.
-    EngineEvent::AcceptLine(self.reader.line())
-  }
-
-  /// Arm the error-hold after the downstream parser/planner reported `error:N` for a forwarded line. The
-  /// driver calls this so subsequent GCode lines are held until a recovery trigger.
-  pub fn note_line_error(&mut self) {
-    self.state = StreamState::ErrorHold;
-  }
-
-  /// Clear the line buffer and lift any error-hold in response to a soft reset. Equivalent to the
-  /// reset path taken when [`ingest`](StreamEngine::ingest) sees `0x18`, exposed for the driver to call
-  /// when a reset originates elsewhere.
+  /// Discard any partially accumulated line in response to a soft reset, so a fresh stream is not
+  /// contaminated by a half-buffered line from before the reset. The driver calls this on `0x18` after
+  /// flushing its downstream queues.
   pub fn soft_reset(&mut self) {
     self.reader.reset();
-    self.state = StreamState::Ready;
   }
 }
 
-/// The `error:N` code used when the stream rejects a line because it is held in the post-error state.
-/// grbl reports `error:1` family codes for parse failures; for the held-line rejection we reuse the
-/// generic "expected command letter" code, matching how a sender already in an error-recovery posture
-/// treats any further rejection — it is halting the stream regardless of the specific code.
-const ERROR_HOLD_CODE: u8 = 1;
-
-/// True if a line has no executable content (empty, or only whitespace). Such a line is the grblHAL
-/// error-state recovery trigger and otherwise produces a bare `ok`.
-fn line_is_blank(line: &[u8]) -> bool {
-  line.iter().all(|&b| b == b' ' || b == b'\t')
+/// The active motion mode reported as the first word of a `$G` (`[GC:...]`) parser-state line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ParserMotion {
+  /// G0 rapid positioning.
+  Rapid,
+  /// G1 linear feed move.
+  Linear,
+  /// G2 clockwise arc.
+  ArcCw,
+  /// G3 counter-clockwise arc.
+  ArcCcw,
 }
 
-/// True if a line is a `$` system command (after leading whitespace). `$` commands clear the error-hold
-/// and are dispatched to the settings/report handlers rather than the GCode parser.
-fn line_is_system_command(line: &[u8]) -> bool {
-  for &b in line {
-    match b {
-      b' ' | b'\t' => continue,
-      b'$' => return true,
-      _ => return false,
+impl ParserMotion {
+  /// The `G<n>` word for this motion mode.
+  fn word(self) -> &'static str {
+    match self {
+      ParserMotion::Rapid => "G0",
+      ParserMotion::Linear => "G1",
+      ParserMotion::ArcCw => "G2",
+      ParserMotion::ArcCcw => "G3",
     }
   }
-  false
+}
+
+/// The active units mode reported in a `$G` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ParserUnits {
+  /// G20 inch units.
+  Inch,
+  /// G21 millimeter units.
+  Millimeter,
+}
+
+impl ParserUnits {
+  /// The `G<n>` word for this units mode.
+  fn word(self) -> &'static str {
+    match self {
+      ParserUnits::Inch => "G20",
+      ParserUnits::Millimeter => "G21",
+    }
+  }
+}
+
+/// The active distance mode reported in a `$G` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ParserDistance {
+  /// G90 absolute distance.
+  Absolute,
+  /// G91 incremental distance.
+  Incremental,
+}
+
+impl ParserDistance {
+  /// The `G<n>` word for this distance mode.
+  fn word(self) -> &'static str {
+    match self {
+      ParserDistance::Absolute => "G90",
+      ParserDistance::Incremental => "G91",
+    }
+  }
+}
+
+/// A `Copy` snapshot of the live parser modal state the `$G` formatter renders. The `firmware` bin builds
+/// this from the consumer's persistent `gcode::Parser` (via its `state()`) so the `[GC:...]` line reports
+/// the real motion/units/distance/feed/spindle words rather than a hardcoded constant. Keeping the
+/// formatter pure over a small snapshot — rather than importing the parser's modal type here — keeps
+/// `protocol` free of any GCode-parsing coupling and the `$G` rendering host-testable in isolation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ParserSnapshot {
+  /// Active motion mode (modal group 1) — the first `$G` word.
+  pub motion: ParserMotion,
+  /// Active units mode (modal group 6).
+  pub units: ParserUnits,
+  /// Active distance mode (modal group 3).
+  pub distance: ParserDistance,
+  /// Programmed feed rate (modal F), in the active units per minute.
+  pub feed: f32,
+  /// Programmed spindle speed (modal S), in RPM.
+  pub spindle_rpm: u16,
+}
+
+impl ParserSnapshot {
+  /// The grbl power-on modal defaults (G0 rapid, mm, absolute, no feed, spindle off). Used before any
+  /// motion word has been parsed, and as the basis for partial snapshots in tests.
+  pub const fn power_on() -> Self {
+    Self {
+      motion: ParserMotion::Rapid,
+      units: ParserUnits::Millimeter,
+      distance: ParserDistance::Absolute,
+      feed: 0.0,
+      spindle_rpm: 0,
+    }
+  }
 }
 
 /// Formatting failure: the destination buffer was too small to hold the rendered response. Callers size
@@ -586,15 +599,41 @@ impl ResponseWriter {
     Ok(())
   }
 
-  /// The `$G` parser-state report: `[GC:<modal words>]`. Stage 1 emits the power-on modal defaults
-  /// (rapid, G54, XY plane, mm, absolute, units/min, no tool-length offset, spindle/coolant off). The
-  /// `firmware` bin will render the live modal state from the parser once it is wired; the default form
-  /// is sufficient for connect-time handshakes and is what a host expects immediately after reset.
-  pub fn parser_state<const N: usize>(out: &mut String<N>) -> Result<(), FmtError> {
-    out
-      .push_str("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]\r\n")
-      .map_err(|_| FmtError)
+  /// The `$G` parser-state report: `[GC:<modal words>]`, rendered from a live [`ParserSnapshot`]. The
+  /// motion (`G0`–`G3`), units (`G20`/`G21`), distance (`G90`/`G91`), feed (`F`), and spindle (`S`) words
+  /// reflect the snapshot; the remaining modal groups (`G54` work coordinate, `G17` plane, `G94` feed
+  /// mode, `M5` spindle stop, `M9` coolant off, `T0` tool) are fixed in Stage 1, where they are not yet
+  /// commandable, but are emitted so the line is a complete, grbl-faithful modal report. Feed is written
+  /// with a minimal decimal (no trailing `.0` for whole values) to match grbl's compact `$G` form.
+  pub fn parser_state<const N: usize>(out: &mut String<N>, snap: &ParserSnapshot) -> Result<(), FmtError> {
+    write!(
+      out,
+      "[GC:{} G54 G17 {} {} G94 M5 M9 T0 F",
+      snap.motion.word(),
+      snap.units.word(),
+      snap.distance.word(),
+    )
+    .map_err(|_| FmtError)?;
+    write_minimal_f32(out, snap.feed)?;
+    write!(out, " S{}]\r\n", snap.spindle_rpm).map_err(|_| FmtError)
   }
+}
+
+/// Write an `f32` with the minimal decimal representation grbl uses for `$G` feed words: an integral value
+/// renders with no fractional part (`1500` not `1500.0`), while a value with a fraction keeps only its
+/// significant fractional digits (`250.25`, not `250.2500`). Rendering through a fixed-precision buffer and
+/// trimming trailing zeros keeps this allocation-free and avoids pulling in float-to-shortest formatting.
+fn write_minimal_f32<const N: usize>(out: &mut String<N>, value: f32) -> Result<(), FmtError> {
+  // Three decimals covers feed resolution finer than any real machine; the trim below removes the padding
+  // so a whole or one-/two-place value renders compactly.
+  let mut scratch: String<24> = String::new();
+  write!(scratch, "{value:.3}").map_err(|_| FmtError)?;
+  let trimmed = if scratch.contains('.') {
+    scratch.trim_end_matches('0').trim_end_matches('.')
+  } else {
+    scratch.as_str()
+  };
+  out.push_str(trimmed).map_err(|_| FmtError)
 }
 
 #[cfg(test)]
@@ -727,15 +766,14 @@ mod tests {
     assert_eq!(framed, std::vec![b"<OVERFLOW>".to_vec(), b"G0".to_vec()]);
   }
 
-  // --- StreamEngine: real-time interception mid-line -------------------------------------------------
+  // --- StreamEngine framer + reader-half real-time split --------------------------------------------
 
-  /// Drive the engine and collect a compact, owned transcript of each ingest decision.
+  /// One outcome of driving the framer with a byte (real-time bytes never reach the framer, so there is
+  /// no `Rt` variant here — see [`split_input`] for the reader-half model).
   #[derive(Debug, PartialEq, Eq)]
   enum Ev {
     None,
-    Rt(RealtimeCommand),
     Accept(StdVec<u8>),
-    Ack,
     Reject(u8),
   }
 
@@ -744,9 +782,7 @@ mod tests {
     for &b in input {
       let ev = match engine.ingest(b) {
         EngineEvent::None => Ev::None,
-        EngineEvent::Realtime(c) => Ev::Rt(c),
         EngineEvent::AcceptLine(l) => Ev::Accept(l.to_vec()),
-        EngineEvent::Acknowledge => Ev::Ack,
         EngineEvent::Reject(c) => Ev::Reject(c),
       };
       out.push(ev);
@@ -764,25 +800,42 @@ mod tests {
       .collect()
   }
 
-  #[test]
-  fn realtime_byte_mid_line_is_intercepted_without_disturbing_line() {
-    // `?` arrives between `G1` and `X5`; it must surface as a Realtime event and NOT corrupt the line.
-    let mut engine = StreamEngine::new();
-    let transcript = run_engine(&mut engine, b"G1 X5\nG1 ?Y3\n");
-    // Both lines frame correctly; the `?` did not enter either line.
-    assert_eq!(accepts(&transcript), std::vec![b"G1 X5".to_vec(), b"G1 Y3".to_vec()]);
-    // Exactly one StatusReport real-time event was emitted.
-    let rt_count = transcript.iter().filter(|e| matches!(e, Ev::Rt(RealtimeCommand::StatusReport))).count();
-    assert_eq!(rt_count, 1);
+  /// Model the `firmware` bin's USB reader half: classify each byte and partition the stream into the
+  /// real-time commands the reader dispatches and the line bytes it forwards to the framer. This is the
+  /// invariant that keeps real-time dispatch off the line back-pressure path — real-time bytes are removed
+  /// before any framing happens.
+  fn split_input(input: &[u8]) -> (StdVec<RealtimeCommand>, StdVec<u8>) {
+    let mut realtime = StdVec::new();
+    let mut line_bytes = StdVec::new();
+    for &b in input {
+      match classify_realtime(b) {
+        Some(cmd) => realtime.push(cmd),
+        None => line_bytes.push(b),
+      }
+    }
+    (realtime, line_bytes)
   }
 
   #[test]
-  fn realtime_byte_never_produces_an_accept_or_reject() {
+  fn reader_half_extracts_realtime_before_framing_without_disturbing_lines() {
+    // `?` arrives between `G1` and `X5` in the wire stream; the reader half removes it before the framer
+    // sees the line, so neither line is corrupted and exactly one StatusReport is dispatched.
+    let (realtime, line_bytes) = split_input(b"G1 X5\nG1 ?Y3\n");
+    assert_eq!(realtime, std::vec![RealtimeCommand::StatusReport]);
     let mut engine = StreamEngine::new();
-    // A lone `?` with no surrounding line must produce only a Realtime event.
-    let transcript = run_engine(&mut engine, b"?");
-    assert_eq!(transcript.len(), 1);
-    assert!(matches!(transcript[0], Ev::Rt(RealtimeCommand::StatusReport)));
+    let transcript = run_engine(&mut engine, &line_bytes);
+    assert_eq!(accepts(&transcript), std::vec![b"G1 X5".to_vec(), b"G1 Y3".to_vec()]);
+  }
+
+  #[test]
+  fn framer_never_emits_realtime_and_lone_realtime_yields_no_line() {
+    // The framer surface has no real-time variant. A lone `?` is fully consumed by the reader half and
+    // never reaches the framer, so no line is produced.
+    let (realtime, line_bytes) = split_input(b"?");
+    assert_eq!(realtime, std::vec![RealtimeCommand::StatusReport]);
+    assert!(line_bytes.is_empty());
+    let mut engine = StreamEngine::new();
+    assert!(run_engine(&mut engine, &line_bytes).is_empty());
   }
 
   #[test]
@@ -793,87 +846,53 @@ mod tests {
   }
 
   #[test]
-  fn blank_line_acknowledges_without_forwarding() {
+  fn blank_line_is_forwarded_as_empty_accept_not_acknowledged() {
+    // A whitespace-only line is forwarded to the single consumer as an AcceptLine over an empty slice (the
+    // consumer owns the bare `ok` and the hold-recovery), never swallowed inside the framer.
     let mut engine = StreamEngine::new();
-    // A whitespace-only line is acknowledged directly and never forwarded as GCode.
     let transcript = run_engine(&mut engine, b"  \t \n");
-    assert!(transcript.iter().any(|e| matches!(e, Ev::Ack)));
-    assert!(accepts(&transcript).is_empty());
+    let lines = accepts(&transcript);
+    assert_eq!(lines.len(), 1, "the blank line is forwarded exactly once");
+    // The forwarded line is whitespace-only; the consumer's trim makes it blank. (Leading/trailing space
+    // is preserved here because the framer does no trimming — trimming is the consumer's job.)
+    assert!(lines[0].iter().all(|&b| b == b' ' || b == b'\t'));
   }
 
   #[test]
   fn exactly_one_response_signal_per_line_across_mixed_input() {
-    // Every consumed line must yield exactly one of Accept/Ack/Reject — the one-ok-per-line invariant.
-    // Mix a move, a blank line, a `$` command, and (after a held error) a rejected line.
+    // Every consumed line must yield exactly one of Accept/Reject — the one-ok-per-line invariant. Mix a
+    // move, a blank line, and a `$` command; the framer forwards all three (including the blank) and the
+    // single downstream consumer answers each with one response.
     let mut engine = StreamEngine::new();
     let mut signals = 0usize;
     for &b in b"G0 X1\n\n$$\n" {
       match engine.ingest(b) {
-        EngineEvent::AcceptLine(_) | EngineEvent::Acknowledge | EngineEvent::Reject(_) => signals += 1,
-        EngineEvent::None | EngineEvent::Realtime(_) => {}
+        EngineEvent::AcceptLine(_) | EngineEvent::Reject(_) => signals += 1,
+        EngineEvent::None => {}
       }
     }
     assert_eq!(signals, 3, "three consumed lines -> three response signals");
   }
 
   #[test]
-  fn connect_handshake_transcript_drives_one_response_per_request() {
-    // A representative connect sequence: status poll (real-time), a build-info query, then a move. The
-    // status `?` produces only a Realtime event; the `$I` line and the move each produce one Accept.
+  fn connect_handshake_splits_realtime_from_forwarded_lines() {
+    // A representative connect sequence: a status poll (real-time), a build-info query, then a move. The
+    // reader half dispatches the `?`; the framer forwards `$I` and the move as two accepted lines.
+    let (realtime, line_bytes) = split_input(b"?$I\nG0 X0\n");
+    assert_eq!(realtime, std::vec![RealtimeCommand::StatusReport]);
     let mut engine = StreamEngine::new();
-    let transcript = run_engine(&mut engine, b"?$I\nG0 X0\n");
-    let rt = transcript.iter().filter(|e| matches!(e, Ev::Rt(RealtimeCommand::StatusReport))).count();
-    assert_eq!(rt, 1);
+    let transcript = run_engine(&mut engine, &line_bytes);
     assert_eq!(accepts(&transcript), std::vec![b"$I".to_vec(), b"G0 X0".to_vec()]);
   }
 
-  // --- Persistent error state & recovery -------------------------------------------------------------
-
   #[test]
-  fn error_hold_rejects_subsequent_gcode_until_recovery() {
+  fn soft_reset_drops_partial_line() {
+    // The framer drops a half-buffered line on soft reset so a fresh stream is clean. (The reader half
+    // would have already classified and dispatched the `0x18`; here we exercise the framer's reset hook.)
     let mut engine = StreamEngine::new();
-    // First line accepted, then the driver learns it errored downstream and arms the hold.
-    let t1 = run_engine(&mut engine, b"G0 X1\n");
-    assert_eq!(accepts(&t1), std::vec![b"G0 X1".to_vec()]);
-    engine.note_line_error();
-    assert_eq!(engine.state(), StreamState::ErrorHold);
-
-    // The next GCode line is rejected, not forwarded.
-    let t2 = run_engine(&mut engine, b"G0 X2\n");
-    assert!(matches!(t2.last(), Some(Ev::Reject(_))));
-    assert!(accepts(&t2).is_empty());
-    assert_eq!(engine.state(), StreamState::ErrorHold);
-  }
-
-  #[test]
-  fn empty_line_clears_error_hold() {
-    let mut engine = StreamEngine::new();
-    engine.note_line_error();
-    let t = run_engine(&mut engine, b"\nG0 X9\n");
-    // The empty line clears the hold (and is itself not rejected); the following line is accepted.
-    assert_eq!(accepts(&t), std::vec![b"G0 X9".to_vec()]);
-    assert_eq!(engine.state(), StreamState::Ready);
-  }
-
-  #[test]
-  fn dollar_command_clears_error_hold_and_is_accepted() {
-    let mut engine = StreamEngine::new();
-    engine.note_line_error();
-    let t = run_engine(&mut engine, b"$$\n");
-    // The `$` system command clears the hold and is itself forwarded (to the settings handler).
-    assert_eq!(accepts(&t), std::vec![b"$$".to_vec()]);
-    assert_eq!(engine.state(), StreamState::Ready);
-  }
-
-  #[test]
-  fn soft_reset_clears_error_hold_and_partial_line() {
-    let mut engine = StreamEngine::new();
-    engine.note_line_error();
-    // A partial line plus a soft reset: the reset must lift the hold and drop the partial.
-    let t = run_engine(&mut engine, b"G0 X1\x18");
-    assert!(matches!(t.last(), Some(Ev::Rt(RealtimeCommand::SoftReset))));
-    assert_eq!(engine.state(), StreamState::Ready);
-    // After reset the dropped partial does not resurface; a fresh line frames cleanly.
+    let _ = run_engine(&mut engine, b"G0 X1");
+    engine.soft_reset();
+    // After the reset the dropped partial does not resurface; a fresh line frames cleanly.
     let t2 = run_engine(&mut engine, b"G0 X2\n");
     assert_eq!(accepts(&t2), std::vec![b"G0 X2".to_vec()]);
   }
@@ -904,7 +923,7 @@ mod tests {
     // Idle at origin, empty buffers fully free.
     assert_eq!(
       s.as_str(),
-      "<Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:16,1024>\r\n",
+      "<Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024>\r\n",
     );
   }
 
@@ -930,8 +949,8 @@ mod tests {
   fn build_info_base_reports_buffer_sizes_in_documented_order() {
     let mut s = String::<RESPONSE_CAPACITY>::new();
     ResponseWriter::build_info(&mut s, false).unwrap();
-    // OPT order: options, block buffer (16), RX buffer (1024), axes (3), tool entries (0).
-    assert!(s.as_str().contains("[OPT:VNMSL,16,1024,3,0]"));
+    // OPT order: options, block buffer (32), RX buffer (1024), axes (3), tool entries (0).
+    assert!(s.as_str().contains("[OPT:VNMSL,32,1024,3,0]"));
     assert!(s.as_str().contains("[VER:1.1f."));
     // Base report does not include the extended grblHAL lines.
     assert!(!s.as_str().contains("[NEWOPT:"));
@@ -948,10 +967,59 @@ mod tests {
   }
 
   #[test]
-  fn parser_state_wire_format() {
+  fn parser_state_power_on_defaults_wire_format() {
+    // The power-on modal defaults (G0 rapid, mm, absolute, F0/S0) render the canonical `$G` line a host
+    // expects immediately after a reset.
     let mut s = String::<RESPONSE_CAPACITY>::new();
-    ResponseWriter::parser_state(&mut s).unwrap();
+    ResponseWriter::parser_state(&mut s, &ParserSnapshot::power_on()).unwrap();
     assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0]\r\n");
+  }
+
+  #[test]
+  fn parser_state_renders_live_modal_words() {
+    // A live state mid-program: G1 linear, inch units, incremental distance, feed 12.5, spindle 8000.
+    let snap = ParserSnapshot {
+      motion: ParserMotion::Linear,
+      units: ParserUnits::Inch,
+      distance: ParserDistance::Incremental,
+      feed: 12.5,
+      spindle_rpm: 8000,
+    };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &snap).unwrap();
+    assert_eq!(s.as_str(), "[GC:G1 G54 G17 G20 G91 G94 M5 M9 T0 F12.5 S8000]\r\n");
+  }
+
+  #[test]
+  fn parser_state_maps_each_motion_mode_to_its_word() {
+    let cases = [
+      (ParserMotion::Rapid, "G0"),
+      (ParserMotion::Linear, "G1"),
+      (ParserMotion::ArcCw, "G2"),
+      (ParserMotion::ArcCcw, "G3"),
+    ];
+    for (motion, word) in cases {
+      let snap = ParserSnapshot { motion, ..ParserSnapshot::power_on() };
+      let mut s = String::<RESPONSE_CAPACITY>::new();
+      ResponseWriter::parser_state(&mut s, &snap).unwrap();
+      // The first modal word in the `[GC:...]` body is the motion mode.
+      assert!(s.as_str().starts_with(&std::format!("[GC:{word} ")), "motion {motion:?} -> {word}");
+    }
+  }
+
+  #[test]
+  fn parser_state_feed_renders_minimal_decimal() {
+    // Feed renders without a trailing `.0` for whole values, but keeps a fractional part when present, so
+    // the line stays compact and grbl-faithful.
+    let whole = ParserSnapshot { feed: 1500.0, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &whole).unwrap();
+    assert!(s.as_str().contains(" F1500 "), "whole feed: {}", s.as_str());
+
+    let frac = ParserSnapshot { feed: 250.25, ..ParserSnapshot::power_on() };
+    let mut s2 = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s2, &frac).unwrap();
+    assert!(s2.as_str().contains(" F250.25 "), "fractional feed: {}", s2.as_str());
   }
 
   #[test]
