@@ -22,7 +22,7 @@ mod generated {
   include!(concat!(env!("OUT_DIR"), "/settings.rs"));
 }
 
-pub use generated::Settings;
+pub use generated::{Coordinates, Settings};
 
 /// A safe upper bound, in bytes, on the encoded length of a [`Settings`] message. The schema is ~40 scalar
 /// fields (each a tag plus a varint or fixed32), so the real maximum is well under this; 512 leaves generous
@@ -59,6 +59,35 @@ pub fn encode_settings_into<const N: usize>(msg: &Settings, out: &mut heapless::
 /// the caller (`firmware-core`) is responsible for having applied real defaults beforehand and for validation.
 pub fn decode_settings(bytes: &[u8]) -> Result<Settings, ProtoError> {
   let mut msg = Settings::default();
+  msg.decode_from_bytes(bytes).map_err(|_| ProtoError::Decode)?;
+  Ok(msg)
+}
+
+/// A safe upper bound, in bytes, on the encoded length of a [`Coordinates`] message. The schema is 25 scalar
+/// fields (one varint + 24 `float`s, each a tag plus a fixed32 or varint), so the real maximum is well under
+/// this; 256 leaves generous headroom for a future axis. Callers size their wire/frame buffers from this.
+pub const COORDINATES_MAX_LEN: usize = 256;
+
+/// The number of bytes [`encode_coordinates_into`] will append for `msg` (its encoded protobuf size). Lets a
+/// caller write a length prefix before the payload without a second encode pass.
+pub fn coordinates_size(msg: &Coordinates) -> usize {
+  msg.compute_size()
+}
+
+/// Encode `msg` as protobuf, appending the bytes to `out`. Returns [`ProtoError::Encode`] if `out` lacks the
+/// capacity. The bytes are appended (not cleared first), so a caller can encode directly after a frame header.
+pub fn encode_coordinates_into<const N: usize>(
+  msg: &Coordinates,
+  out: &mut heapless::Vec<u8, N>,
+) -> Result<(), ProtoError> {
+  let mut encoder = PbEncoder::new(out);
+  msg.encode(&mut encoder).map_err(|_| ProtoError::Encode)
+}
+
+/// Decode a full [`Coordinates`] message from `bytes`. Fields absent from the wire take their proto3 zero
+/// value; the caller (`firmware-core`) applies real defaults (all zero, G54 active) beforehand.
+pub fn decode_coordinates(bytes: &[u8]) -> Result<Coordinates, ProtoError> {
+  let mut msg = Coordinates::default();
   msg.decode_from_bytes(bytes).map_err(|_| ProtoError::Decode)?;
   Ok(msg)
 }

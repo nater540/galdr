@@ -119,6 +119,32 @@ impl SegmentGenerator {
   /// - **Dominant axis every tick:** the axis with the largest step count steps on every emitted tick.
   /// - **Burst cap:** no burst exceeds [`MAX_SYMBOLS_PER_BURST`] events.
   pub fn run_block(&self, block: &Block, exit_speed_sq: f32, sink: &mut impl StepSink) -> Result<u32, MotionError> {
+    // The unscaled path: a 100 % feed/rapid override (`scale = 1.0`) and no extra speed ceiling beyond the
+    // pulse-timing limits (`max_speed_sq = +∞`). The realized motion is identical to the pre-override behavior,
+    // so every existing caller and host test is unchanged.
+    self.run_block_scaled(block, exit_speed_sq, 1.0, f32::INFINITY, sink)
+  }
+
+  /// Realize one planner `block` with a LIVE feed/rapid override applied (Phase E, DOC-08). `override_scale` is
+  /// the override fraction (e.g. `1.5` for a 150 % feed override, `0.5` for a 50 % rapid override) the executor
+  /// reads from the shared [`Overrides`](crate::protocol::Overrides) per block; it scales the trapezoid's
+  /// entry/cruise/exit speeds so a change takes effect on the currently-executing motion WITHOUT re-planning the
+  /// queue (grbl applies overrides in the stepper, not the planner). `max_speed_sq` is the squared mm/s ceiling
+  /// along the block — the axis max-rate (`$110-112`) projected onto the block — so scaling UP can never exceed
+  /// the configured rate limit: each scaled speed is clamped to it. `exit_speed_sq` is the next block's entry
+  /// speed (also scaled here so junctions stay consistent). Acceleration is NOT scaled — grbl keeps the accel
+  /// limits — so a higher override just lengthens the ramp to a higher cruise, never exceeding `max_speed_sq`.
+  ///
+  /// The unscaled [`run_block`](SegmentGenerator::run_block) delegates here with `override_scale = 1.0` and
+  /// `max_speed_sq = +∞`, so the two share one code path and the scaling is the only added behavior.
+  pub fn run_block_scaled(
+    &self,
+    block: &Block,
+    exit_speed_sq: f32,
+    override_scale: f32,
+    max_speed_sq: f32,
+    sink: &mut impl StepSink,
+  ) -> Result<u32, MotionError> {
     if self.config.tick_hz <= 0.0 || self.config.min_period_ticks() == 0 {
       return Err(MotionError::InvalidConfig);
     }
@@ -133,7 +159,19 @@ impl SegmentGenerator {
     let dir = DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0] };
     sink.set_direction(dir)?;
 
-    let profile = TrapezoidProfile::plan(block, exit_speed_sq);
+    // Apply the override to the squared speeds: a speed scales by `override_scale²` (since the stored quantity is
+    // v²), then clamps to the squared max-rate ceiling so a feed boost never exceeds `$110-112`. A non-positive or
+    // non-finite scale is treated as 1.0 defensively so a degenerate override cannot freeze or runaway motion.
+    let scale = if override_scale.is_finite() && override_scale > 0.0 { override_scale } else { 1.0 };
+    let scale_sq = scale * scale;
+    let ceiling_sq = if max_speed_sq.is_finite() { max_speed_sq.max(0.0) } else { f32::INFINITY };
+    let scaled = ScaledBlock {
+      entry_speed_sq: clamp_speed_sq(block.entry_speed_sq * scale_sq, ceiling_sq),
+      nominal_speed_sq: clamp_speed_sq(block.nominal_speed_sq * scale_sq, ceiling_sq),
+    };
+    let scaled_exit_sq = clamp_speed_sq(exit_speed_sq * scale_sq, ceiling_sq);
+
+    let profile = TrapezoidProfile::plan_scaled(block, &scaled, scaled_exit_sq);
     self.emit_profile(block, &profile, sink)
   }
 
@@ -275,6 +313,123 @@ impl StepTiming {
   }
 }
 
+/// The result of running a [`ProbeStepper`] cycle: whether the expected probe edge was seen and the number of
+/// dominant-axis steps actually emitted before stopping (so the executor can reconstruct the exact stop position
+/// from the live step counter). `triggered` is `true` when the watched edge occurred within travel and `false`
+/// when the probe reached the no-contact end of the block; the consumer turns `false` into `[PRB:..:0]` and, for
+/// an alarming mode (G38.2/.4), ALARM:4/5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ProbeOutcome {
+  /// `true` if the expected edge (trigger for a toward probe, release for an away probe) was seen within travel.
+  pub triggered: bool,
+  /// The number of dominant-axis steps emitted before stopping (≤ the block's `step_event_count`). On a trigger
+  /// this is where the probe stopped; on no-contact it equals the full block length.
+  pub steps_emitted: u32,
+}
+
+/// Walks a probe `Block` one tick at a time, sampling the probe state BEFORE each tick and stopping the instant
+/// the expected edge appears, so the latched stop position is the finest the architecture allows. Unlike
+/// [`SegmentGenerator`] (which batches up to [`MAX_SYMBOLS_PER_BURST`] ticks per burst, so the probe could only
+/// be sampled at burst boundaries), the probe stepper emits exactly ONE tick per [`StepSink::emit_burst`] call,
+/// so the firmware bin's probe-watching sink can read the probe input between every single step.
+///
+/// grbl probes at a constant feed (no trapezoid: a probe seeks slowly and stops on contact, never ramping), so
+/// each tick uses a single fixed step period derived from the probe feed — there is no entry/cruise/exit shaping.
+/// The probe predicate is passed in (so the `$6`-adjusted read stays in the firmware bin / host test), keeping
+/// this walker pure: it owns step generation + Bresenham coordination, not the electrical read.
+///
+/// ## Sampling-resolution limit (hardware boundary, DOC-02)
+/// grbl samples the probe in the step ISR, stopping mid-step on contact. Galdr's RMT design transmits whole
+/// bursts that cannot be preempted, so the FINEST the probe can be sampled is ONE STEP (between single-tick
+/// bursts) — realized here. Over-travel past the trigger point is therefore bounded by one step plus the
+/// deceleration of the in-flight single-step burst; keep the probe feed low (25–100 mm/min) to bound it, exactly
+/// as `docs/tlo-offsets.md` Finding #10 prescribes. This is the documented approximation versus grbl's per-ISR
+/// sampling.
+pub struct ProbeStepper {
+  config: MotionConfig,
+}
+
+impl ProbeStepper {
+  /// Create a probe stepper with the given timing configuration (the same [`MotionConfig`] the generator uses).
+  pub fn new(config: MotionConfig) -> Self {
+    ProbeStepper { config }
+  }
+
+  /// Run the probe block on `sink`, sampling `is_at_stop_edge` before each tick. `is_at_stop_edge` returns `true`
+  /// when the probe is at the edge that should STOP the cycle (for a TOWARD probe, "triggered"; for an AWAY
+  /// probe, "released") — the firmware bin composes it from the live [`crate::hal_traits::probe_triggered`] read
+  /// and the toward/away sense. The walk stops the instant the predicate is true; if it is true BEFORE the first
+  /// tick the cycle stops immediately with zero steps (the firmware bin must reject a toward-probe already at the
+  /// edge as ALARM:4 *before* calling this — see the consumer). Returns the [`ProbeOutcome`].
+  ///
+  /// `step_period_ticks` is the fixed probe-feed step period (the firmware bin derives it from the probe `F` word
+  /// and `$100..102`); it is clamped into the representable `[min, max]` interval so a degenerate feed cannot
+  /// produce an unencodable burst.
+  pub fn run_probe<S: StepSink>(
+    &self,
+    block: &Block,
+    step_period_ticks: u32,
+    mut is_at_stop_edge: impl FnMut() -> bool,
+    sink: &mut S,
+  ) -> Result<ProbeOutcome, MotionError> {
+    if self.config.tick_hz <= 0.0 || self.config.min_period_ticks() == 0 {
+      return Err(MotionError::InvalidConfig);
+    }
+    let total = block.step_event_count;
+    if total == 0 {
+      // A zero-length probe block: sample once so an already-at-edge probe reports a trigger with no motion.
+      return Ok(ProbeOutcome { triggered: is_at_stop_edge(), steps_emitted: 0 });
+    }
+
+    let dir = DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0] };
+    sink.set_direction(dir)?;
+
+    // Clamp the probe period into the representable interval, mirroring `StepTiming` (probes are slow, so the
+    // period typically sits near the max; the floor guards a degenerate fast feed).
+    let max_period = (RMT_MAX_FIELD_LEN + self.config.step_pulse_ticks).max(self.config.min_period_ticks());
+    let period = step_period_ticks.clamp(self.config.min_period_ticks(), max_period);
+
+    let dominant = dominant_axis(&block.steps);
+    let abs_steps = [
+      block.steps[0].unsigned_abs() as i64,
+      block.steps[1].unsigned_abs() as i64,
+      block.steps[2].unsigned_abs() as i64,
+    ];
+    let dom_count = abs_steps[dominant];
+    let mut error = [0i64; AXES];
+    let mut emitted = 0u32;
+
+    for _ in 0..total {
+      // Sample the probe BEFORE emitting the next step: if the stop edge is already present, stop without taking
+      // another step so the latched position is the last position actually reached.
+      if is_at_stop_edge() {
+        return Ok(ProbeOutcome { triggered: true, steps_emitted: emitted });
+      }
+      // Decide this tick's per-axis step mask with the same exact-integer Bresenham the generator uses.
+      let mut step = [false; AXES];
+      for axis in 0..AXES {
+        if axis == dominant {
+          step[axis] = abs_steps[axis] != 0;
+          continue;
+        }
+        error[axis] += abs_steps[axis];
+        if error[axis] >= dom_count {
+          error[axis] -= dom_count;
+          step[axis] = true;
+        }
+      }
+      // Emit exactly one tick so the next loop iteration can re-sample the probe after a single step.
+      sink.emit_burst(&[StepEvent { step, period_ticks: period }])?;
+      emitted += 1;
+    }
+
+    // Reached the end of travel without the stop edge: sample once more so a trigger on the final step still
+    // counts (the loop checks BEFORE each step, so the very last position is not otherwise sampled).
+    Ok(ProbeOutcome { triggered: is_at_stop_edge(), steps_emitted: emitted })
+  }
+}
+
 /// Live machine position in step space, advanced one [`StepEvent`] at a time as the motion executor
 /// drives the [`StepSink`], so the status reporter can publish a *live* (interpolated) MPos rather than
 /// the planner's end-of-look-ahead position. It is the firmware bin's counterpart to the generator: the
@@ -407,6 +562,30 @@ fn dominant_axis(steps: &[i32; AXES]) -> usize {
   best
 }
 
+/// The override-scaled entry and nominal (cruise) squared speeds for one block (Phase E). The live feed/rapid
+/// override scales these before the trapezoid is classified, while the block's geometry (acceleration, length)
+/// is untouched — grbl applies the override to the velocity, not the accel limits. Kept as a tiny `Copy` struct
+/// so [`TrapezoidProfile::plan_scaled`] takes the scaled speeds explicitly without mutating the planner `Block`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScaledBlock {
+  /// The override-scaled, max-rate-clamped squared entry speed (mm/s)².
+  entry_speed_sq: f32,
+  /// The override-scaled, max-rate-clamped squared nominal (cruise) speed (mm/s)².
+  nominal_speed_sq: f32,
+}
+
+/// Clamp a (possibly override-scaled) squared speed into `[0, ceiling_sq]`, so a feed/rapid override that
+/// scales UP can never exceed the axis max-rate ceiling (`$110-112` projected onto the block). A non-finite or
+/// negative input is floored at zero; an infinite ceiling (the unscaled path) leaves the value unclamped.
+fn clamp_speed_sq(speed_sq: f32, ceiling_sq: f32) -> f32 {
+  let floored = if speed_sq.is_finite() { speed_sq.max(0.0) } else { 0.0 };
+  if ceiling_sq.is_finite() {
+    floored.min(ceiling_sq)
+  } else {
+    floored
+  }
+}
+
 /// The classified trapezoidal velocity profile for one block, expressed as the squared entry/cruise/exit
 /// speeds and the two breakpoint distances (end of acceleration, start of deceleration) along the block
 /// in mm. Covers every shape grbl distinguishes: cruise-only, accel-cruise, cruise-decel, full
@@ -433,13 +612,15 @@ struct TrapezoidProfile {
 }
 
 impl TrapezoidProfile {
-  /// Classify the block's trapezoid from its planner-solved entry speed, its nominal cruise speed, and
-  /// the required exit speed. Distances are derived from `v² = v₀² + 2·a·d`, rearranged to
-  /// `d = (v² − v₀²) / (2·a)`. When the accel and decel ramps would overlap before reaching nominal, the
-  /// block is a triangle and the peak is found from the ramp-intersection distance.
-  fn plan(block: &Block, exit_speed_sq: f32) -> Self {
-    let entry_sq = block.entry_speed_sq.max(0.0);
-    let nominal_sq = block.nominal_speed_sq.max(0.0);
+  /// Classify the block's trapezoid from its (possibly override-SCALED) entry/nominal speeds plus the required
+  /// exit speed, reusing the block only for its geometry (acceleration, length). Distances are derived from
+  /// `v² = v₀² + 2·a·d`, rearranged to `d = (v² − v₀²) / (2·a)`. When the accel and decel ramps would overlap
+  /// before reaching nominal, the block is a triangle and the peak is found from the ramp-intersection distance.
+  /// The unscaled [`run_block`](SegmentGenerator::run_block) passes the block's own speeds (`scale = 1.0`) and the
+  /// live-override path passes the scaled-and-clamped speeds, so the classification math lives in one place.
+  fn plan_scaled(block: &Block, scaled: &ScaledBlock, exit_speed_sq: f32) -> Self {
+    let entry_sq = scaled.entry_speed_sq.max(0.0);
+    let nominal_sq = scaled.nominal_speed_sq.max(0.0);
     let exit_sq = exit_speed_sq.max(0.0);
     let accel = block.acceleration.max(0.0);
     let length = block.millimeters.max(0.0);
@@ -619,6 +800,7 @@ mod tests {
       max_entry_speed_sq: nominal_sq,
       entry_speed_sq: entry_sq,
       rapid: false,
+      jog: false,
     }
   }
 
@@ -952,6 +1134,7 @@ mod tests {
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 600.0,
+        machine_coords: false,
       })
       .expect("queued");
     let block = *planner.peek_block().expect("a block");
@@ -962,6 +1145,81 @@ mod tests {
     // X3 Y4 at 100 steps/mm: 300 X steps, 400 Y steps; Y dominates so 400 ticks, steps conserved.
     assert_eq!(emitted, 400);
     assert_eq!(sink.step_totals(), [300, 400, 0]);
+  }
+
+  // ---- Phase E: feed/rapid override scaling -----------------------------------------------------
+
+  #[test]
+  fn override_scale_one_matches_unscaled() {
+    // `run_block_scaled` with scale 1.0 and an infinite ceiling must be byte-for-byte identical to `run_block`.
+    let generator = SegmentGenerator::new(test_config());
+    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let mut plain = RecordingSink::new();
+    generator.run_block(&block, 400.0, &mut plain).expect("runs");
+    let mut scaled = RecordingSink::new();
+    generator.run_block_scaled(&block, 400.0, 1.0, f32::INFINITY, &mut scaled).expect("runs");
+    assert_eq!(plain.all_ticks(), scaled.all_ticks(), "scale 1.0 is identical to the unscaled path");
+  }
+
+  #[test]
+  fn feed_override_above_100_speeds_up_cruise_until_max_rate() {
+    // A cruise-only block at v=20 mm/s (v²=400). A 150% feed override should raise the cruise to ~30 mm/s when
+    // the max-rate ceiling allows it (period shrinks), but a ceiling at 20 mm/s (v²=400) must hold it at 20.
+    let cfg = test_config();
+    let generator = SegmentGenerator::new(cfg);
+    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+
+    // 150% with a generous ceiling (v=40 mm/s, v²=1600): cruise should rise toward 30 mm/s.
+    let mut up = RecordingSink::new();
+    generator.run_block_scaled(&block, 400.0, 1.5, 1600.0, &mut up).expect("runs");
+    let v_up = velocities_from_periods(&up, &block, &cfg);
+    let peak_up = v_up.iter().cloned().fold(0.0_f32, f32::max);
+    assert!((peak_up - 30.0).abs() < 2.0, "150% feed raises cruise to ~30 mm/s, got {peak_up}");
+
+    // 150% but with the ceiling AT the original 20 mm/s (v²=400): the scaled feed is clamped, cruise stays ~20.
+    let mut capped = RecordingSink::new();
+    generator.run_block_scaled(&block, 400.0, 1.5, 400.0, &mut capped).expect("runs");
+    let v_cap = velocities_from_periods(&capped, &block, &cfg);
+    let peak_cap = v_cap.iter().cloned().fold(0.0_f32, f32::max);
+    assert!((peak_cap - 20.0).abs() < 2.0, "feed clamps to the max-rate ceiling (~20 mm/s), got {peak_cap}");
+  }
+
+  #[test]
+  fn feed_override_below_100_slows_down_cruise() {
+    // A 50% feed override on a v=20 mm/s cruise block must halve the cruise to ~10 mm/s (period doubles).
+    let cfg = test_config();
+    let generator = SegmentGenerator::new(cfg);
+    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let mut sink = RecordingSink::new();
+    generator.run_block_scaled(&block, 400.0, 0.5, f32::INFINITY, &mut sink).expect("runs");
+    let v = velocities_from_periods(&sink, &block, &cfg);
+    let peak = v.iter().cloned().fold(0.0_f32, f32::max);
+    assert!((peak - 10.0).abs() < 1.5, "50% feed halves cruise to ~10 mm/s, got {peak}");
+  }
+
+  #[test]
+  fn override_scaling_conserves_steps() {
+    // Scaling the feed must never drop or invent a step — only the periods change, not the step counts.
+    let generator = SegmentGenerator::new(test_config());
+    let block = make_block([400, 300, 100], 5.0, 100.0, 0.0, 400.0);
+    let mut sink = RecordingSink::new();
+    let emitted = generator.run_block_scaled(&block, 0.0, 1.75, f32::INFINITY, &mut sink).expect("runs");
+    assert_eq!(emitted, 400, "one tick per dominant-axis step regardless of the override");
+    assert_eq!(sink.step_totals(), [400, 300, 100], "each axis steps exactly its delta under scaling");
+  }
+
+  #[test]
+  fn degenerate_override_scale_falls_back_to_unscaled() {
+    // A non-positive / non-finite override scale must not freeze or runaway motion: it is treated as 1.0.
+    let generator = SegmentGenerator::new(test_config());
+    let block = make_block([500, 0, 0], 5.0, 100.0, 400.0, 400.0);
+    let mut plain = RecordingSink::new();
+    generator.run_block(&block, 400.0, &mut plain).expect("runs");
+    for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+      let mut sink = RecordingSink::new();
+      generator.run_block_scaled(&block, 400.0, bad, f32::INFINITY, &mut sink).expect("runs");
+      assert_eq!(sink.all_ticks(), plain.all_ticks(), "degenerate scale {bad} falls back to unscaled");
+    }
   }
 
   // ---- StepCounter: live position tracking ------------------------------------------------------
@@ -1043,6 +1301,168 @@ mod tests {
     assert!((mm[1] + 2.5).abs() < 1e-6);
     // A zero steps/mm axis is reported as 0.0, never a division blow-up.
     assert_eq!(mm[2], 0.0);
+  }
+
+  // ---- Probe stepper: per-step sampling, stop-on-edge, no-contact (Phase C) ---------------------
+
+  /// A probe block straight down Z by 5 mm at 100 steps/mm → 500 Z steps. Constant feed, no trapezoid.
+  fn probe_block() -> Block {
+    make_block([0, 0, -500], 5.0, 100.0, 0.0, 100.0)
+  }
+
+  #[test]
+  fn probe_stops_on_the_trigger_edge_and_reports_steps() {
+    // The probe triggers after 120 steps of travel: the stepper must emit exactly 120 steps then stop, reporting
+    // a trigger. The single-tick bursts give per-step sampling granularity (the architecture's finest).
+    let stepper = ProbeStepper::new(test_config());
+    let block = probe_block();
+    let mut count = 0u32;
+    let mut sink = RecordingSink::new();
+    let outcome = stepper
+      .run_probe(&block, 1000, || { let trip = count >= 120; count += 1; trip }, &mut sink)
+      .expect("probe runs");
+    assert!(outcome.triggered, "the probe saw its trigger edge");
+    assert_eq!(outcome.steps_emitted, 120, "stopped exactly at the trigger step");
+    // Each burst is a single tick (per-step sampling), and the dominant Z axis steps every tick.
+    assert!(sink.bursts.iter().all(|b| b.len() == 1), "probe bursts are single-tick for per-step sampling");
+    assert_eq!(sink.bursts.len(), 120);
+    assert!(sink.all_ticks().iter().all(|ev| ev.step[2]), "Z steps on every probe tick");
+  }
+
+  #[test]
+  fn probe_reaching_target_without_contact_reports_no_trigger() {
+    // The probe never trips: the stepper runs the full 500-step block and reports no trigger (the consumer turns
+    // this into ALARM:4/5 for G38.2/.4, or a silent finish for G38.3/.5).
+    let stepper = ProbeStepper::new(test_config());
+    let block = probe_block();
+    let mut sink = RecordingSink::new();
+    let outcome = stepper.run_probe(&block, 1000, || false, &mut sink).expect("probe runs");
+    assert!(!outcome.triggered, "no contact within travel");
+    assert_eq!(outcome.steps_emitted, 500, "ran the full block to the no-contact end of travel");
+    assert_eq!(sink.step_totals(), [0, 0, 500]);
+  }
+
+  #[test]
+  fn probe_already_at_edge_stops_immediately_with_no_steps() {
+    // If the stop edge is present before the first tick, the stepper takes no step (the firmware bin rejects a
+    // toward-probe already triggered as ALARM:4 before calling this, but the walker is still safe).
+    let stepper = ProbeStepper::new(test_config());
+    let block = probe_block();
+    let mut sink = RecordingSink::new();
+    let outcome = stepper.run_probe(&block, 1000, || true, &mut sink).expect("probe runs");
+    assert!(outcome.triggered);
+    assert_eq!(outcome.steps_emitted, 0, "no step taken when already at the edge");
+    assert!(sink.bursts.is_empty(), "no bursts emitted");
+  }
+
+  #[test]
+  fn probe_trigger_on_the_final_step_is_detected() {
+    // A trigger on the very last step of travel must still report a trigger (the loop samples before each step
+    // and once more after the final step, so the last position is not missed).
+    let stepper = ProbeStepper::new(test_config());
+    let block = probe_block();
+    let mut count = 0u32;
+    let mut sink = RecordingSink::new();
+    let outcome = stepper
+      .run_probe(&block, 1000, || { let trip = count >= 500; count += 1; trip }, &mut sink)
+      .expect("probe runs");
+    assert!(outcome.triggered, "a trigger on the final step is detected by the post-loop sample");
+    assert_eq!(outcome.steps_emitted, 500);
+  }
+
+  #[test]
+  fn probe_cycle_latches_machine_position_and_renders_prb_and_wpos() {
+    // The end-to-end simulated probe → Z-zero workflow, crossing the probe stepper, the live step counter, the
+    // `[PRB:]` formatter, and the coordinate model — the exact pipeline the firmware bin wires, but host-tested.
+    use crate::coords::CoordinateSystems;
+    use crate::hal_traits::{probe_triggered, ProbeConfig};
+    use crate::protocol::ResponseWriter;
+    use std::string::String as StdString;
+
+    // A probe block straight down Z by 5 mm at 100 steps/mm, starting at machine Z = 0 (no prior moves). The
+    // touch plate (with `$6=1`, NO-plate) trips after 4.2 mm of travel → 420 Z steps, i.e. machine Z = -4.2 mm.
+    let cfg = test_config();
+    let prober = ProbeStepper::new(cfg);
+    let block = make_block([0, 0, -500], 5.0, 100.0, 0.0, 100.0);
+
+    // A scripted mock probe: idles high (untouched), goes low after 420 steps of travel. Under the base sense
+    // (`$6=0`) a high pin reads not-triggered and a low pin (grounded by contact) reads triggered — the right
+    // config for an idle-high touch-plate input on this electrical model (`probe_triggered` is unit-tested in
+    // `hal_traits`). `steps_taken` is a shared `Cell` so the counting sink and the probe predicate can both touch
+    // it without an aliasing borrow conflict.
+    let probe_cfg = ProbeConfig { invert: false, pullup_disable: false };
+    let steps_taken = std::cell::Cell::new(0u32);
+    let raw_high = std::cell::Cell::new(true);
+    let is_at_edge = || {
+      // The plate trips (goes low) once 420 steps have been emitted.
+      if steps_taken.get() >= 420 {
+        raw_high.set(false);
+      }
+      probe_triggered(raw_high.get(), &probe_cfg)
+    };
+
+    // Advance a live step counter through the same ticks the prober emits, exactly as the firmware's CountingSink
+    // does, so the latched position is derived from the emitted steps.
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0] });
+
+    struct CountingRecorder<'a> {
+      counter: &'a mut StepCounter,
+      steps_taken: &'a std::cell::Cell<u32>,
+    }
+    impl StepSink for CountingRecorder<'_> {
+      fn set_direction(&mut self, _dir: DirState) -> Result<(), StepError> {
+        Ok(())
+      }
+      fn emit_burst(&mut self, ticks: &[StepEvent]) -> Result<(), StepError> {
+        for ev in ticks {
+          self.counter.advance(ev);
+          self.steps_taken.set(self.steps_taken.get() + 1);
+        }
+        Ok(())
+      }
+    }
+    let mut sink = CountingRecorder { counter: &mut counter, steps_taken: &steps_taken };
+    let outcome = prober.run_probe(&block, 1000, is_at_edge, &mut sink).expect("probe runs");
+
+    assert!(outcome.triggered, "the NO plate tripped within travel");
+    // The latched machine position: 420 Z steps in the negative direction → Z = -4.2 mm at 100 steps/mm.
+    let stop_steps = counter.position_steps();
+    assert_eq!(stop_steps, [0, 0, -420], "latched at the trigger step");
+    let steps_per_mm = [100.0, 100.0, 100.0];
+    let probe_mm = steps_to_mm(&stop_steps, &steps_per_mm);
+    assert!((probe_mm[2] + 4.2).abs() < 1e-4, "probe machine Z is -4.2 mm, got {}", probe_mm[2]);
+
+    // The immediate `[PRB:]` push reports the triggered machine position with flag 1.
+    let mut prb: StdString = StdString::new();
+    {
+      let mut s = heapless::String::<64>::new();
+      ResponseWriter::probe_report(&mut s, &probe_mm, outcome.triggered).expect("prb");
+      prb.push_str(s.as_str());
+    }
+    assert_eq!(prb, "[PRB:0.000,0.000,-4.200:1]\r\n");
+
+    // Z-zero: the plate is 1.0 mm thick, so `G10 L20 P1 Z1.0` makes the probed point read work Z = 1.0, putting
+    // the copper top (1 mm below the plate top the probe touched) at WPos Z = 0.
+    let mut cs = CoordinateSystems::new();
+    cs.set_wcs_offset_to_position(0, probe_mm, [0.0, 0.0, 1.0], [false, false, true]);
+    let copper_top = [probe_mm[0], probe_mm[1], probe_mm[2] - 1.0];
+    let wpos = cs.machine_to_work(copper_top);
+    assert!(wpos[2].abs() < 1e-4, "copper top reads WPos Z = 0, got {}", wpos[2]);
+  }
+
+  #[test]
+  fn probe_period_clamps_into_representable_interval() {
+    // A wildly slow requested period must clamp to the representable max so the single-tick burst is encodable;
+    // the probe still runs and reports correctly.
+    let cfg = test_config();
+    let stepper = ProbeStepper::new(cfg);
+    let block = probe_block();
+    let mut sink = RecordingSink::new();
+    stepper.run_probe(&block, u32::MAX, || false, &mut sink).expect("probe runs");
+    let max_period = RMT_MAX_FIELD_LEN + cfg.step_pulse_ticks;
+    assert!(sink.all_ticks().iter().all(|e| e.period_ticks <= max_period), "probe period stays representable");
+    assert!(sink.all_ticks().iter().all(|e| e.period_ticks >= cfg.min_period_ticks()), "and above the min");
   }
 
   // ---- Silent-symbol half split: never an RMT end marker (Finding #1) ---------------------------

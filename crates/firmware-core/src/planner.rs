@@ -31,7 +31,7 @@
 //! [`BLOCK_QUEUE_LEN`]; an over-full queue is a recoverable [`PlannerError::QueueFull`], never a
 //! panic. All arithmetic is `f32`; `libm` supplies `sqrtf`, `acosf`, `sinf`, `cosf`.
 
-use crate::gcode::{AxisWords, DistanceMode, PlannerCommand, Units};
+use crate::gcode::{AxisWords, CoordinateOp, DistanceMode, JogCommand, PlannerCommand, ProbeKind, Units};
 use heapless::Deque;
 
 /// Number of axes the planner coordinates (X, Y, Z) per DOC-02. The spare RMT channel's 4th axis is
@@ -60,6 +60,10 @@ pub enum PlannerError {
   /// An arc was malformed: neither I nor J was given, or the computed radius/sweep is degenerate so no
   /// valid circular geometry exists. Maps to grblHAL `error:33` (invalid motion/arc geometry).
   InvalidArc,
+  /// A `$J=` jog target exceeded the machine travel envelope while `$20` soft limits are enabled (DOC-08 Phase
+  /// D). grbl's `error:15` — "Jog target exceeds machine travel. Command ignored." The jog is rejected BEFORE
+  /// any motion or block enqueue, so a soft-limited jog never moves the machine toward the limit.
+  JogExceedsTravel,
 }
 
 impl PlannerError {
@@ -71,8 +75,21 @@ impl PlannerError {
       // planner task back-pressures instead of emitting this to the host.
       PlannerError::QueueFull => 1,
       PlannerError::InvalidArc => 33,
+      // grbl's "Travel exceeded" jog rejection code; the jog command is ignored and the host sees error:15.
+      PlannerError::JogExceedsTravel => 15,
     }
   }
+}
+
+/// The `$20`/`$130–$132` soft-limit envelope a jog target is checked against (DOC-08 Phase D). grbl homes to
+/// machine zero at the positive end of each axis and treats the work volume as the closed interval
+/// `[-max_travel, 0]` per axis (machine coordinates are ≤ 0). A jog whose resolved MACHINE target leaves that
+/// interval on any axis is rejected with [`PlannerError::JogExceedsTravel`] before any motion. Held as a small
+/// `Copy` value the consumer builds from the live `$20`/`$130–$132` settings and passes into [`Planner::plan_jog`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoftLimits {
+  /// `$130–$132` maximum travel per axis in mm, `[X, Y, Z]`. The envelope is `[-max_travel, 0]` per axis.
+  pub max_travel_mm: [f32; AXES],
 }
 
 /// The machine settings the planner needs to resolve geometry and kinematics. These mirror the
@@ -140,6 +157,10 @@ pub struct Block {
   pub entry_speed_sq: f32,
   /// True for a G0 rapid block (speed governed by max rates, not a feed word); false for a feed move.
   pub rapid: bool,
+  /// True when this block was enqueued by a `$J=` jog (DOC-08 Phase D). Tagged so a jog-cancel (`0x85`) can
+  /// identify and flush ONLY the queued jog blocks via [`Planner::flush_jog_blocks`], leaving any program
+  /// blocks untouched. A normal program block (move/arc/probe-derived) is always `false`.
+  pub jog: bool,
 }
 
 impl Block {
@@ -179,9 +200,28 @@ pub enum PlannerOutcome {
   GoToPredefined { is_g28: bool },
   /// M30 program end. The look-ahead is flushed to a stop; the caller resets modal/program state.
   ProgramEnd,
-  /// G92 set coordinate offset; the work offset was updated. No motion is produced and look-ahead is
-  /// preserved (G92 does not move the machine), matching grbl.
-  OffsetUpdated,
+  /// A coordinate-system / offset op (G10, G54-G59, G92, G28.1/G30.1, G43.1/G49) passed through for the caller
+  /// to apply to the shared [`crate::coords::CoordinateSystems`]. No motion is produced and look-ahead is
+  /// preserved (these do not move the machine), matching grbl; the caller then pushes the recomputed WCO back
+  /// into the planner via [`Planner::set_work_offset`].
+  Coordinate(CoordinateOp),
+  /// A `G38.x` probe move (DOC-09). The planner has resolved the work-coordinate axis words into an absolute
+  /// MACHINE step `target` and flushed look-ahead (a probe is a synchronized boundary, so it starts from rest).
+  /// The planner does NOT enqueue a normal block for it: the firmware bin runs a distinct, probe-watching
+  /// execution path that stops on the probe edge, then syncs the planner's commanded position to the actual stop
+  /// point via [`Planner::sync_position`] (grbl sets `gc_state.position` to the probe stop). `kind` carries the
+  /// toward/away + alarm-on-fail semantics and `feed` the seek speed.
+  Probe {
+    /// The probe mode (toward/away, alarm-on-fail) from `G38.2`/`.3`/`.4`/`.5`.
+    kind: ProbeKind,
+    /// The absolute MACHINE step target the probe seeks toward (work words already resolved through the WCO /
+    /// distance mode). The probe stops early on the expected edge; this is the no-contact end of travel.
+    target: [i32; AXES],
+    /// The probe seek feed in the program's active units per minute (the firmware converts to a step rate).
+    feed: f32,
+    /// The active units for `feed` (the firmware bin scales inch/min → mm/min before deriving the step rate).
+    units: Units,
+  },
 }
 
 /// The geometry of one G2/G3 arc, bundled so the arc planner takes a single borrowed request rather
@@ -201,6 +241,8 @@ struct ArcRequest<'a> {
   distance: DistanceMode,
   /// Active feed rate (modal F) in `units` per minute, shared by every subdivided segment.
   feed: f32,
+  /// True for a `G53` machine-coordinate arc: the endpoint words are MACHINE positions (no work offset).
+  machine_coords: bool,
 }
 
 /// The motion planner. Holds machine settings, the block ring buffer, the current machine position in
@@ -216,8 +258,11 @@ pub struct Planner {
   /// Current machine position in steps per axis. Targets are resolved relative to this and it is
   /// advanced as blocks are planned, so look-ahead chains from the program's commanded position.
   position_steps: [i32; AXES],
-  /// Active G92 work offset in mm per axis, added to commanded work coordinates to get machine
-  /// coordinates. Updated by [`PlannerCommand::SetCoordinateOffset`].
+  /// The active Work Coordinate Offset (WCO) in mm per axis, added to commanded WORK coordinates to get
+  /// MACHINE coordinates (`MPos = WPos + WCO`). The full grbl WCO — `G54..59[active] + G92 + TLO` — is computed
+  /// by [`crate::coords::CoordinateSystems`] in the consumer, which pushes it here via [`set_work_offset`] on
+  /// every coordinate-system change. The planner applies it only to ABSOLUTE work moves; an incremental move
+  /// (offset already baked into the current machine position) and a G53 machine-coordinate move bypass it.
   work_offset_mm: [f32; AXES],
   /// Unit direction vector of the most recently planned block, for the next junction's cornering. The
   /// zero vector marks "no previous block" (start of program or after a flush): entry speed is 0.
@@ -253,6 +298,17 @@ impl Planner {
     self.position_steps
   }
 
+  /// Force the planner's commanded machine position (in steps) to `steps`, used after a `G38.x` probe to set the
+  /// commanded position to the ACTUAL stop point the executor latched (grbl sets `gc_state.position` to the probe
+  /// stop). This also drops the trailing junction state so the next move corners from rest at the new position —
+  /// correct because a probe is a synchronized boundary and the machine has just decelerated to a stop there. The
+  /// queue is left untouched (the probe enqueued no normal block; look-ahead was already flushed when it ran).
+  pub fn sync_position(&mut self, steps: [i32; AXES]) {
+    self.position_steps = steps;
+    self.prev_unit_vec = [0.0; AXES];
+    self.prev_nominal_speed_sq = 0.0;
+  }
+
   /// The current machine position in mm per axis, derived from the step position and `$100–$102`.
   pub fn position_mm(&self) -> [f32; AXES] {
     let mut out = [0.0; AXES];
@@ -260,6 +316,24 @@ impl Planner {
       *slot = self.position_steps[axis] as f32 / self.config.steps_per_mm[axis];
     }
     out
+  }
+
+  /// Set the active Work Coordinate Offset (WCO) in mm per axis. The consumer calls this after applying any
+  /// coordinate-system change (G10 / G54-G59 / G92 / G43.1 / G49) to the shared
+  /// [`crate::coords::CoordinateSystems`], so the planner's absolute work→machine transform always uses the
+  /// live WCO. It does NOT move the machine or touch look-ahead — only the offset future absolute moves resolve
+  /// against changes. Non-finite components are ignored per axis so a degenerate offset cannot poison geometry.
+  pub fn set_work_offset(&mut self, wco: [f32; AXES]) {
+    for (slot, &value) in self.work_offset_mm.iter_mut().zip(wco.iter()) {
+      if value.is_finite() {
+        *slot = value;
+      }
+    }
+  }
+
+  /// The active Work Coordinate Offset in mm per axis (for tests / diagnostics).
+  pub fn work_offset(&self) -> [f32; AXES] {
+    self.work_offset_mm
   }
 
   /// The number of blocks currently queued for the motion executor.
@@ -301,15 +375,33 @@ impl Planner {
   /// block cannot be enqueued (back-pressure) or [`PlannerError::InvalidArc`] for bad arc geometry.
   pub fn plan_command(&mut self, command: &PlannerCommand) -> Result<PlannerOutcome, PlannerError> {
     match command {
-      PlannerCommand::Move { rapid, axes, units, distance, feed } => {
-        let target = self.resolve_target(axes, *units, *distance);
+      PlannerCommand::Move { rapid, axes, units, distance, feed, machine_coords } => {
+        let target = self.resolve_target(axes, *units, *distance, *machine_coords);
         let queued = self.plan_line(target, *feed, *units, *rapid)?;
         Ok(PlannerOutcome::Queued { blocks: queued })
       }
-      PlannerCommand::Arc { cw, axes, i, j, units, distance, feed } => {
-        let request = ArcRequest { cw: *cw, axes, i: *i, j: *j, units: *units, distance: *distance, feed: *feed };
+      PlannerCommand::Arc { cw, axes, i, j, units, distance, feed, machine_coords } => {
+        let request = ArcRequest {
+          cw: *cw,
+          axes,
+          i: *i,
+          j: *j,
+          units: *units,
+          distance: *distance,
+          feed: *feed,
+          machine_coords: *machine_coords,
+        };
         let queued = self.plan_arc(&request)?;
         Ok(PlannerOutcome::Queued { blocks: queued })
+      }
+      PlannerCommand::Probe { kind, axes, units, distance, feed } => {
+        // Resolve the work-coordinate probe target to an absolute MACHINE step target exactly as a move does (a
+        // probe is never a G53 machine-coordinate move, so `machine_coords` is false). Flush look-ahead so the
+        // probe starts from rest — it is a synchronized boundary, like a dwell. The firmware bin runs the actual
+        // probe-watching motion and syncs the position to the stop point via [`sync_position`].
+        let target = self.resolve_target(axes, *units, *distance, false);
+        self.flush_lookahead();
+        Ok(PlannerOutcome::Probe { kind: *kind, target, feed: *feed, units: *units })
       }
       PlannerCommand::Dwell { seconds } => {
         self.flush_lookahead();
@@ -320,9 +412,10 @@ impl Planner {
         self.flush_lookahead();
         Ok(PlannerOutcome::GoToPredefined { is_g28: *is_g28 })
       }
-      PlannerCommand::SetCoordinateOffset { axes, units } => {
-        self.apply_g92_offset(axes, *units);
-        Ok(PlannerOutcome::OffsetUpdated)
+      PlannerCommand::Coordinate(op) => {
+        // A coordinate-system op does not move the machine; pass it through for the consumer to apply to the
+        // shared coordinate model. Look-ahead is preserved (grbl does not flush on G10/G92/G54-59/G43.1).
+        Ok(PlannerOutcome::Coordinate(*op))
       }
       PlannerCommand::ProgramEnd => {
         self.flush_lookahead();
@@ -331,9 +424,59 @@ impl Planner {
     }
   }
 
-  /// Resolve a line's axis words into an absolute machine target in *steps*, applying units, distance
-  /// mode, and the active G92 work offset. Axes not mentioned on the line keep their current position.
-  fn resolve_target(&self, axes: &AxisWords, units: Units, distance: DistanceMode) -> [i32; AXES] {
+  /// Plan a `$J=` jog (DOC-08 Phase D) into one cancelable [`jog`](Block::jog)-tagged block. The jog target is
+  /// resolved through the SAME work→machine path as a move (honoring units, distance mode, and — for `G53` — the
+  /// machine-coordinate bypass of the WCO), so a jog blends with the program's coordinate frame. When `limits`
+  /// is `Some` (i.e. `$20` soft limits are enabled) the resolved MACHINE target is checked against the
+  /// `[-max_travel, 0]` envelope FIRST and a violating jog is rejected with [`PlannerError::JogExceedsTravel`]
+  /// before any block is built — so a soft-limited jog never moves the machine toward the limit. A jog runs at
+  /// its own `F` feed (clamped to per-axis max rates exactly like a feed move), not the modal feed.
+  ///
+  /// On success the block is enqueued, tagged `jog = true` so [`flush_jog_blocks`](Planner::flush_jog_blocks) can
+  /// drain it on a jog-cancel, and look-ahead is recalculated. A zero-length jog (target equals the current
+  /// position) enqueues nothing and returns `Queued { blocks: 0 }`.
+  pub fn plan_jog(&mut self, jog: &JogCommand, limits: Option<SoftLimits>) -> Result<PlannerOutcome, PlannerError> {
+    let target = self.resolve_target(&jog.axes, jog.units, jog.distance_mode, jog.machine_coords);
+    if let Some(limits) = limits
+      && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm)
+    {
+      return Err(PlannerError::JogExceedsTravel);
+    }
+    // A jog is a feed move (its `F` governs speed, not the rapid max-rate path), tagged `jog = true` so a
+    // jog-cancel can flush exactly the jog blocks. Run look-ahead immediately like a single move.
+    let enqueued = self.enqueue_move(target, jog.feed, jog.units, false, true)?;
+    if enqueued == 1 {
+      self.recalculate();
+    }
+    Ok(PlannerOutcome::Queued { blocks: enqueued })
+  }
+
+  /// Drain the trailing `$J=` jog blocks from the queue on a jog-cancel (`0x85`), returning how many were
+  /// removed. ONLY [`jog`](Block::jog)-tagged blocks are flushed, and only from the BACK of the queue, so a
+  /// program block can never be dropped: in normal operation a jog never shares the queue with program motion
+  /// (the consumer accepts a jog only from Idle/Jog), so the whole queue is jog blocks — but draining from the
+  /// back and stopping at the first non-jog block is defensive against any future interleaving. The trailing
+  /// junction state is reset so the next planned move starts from rest at the (about-to-be-synced) stop point,
+  /// matching the executor decelerating the active jog block to a stop at its boundary.
+  pub fn flush_jog_blocks(&mut self) -> usize {
+    let mut flushed = 0;
+    while matches!(self.queue.back(), Some(block) if block.jog) {
+      self.queue.pop_back();
+      flushed += 1;
+    }
+    // The active (front) jog block keeps executing to its boundary; dropping the trailing junction state means a
+    // post-cancel move corners from rest. `head_busy` is left as-is: if the front block is still in flight the
+    // executor's committed entry must not be disturbed, and an emptied queue clears it on the next pop anyway.
+    self.prev_unit_vec = [0.0; AXES];
+    self.prev_nominal_speed_sq = 0.0;
+    flushed
+  }
+
+  /// Resolve a line's axis words into an absolute machine target in *steps*, applying units, distance mode, and
+  /// — for an ABSOLUTE work move — the active Work Coordinate Offset (WCO). A `machine_coords` (G53) move treats
+  /// the words as MACHINE positions and skips the offset; an incremental move adds to the current machine
+  /// position (the offset is already baked in). Axes not mentioned on the line keep their current position.
+  fn resolve_target(&self, axes: &AxisWords, units: Units, distance: DistanceMode, machine_coords: bool) -> [i32; AXES] {
     let scale = units_scale(units);
     let words = [axes.x, axes.y, axes.z];
     let mut target = self.position_steps;
@@ -341,9 +484,11 @@ impl Planner {
       if let Some(value) = words[axis] {
         let value_mm = value * scale;
         let machine_mm = match distance {
-          // Absolute work coordinates map to machine coordinates by adding the work offset.
+          // Absolute words are MACHINE coordinates under G53 (no offset), else WORK coordinates (add the WCO).
+          DistanceMode::Absolute if machine_coords => value_mm,
           DistanceMode::Absolute => value_mm + self.work_offset_mm[axis],
-          // Incremental words add to the current machine position; the offset is already baked in.
+          // Incremental words add to the current machine position; the offset is already baked in (G53 has no
+          // effect on an incremental move, matching grbl — the delta is identical either way).
           DistanceMode::Incremental => {
             self.position_steps[axis] as f32 / self.config.steps_per_mm[axis] + value_mm
           }
@@ -354,24 +499,11 @@ impl Planner {
     target
   }
 
-  /// Apply a G92 offset so the current machine position reads as the commanded work values. The offset
-  /// for a mentioned axis is `machine_position − commanded_value`; unmentioned axes keep their offset.
-  fn apply_g92_offset(&mut self, axes: &AxisWords, units: Units) {
-    let scale = units_scale(units);
-    let words = [axes.x, axes.y, axes.z];
-    for (axis, word) in words.iter().enumerate() {
-      if let Some(value) = word {
-        let machine_mm = self.position_steps[axis] as f32 / self.config.steps_per_mm[axis];
-        self.work_offset_mm[axis] = machine_mm - value * scale;
-      }
-    }
-  }
-
   /// Plan a single straight-line move to an absolute step target. Builds the block, enqueues it, runs
   /// look-ahead, and advances the planner position. Returns 1 if a block was enqueued, 0 for a no-op
   /// move (target equals current position).
   fn plan_line(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool) -> Result<usize, PlannerError> {
-    let enqueued = self.enqueue_move(target, feed, units, rapid)?;
+    let enqueued = self.enqueue_move(target, feed, units, rapid, false)?;
     if enqueued == 1 {
       // A single move runs the full look-ahead immediately, so its planned entry speeds are final the
       // moment the command returns (the arc path defers this to one recalculate after the whole sweep).
@@ -385,8 +517,8 @@ impl Planner {
   /// against this one correctly. Returns 1 if a block was enqueued, 0 for a no-op move. Separated from the
   /// `recalculate()` pass so an arc can enqueue all its segments first and recalculate exactly once — the
   /// per-block reverse+forward passes are O(n), so calling them per segment makes arc planning O(n²).
-  fn enqueue_move(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool) -> Result<usize, PlannerError> {
-    let block = match self.build_block(target, feed, units, rapid) {
+  fn enqueue_move(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool, jog: bool) -> Result<usize, PlannerError> {
+    let block = match self.build_block(target, feed, units, rapid, jog) {
       Some(block) => block,
       None => return Ok(0),
     };
@@ -400,7 +532,7 @@ impl Planner {
   /// Build a block from the current position to an absolute step `target`. Returns `None` for a
   /// zero-length move. Computes the step delta, dominant-axis count, unit vector and mm travel, the
   /// limiting acceleration and nominal speed, and the junction-deviation entry-speed cap.
-  fn build_block(&self, target: [i32; AXES], feed: f32, units: Units, rapid: bool) -> Option<Block> {
+  fn build_block(&self, target: [i32; AXES], feed: f32, units: Units, rapid: bool, jog: bool) -> Option<Block> {
     let mut steps = [0i32; AXES];
     let mut delta_mm = [0.0f32; AXES];
     let mut step_event_count = 0u32;
@@ -436,6 +568,7 @@ impl Planner {
       // Seeded to the cap; the reverse/forward passes lower it as the chain requires.
       entry_speed_sq: max_entry_speed_sq,
       rapid,
+      jog,
     })
   }
 
@@ -585,7 +718,7 @@ impl Planner {
   fn plan_arc(&mut self, request: &ArcRequest) -> Result<usize, PlannerError> {
     let scale = units_scale(request.units);
     let start = self.position_mm();
-    let target = self.arc_endpoint_mm(request.axes, scale, request.distance, &start);
+    let target = self.arc_endpoint_mm(request.axes, scale, request.distance, request.machine_coords, &start);
 
     // Center offsets I/J are relative to the start point. At least one must be present (grbl IJ form).
     if request.i.is_none() && request.j.is_none() {
@@ -630,7 +763,7 @@ impl Planner {
       // this cannot hit `QueueFull` mid-arc, and the per-segment junction state still advances so adjacent
       // segments corner against each other. The single `recalculate()` below then resolves all entry speeds
       // in one O(n) reverse+forward pass instead of one pass per segment (which would be O(n²)).
-      enqueued += self.enqueue_move(seg_target, request.feed, request.units, false)?;
+      enqueued += self.enqueue_move(seg_target, request.feed, request.units, false, false)?;
     }
     // Resolve look-ahead once across the whole arc. This is exactly equivalent to recalculating after each
     // segment, because the reverse/forward passes always sweep the entire queue — only the final state of
@@ -639,14 +772,23 @@ impl Planner {
     Ok(enqueued)
   }
 
-  /// Resolve an arc endpoint to absolute machine mm, honouring units and distance mode. Unmentioned
-  /// axes keep the start position. Returns `[x, y, z]` in machine mm.
-  fn arc_endpoint_mm(&self, axes: &AxisWords, scale: f32, distance: DistanceMode, start: &[f32; AXES]) -> [f32; AXES] {
+  /// Resolve an arc endpoint to absolute machine mm, honouring units, distance mode, and the G53
+  /// machine-coordinate flag. An absolute work endpoint adds the WCO; an absolute G53 endpoint is already in
+  /// machine coordinates; an incremental endpoint adds to the start. Unmentioned axes keep the start position.
+  fn arc_endpoint_mm(
+    &self,
+    axes: &AxisWords,
+    scale: f32,
+    distance: DistanceMode,
+    machine_coords: bool,
+    start: &[f32; AXES],
+  ) -> [f32; AXES] {
     let words = [axes.x, axes.y, axes.z];
     let mut endpoint = *start;
     for axis in 0..AXES {
       if let Some(value) = words[axis] {
         endpoint[axis] = match distance {
+          DistanceMode::Absolute if machine_coords => value * scale,
           DistanceMode::Absolute => value * scale + self.work_offset_mm[axis],
           DistanceMode::Incremental => start[axis] + value * scale,
         };
@@ -676,6 +818,24 @@ fn units_scale(units: Units) -> f32 {
 /// Convert a position in mm to the nearest whole step count for an axis with `steps_per_mm` resolution.
 fn mm_to_steps(pos_mm: f32, steps_per_mm: f32) -> i32 {
   libm::roundf(pos_mm * steps_per_mm) as i32
+}
+
+/// Whether a resolved MACHINE step `target` violates the `$20`/`$130–$132` soft-limit envelope on any axis
+/// (DOC-08 Phase D). grbl homes each axis to machine zero at its positive end, so the work volume is the closed
+/// interval `[-max_travel, 0]` per axis (machine coordinates are non-positive). A small one-step tolerance
+/// absorbs the `round()` at the mm→step boundary so a jog exactly to `-max_travel` is accepted, not spuriously
+/// rejected by sub-step rounding. Host-tested in isolation so the envelope rule cannot drift from the jog path.
+pub fn soft_limit_violation(target: &[i32; AXES], steps_per_mm: &[f32; AXES], max_travel_mm: &[f32; AXES]) -> bool {
+  for axis in 0..AXES {
+    // The lower bound in steps, with a one-step rounding tolerance: a target at exactly `-max_travel` (which
+    // `round()` may place one step beyond) is still inside the envelope.
+    let lower = mm_to_steps(-max_travel_mm[axis], steps_per_mm[axis]) - 1;
+    // The upper bound is machine zero, with the same one-step tolerance for a jog to the home end.
+    if target[axis] < lower || target[axis] > 1 {
+      return true;
+    }
+  }
+  false
 }
 
 /// True when every component of `vec` is effectively zero (used to detect "no previous block").
@@ -770,6 +930,7 @@ mod tests {
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed,
+      machine_coords: false,
     }
   }
 
@@ -779,7 +940,7 @@ mod tests {
   fn resolve_absolute_mm_target_to_steps() {
     let planner = Planner::new(test_config());
     let axes = AxisWords { x: Some(10.0), y: Some(-5.0), z: None };
-    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute);
+    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, false);
     // 10 mm × 100 steps/mm = 1000; -5 mm × 100 = -500; Z unmentioned stays at 0.
     assert_eq!(target, [1000, -500, 0]);
   }
@@ -788,7 +949,7 @@ mod tests {
   fn resolve_inch_target_scales_by_25_4() {
     let planner = Planner::new(test_config());
     let axes = AxisWords { x: Some(1.0), y: None, z: None };
-    let target = planner.resolve_target(&axes, Units::Inch, DistanceMode::Absolute);
+    let target = planner.resolve_target(&axes, Units::Inch, DistanceMode::Absolute, false);
     // 1 inch = 25.4 mm × 100 steps/mm = 2540 steps.
     assert_eq!(target, [2540, 0, 0]);
   }
@@ -799,25 +960,214 @@ mod tests {
     // Move to X10 absolute first so the position advances to 1000 steps.
     planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
     let axes = AxisWords { x: Some(2.5), y: None, z: None };
-    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Incremental);
+    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Incremental, false);
     // 1000 steps (10 mm) + 2.5 mm × 100 = 1250 steps.
     assert_eq!(target, [1250, 0, 0]);
   }
 
   #[test]
-  fn g92_offset_makes_current_position_read_commanded_value() {
+  fn work_offset_maps_absolute_work_words_to_machine() {
+    // The planner no longer owns G92 — the consumer computes the full WCO via `coords::CoordinateSystems` and
+    // pushes it here. The planner's job is to ADD that WCO to absolute work words. Push a WCO of (10, 20) so an
+    // absolute work (0, 0) resolves to machine (10, 20).
     let mut planner = Planner::new(test_config());
-    planner.plan_command(&mm_move(Some(10.0), Some(20.0), None, 600.0, false)).expect("queued");
-    // At machine (10, 20) declare the work position to be (0, 0); the offset becomes the machine pos.
-    let g92 = PlannerCommand::SetCoordinateOffset {
-      axes: AxisWords { x: Some(0.0), y: Some(0.0), z: None },
-      units: Units::Millimeter,
-    };
-    assert_eq!(planner.plan_command(&g92).expect("offset"), PlannerOutcome::OffsetUpdated);
-    // Now an absolute G0 X0 Y0 must map back to machine (10, 20) — i.e. produce no motion.
+    planner.set_work_offset([10.0, 20.0, 0.0]);
+    assert_eq!(planner.work_offset(), [10.0, 20.0, 0.0]);
     let axes = AxisWords { x: Some(0.0), y: Some(0.0), z: None };
-    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute);
+    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, false);
     assert_eq!(target, [1000, 2000, 0]);
+  }
+
+  #[test]
+  fn g53_machine_move_bypasses_the_work_offset() {
+    // A G53 one-shot move's words are MACHINE coordinates, so the WCO must NOT be applied: an absolute G53
+    // X0 Y0 resolves to machine (0, 0) even with a non-zero work offset set.
+    let mut planner = Planner::new(test_config());
+    planner.set_work_offset([10.0, 20.0, 0.0]);
+    let axes = AxisWords { x: Some(0.0), y: Some(0.0), z: None };
+    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, true);
+    assert_eq!(target, [0, 0, 0]);
+  }
+
+  #[test]
+  fn coordinate_op_passes_through_without_motion() {
+    // A coordinate op (here G92.1 clear) is passed through for the consumer to apply to the coordinate model;
+    // the planner produces no block and leaves the queue untouched.
+    let mut planner = Planner::new(test_config());
+    let op = CoordinateOp::ClearG92;
+    assert_eq!(
+      planner.plan_command(&PlannerCommand::Coordinate(op)).expect("passthrough"),
+      PlannerOutcome::Coordinate(op),
+    );
+    assert!(planner.is_empty());
+  }
+
+  // ---- Phase C: probe command resolution + position sync ----------------------------------------
+
+  #[test]
+  fn probe_resolves_work_target_to_machine_steps_and_flushes() {
+    use crate::gcode::ProbeKind;
+    let mut planner = Planner::new(test_config());
+    // A WCO of (0, 0, 50): an absolute work probe to Z-5 resolves to machine Z = -5 + 50 = 45 mm → 4500 steps.
+    planner.set_work_offset([0.0, 0.0, 50.0]);
+    // Queue a move first so the flush is observable (the probe must clear trailing junction state).
+    planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
+    let cmd = PlannerCommand::Probe {
+      kind: ProbeKind::G38_2,
+      axes: AxisWords { x: None, y: None, z: Some(-5.0) },
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed: 50.0,
+    };
+    let outcome = planner.plan_command(&cmd).expect("probe");
+    assert_eq!(
+      outcome,
+      PlannerOutcome::Probe {
+        kind: ProbeKind::G38_2,
+        target: [1000, 0, 4500],
+        feed: 50.0,
+        units: Units::Millimeter,
+      }
+    );
+    // A probe does NOT enqueue a block; the queue is unchanged (still holds the earlier move).
+    assert_eq!(planner.queued_len(), 1);
+  }
+
+  #[test]
+  fn sync_position_sets_commanded_position_to_the_probe_stop() {
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
+    // The executor latched a stop at machine Z = 4.2 mm → 420 steps; sync the commanded position to it.
+    planner.sync_position([0, 0, 420]);
+    assert_eq!(planner.position_steps(), [0, 0, 420]);
+    // The next absolute move resolves relative to the synced position (Z stays, X moves to 10).
+    let target = planner.resolve_target(
+      &AxisWords { x: Some(10.0), y: None, z: None },
+      Units::Millimeter,
+      DistanceMode::Absolute,
+      false,
+    );
+    assert_eq!(target, [1000, 0, 420]);
+  }
+
+  #[test]
+  fn probe_after_sync_starts_next_move_from_rest() {
+    use crate::gcode::ProbeKind;
+    let mut planner = Planner::new(test_config());
+    // Run a probe (flushes look-ahead), sync to the stop, then a following move must start from rest (no
+    // previous-block junction carried across the probe boundary).
+    planner
+      .plan_command(&PlannerCommand::Probe {
+        kind: ProbeKind::G38_2,
+        axes: AxisWords { x: None, y: None, z: Some(-5.0) },
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 50.0,
+      })
+      .expect("probe");
+    planner.sync_position([0, 0, 420]);
+    planner.plan_command(&mm_move(Some(0.0), None, Some(10.0), 600.0, false)).expect("queued");
+    let block = planner.peek_block().expect("a block");
+    assert!(block.entry_speed_sq < 1e-3, "the post-probe move starts at rest");
+  }
+
+  // ---- Phase D: jog planning, tagging, flush, and soft-limit rejection ---------------------------
+
+  fn jog(x: Option<f32>, y: Option<f32>, z: Option<f32>, feed: f32, machine_coords: bool) -> JogCommand {
+    JogCommand {
+      axes: AxisWords { x, y, z },
+      distance_mode: DistanceMode::Absolute,
+      units: Units::Millimeter,
+      feed,
+      machine_coords,
+    }
+  }
+
+  #[test]
+  fn plan_jog_enqueues_a_jog_tagged_block_resolved_through_the_work_offset() {
+    let mut planner = Planner::new(test_config());
+    // An absolute work jog with a WCO of (10, 0, 0): work X0 resolves to machine X10 → 1000 steps.
+    planner.set_work_offset([10.0, 0.0, 0.0]);
+    let outcome = planner.plan_jog(&jog(Some(0.0), None, None, 600.0, false), None).expect("jog");
+    assert_eq!(outcome, PlannerOutcome::Queued { blocks: 1 });
+    let block = planner.peek_block().expect("a jog block");
+    assert!(block.jog, "the block is tagged as a jog so a jog-cancel can flush it");
+    assert_eq!(block.steps, [1000, 0, 0]);
+  }
+
+  #[test]
+  fn plan_jog_g53_bypasses_the_work_offset() {
+    let mut planner = Planner::new(test_config());
+    planner.set_work_offset([10.0, 20.0, 0.0]);
+    // A G53 jog's words are MACHINE coordinates: machine X-5 resolves to -500 steps regardless of the WCO.
+    let outcome = planner.plan_jog(&jog(Some(-5.0), None, None, 600.0, true), None).expect("jog");
+    assert_eq!(outcome, PlannerOutcome::Queued { blocks: 1 });
+    assert_eq!(planner.peek_block().expect("block").steps, [-500, 0, 0]);
+  }
+
+  #[test]
+  fn flush_jog_blocks_drains_only_jog_blocks() {
+    let mut planner = Planner::new(test_config());
+    // Enqueue a program move first (NOT a jog), then two jogs behind it. A flush must remove ONLY the two jog
+    // blocks from the back, leaving the program block intact.
+    planner.plan_command(&mm_move(Some(1.0), None, None, 600.0, false)).expect("move");
+    planner.plan_jog(&jog(Some(2.0), None, None, 600.0, false), None).expect("jog");
+    planner.plan_jog(&jog(Some(3.0), None, None, 600.0, false), None).expect("jog");
+    assert_eq!(planner.queued_len(), 3);
+    let flushed = planner.flush_jog_blocks();
+    assert_eq!(flushed, 2, "exactly the two jog blocks are flushed");
+    assert_eq!(planner.queued_len(), 1, "the program block survives");
+    assert!(!planner.peek_block().expect("block").jog, "the surviving block is the program move");
+  }
+
+  #[test]
+  fn flush_jog_blocks_on_an_all_jog_queue_empties_it() {
+    let mut planner = Planner::new(test_config());
+    planner.plan_jog(&jog(Some(1.0), None, None, 600.0, false), None).expect("jog");
+    planner.plan_jog(&jog(Some(2.0), None, None, 600.0, false), None).expect("jog");
+    assert_eq!(planner.flush_jog_blocks(), 2);
+    assert!(planner.is_empty());
+  }
+
+  #[test]
+  fn plan_jog_rejects_a_target_outside_the_soft_limit_envelope() {
+    let mut planner = Planner::new(test_config());
+    // 100 steps/mm; a 50 mm travel envelope means machine [-50, 0] mm. A jog to machine X+10 (positive → past
+    // the home end) violates, and a jog to X-60 (past -max_travel) violates; a jog to X-25 is accepted.
+    let limits = SoftLimits { max_travel_mm: [50.0; AXES] };
+    assert_eq!(
+      planner.plan_jog(&jog(Some(10.0), None, None, 600.0, true), Some(limits)),
+      Err(PlannerError::JogExceedsTravel),
+    );
+    assert!(planner.is_empty(), "a rejected jog enqueues nothing");
+    assert_eq!(
+      planner.plan_jog(&jog(Some(-60.0), None, None, 600.0, true), Some(limits)),
+      Err(PlannerError::JogExceedsTravel),
+    );
+    planner.plan_jog(&jog(Some(-25.0), None, None, 600.0, true), Some(limits)).expect("in-envelope jog");
+    assert_eq!(planner.queued_len(), 1);
+  }
+
+  #[test]
+  fn plan_jog_ignores_soft_limits_when_disabled() {
+    let mut planner = Planner::new(test_config());
+    // With `$20` off (limits = None) even an out-of-envelope jog is accepted (grbl only checks when enabled).
+    planner.plan_jog(&jog(Some(10.0), None, None, 600.0, true), None).expect("jog");
+    assert_eq!(planner.queued_len(), 1);
+  }
+
+  #[test]
+  fn soft_limit_violation_envelope() {
+    let steps_per_mm = [100.0; AXES];
+    let max_travel = [50.0; AXES];
+    // Inside the [-50, 0] mm envelope (machine coordinates ≤ 0): accepted.
+    assert!(!soft_limit_violation(&[0, -2500, -5000], &steps_per_mm, &max_travel));
+    // A positive target (past the home end) violates.
+    assert!(soft_limit_violation(&[100, 0, 0], &steps_per_mm, &max_travel));
+    // Past -max_travel violates.
+    assert!(soft_limit_violation(&[0, -5200, 0], &steps_per_mm, &max_travel));
+    // Exactly at the -max_travel boundary is accepted (one-step rounding tolerance).
+    assert!(!soft_limit_violation(&[-5000, 0, 0], &steps_per_mm, &max_travel));
   }
 
   // ---- Block geometry: unit vector, mm travel, dominant axis ------------------------------------
@@ -1112,6 +1462,7 @@ mod tests {
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
+      machine_coords: false,
     }
   }
 
@@ -1182,6 +1533,7 @@ mod tests {
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
+      machine_coords: false,
     })
     .expect("queued");
     let first_cw = cw.peek_block().expect("a block");
@@ -1211,7 +1563,7 @@ mod tests {
     // Path A: recalculate after every segment (the pre-refactor behavior).
     let mut per_segment = Planner::new(test_config());
     for &target in &chain {
-      let n = per_segment.enqueue_move(target, feed, Units::Millimeter, false).expect("enqueued");
+      let n = per_segment.enqueue_move(target, feed, Units::Millimeter, false, false).expect("enqueued");
       assert_eq!(n, 1, "each chain step is a real move");
       per_segment.recalculate();
     }
@@ -1219,7 +1571,7 @@ mod tests {
     // Path B: enqueue every segment, then recalculate exactly once (the refactored arc behavior).
     let mut once = Planner::new(test_config());
     for &target in &chain {
-      once.enqueue_move(target, feed, Units::Millimeter, false).expect("enqueued");
+      once.enqueue_move(target, feed, Units::Millimeter, false, false).expect("enqueued");
     }
     once.recalculate();
 
@@ -1248,6 +1600,7 @@ mod tests {
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
+      machine_coords: false,
     };
     assert_eq!(planner.plan_command(&arc), Err(PlannerError::InvalidArc));
   }

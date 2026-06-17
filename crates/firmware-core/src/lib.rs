@@ -12,6 +12,7 @@
 //! and host-tested. The remaining subsystems are documented stubs awaiting their DOC-referenced
 //! implementations.
 
+pub mod coords;
 pub mod drivers;
 pub mod gcode;
 pub mod hal_traits;
@@ -19,3 +20,4 @@ pub mod motion;
 pub mod planner;
 pub mod protocol;
 pub mod settings;
+pub mod storage_frame;

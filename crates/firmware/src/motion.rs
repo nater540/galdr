@@ -15,7 +15,8 @@
 //! three channel transmits (the hardware then runs them concurrently and sample-aligned), then blocking-waits
 //! all three before returning. Blocking core 1 for a sub-millisecond burst is the intended design, not a
 //! stall — nothing else runs there. The only `.await` in the executor sits *between* blocks (awaiting
-//! [`BLOCK_AVAILABLE`](crate::comms::BLOCK_AVAILABLE) and, on a hold, [`CYCLE_START`](crate::comms::CYCLE_START)).
+//! [`BLOCK_AVAILABLE`](crate::comms::BLOCK_AVAILABLE) and, on a hold, the [`HOLD_WAKE`](crate::comms::HOLD_WAKE)
+//! level-change wake that releases the park).
 //!
 //! ## What is compile-verified vs host-tested
 //! The RMT/PulseCode encoding and the core-1 executor glue touch esp-hal and are verified by the Xtensa
@@ -31,17 +32,19 @@
 use core::sync::atomic::Ordering;
 
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rmt::{Channel, PulseCode, Tx, TxChannelConfig, TxChannelCreator};
 use esp_hal::Blocking;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select, select4, Either, Either4};
 
-use firmware_core::hal_traits::{DirState, StepError, StepEvent, StepSink, MAX_SYMBOLS_PER_BURST};
-use firmware_core::motion::{silent_symbol_halves, MotionConfig, SegmentGenerator, StepCounter};
+use firmware_core::hal_traits::{probe_triggered, DirState, ProbeConfig, ProbeInput, StepError, StepEvent, StepSink, MAX_SYMBOLS_PER_BURST};
+use firmware_core::motion::{silent_symbol_halves, MotionConfig, ProbeStepper, SegmentGenerator, StepCounter};
 use firmware_core::planner::{Block, Planner, AXES};
 
 use crate::comms::{
-  BLOCK_AVAILABLE, CYCLE_START, FEED_HOLD, LIVE_POSITION, MOTION_RESET, MOTION_RESET_PENDING, PLANNER,
+  overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HOLD_REQUESTED, HOLD_WAKE,
+  LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
+  MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT,
 };
 
 /// One RMT TX channel per axis, indexed `[X, Y, Z]`. The blocking transmit API consumes the channel and
@@ -130,6 +133,30 @@ impl RmtStepSink {
     // length, and it must be last so transmission stops exactly at the end of the encoded ticks.
     self.scratch[axis][ticks.len()] = PulseCode::end_marker();
     ticks.len() + 1
+  }
+}
+
+/// The RMT-adjacent probe digital input (DOC-09, Phase C): a single GPIO (PROBE, GPIO21 — see [`init_probe`])
+/// read as the raw electrical level. The `$6` invert is applied by the host-tested
+/// [`probe_triggered`](firmware_core::hal_traits::probe_triggered), so this carries no settings knowledge — it
+/// just reports the pin level. `$19` (pull-up disable) is honored at pin config in [`init_probe`].
+pub struct RmtProbeInput {
+  /// The PROBE input pin, configured with (or without, per `$19`) the internal pull-up at bring-up.
+  pin: Input<'static>,
+}
+
+impl RmtProbeInput {
+  /// Wrap a configured probe input pin.
+  pub fn new(pin: Input<'static>) -> Self {
+    RmtProbeInput { pin }
+  }
+}
+
+impl ProbeInput for RmtProbeInput {
+  /// The raw electrical level of the probe pin: `true` = high. The trigger decision (with `$6` invert) is made by
+  /// [`probe_triggered`](firmware_core::hal_traits::probe_triggered) in the probe cycle, not here.
+  fn is_high(&self) -> bool {
+    self.pin.is_high()
   }
 }
 
@@ -239,21 +266,41 @@ impl StepSink for RmtStepSink {
 /// 1. Service a pending soft reset (dedicated [`MOTION_RESET`] / [`MOTION_RESET_PENDING`], NOT the shared
 ///    `SOFT_RESET` — an embassy `Signal` wakes one waiter, so the executor needs its own — Finding #3):
 ///    zero the live position so MPos returns to the origin in step with the consumer's pipeline reset.
-/// 2. At each block boundary (never mid-burst), honor a feed-hold: if [`FEED_HOLD`](crate::comms::FEED_HOLD)
-///    is set, drain any stale latched [`CYCLE_START`](crate::comms::CYCLE_START) (Finding #8) then await a
-///    fresh one before running the block. A reset releases the hold.
+/// 2. At each block boundary (never mid-burst), honor the hold LEVEL: while [`HOLD_REQUESTED`](crate::comms::
+///    HOLD_REQUESTED) is set, PARK — acknowledge the park via [`MOTION_PARKED`](crate::comms::MOTION_PARKED) so
+///    the consumer's quiesce primitive observes a real "parked" fact (Finding #11/#3), then wait on
+///    [`HOLD_WAKE`](crate::comms::HOLD_WAKE) and re-read the level (a `~` resume / `$SLP`-then-reset clears it).
+///    The level is authoritative and re-read every wake, so a hold can never be missed or drained-as-stale, and
+///    a legitimate cycle-start can never be discarded (Finding #11). A reset also breaks the park.
 /// 3. Pop the next block under the planner lock, peeking the following block's `entry_speed_sq` as this
 ///    block's `exit_speed_sq` (0.0 when the queue holds only this block, so it stops at rest). Release the
 ///    lock BEFORE any RMT transmit — the planner mutex is never held across step emission.
-/// 4. If the queue was empty, await [`BLOCK_AVAILABLE`](crate::comms::BLOCK_AVAILABLE) rather than polling,
-///    racing [`MOTION_RESET`] so a `0x18` wakes the executor promptly.
+/// 4. If the queue was empty, honor the hold level FIRST (so a hold latched while idle still parks and is
+///    acknowledged — Finding #2), then await [`BLOCK_AVAILABLE`](crate::comms::BLOCK_AVAILABLE) rather than
+///    polling, racing [`MOTION_RESET`] so a `0x18` wakes the executor promptly, [`HOLD_WAKE`] so a hold latched
+///    while waiting parks promptly, AND [`PROBE_REQUEST`](crate::comms::PROBE_REQUEST) so a `G38.x` probe runs
+///    once the queue has fully drained. Servicing the probe only in the empty-queue branch keeps it strictly
+///    AFTER any blocks queued before it (the consumer flushes look-ahead when issuing a probe, so no NEW blocks
+///    follow it) — the probe is a synchronized boundary, never reordered.
 /// 5. Run the block synchronously through the [`SegmentGenerator`], advancing the live [`StepCounter`] and
 ///    publishing the live step position into the [`LIVE_POSITION`] atomics after EACH burst (so MPos is live
 ///    within a long block, not frozen until the block ends — Finding #5). A reset pending between bursts
 ///    aborts the block early via a sink error, then the next loop iteration zeroes the position.
-pub async fn run(sink: &mut RmtStepSink, config: MotionConfig) -> ! {
+/// 6. A probe ([`run_probe`]) walks a probe block one tick per burst, sampling the probe input between every
+///    step and stopping on the expected edge, then publishes the latched stop position + outcome via
+///    [`PROBE_RESULT`](crate::comms::PROBE_RESULT) for the consumer to turn into `[PRB:]` / position sync / alarm.
+pub async fn run(
+  sink: &mut RmtStepSink,
+  probe: &mut RmtProbeInput,
+  config: MotionConfig,
+  max_rate_mm_min: [f32; AXES],
+) -> ! {
   let generator = SegmentGenerator::new(config);
+  let prober = ProbeStepper::new(config);
   let mut counter = StepCounter::new();
+  // The most-restrictive axis max-rate in mm/s — the conservative ceiling the Phase-E feed-override scale-up is
+  // clamped to (squared, since the generator reasons in v²), so a boosted feed never exceeds `$110-112`.
+  let max_rate_mm_s = min_max_rate_mm_s(&max_rate_mm_min);
   loop {
     // Service a pending soft reset at the top of the loop: drop the live position so MPos returns to the
     // origin in step with the consumer's pipeline reset. `MOTION_RESET_PENDING` is the poll-able flag the
@@ -264,20 +311,15 @@ pub async fn run(sink: &mut RmtStepSink, config: MotionConfig) -> ! {
       reset_live_position(&mut counter);
     }
 
-    // Honor a feed-hold at the block boundary: pause until cycle-start. Checking here (never mid-block)
-    // matches DOC-02 — a burst in flight is never split. Drain any STALE latched cycle-start first (Finding
-    // #8): a `~` that arrived while no hold was pending must not auto-release this fresh hold, so we clear it
-    // before awaiting a genuinely new one. A soft reset also releases the hold.
-    if FEED_HOLD.try_take().is_some() {
-      CYCLE_START.try_take();
-      match select(CYCLE_START.wait(), MOTION_RESET.wait()).await {
-        Either::First(()) => {}
-        Either::Second(()) => {
-          MOTION_RESET_PENDING.store(false, Ordering::Release);
-          reset_live_position(&mut counter);
-          continue;
-        }
-      }
+    // Honor the hold LEVEL at the block boundary (never mid-block — a burst in flight is never split, matching
+    // DOC-02): while `HOLD_REQUESTED` is set, PARK until it clears. `park_on_hold` pulses `MOTION_PARKED` so the
+    // consumer's quiesce primitive observes a real "parked" acknowledgment (Finding #11/#3), then waits on
+    // `HOLD_WAKE` and re-reads the LEVEL — a `~` resume (or a `$SLP`-then-reset) clears it, and the LEVEL being
+    // authoritative is what makes a hold impossible to miss and a legitimate resume impossible to discard. A
+    // pending soft reset breaks the park; loop back to service it at the top.
+    if HOLD_REQUESTED.load(Ordering::Acquire) {
+      park_on_hold().await;
+      continue;
     }
 
     // Pop the next block and peek the one after it for the exit speed, all under one short lock, releasing
@@ -291,16 +333,74 @@ pub async fn run(sink: &mut RmtStepSink, config: MotionConfig) -> ! {
     };
 
     match popped {
-      Some((block, exit_speed_sq)) => run_block(&generator, &block, exit_speed_sq, sink, &mut counter),
-      // Queue empty: await a freshly enqueued block instead of polling, racing the dedicated motion reset so
-      // a reset arriving while idle is observed promptly (it zeroes the position on the next iteration).
-      None => match select(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait()).await {
-        Either::First(()) => {}
-        Either::Second(()) => {
+      Some((block, exit_speed_sq)) => {
+        // Publish "a block is in flight" so `status_responder` reports `Run` for the whole duration of this
+        // block — including the tail after the queue drained but the last burst is still emitting. Cleared
+        // when the block finishes (or aborts). `AcqRel`/`Acquire` publishes the flag to the core-0 reporter.
+        EXECUTOR_RUNNING.store(true, Ordering::Release);
+        run_block(&generator, &block, exit_speed_sq, max_rate_mm_s, sink, &mut counter);
+        // Motion stopped (block finished or aborted): zero the published programmed feed so `FS:` reads 0 while
+        // idle. The next block republishes it. The override-scaled REALIZED feed is computed by the reporter.
+        LIVE_PROGRAMMED_FEED_MM_MIN.store(0, Ordering::Release);
+        EXECUTOR_RUNNING.store(false, Ordering::Release);
+      }
+      // Queue empty: await a freshly enqueued block instead of polling, racing the dedicated motion reset (so a
+      // reset while idle is observed promptly), the hold-level wake (so a hold latched while idle is honored —
+      // the executor loops back to `park_on_hold` rather than running the next block — Finding #2), AND a probe
+      // request (so a `G38.x` issued while the executor is idle — the common case, since the consumer flushes
+      // look-ahead before a probe — wakes it immediately). The probe request `wait()` CONSUMES the request, so
+      // it is run inline here rather than looped back to the top-of-loop `try_take` (which would find it gone).
+      None => match select4(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait(), HOLD_WAKE.wait(), PROBE_REQUEST.wait()).await {
+        Either4::First(()) => {}
+        Either4::Second(()) => {
           MOTION_RESET_PENDING.store(false, Ordering::Release);
           reset_live_position(&mut counter);
         }
+        // A hold-level change while idle: loop back so the top-of-loop hold check re-reads the LEVEL and parks if
+        // it is set (or simply proceeds if a spurious wake found it clear). Re-reading the level — never acting on
+        // the edge — is the Finding #11 invariant.
+        Either4::Third(()) => {}
+        Either4::Fourth(request) => run_probe(&prober, &request, probe, sink, &mut counter),
       },
+    }
+  }
+}
+
+/// Park the executor on the hold LEVEL until it clears (or a soft reset breaks the park). This is the executor
+/// side of the level-based hold/resume protocol (Finding #11): it first PUBLISHES the park acknowledgment via
+/// [`MOTION_PARKED`] so the consumer's [`quiesce_executor`](crate::comms::quiesce_executor) primitive observes a
+/// real "the executor has parked" fact — closing the race jog-cancel/probe-abort previously had with the
+/// `EXECUTOR_RUNNING` clear (Finding #3) — then loops waiting on [`HOLD_WAKE`] and RE-READING the authoritative
+/// [`HOLD_REQUESTED`] level each wake. Re-reading the level (never acting on an edge) is what makes a hold
+/// impossible to miss and a legitimate cycle-start resume impossible to drain-as-stale.
+///
+/// `EXECUTOR_RUNNING` is already false here (the boundary check runs only after a block finished or from idle),
+/// so the reporter sees the latched control state (`Hold`/`Sleep`) drive the wire state, never a phantom `Run`.
+/// A pending soft reset breaks the park immediately: the caller loops back to the top to service the reset
+/// (which clears the level and zeroes the live position), so the executor never stays parked across a warm
+/// reset (Finding #2).
+async fn park_on_hold() {
+  // Acknowledge the park exactly once per entry, AFTER the level has been observed set, so a waiter in
+  // `quiesce_executor` that raised the level then awaited the ack is released the moment the executor rests.
+  MOTION_PARKED.signal(());
+  loop {
+    // A soft reset latched while parked must win immediately: zero the position and let the caller service it.
+    if MOTION_RESET_PENDING.load(Ordering::Acquire) {
+      return;
+    }
+    // The level cleared (a `~` resume or the reset-path clear): leave the park and run the next block.
+    if !HOLD_REQUESTED.load(Ordering::Acquire) {
+      return;
+    }
+    // Wait for a level change (or a reset wake) rather than spinning. The level is re-read at the top of the
+    // loop after every wake, so a coalesced or spurious `HOLD_WAKE` is harmless.
+    match select(HOLD_WAKE.wait(), MOTION_RESET.wait()).await {
+      Either::First(()) => {}
+      Either::Second(()) => {
+        // A reset broke the park: leave `MOTION_RESET_PENDING` set so the top-of-loop reset service runs (it
+        // drains `MOTION_RESET` and zeroes the position). Returning here lets the caller `continue` to it.
+        return;
+      }
     }
   }
 }
@@ -315,13 +415,41 @@ fn take_block(planner: &mut Planner) -> Option<(Block, f32)> {
   Some((block, exit_speed_sq))
 }
 
-/// Realize one block through the generator while advancing the live step counter. The counter is fed in
-/// lock-step with the sink: `set_direction` latches the per-axis sign from the block, and each emitted
-/// [`StepEvent`] advances the counter and publishes the live position into [`LIVE_POSITION`] per burst — so
-/// the live MPos mirrors exactly what the RMT channels emit, updated within the block rather than only at its
-/// end. A generator/sink error (including a soft-reset abort tested between bursts) abandons the block; the
-/// next status report still reflects the steps published so far.
-fn run_block(generator: &SegmentGenerator, block: &Block, exit_speed_sq: f32, sink: &mut RmtStepSink, counter: &mut StepCounter) {
+/// Realize one block through the generator while advancing the live step counter, applying the LIVE feed/rapid
+/// override (Phase E). The counter is fed in lock-step with the sink: `set_direction` latches the per-axis sign
+/// from the block, and each emitted [`StepEvent`] advances the counter and publishes the live position into
+/// [`LIVE_POSITION`] per burst — so the live MPos mirrors exactly what the RMT channels emit, updated within the
+/// block rather than only at its end. A generator/sink error (including a soft-reset abort tested between bursts)
+/// abandons the block; the next status report still reflects the steps published so far.
+///
+/// The override is read from the shared [`overrides`] HERE, per block, so a `0x91`/`0x9B` arriving while the
+/// queue runs takes effect on the very next block without re-planning (grbl applies overrides in the stepper).
+/// A G0 rapid scales by the rapid override; a feed/jog move scales by the feed override and is clamped to the
+/// axis max-rate ceiling (`max_rate_mm_s`, squared) so a boost never exceeds `$110-112`. The PROGRAMMED nominal
+/// feed (rapid max-rate for a G0, feed nominal otherwise) is published into [`LIVE_PROGRAMMED_FEED_MM_MIN`] +
+/// [`LIVE_BLOCK_IS_RAPID`] so the reporter renders the override-scaled REALIZED `FS:` feed.
+fn run_block(
+  generator: &SegmentGenerator,
+  block: &Block,
+  exit_speed_sq: f32,
+  max_rate_mm_s: f32,
+  sink: &mut RmtStepSink,
+  counter: &mut StepCounter,
+) {
+  // Read the live overrides once for this block and pick the scale: a rapid (G0) uses the rapid override, a
+  // feed/jog move uses the feed override. Both are percentages; the generator takes a fraction.
+  let ov = overrides();
+  let override_pct = if block.rapid { ov.rapid } else { ov.feed };
+  let override_scale = override_pct as f32 / 100.0;
+  // The squared max-rate ceiling the scale-up clamps to. A rapid is already at the max-rate and the rapid
+  // override only scales DOWN, so it needs no extra ceiling (INFINITY); a feed move clamps to the axis max-rate.
+  let max_speed_sq = if block.rapid { f32::INFINITY } else { max_rate_mm_s * max_rate_mm_s };
+
+  // Publish the PROGRAMMED nominal feed (mm/min) and the rapid flag so the reporter can render the realized feed.
+  // The block stores nominal speed as mm/s; convert to mm/min for the `FS:` units.
+  LIVE_PROGRAMMED_FEED_MM_MIN.store((block.nominal_speed() * 60.0).to_bits(), Ordering::Release);
+  LIVE_BLOCK_IS_RAPID.store(block.rapid, Ordering::Relaxed);
+
   // Latch the live counter's direction from the same step signs the generator latches onto the sink, so the
   // counter advances each axis the correct way. A zero-length block never steps, so this is harmless then.
   counter.set_direction(DirState {
@@ -331,7 +459,114 @@ fn run_block(generator: &SegmentGenerator, block: &Block, exit_speed_sq: f32, si
   // The generator returns the tick count or a recoverable error; on error we simply stop emitting this
   // block. The error is not surfaced upward because Stage 1 has no alarm state machine yet (DOC-06/Stage 2);
   // the abandoned block leaves the machine where the last published burst put it, which the live MPos shows.
-  let _ = generator.run_block(block, exit_speed_sq, &mut tracking);
+  let _ = generator.run_block_scaled(block, exit_speed_sq, override_scale, max_speed_sq, &mut tracking);
+}
+
+/// The most-restrictive (smallest) per-axis max-rate in mm/SECOND, the conservative ceiling the Phase-E feed
+/// override scale-up is clamped to. A non-positive / empty set yields `f32::INFINITY` (no clamp) so a degenerate
+/// setting cannot pin motion to zero. Computed once in [`run`] from the `$110-112` mm/min rates.
+fn min_max_rate_mm_s(max_rate_mm_min: &[f32; AXES]) -> f32 {
+  let min_mm_min = max_rate_mm_min
+    .iter()
+    .copied()
+    .filter(|r| r.is_finite() && *r > 0.0)
+    .fold(f32::INFINITY, f32::min);
+  if min_mm_min.is_finite() {
+    min_mm_min / 60.0
+  } else {
+    f32::INFINITY
+  }
+}
+
+/// Run one `G38.x` probe cycle (Phase C): build a probe block from the live position to the request `target`,
+/// walk it one tick at a time through the [`ProbeStepper`] while WATCHING the probe input between every step, and
+/// publish the latched stop position + outcome back to the consumer via [`PROBE_RESULT`].
+///
+/// The probe is sampled by reading the raw pin level and applying the request's `$6` invert through the
+/// host-tested [`probe_triggered`]; the `toward`/away sense picks the stop edge (trigger for a toward probe,
+/// release for an away probe). The live [`StepCounter`] advances in lock-step (through the same [`CountingSink`]
+/// that publishes the live MPos per burst), so the stop position is published live as the probe moves and the
+/// final latched steps are exactly where the probe stopped.
+///
+/// ## ALARM:4 already-at-edge detection
+/// For a TOWARD probe that is ALREADY triggered before the first step, the [`ProbeStepper`] returns a trigger
+/// with `steps_emitted == 0`; this surfaces as `already_at_edge` so the consumer maps it to `ALARM:4` (wrong
+/// initial state) rather than `ALARM:5`.
+///
+/// ## Sampling-resolution limit (hardware boundary, DOC-02)
+/// The probe is sampled at SINGLE-STEP granularity (between one-tick bursts) — the finest the RMT burst
+/// architecture allows, since a burst in flight cannot be preempted. Over-travel past the trigger is bounded by
+/// one step plus the in-flight burst's deceleration; the probe feed should be kept low (25-100 mm/min) to bound
+/// it, exactly as `docs/tlo-offsets.md` Finding #10 prescribes.
+fn run_probe(prober: &ProbeStepper, request: &ProbeRequest, probe: &RmtProbeInput, sink: &mut RmtStepSink, counter: &mut StepCounter) {
+  // Publish "running" so `?` reports `Run` (grbl shows `Run`/`Run:2` during a probe) for the cycle's duration.
+  EXECUTOR_RUNNING.store(true, Ordering::Release);
+
+  let start = counter.position_steps();
+  let block = probe_block_to(start, request.target);
+  let config = ProbeConfig { invert: request.invert, pullup_disable: false };
+
+  // The stop predicate: for a TOWARD probe stop when the probe TRIGGERS, for an AWAY probe when it RELEASES.
+  // Each sample also publishes the LOGICAL probe-asserted state (after `$6` invert) into [`PROBE_ASSERTED`] so
+  // the `Pn:P` status letter reflects the probe during the cycle (Phase E) — this is the one input continuously
+  // sampled today; continuous idle sampling of all inputs is a DOC-06 follow-up.
+  let toward = request.toward;
+  let mut at_stop_edge = || {
+    let triggered = probe_triggered(probe.is_high(), &config);
+    PROBE_ASSERTED.store(triggered, Ordering::Release);
+    if toward { triggered } else { !triggered }
+  };
+
+  // Track whether the very first sample was already at the stop edge, so the consumer can distinguish ALARM:4
+  // (already-at-edge) from ALARM:5 (no contact). `ProbeStepper` returns `steps_emitted == 0` with a trigger in
+  // that case, but we also need the raw position; the counter holds it.
+  let mut tracking = CountingSink { inner: sink, counter };
+  let outcome = prober.run_probe(&block, request.step_period_ticks, &mut at_stop_edge, &mut tracking);
+
+  // The latched stop position is exactly what the counter shows (the CountingSink advanced it per emitted step).
+  let stop_steps = counter.position_steps();
+  EXECUTOR_RUNNING.store(false, Ordering::Release);
+
+  // Map the stepper outcome to the consumer's success/alarm distinction. A probe that stops at the edge with ZERO
+  // steps was ALREADY at its expected stop edge before any motion — grbl's "probe not in the expected initial
+  // state" (ALARM:4): it is NOT a valid probe success, because the probe never moved onto the workpiece. We
+  // report it as `triggered = false` with `already_at_edge = true` so the consumer raises ALARM:4 (for an
+  // alarming mode) instead of acking a degenerate zero-travel "success".
+  let (triggered, already_at_edge) = match outcome {
+    Ok(o) if o.triggered && o.steps_emitted == 0 => (false, true),
+    Ok(o) => (o.triggered, false),
+    // A sink/config error abandons the probe; report a no-trigger so the consumer alarms (for an alarming mode)
+    // rather than fabricating a success. This mirrors `run_block`'s error tolerance.
+    Err(_) => (false, false),
+  };
+  PROBE_RESULT.signal(ProbeResult { triggered, stop_steps, already_at_edge });
+}
+
+/// Build a probe [`Block`] from the current machine position `start` (steps) to the probe `target` (steps). A
+/// probe runs at a constant feed (no trapezoid), so the block's speed fields are placeholders the [`ProbeStepper`]
+/// ignores — only the step deltas, dominant-axis count, and (for direction latching) the signs matter. The mm
+/// length is left at 1.0 as a non-zero placeholder (the prober uses the caller's fixed period, not the mm length).
+fn probe_block_to(start: [i32; AXES], target: [i32; AXES]) -> Block {
+  let mut steps = [0i32; AXES];
+  let mut step_event_count = 0u32;
+  for axis in 0..AXES {
+    steps[axis] = target[axis] - start[axis];
+    step_event_count = step_event_count.max(steps[axis].unsigned_abs());
+  }
+  Block {
+    steps,
+    step_event_count,
+    // The unit vector / mm length / speeds are unused by the probe stepper (it walks at a fixed period and exact
+    // integer Bresenham); set benign non-degenerate placeholders.
+    unit_vec: [0.0; AXES],
+    millimeters: 1.0,
+    acceleration: 1.0,
+    nominal_speed_sq: 1.0,
+    max_entry_speed_sq: 1.0,
+    entry_speed_sq: 0.0,
+    rapid: false,
+    jog: false,
+  }
 }
 
 /// A [`StepSink`] decorator that advances a [`StepCounter`] and publishes the live position as bursts pass
@@ -457,3 +692,18 @@ pub fn init(
 /// `$0`. DOC-02 cites a 2 µs practical minimum; 5 µs gives comfortable margin for the TMC2209 DIR-to-STEP
 /// setup without measurably slowing motion (incurred once per block, not per step).
 const DIR_SETUP_US: u32 = 5;
+
+/// Configure the PROBE digital input on GPIO21 (DOC-09, Phase C) and wrap it as an [`RmtProbeInput`]. The DOC-00
+/// GPIO manifest assigns no probe pin (it predates probing); GPIO21 is the first genuinely-free input pin
+/// (GPIO16/17 are the optional feed-hold/cycle-start inputs, GPIO18 is the spare RMT ch3), so it is chosen here
+/// for the dedicated probe input — kept separate from the limit switches as `docs/tlo-offsets.md` Finding #7
+/// requires. The internal pull-up is ENABLED unless `$19` (`pullup_disable`) is set: a passive touch plate needs
+/// the pull-up, so the default (`$19=0`) is pulled up. The `$6` invert is applied per-sample by the probe cycle,
+/// not at pin config.
+pub fn init_probe(probe_pin: esp_hal::peripherals::GPIO21<'static>, config: &ProbeConfig) -> RmtProbeInput {
+  // `$19=0` (the passive-plate default) keeps the internal pull-up; `$19=1` disables it (an externally-biased
+  // probe input). grbl's `$19` is exactly this pull-up-disable bit.
+  let pull = if config.pullup_disable { Pull::None } else { Pull::Up };
+  let input = Input::new(probe_pin, InputConfig::default().with_pull(pull));
+  RmtProbeInput::new(input)
+}

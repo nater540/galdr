@@ -39,6 +39,16 @@ pub enum GcodeError {
   ModalGroupViolation,
   /// `error:20` — an unsupported or unrecognized command word for the implemented GCode subset.
   UnsupportedCommand,
+  /// `error:23` — a `G38.x` probe command carried no axis word, so there is no direction to probe. grbl's
+  /// "G-code command in block requires axis words" — a probe must name at least one axis to move toward/away.
+  ProbeNoAxis,
+  /// `error:22` — a `$J=` jog (or a feed move) carried no `F` word, so the feed rate is undefined. grbl's
+  /// "Feed rate has not yet been set or is undefined" — a jog MUST name a feed; there is no modal feed for it.
+  FeedRateUndefined,
+  /// `error:23` — a `$J=` jog carried no axis word, so there is no direction to move. Same grbl class as
+  /// [`ProbeNoAxis`](GcodeError::ProbeNoAxis) ("G-code command in block requires axis words"); kept a distinct
+  /// variant so a jog rejection reads clearly at the call site, while sharing the wire code 23.
+  JogNoAxis,
 }
 
 impl GcodeError {
@@ -49,6 +59,9 @@ impl GcodeError {
       GcodeError::BadNumberFormat => 2,
       GcodeError::ModalGroupViolation => 9,
       GcodeError::UnsupportedCommand => 20,
+      GcodeError::ProbeNoAxis => 23,
+      GcodeError::FeedRateUndefined => 22,
+      GcodeError::JogNoAxis => 23,
     }
   }
 }
@@ -219,6 +232,41 @@ pub enum Units {
   Millimeter,
 }
 
+/// The four `G38.x` probe modes (DOC-09, `docs/tlo-offsets.md` §8, `docs/gcode-streaming.md` §9). Each pairs a
+/// direction sense with whether a failed probe ALARMS:
+/// - **G38.2** — probe TOWARD the workpiece, stop on contact; **error/ALARM if no contact** within the travel.
+/// - **G38.3** — probe toward, stop on contact; **no error** if no contact (the sender checks the `[PRB:]` flag).
+/// - **G38.4** — probe AWAY from the workpiece, stop on loss of contact; **error/ALARM if still in contact** at
+///   the end of travel.
+/// - **G38.5** — probe away, stop on loss of contact; **no error** if it never releases.
+///
+/// `toward` distinguishes the contact-seeking modes (.2/.3) from the release-seeking modes (.4/.5);
+/// `alarm_on_fail` distinguishes the alarming modes (.2/.4) from the silent ones (.3/.5). The executor uses
+/// `toward` to choose the stop edge (trigger vs release) and the consumer uses `alarm_on_fail` to decide whether
+/// a no-trigger outcome raises ALARM:4/5 or simply finishes with `[PRB:..:0]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ProbeKind {
+  /// `true` for the contact-seeking modes (G38.2/.3): stop the instant the probe TRIGGERS. `false` for the
+  /// release-seeking modes (G38.4/.5): stop the instant the probe RELEASES (loses contact).
+  pub toward: bool,
+  /// `true` for the alarming modes (G38.2/.4): a probe that reaches the target without the expected edge raises
+  /// ALARM (4 if it never moved off its initial state, 5 if it never reached the expected edge in travel).
+  /// `false` for the silent modes (G38.3/.5): a no-edge outcome just finishes with a `[PRB:..:0]` and one `ok`.
+  pub alarm_on_fail: bool,
+}
+
+impl ProbeKind {
+  /// The contact-seeking, alarming probe (G38.2) — the touch-plate default in `docs/tlo-offsets.md`.
+  pub const G38_2: ProbeKind = ProbeKind { toward: true, alarm_on_fail: true };
+  /// The contact-seeking, silent probe (G38.3).
+  pub const G38_3: ProbeKind = ProbeKind { toward: true, alarm_on_fail: false };
+  /// The release-seeking, alarming probe (G38.4).
+  pub const G38_4: ProbeKind = ProbeKind { toward: false, alarm_on_fail: true };
+  /// The release-seeking, silent probe (G38.5).
+  pub const G38_5: ProbeKind = ProbeKind { toward: false, alarm_on_fail: false };
+}
+
 /// Spindle state requested by a line (grbl modal group 7): M3/M4 start the spindle in a direction,
 /// M5 stops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +291,12 @@ pub struct ModalState {
   pub distance: DistanceMode,
   /// Active units (modal group 6).
   pub units: Units,
+  /// Active work coordinate system (modal group 12): 0 = G54 … 5 = G59. Sticky across lines and reported in
+  /// `$G` as `G54`…`G59`. The actual offset for the active WCS lives in [`crate::coords::CoordinateSystems`].
+  pub wcs: usize,
+  /// Active tool-length-offset mode (modal group 8): `true` when a dynamic `G43.1` TLO is in effect, `false`
+  /// after `G49`. Tracked for `$G` (`G43.1`/`G49`); the TLO value lives in the coordinate model.
+  pub tlo_active: bool,
   /// Last commanded feed rate (F word), in the active units per minute; sticky across lines.
   pub feed: f32,
   /// Last commanded spindle speed (S word), in RPM; sticky across lines.
@@ -255,6 +309,8 @@ impl Default for ModalState {
       motion: MotionMode::Rapid,
       distance: DistanceMode::Absolute,
       units: Units::Millimeter,
+      wcs: 0,
+      tlo_active: false,
       feed: 0.0,
       spindle_speed: 0.0,
     }
@@ -273,6 +329,89 @@ pub struct AxisWords {
   pub y: Option<f32>,
   /// Z target word, if present on the line.
   pub z: Option<f32>,
+}
+
+/// A coordinate-system / offset operation the parser emits for the Phase B words (G10, G54-G59, G92,
+/// G28.1/G30.1, G43.1/G49). These mutate the [`crate::coords::CoordinateSystems`] model the consumer owns,
+/// NOT the planner geometry directly — so they carry only the WORK-coordinate words and intent; the consumer
+/// resolves any "make the current machine position read this work value" op against the live machine position
+/// (which the parser does not have). All axis/offset values are raw, in the active units (the consumer scales
+/// inch→mm via [`Units`] before applying), so the parser stays a pure function of the line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum CoordinateOp {
+  /// `G54`-`G59` select the active work coordinate system. `index` is 0 = G54 … 5 = G59.
+  SelectWcs {
+    /// The selected WCS index (0 = G54 … 5 = G59).
+    index: usize,
+  },
+  /// `G10 L2 P<n>` set WCS `index` offset directly to the present axis words (the literal new offset).
+  SetWcsOffset {
+    /// The target WCS index (0 = G54 … 5 = G59), from the `P` word (`P1` = G54).
+    index: usize,
+    /// The new offset axis words (only present axes are written).
+    axes: AxisWords,
+    /// Active units for the offset words.
+    units: Units,
+  },
+  /// `G10 L20 P<n>` set WCS `index` offset so the current machine position maps to the present work words.
+  SetWcsOffsetToPosition {
+    /// The target WCS index (0 = G54 … 5 = G59), from the `P` word (`P1` = G54).
+    index: usize,
+    /// The work-coordinate target the current machine position should read back as.
+    axes: AxisWords,
+    /// Active units for the work words.
+    units: Units,
+  },
+  /// `G92` set the dynamic offset so the current machine position reads as the present work words.
+  SetG92ToPosition {
+    /// The work-coordinate target the current machine position should read back as.
+    axes: AxisWords,
+    /// Active units for the work words.
+    units: Units,
+  },
+  /// `G92.1` clear the G92 dynamic offset to identity.
+  ClearG92,
+  /// `G28.1`/`G30.1` store the current machine position as the predefined position `index` (0 = G28, 1 = G30).
+  StorePredefined {
+    /// 0 = G28 (via G28.1), 1 = G30 (via G30.1).
+    index: usize,
+  },
+  /// `G43.1 Z<value>` apply a dynamic tool-length offset from the Z word (in the active units).
+  ApplyTlo {
+    /// The Z tool-length-offset value (raw, in `units`).
+    z: f32,
+    /// Active units for the Z value.
+    units: Units,
+  },
+  /// `G49` cancel the dynamic tool-length offset.
+  CancelTlo,
+}
+
+/// A validated `$J=` jog command (DOC-08, `docs/gcode-streaming.md` §"jogging"). A jog is an independent,
+/// cancelable rapid-style move that, by grbl design, NEVER disturbs the persistent parser modal state — it is
+/// parsed in a throwaway modal context seeded from (but discarded back to) the current state, so a program left
+/// in `G91`/`G20` makes `$J=X10` incremental/inch without mutating `gc_state`. The fields carry exactly the raw
+/// words plus the throwaway modal flags the planner needs to resolve the target; `feed` is mandatory (a jog has
+/// no modal feed) and at least one axis must be present (otherwise [`GcodeError::JogNoAxis`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct JogCommand {
+  /// The jog target axis words present on the `$J=` line (at least one is present; the parser rejects a jog
+  /// with no axis word as [`GcodeError::JogNoAxis`]).
+  pub axes: AxisWords,
+  /// The throwaway distance mode (G90 absolute / G91 incremental) the jog resolves against — seeded from the
+  /// current persistent state and overridable by a `G90`/`G91` word on the jog line, but NOT written back.
+  pub distance_mode: DistanceMode,
+  /// The throwaway units mode (G20 inch / G21 mm) for the axis/feed words — seeded from the current state and
+  /// overridable by a `G20`/`G21` word on the jog line, but NOT written back.
+  pub units: Units,
+  /// The mandatory jog feed rate (`F` word), in `units` per minute. A jog with no `F` is rejected as
+  /// [`GcodeError::FeedRateUndefined`]: unlike a G1 move, a jog has no modal feed to fall back on.
+  pub feed: f32,
+  /// True when a `G53` word on the jog line makes the axis words MACHINE coordinates (the planner must NOT apply
+  /// the active work offset), false for an ordinary work-coordinate jog.
+  pub machine_coords: bool,
 }
 
 /// A validated command emitted to the planner (the payload of the parser→planner channel, DOC-04).
@@ -295,6 +434,9 @@ pub enum PlannerCommand {
     distance: DistanceMode,
     /// Active feed rate (modal F), in `units` per minute.
     feed: f32,
+    /// True when this is a `G53` one-shot machine-coordinate move: the axis words are MACHINE positions,
+    /// so the planner must NOT apply the active work offset. False for an ordinary work-coordinate move.
+    machine_coords: bool,
   },
   /// An arc move (G2/G3). `cw` distinguishes G2 from G3; `i`/`j` are the center offsets in the active
   /// units relative to the start point (grbl IJ arc form). Plane is fixed to G17 (XY) per DOC-04.
@@ -312,6 +454,28 @@ pub enum PlannerCommand {
     /// Active distance mode for the axis words.
     distance: DistanceMode,
     /// Active feed rate (modal F), in `units` per minute.
+    feed: f32,
+    /// True when this is a `G53` one-shot machine-coordinate arc: the endpoint words are MACHINE positions
+    /// (the planner must not apply the work offset). False for an ordinary work-coordinate arc.
+    machine_coords: bool,
+  },
+  /// A `G38.x` probe move (DOC-09). The axis words are the probe TARGET in the active work coordinate system —
+  /// the planner converts them to a machine target exactly like an absolute/incremental move (the WCO is applied
+  /// for an absolute work probe, an incremental probe adds to the current position). `kind` carries the
+  /// toward/away + alarm-on-fail semantics; `feed` is the probe feed (`F` word, modal). A probe is a synchronized
+  /// motion boundary: the planner flushes look-ahead so the probe starts from rest, and the firmware runs the
+  /// probe block on a distinct, probe-watching execution path (it is NOT a normal queued block).
+  Probe {
+    /// The probe mode (toward/away, alarm-on-fail) from `G38.2`/`.3`/`.4`/`.5`.
+    kind: ProbeKind,
+    /// The probe target axis words (work coordinates), at least one present — the parser rejects a probe with no
+    /// axis word as [`GcodeError::ProbeNoAxis`].
+    axes: AxisWords,
+    /// Active units for the axis/feed words.
+    units: Units,
+    /// Active distance mode for the axis words (absolute work target vs incremental from the current position).
+    distance: DistanceMode,
+    /// Active feed rate (modal F), in `units` per minute — the probe seek speed.
     feed: f32,
   },
   /// G4 dwell for `seconds` (the P word, always seconds regardless of units mode).
@@ -331,14 +495,10 @@ pub enum PlannerCommand {
     /// Active distance mode for the intermediate axis words.
     distance: DistanceMode,
   },
-  /// G92 set coordinate offset. The axis words define the offset applied so the current position
-  /// reads as the given values; resolution against current position is the planner's job.
-  SetCoordinateOffset {
-    /// Axis words defining the new offset.
-    axes: AxisWords,
-    /// Active units for the offset words.
-    units: Units,
-  },
+  /// A coordinate-system / offset operation (G10, G54-G59, G92, G28.1/G30.1, G43.1/G49). The planner passes
+  /// it through to the consumer (it does not move the machine); the consumer applies it to the shared
+  /// [`crate::coords::CoordinateSystems`] and pushes the recomputed WCO back into the planner.
+  Coordinate(CoordinateOp),
   /// M3/M4/M5 spindle control. `speed` carries the active modal S value for M3/M4.
   Spindle {
     /// Requested spindle state.
@@ -362,6 +522,13 @@ enum Group {
   Plane,
   Spindle,
   Stop,
+  /// Work-coordinate-system select (grbl modal group 12): G54-G59.
+  Coordinate,
+  /// Tool-length-offset mode (grbl modal group 8): G43.1 / G49.
+  ToolOffset,
+  /// Non-modal group 0 one-shot commands that share a line slot with motion: G10 / G28.1 / G30.1 / G92 / G92.1.
+  /// G53 is also group 0 but is a one-shot MODIFIER of a motion word, so it has its own flag, not this slot.
+  NonModal,
 }
 
 /// Tracks which modal groups have already been set on the current line so a repeat is rejected.
@@ -373,6 +540,9 @@ struct GroupGuard {
   plane: bool,
   spindle: bool,
   stop: bool,
+  coordinate: bool,
+  tool_offset: bool,
+  non_modal: bool,
 }
 
 impl GroupGuard {
@@ -386,6 +556,9 @@ impl GroupGuard {
       Group::Plane => &mut self.plane,
       Group::Spindle => &mut self.spindle,
       Group::Stop => &mut self.stop,
+      Group::Coordinate => &mut self.coordinate,
+      Group::ToolOffset => &mut self.tool_offset,
+      Group::NonModal => &mut self.non_modal,
     };
     if *slot {
       return Err(GcodeError::ModalGroupViolation);
@@ -403,13 +576,54 @@ impl GroupGuard {
 struct LineAccumulator {
   pending_predefined: Option<bool>, // Some(true) = G28, Some(false) = G30.
   pending_dwell: bool,
-  pending_set_offset: bool,
+  /// A pending `G38.x` probe (motion group 1). The axis/feed words are folded in at emit time; a probe with no
+  /// axis word is rejected as [`GcodeError::ProbeNoAxis`].
+  pending_probe: Option<ProbeKind>,
   pending_spindle: Option<SpindleState>,
   pending_program_end: bool,
+  /// A pending non-motion coordinate op (G10/G92/G92.1/G28.1/G30.1/G43.1/G49) that takes the whole line. The
+  /// WCS-select (G54-G59) is modal and does NOT use this slot — it updates `next_state.wcs` and emits its own
+  /// `SelectWcs` op only when the line carries no other action.
+  pending_coordinate: Option<PendingCoordinate>,
+  /// G53 one-shot machine-coordinate modifier for THIS line's motion words (group 0; modifies, not replaces).
+  machine_coords: bool,
+  /// True when a G54-G59 word selected a (possibly new) active WCS on this line. The active WCS is modal, but
+  /// a bare select line still emits a [`CoordinateOp::SelectWcs`] so the consumer can push the new WCO into the
+  /// planner; this flag tells `emit` to do so when no other action takes the line.
+  selected_wcs: bool,
+  /// `L` word value (the G10 sub-mode selector: `L2` literal offset, `L20` set-to-position).
+  l: Option<f32>,
   axes: AxisWords,
   i: Option<f32>,
   j: Option<f32>,
   p: Option<f32>,
+}
+
+impl LineAccumulator {
+  /// Whether this line carried any axis word (X/Y/Z). Used to reject a directionless `G38.x` probe and to decide
+  /// whether a line realizes the active motion mode.
+  fn has_axes(&self) -> bool {
+    self.axes.x.is_some() || self.axes.y.is_some() || self.axes.z.is_some()
+  }
+}
+
+/// A coordinate op staged on the current line before its words (axes / P / L) are known, resolved into a
+/// concrete [`CoordinateOp`] at emit time. Separated from [`CoordinateOp`] because the P/L/axis words can
+/// arrive in any order after the G-word that named the op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCoordinate {
+  /// `G10` — the L word (2 or 20) and P word are resolved at emit time into a literal or set-to-position op.
+  G10,
+  /// `G92` — set the dynamic offset to the current position (the axis words are the work target).
+  G92Set,
+  /// `G92.1` — clear the dynamic offset.
+  G92Clear,
+  /// `G28.1` / `G30.1` — store the current machine position as predefined `index` (0 = G28, 1 = G30).
+  StorePredefined { index: usize },
+  /// `G43.1` — apply a dynamic Z tool-length offset from the Z word.
+  ApplyTlo,
+  /// `G49` — cancel the dynamic tool-length offset.
+  CancelTlo,
 }
 
 /// The GCode parser. Holds the persistent [`ModalState`] and turns whole lines into at most one
@@ -450,9 +664,69 @@ impl Parser {
       self.apply_word(word, &mut guard, &mut acc, &mut next_state)?;
     }
 
-    let command = self.emit(&acc, &next_state);
+    // A `G38.x` probe MUST carry at least one axis word (the direction to probe); reject one that does not before
+    // committing the line's modal state, so a bare `G38.2` errors rather than emitting a directionless probe.
+    if acc.pending_probe.is_some() && !acc.has_axes() {
+      return Err(GcodeError::ProbeNoAxis);
+    }
+
+    // Build the command BEFORE committing `next_state`, passing the pre-line active WCS as the P-less `G10`
+    // fallback and surfacing a feed-undefined rejection. A rejected line leaves `self.state` untouched.
+    let command = self.emit(&acc, &next_state, self.state.wcs)?;
     self.state = next_state;
     Ok(command)
+  }
+
+  /// Parse a `$J=` jog line (the bytes AFTER the `$J=` prefix, CR/LF terminator already removed) into a
+  /// [`JogCommand`], using grbl's **seed-from-current-then-discard** modal rule.
+  ///
+  /// A throwaway [`ModalState`] is SEEDED from `self.state` so the jog inherits the program's current distance
+  /// (G90/G91) and units (G20/G21) — a program left in `G91`/`G20` makes `$J=X10` incremental/inch. The jog
+  /// line's own `G90`/`G91`/`G20`/`G21`/`G53` words override only WITHIN that throwaway context; every change is
+  /// DISCARDED, so the persistent `self.state` is left byte-for-byte untouched (a jog never mutates `gc_state`,
+  /// matching grbl — the parser is undisturbed by jogging). A jog MUST carry an `F` feed (there is no modal jog
+  /// feed → [`GcodeError::FeedRateUndefined`]) and at least one axis word (→ [`GcodeError::JogNoAxis`]); only
+  /// `G90/G91/G20/G21/G53`, the X/Y/Z axis words, and `F` are accepted — any other word is
+  /// [`GcodeError::UnsupportedCommand`].
+  pub fn parse_jog(&self, line: &[u8]) -> Result<JogCommand, GcodeError> {
+    // Seed the throwaway context from the persistent state, then fold the jog line's words into it WITHOUT ever
+    // writing back. `seen_feed` tracks the mandatory `F`; `machine_coords` the optional one-shot G53.
+    let mut ctx = self.state;
+    let mut axes = AxisWords::default();
+    let mut seen_feed = false;
+    let mut machine_coords = false;
+    let mut lexer = Lexer::new(line);
+    while let Some(word) = lexer.next_word() {
+      let word = word?;
+      match word.letter {
+        b'X' => axes.x = Some(word.value),
+        b'Y' => axes.y = Some(word.value),
+        b'Z' => axes.z = Some(word.value),
+        b'F' => {
+          ctx.feed = word.value;
+          seen_feed = true;
+        }
+        // Only the distance/units/G53 G-words are legal in a jog; everything else (motion modes, coordinate
+        // ops, spindle, …) is rejected so a jog stays a pure axis-target move. `g_code` rejects fractional and
+        // out-of-range codes; the integer arms below accept exactly grbl's jog-modifier subset.
+        b'G' => match g_code(word.value)? {
+          20 => ctx.units = Units::Inch,
+          21 => ctx.units = Units::Millimeter,
+          90 => ctx.distance = DistanceMode::Absolute,
+          91 => ctx.distance = DistanceMode::Incremental,
+          53 => machine_coords = true,
+          _ => return Err(GcodeError::UnsupportedCommand),
+        },
+        _ => return Err(GcodeError::UnsupportedCommand),
+      }
+    }
+    if !seen_feed {
+      return Err(GcodeError::FeedRateUndefined);
+    }
+    if axes.x.is_none() && axes.y.is_none() && axes.z.is_none() {
+      return Err(GcodeError::JogNoAxis);
+    }
+    Ok(JogCommand { axes, distance_mode: ctx.distance, units: ctx.units, feed: ctx.feed, machine_coords })
   }
 
   /// Fold a single lexed word into the per-line accumulator and staged modal state, enforcing modal
@@ -491,6 +765,10 @@ impl Parser {
         acc.p = Some(word.value);
         Ok(())
       }
+      b'L' => {
+        acc.l = Some(word.value);
+        Ok(())
+      }
       b'F' => {
         next_state.feed = word.value;
         Ok(())
@@ -503,8 +781,9 @@ impl Parser {
     }
   }
 
-  /// Apply a `G` word. The value is matched on its integer code; a non-integer or out-of-subset code
-  /// is [`GcodeError::UnsupportedCommand`].
+  /// Apply a `G` word. Fractional codes (G28.1, G30.1, G43.1, G59.1-.3, G92.1) are dispatched first by their
+  /// exact value; the remaining whole-number codes go through the integer match. Any code outside the
+  /// supported subset is [`GcodeError::UnsupportedCommand`].
   fn apply_g_word(
     &self,
     value: f32,
@@ -512,6 +791,11 @@ impl Parser {
     acc: &mut LineAccumulator,
     next_state: &mut ModalState,
   ) -> Result<(), GcodeError> {
+    // Resolve the fractional Phase B codes before the integer path: G code values like 28.1 / 43.1 / 92.1 are
+    // exact-matched against a scaled integer (×10) so f32 round-off cannot mis-classify them.
+    if let Some(result) = self.apply_fractional_g_word(value, guard, acc, next_state) {
+      return result;
+    }
     match g_code(value)? {
       0 => {
         guard.claim(Group::Motion)?;
@@ -536,6 +820,12 @@ impl Parser {
       4 => {
         guard.claim(Group::Motion)?;
         acc.pending_dwell = true;
+        Ok(())
+      }
+      10 => {
+        // G10 is a non-modal group-0 command; the L/P/axis words are resolved at emit time.
+        guard.claim(Group::NonModal)?;
+        acc.pending_coordinate = Some(PendingCoordinate::G10);
         Ok(())
       }
       17 => {
@@ -563,6 +853,27 @@ impl Parser {
         acc.pending_predefined = Some(false);
         Ok(())
       }
+      // G53 one-shot machine-coordinate modifier (non-modal group 0): the next move's words are machine
+      // coordinates. It modifies a motion word rather than taking the line, so it sets a flag and does NOT
+      // claim the motion group. grbl requires an explicit G0/G1 on the same line; the planner honors the flag.
+      53 => {
+        acc.machine_coords = true;
+        Ok(())
+      }
+      // G49 cancel the dynamic tool-length offset (modal group 8 tool-offset).
+      49 => {
+        guard.claim(Group::ToolOffset)?;
+        next_state.tlo_active = false;
+        acc.pending_coordinate = Some(PendingCoordinate::CancelTlo);
+        Ok(())
+      }
+      // G54-G59 select the active work coordinate system (modal group 12). Index 0 = G54 … 5 = G59.
+      54..=59 => {
+        guard.claim(Group::Coordinate)?;
+        next_state.wcs = (g_code(value)? - 54) as usize;
+        acc.selected_wcs = true;
+        Ok(())
+      }
       90 => {
         guard.claim(Group::Distance)?;
         next_state.distance = DistanceMode::Absolute;
@@ -573,13 +884,62 @@ impl Parser {
         next_state.distance = DistanceMode::Incremental;
         Ok(())
       }
+      // G92 (whole) — set the dynamic offset to the current position (group 0 non-modal).
       92 => {
-        guard.claim(Group::Motion)?;
-        acc.pending_set_offset = true;
+        guard.claim(Group::NonModal)?;
+        acc.pending_coordinate = Some(PendingCoordinate::G92Set);
         Ok(())
       }
       _ => Err(GcodeError::UnsupportedCommand),
     }
+  }
+
+  /// Dispatch the fractional Phase B `G` codes (G28.1, G30.1, G43.1, G49 has no fraction but G43.1 does, G92.1).
+  /// Returns `Some(result)` when `value` matched a fractional code (claiming the right group and staging the op)
+  /// and `None` when it is not a fractional code this subset knows, so the integer path can handle it. Matching
+  /// is done on `round(value × 10)` so f32 representation error (e.g. 28.1 stored as 28.0999994) cannot
+  /// mis-classify a code; a value within tolerance of an integer (`×10` ends in 0) is left for the integer path.
+  fn apply_fractional_g_word(
+    &self,
+    value: f32,
+    guard: &mut GroupGuard,
+    acc: &mut LineAccumulator,
+    next_state: &mut ModalState,
+  ) -> Option<Result<(), GcodeError>> {
+    let scaled = libm::roundf(value * 10.0);
+    // Reject only genuine fractional codes here; a whole-number code (×10 divisible by 10) belongs to the
+    // integer path. Guard against representation error the same way `g_code` does.
+    if libm::fabsf(value * 10.0 - scaled) > 1e-2 || (scaled as i32) % 10 == 0 {
+      return None;
+    }
+    let code = scaled as i32;
+    Some(match code {
+      // G28.1 / G30.1 store the current machine position as the predefined position (group 0 non-modal).
+      281 => guard
+        .claim(Group::NonModal)
+        .map(|()| acc.pending_coordinate = Some(PendingCoordinate::StorePredefined { index: 0 })),
+      301 => guard
+        .claim(Group::NonModal)
+        .map(|()| acc.pending_coordinate = Some(PendingCoordinate::StorePredefined { index: 1 })),
+      // G43.1 dynamic tool-length offset (group 8 tool-offset). The Z value is resolved at emit time, and the
+      // modal `tlo_active` flag is set so `$G` reports `G43.1`.
+      431 => guard.claim(Group::ToolOffset).map(|()| {
+        acc.pending_coordinate = Some(PendingCoordinate::ApplyTlo);
+        next_state.tlo_active = true;
+      }),
+      // G92.1 clear the dynamic offset (group 0 non-modal).
+      921 => guard
+        .claim(Group::NonModal)
+        .map(|()| acc.pending_coordinate = Some(PendingCoordinate::G92Clear)),
+      // G38.2/.3/.4/.5 probe moves (motion group 1). They share the motion slot like G0-G4, so a probe on the
+      // same line as another motion word is a modal-group violation. The axis/feed words are folded in at emit
+      // time; the toward/away + alarm-on-fail semantics ride in the staged [`ProbeKind`].
+      382 => guard.claim(Group::Motion).map(|()| acc.pending_probe = Some(ProbeKind::G38_2)),
+      383 => guard.claim(Group::Motion).map(|()| acc.pending_probe = Some(ProbeKind::G38_3)),
+      384 => guard.claim(Group::Motion).map(|()| acc.pending_probe = Some(ProbeKind::G38_4)),
+      385 => guard.claim(Group::Motion).map(|()| acc.pending_probe = Some(ProbeKind::G38_5)),
+      _ => Err(GcodeError::UnsupportedCommand),
+    })
   }
 
   /// Apply an `M` word from the supported subset (M3/M4/M5 spindle, M30 program end).
@@ -614,38 +974,78 @@ impl Parser {
   /// offset) takes the line; otherwise axis words realize the active motion mode; otherwise a spindle
   /// word emits a spindle command; a line with none of these yields `None`.
   ///
+  /// `pre_line_wcs` is the active WCS committed BEFORE the line began; it is the fallback for a P-less
+  /// `G10` so a same-line `G54`-`G59` select does not retarget the offset write (see [`resolve_coordinate`]).
+  ///
+  /// Returns [`GcodeError::FeedRateUndefined`] (error:22) when the line realizes a move that requires a feed
+  /// (a `G38.x` probe, or a G1/G2/G3 feed move) but no feed is defined (`feed <= 0`). G0 rapids do not need a
+  /// feed and are unaffected, matching grbl. The check sits at each affected emit point so it respects the
+  /// precedence above (e.g. a `G10`/dwell line that happens to have feed 0 is never rejected).
+  ///
   /// Per the DOC-04 subset each line emits at most one [`PlannerCommand`], so when a spindle word
   /// shares a line with a move (uncommon for PCB milling) the move is emitted and the S value / state
   /// persist in modal state for the spindle task to act on — the two are not fused into one command.
-  fn emit(&self, acc: &LineAccumulator, state: &ModalState) -> Option<PlannerCommand> {
+  fn emit(
+    &self,
+    acc: &LineAccumulator,
+    state: &ModalState,
+    pre_line_wcs: usize,
+  ) -> Result<Option<PlannerCommand>, GcodeError> {
     if acc.pending_program_end {
-      return Some(PlannerCommand::ProgramEnd);
+      return Ok(Some(PlannerCommand::ProgramEnd));
     }
     if acc.pending_dwell {
-      return Some(PlannerCommand::Dwell { seconds: acc.p.unwrap_or(0.0) });
+      return Ok(Some(PlannerCommand::Dwell { seconds: acc.p.unwrap_or(0.0) }));
     }
     if let Some(is_g28) = acc.pending_predefined {
-      return Some(PlannerCommand::GoToPredefined {
+      return Ok(Some(PlannerCommand::GoToPredefined {
         is_g28,
         intermediate: acc.axes,
         units: state.units,
         distance: state.distance,
-      });
+      }));
     }
-    if acc.pending_set_offset {
-      return Some(PlannerCommand::SetCoordinateOffset { axes: acc.axes, units: state.units });
+    if let Some(pending) = acc.pending_coordinate {
+      return Ok(Some(PlannerCommand::Coordinate(resolve_coordinate(pending, acc, state, pre_line_wcs))));
     }
-    let has_axes = acc.axes.x.is_some() || acc.axes.y.is_some() || acc.axes.z.is_some();
-    if has_axes {
-      return Some(self.motion_command(acc, state));
+    // A `G38.x` probe takes the line ahead of an ordinary move: it carries axis words but is NOT a Move (it has
+    // its own toward/away + alarm semantics). `parse_line` already guaranteed at least one axis word is present.
+    // A probe MUST have a defined feed (the seek speed); with feed 0 it would crawl, so grbl rejects it (error:22).
+    if let Some(kind) = acc.pending_probe {
+      if state.feed <= 0.0 {
+        return Err(GcodeError::FeedRateUndefined);
+      }
+      return Ok(Some(PlannerCommand::Probe {
+        kind,
+        axes: acc.axes,
+        units: state.units,
+        distance: state.distance,
+        feed: state.feed,
+      }));
+    }
+    if acc.has_axes() {
+      // G1/G2/G3 feed moves require a defined feed; G0 rapids run at rapid rate and do not. Reject a feed move
+      // with no defined feed (error:22) rather than crawling at feed 0; the modal feed (set on an earlier line)
+      // satisfies the check, so only a genuinely undefined feed is rejected.
+      if state.motion != MotionMode::Rapid && state.feed <= 0.0 {
+        return Err(GcodeError::FeedRateUndefined);
+      }
+      return Ok(Some(self.motion_command(acc, state)));
     }
     if let Some(spindle) = acc.pending_spindle {
-      return Some(PlannerCommand::Spindle { state: spindle, speed: state.spindle_speed });
+      return Ok(Some(PlannerCommand::Spindle { state: spindle, speed: state.spindle_speed }));
     }
-    None
+    // A bare WCS select (no move on the line) emits a SelectWcs op so the consumer can push the new WCO into
+    // the planner. When a select SHARES a line with a move, the move takes the line; the consumer keeps the
+    // active WCS in sync with the parser's modal `wcs` before planning, so the move still uses the right offset.
+    if acc.selected_wcs {
+      return Ok(Some(PlannerCommand::Coordinate(CoordinateOp::SelectWcs { index: state.wcs })));
+    }
+    Ok(None)
   }
 
-  /// Construct the move/arc command for a line carrying axis words, using the active motion mode.
+  /// Construct the move/arc command for a line carrying axis words, using the active motion mode and threading
+  /// the G53 one-shot machine-coordinate flag (`acc.machine_coords`) through to the planner.
   fn motion_command(&self, acc: &LineAccumulator, state: &ModalState) -> PlannerCommand {
     match state.motion {
       MotionMode::Rapid => PlannerCommand::Move {
@@ -654,6 +1054,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        machine_coords: acc.machine_coords,
       },
       MotionMode::Linear => PlannerCommand::Move {
         rapid: false,
@@ -661,6 +1062,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        machine_coords: acc.machine_coords,
       },
       MotionMode::ArcCw => PlannerCommand::Arc {
         cw: true,
@@ -670,6 +1072,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        machine_coords: acc.machine_coords,
       },
       MotionMode::ArcCcw => PlannerCommand::Arc {
         cw: false,
@@ -679,8 +1082,58 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        machine_coords: acc.machine_coords,
       },
     }
+  }
+}
+
+/// Resolve a staged [`PendingCoordinate`] into a concrete [`CoordinateOp`], folding in the line's P/L/axis
+/// words. The P word selects the WCS for `G10` (grbl `P1` = G54, so `index = P − 1`); the L word picks the
+/// `G10` sub-mode (`L2` literal offset, `L20` set-to-position, with `L2` the grbl default if absent). For an
+/// out-of-range / missing P the WCS defaults to `active_wcs_fallback`, which is the system that was active
+/// BEFORE the line began (the parser's committed modal `wcs`), matching grbl's "P0 / absent = active system"
+/// rule: a same-line `G54`-`G59` select does NOT retarget a P-less G10 (so `G56 G10 L2 X5` writes the pre-line
+/// system, not G56). An explicit, in-range P overrides the fallback entirely.
+fn resolve_coordinate(
+  pending: PendingCoordinate,
+  acc: &LineAccumulator,
+  state: &ModalState,
+  active_wcs_fallback: usize,
+) -> CoordinateOp {
+  match pending {
+    PendingCoordinate::G10 => {
+      let index = wcs_index_from_p(acc.p, active_wcs_fallback);
+      // L20 sets the offset so the current position reads the work words; L2 (and the default) sets it literally.
+      let is_l20 = matches!(acc.l, Some(l) if libm::roundf(l) as i32 == 20);
+      if is_l20 {
+        CoordinateOp::SetWcsOffsetToPosition { index, axes: acc.axes, units: state.units }
+      } else {
+        CoordinateOp::SetWcsOffset { index, axes: acc.axes, units: state.units }
+      }
+    }
+    PendingCoordinate::G92Set => CoordinateOp::SetG92ToPosition { axes: acc.axes, units: state.units },
+    PendingCoordinate::G92Clear => CoordinateOp::ClearG92,
+    PendingCoordinate::StorePredefined { index } => CoordinateOp::StorePredefined { index },
+    PendingCoordinate::ApplyTlo => CoordinateOp::ApplyTlo { z: acc.axes.z.unwrap_or(0.0), units: state.units },
+    PendingCoordinate::CancelTlo => CoordinateOp::CancelTlo,
+  }
+}
+
+/// Map a `G10 P<n>` word to a WCS index: grbl numbers `P1` = G54 … `P6` = G59, so `index = P − 1`. A missing
+/// or out-of-range P (`P0`, or `P > 6`) falls back to the currently active WCS (`fallback`), matching grbl's
+/// "absent / P0 = active coordinate system" convention.
+fn wcs_index_from_p(p: Option<f32>, fallback: usize) -> usize {
+  match p {
+    Some(value) => {
+      let n = libm::roundf(value) as i32;
+      if (1..=crate::coords::WCS_COUNT as i32).contains(&n) {
+        (n - 1) as usize
+      } else {
+        fallback
+      }
+    }
+    None => fallback,
   }
 }
 
@@ -838,6 +1291,7 @@ mod tests {
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 0.0,
+        machine_coords: false,
       })
     );
   }
@@ -854,6 +1308,7 @@ mod tests {
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 250.0,
+        machine_coords: false,
       })
     );
   }
@@ -901,6 +1356,7 @@ mod tests {
         units: Units::Inch,
         distance: DistanceMode::Incremental,
         feed: 10.0,
+        machine_coords: false,
       })
     );
   }
@@ -920,6 +1376,7 @@ mod tests {
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 100.0,
+        machine_coords: false,
       })
     );
   }
@@ -946,17 +1403,357 @@ mod tests {
     );
   }
 
+  // ---- Phase B: coordinate-system & offset words ------------------------------------------------
+
   #[test]
-  fn parse_set_coordinate_offset_g92() {
+  fn parse_g92_set_emits_coordinate_op() {
     let mut parser = Parser::new();
     let cmd = parser.parse_line(b"G92 X0 Y0").expect("valid");
     assert_eq!(
       cmd,
-      Some(PlannerCommand::SetCoordinateOffset {
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetG92ToPosition {
         axes: AxisWords { x: Some(0.0), y: Some(0.0), z: None },
         units: Units::Millimeter,
+      }))
+    );
+  }
+
+  #[test]
+  fn parse_g92_1_clears_g92() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"G92.1").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coordinate(CoordinateOp::ClearG92)));
+  }
+
+  #[test]
+  fn parse_wcs_select_is_modal_and_emits_select_op() {
+    let mut parser = Parser::new();
+    // G55 selects WCS index 1 and, on a bare select line, emits a SelectWcs op.
+    let cmd = parser.parse_line(b"G55").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coordinate(CoordinateOp::SelectWcs { index: 1 })));
+    assert_eq!(parser.state().wcs, 1);
+    // The selection is modal: a following move inherits it without re-emitting a select.
+    let cmd = parser.parse_line(b"G0 X1").expect("valid");
+    assert!(matches!(cmd, Some(PlannerCommand::Move { machine_coords: false, .. })));
+  }
+
+  #[test]
+  fn parse_all_six_wcs_indices() {
+    for (line, index) in [
+      (b"G54".as_slice(), 0usize),
+      (b"G55", 1),
+      (b"G56", 2),
+      (b"G57", 3),
+      (b"G58", 4),
+      (b"G59", 5),
+    ] {
+      let mut parser = Parser::new();
+      let cmd = parser.parse_line(line).expect("valid");
+      assert_eq!(cmd, Some(PlannerCommand::Coordinate(CoordinateOp::SelectWcs { index })));
+    }
+  }
+
+  #[test]
+  fn parse_g10_l2_sets_offset_for_p_indexed_wcs() {
+    let mut parser = Parser::new();
+    // G10 L2 P1 = G54 (index 0). The X/Y words are the literal new offset.
+    let cmd = parser.parse_line(b"G10 L2 P1 X10 Y20").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
+        index: 0,
+        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None },
+        units: Units::Millimeter,
+      }))
+    );
+  }
+
+  #[test]
+  fn parse_g10_l20_sets_offset_to_position() {
+    let mut parser = Parser::new();
+    // G10 L20 P2 = G55 (index 1). The X word is the work target the current position should read as.
+    let cmd = parser.parse_line(b"G10 L20 P2 X0").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffsetToPosition {
+        index: 1,
+        axes: AxisWords { x: Some(0.0), y: None, z: None },
+        units: Units::Millimeter,
+      }))
+    );
+  }
+
+  #[test]
+  fn parse_g10_without_p_targets_active_wcs() {
+    let mut parser = Parser::new();
+    parser.parse_line(b"G56").expect("valid"); // active WCS = index 2.
+    // G10 L2 with no P writes the active WCS (grbl P0/absent = active system).
+    let cmd = parser.parse_line(b"G10 L2 X5").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
+        index: 2,
+        axes: AxisWords { x: Some(5.0), y: None, z: None },
+        units: Units::Millimeter,
+      }))
+    );
+  }
+
+  #[test]
+  fn parse_g10_without_p_targets_pre_line_active_wcs_not_same_line_select() {
+    let mut parser = Parser::new();
+    // Start with G54 active. A line that BOTH selects G56 and issues a P-less `G10 L2` must write the system that
+    // was active BEFORE the line began (G54, index 0), per grbl — NOT the G56 staged by the same-line select.
+    let cmd = parser.parse_line(b"G56 G10 L2 X5").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
+        index: 0,
+        axes: AxisWords { x: Some(5.0), y: None, z: None },
+        units: Units::Millimeter,
+      }))
+    );
+    // The same-line select still commits modally for subsequent lines (G56 is now active).
+    assert_eq!(parser.state().wcs, 2);
+  }
+
+  #[test]
+  fn parse_g10_l20_without_p_targets_pre_line_active_wcs_not_same_line_select() {
+    let mut parser = Parser::new();
+    // The L20 form has the same P-less fallback rule: `G55 G10 L20 X0` writes the pre-line active G54, not G55.
+    let cmd = parser.parse_line(b"G55 G10 L20 X0").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffsetToPosition {
+        index: 0,
+        axes: AxisWords { x: Some(0.0), y: None, z: None },
+        units: Units::Millimeter,
+      }))
+    );
+  }
+
+  #[test]
+  fn parse_g10_with_explicit_p_is_unaffected_by_same_line_select() {
+    let mut parser = Parser::new();
+    // An explicit P word overrides the fallback entirely: `G56 G10 L2 P3 X5` writes P3 = G56 (index 2) regardless
+    // of which system was active, proving the fix only changes the P-ABSENT fallback.
+    let cmd = parser.parse_line(b"G56 G10 L2 P3 X5").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
+        index: 2,
+        axes: AxisWords { x: Some(5.0), y: None, z: None },
+        units: Units::Millimeter,
+      }))
+    );
+  }
+
+  #[test]
+  fn parse_g28_1_stores_predefined_g28() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"G28.1").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coordinate(CoordinateOp::StorePredefined { index: 0 })));
+  }
+
+  #[test]
+  fn parse_g30_1_stores_predefined_g30() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"G30.1").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coordinate(CoordinateOp::StorePredefined { index: 1 })));
+  }
+
+  #[test]
+  fn parse_g43_1_applies_z_tlo_and_sets_modal() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"G43.1 Z-14.442").expect("valid");
+    // The Z word is parsed by the no_std lexer; assert on the resolved op shape and a tolerant Z value (the
+    // exact f32 of -14.442 is not representable, so compare within an epsilon rather than for bit equality).
+    match cmd {
+      Some(PlannerCommand::Coordinate(CoordinateOp::ApplyTlo { z, units: Units::Millimeter })) => {
+        assert!((z + 14.442).abs() < 1e-3, "TLO Z was {z}");
+      }
+      other => panic!("expected ApplyTlo, got {other:?}"),
+    }
+    assert!(parser.state().tlo_active);
+  }
+
+  #[test]
+  fn parse_g49_cancels_tlo_and_clears_modal() {
+    let mut parser = Parser::new();
+    parser.parse_line(b"G43.1 Z1").expect("valid");
+    assert!(parser.state().tlo_active);
+    let cmd = parser.parse_line(b"G49").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coordinate(CoordinateOp::CancelTlo)));
+    assert!(!parser.state().tlo_active);
+  }
+
+  #[test]
+  fn parse_g53_one_shot_marks_move_machine_coords() {
+    let mut parser = Parser::new();
+    // G53 modifies the move on its OWN line: the words are machine coordinates.
+    let cmd = parser.parse_line(b"G53 G0 X10 Y20").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Move {
+        rapid: true,
+        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None },
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 0.0,
+        machine_coords: true,
       })
     );
+    // G53 is one-shot: the next move is back to work coordinates.
+    let cmd = parser.parse_line(b"G0 X0").expect("valid");
+    assert!(matches!(cmd, Some(PlannerCommand::Move { machine_coords: false, .. })));
+  }
+
+  // ---- Phase C: G38.x probe parsing -------------------------------------------------------------
+
+  #[test]
+  fn parse_g38_2_probe_toward_with_alarm() {
+    let mut parser = Parser::new();
+    // The touch-plate default: G38.2 Z-5 F50 — probe toward, alarm on no contact. The work-coordinate Z target
+    // and the modal feed ride into the probe command; units/distance carry the active modes.
+    let cmd = parser.parse_line(b"G38.2 Z-5 F50").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Probe {
+        kind: ProbeKind::G38_2,
+        axes: AxisWords { x: None, y: None, z: Some(-5.0) },
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 50.0,
+      })
+    );
+    assert_eq!((ProbeKind::G38_2.toward, ProbeKind::G38_2.alarm_on_fail), (true, true));
+  }
+
+  #[test]
+  fn parse_all_four_g38_modes_map_to_their_kind() {
+    for (line, expected) in [
+      // Each probe carries a feed: a probe now REQUIRES a defined feed (error:22 otherwise), so the F word keeps
+      // these focused on the kind mapping rather than tripping the feed guard.
+      (b"G38.2 Z-1 F10".as_slice(), ProbeKind::G38_2),
+      (b"G38.3 Z-1 F10", ProbeKind::G38_3),
+      (b"G38.4 Z1 F10", ProbeKind::G38_4),
+      (b"G38.5 Z1 F10", ProbeKind::G38_5),
+    ] {
+      let mut parser = Parser::new();
+      let cmd = parser.parse_line(line).expect("valid");
+      match cmd {
+        Some(PlannerCommand::Probe { kind, .. }) => assert_eq!(kind, expected, "{line:?} -> {expected:?}"),
+        other => panic!("expected a probe for {line:?}, got {other:?}"),
+      }
+    }
+    // The toward/away + alarm matrix the four modes encode (toward, alarm_on_fail).
+    assert_eq!((ProbeKind::G38_2.toward, ProbeKind::G38_2.alarm_on_fail), (true, true));
+    assert_eq!((ProbeKind::G38_3.toward, ProbeKind::G38_3.alarm_on_fail), (true, false));
+    assert_eq!((ProbeKind::G38_4.toward, ProbeKind::G38_4.alarm_on_fail), (false, true));
+    assert_eq!((ProbeKind::G38_5.toward, ProbeKind::G38_5.alarm_on_fail), (false, false));
+  }
+
+  #[test]
+  fn parse_probe_carries_inch_and_incremental_modes() {
+    let mut parser = Parser::new();
+    parser.parse_line(b"G20 G91").expect("valid");
+    let cmd = parser.parse_line(b"G38.2 Z-0.2 F2").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Probe {
+        kind: ProbeKind::G38_2,
+        axes: AxisWords { x: None, y: None, z: Some(-0.2) },
+        units: Units::Inch,
+        distance: DistanceMode::Incremental,
+        feed: 2.0,
+      })
+    );
+  }
+
+  #[test]
+  fn parse_probe_with_no_axis_word_is_rejected() {
+    let mut parser = Parser::new();
+    // A bare G38.2 has no direction to probe; grbl rejects it with error:23 (axis words required).
+    assert_eq!(parser.parse_line(b"G38.2 F50"), Err(GcodeError::ProbeNoAxis));
+    assert_eq!(GcodeError::ProbeNoAxis.code(), 23);
+  }
+
+  #[test]
+  fn parse_probe_conflicts_with_another_motion_word() {
+    let mut parser = Parser::new();
+    // G38 is motion group 1, so it cannot share a line with G0/G1 (a modal-group violation).
+    assert_eq!(parser.parse_line(b"G1 G38.2 Z-5"), Err(GcodeError::ModalGroupViolation));
+  }
+
+  // ---- feed-rate required for probes and G1/G2/G3 moves (grbl error:22) -------------------------
+
+  #[test]
+  fn parse_probe_with_no_feed_is_error_22() {
+    let mut parser = Parser::new();
+    // A probe with an axis word but no modal feed is undefined (it would crawl at feed 0); grbl rejects it as
+    // error:22, not accept it. The axis-present check passes, so this proves the feed guard, not [`ProbeNoAxis`].
+    assert_eq!(parser.parse_line(b"G38.2 Z-5"), Err(GcodeError::FeedRateUndefined));
+  }
+
+  #[test]
+  fn parse_probe_with_feed_on_same_line_is_ok() {
+    let mut parser = Parser::new();
+    // The same probe WITH an F word on the line is accepted (feed is defined).
+    assert!(matches!(parser.parse_line(b"G38.2 Z-5 F50"), Ok(Some(PlannerCommand::Probe { .. }))));
+  }
+
+  #[test]
+  fn parse_g1_feed_move_with_no_feed_is_error_22() {
+    let mut parser = Parser::new();
+    // A G1 feed move with no prior modal F has feed 0 — undefined; grbl rejects it as error:22.
+    assert_eq!(parser.parse_line(b"G1 X1"), Err(GcodeError::FeedRateUndefined));
+  }
+
+  #[test]
+  fn parse_g1_feed_move_with_prior_modal_feed_is_ok() {
+    let mut parser = Parser::new();
+    // A feed set on an EARLIER line persists (modal F), so a later bare G1 move is accepted.
+    parser.parse_line(b"G1 X0 F100").expect("valid");
+    assert!(matches!(parser.parse_line(b"G1 X1"), Ok(Some(PlannerCommand::Move { rapid: false, .. }))));
+  }
+
+  #[test]
+  fn parse_g1_feed_move_with_feed_on_same_line_is_ok() {
+    let mut parser = Parser::new();
+    // A feed word on the SAME line as the move satisfies the requirement (no prior modal feed needed).
+    assert!(matches!(parser.parse_line(b"G1 X1 F100"), Ok(Some(PlannerCommand::Move { rapid: false, .. }))));
+  }
+
+  #[test]
+  fn parse_g0_rapid_with_no_feed_is_ok() {
+    let mut parser = Parser::new();
+    // G0 rapids do NOT need a feed (they run at rapid rate), so a rapid with no F is accepted — matching grbl.
+    assert!(matches!(parser.parse_line(b"G0 X1"), Ok(Some(PlannerCommand::Move { rapid: true, .. }))));
+  }
+
+  #[test]
+  fn parse_default_rapid_with_no_feed_is_ok() {
+    let mut parser = Parser::new();
+    // The power-on default motion mode is G0 rapid, so a bare axis line with no feed is also a rapid and accepted.
+    assert!(matches!(parser.parse_line(b"X1"), Ok(Some(PlannerCommand::Move { rapid: true, .. }))));
+  }
+
+  #[test]
+  fn parse_arc_with_no_feed_is_error_22() {
+    let mut parser = Parser::new();
+    // G2/G3 arcs are feed moves like G1, so an arc with no defined feed is rejected as error:22.
+    assert_eq!(parser.parse_line(b"G2 X10 Y0 I5 J0"), Err(GcodeError::FeedRateUndefined));
+  }
+
+  #[test]
+  fn parse_probe_does_not_become_the_modal_motion_mode() {
+    let mut parser = Parser::new();
+    parser.parse_line(b"G1 F100").expect("valid");
+    // A probe runs but must NOT change the modal motion mode away from G1 (grbl leaves group 1 as the probe is a
+    // one-shot synchronized move, and the next bare axis line should still feed-move under G1).
+    parser.parse_line(b"G38.2 Z-5 F50").expect("valid");
+    let cmd = parser.parse_line(b"X5").expect("valid");
+    assert!(matches!(cmd, Some(PlannerCommand::Move { rapid: false, .. })), "motion mode stays G1 after a probe");
   }
 
   #[test]
@@ -1056,5 +1853,110 @@ mod tests {
     assert_eq!(GcodeError::BadNumberFormat.code(), 2);
     assert_eq!(GcodeError::ModalGroupViolation.code(), 9);
     assert_eq!(GcodeError::UnsupportedCommand.code(), 20);
+    assert_eq!(GcodeError::FeedRateUndefined.code(), 22);
+    assert_eq!(GcodeError::JogNoAxis.code(), 23);
+  }
+
+  // ---- Phase D: `$J=` jog parsing (seed-from-current-then-discard) ------------------------------
+
+  #[test]
+  fn parse_jog_absolute_default_with_feed() {
+    let parser = Parser::new();
+    // Default state is G90 absolute, G21 mm; a plain `$J=X10 Y5 F600` resolves against those.
+    let jog = parser.parse_jog(b"X10 Y5 F600").expect("valid jog");
+    assert_eq!(
+      jog,
+      JogCommand {
+        axes: AxisWords { x: Some(10.0), y: Some(5.0), z: None },
+        distance_mode: DistanceMode::Absolute,
+        units: Units::Millimeter,
+        feed: 600.0,
+        machine_coords: false,
+      }
+    );
+  }
+
+  #[test]
+  fn parse_jog_line_g91_g20_override_within_throwaway_context() {
+    let parser = Parser::new();
+    // The jog line's own G91/G20 override the (default G90/G21) seeded context for THIS jog only.
+    let jog = parser.parse_jog(b"G91 G20 X1 F30").expect("valid jog");
+    assert_eq!(jog.distance_mode, DistanceMode::Incremental);
+    assert_eq!(jog.units, Units::Inch);
+    assert_eq!(jog.feed, 30.0);
+    assert_eq!(jog.axes, AxisWords { x: Some(1.0), y: None, z: None });
+  }
+
+  #[test]
+  fn parse_jog_g53_marks_machine_coordinates() {
+    let parser = Parser::new();
+    let jog = parser.parse_jog(b"G53 Z-1 F100").expect("valid jog");
+    assert!(jog.machine_coords);
+    assert_eq!(jog.axes, AxisWords { x: None, y: None, z: Some(-1.0) });
+  }
+
+  #[test]
+  fn parse_jog_seeds_distance_from_current_program_state() {
+    let mut parser = Parser::new();
+    // Leave the program in G91 incremental; a jog with no distance word inherits it (grbl seed-from-current).
+    parser.parse_line(b"G91").expect("valid");
+    let jog = parser.parse_jog(b"X10 F600").expect("valid jog");
+    assert_eq!(jog.distance_mode, DistanceMode::Incremental);
+  }
+
+  #[test]
+  fn parse_jog_seeds_units_from_current_program_state() {
+    let mut parser = Parser::new();
+    // Leave the program in G20 inch; a jog with no units word inherits it.
+    parser.parse_line(b"G20").expect("valid");
+    let jog = parser.parse_jog(b"X1 F30").expect("valid jog");
+    assert_eq!(jog.units, Units::Inch);
+  }
+
+  #[test]
+  fn parse_jog_does_not_mutate_persistent_modal_state() {
+    let mut parser = Parser::new();
+    // Start the program in a known modal state, then jog with line words that WOULD change it if applied.
+    parser.parse_line(b"G90 G21 G1 F100").expect("valid");
+    let before = *parser.state();
+    let _ = parser.parse_jog(b"G91 G20 X10 F600").expect("valid jog");
+    // grbl: jogging is independent of modal state by design — the persistent state is byte-for-byte unchanged.
+    assert_eq!(*parser.state(), before);
+    assert_eq!(parser.state().distance, DistanceMode::Absolute);
+    assert_eq!(parser.state().units, Units::Millimeter);
+    assert_eq!(parser.state().feed, 100.0);
+  }
+
+  #[test]
+  fn parse_jog_missing_feed_is_error_22() {
+    let parser = Parser::new();
+    // grbl rejects a jog with no F (feed undefined) as error:22 — there is no modal jog feed to fall back on.
+    assert_eq!(parser.parse_jog(b"X10"), Err(GcodeError::FeedRateUndefined));
+  }
+
+  #[test]
+  fn parse_jog_missing_axis_is_error_23() {
+    let parser = Parser::new();
+    // A jog with a feed but no axis word has no direction to move — error:23 (requires axis words).
+    assert_eq!(parser.parse_jog(b"F600"), Err(GcodeError::JogNoAxis));
+  }
+
+  #[test]
+  fn parse_jog_rejects_unsupported_word() {
+    let parser = Parser::new();
+    // A jog may carry only G90/G91/G20/G21/G53, X/Y/Z, and F. A motion mode (G1), spindle (M3), or any other
+    // G-word is rejected so a jog stays a pure axis-target move.
+    assert_eq!(parser.parse_jog(b"G1 X10 F600"), Err(GcodeError::UnsupportedCommand));
+    assert_eq!(parser.parse_jog(b"M3 X10 F600"), Err(GcodeError::UnsupportedCommand));
+    assert_eq!(parser.parse_jog(b"X10 S1000 F600"), Err(GcodeError::UnsupportedCommand));
+  }
+
+  #[test]
+  fn parse_jog_is_case_insensitive_and_tolerates_whitespace() {
+    let parser = Parser::new();
+    let jog = parser.parse_jog(b"  g91 x10  f600 ").expect("valid jog");
+    assert_eq!(jog.distance_mode, DistanceMode::Incremental);
+    assert_eq!(jog.axes, AxisWords { x: Some(10.0), y: None, z: None });
+    assert_eq!(jog.feed, 600.0);
   }
 }

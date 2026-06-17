@@ -1,0 +1,8 @@
+- [Galdr firmware architecture](galdr-firmware-arch.md) — ESP32-S3 grblHAL firmware; firmware-core (host-tested no_std) + firmware (esp-hal/Embassy via esp-rtos) split
+- [Streaming state sharing](streaming-state-sharing.md) — how machine state / live position / buffer counts are shared across the comms tasks and core-1 executor
+- [Build & test commands](build-test-commands.md) — host test vs Xtensa firmware build invocations and gotchas
+- [Coordinate model (Phase B)](coordinate-model-phase-b.md) — G54-59/G92/G28-30/TLO, WCO semantics, where work→machine happens, $#/WPos/WCO, 2nd NVS record
+- [Probe cycle (Phase C)](probe-cycle-phase-c.md) — G38.x probe input trait, GPIO21, burst-boundary sampling limit, PROBE_RESULT/position-sync, LAST_PROBE for $#
+- [Jogging (Phase D)](jogging-phase-d.md) — `$J=` seed-then-discard parse, jog-tagged blocks + flush, `0x85` cancel via feed-hold reuse + sync_position, ControlState::Jog
+- [Overrides (Phase E)](overrides-phase-e.md) — feed/rapid/spindle `Overrides` model, `run_block_scaled` live executor scaling w/ max-rate clamp, `Ov:`/`Pn:`/`FS:` realized status fields
+- [Enumeration + auto-report (Phase F)](enumeration-autoreport-phase-f.md) — `$481`/`0x8C` auto-status-report task (reuses STATUS_REQUEST), `$ES`/`$EG`/`$EE`/`$EA`/`$SED` driven off SETTING_DESCRIPTORS+code enums, NEWOPT ENUMS/SED

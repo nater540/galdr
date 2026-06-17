@@ -65,9 +65,40 @@ message Settings {
   uint32 tmc_tpwmthrs          = 51;  // TPWMTHRS StealthChop->SpreadCycle threshold.
   uint32 tmc_send_delay        = 52;  // SLAVECONF.SENDDELAY (units of 8 bit-times).
   float  tmc_r_sense_ohms      = 53;  // sense-resistor value, ohms.
+
+  // --- grbl $6/$19 (probe, DOC-09 Phase C). Added after the TMC range; additive proto3 fields, no version bump. ---
+  bool   probe_invert          = 54;  // $6  probe-pin invert (set 1 for a Normally-Open touch plate).
+  bool   probe_pullup_disable  = 55;  // $19 probe-pin pull-up disable (0 = enabled, the passive-plate default).
+
+  // --- grbl $481 (auto-report interval, DOC-08 Phase F). Additive proto3 field, no version bump. ---
+  uint32 auto_report_interval_ms = 56; // $481 auto status report interval, ms (0 = disabled, else 100..=1000).
 }
 
 // Note: the `$PBX` host-sync channel transfers a FULL `Settings` message in both directions (the host does a
 // read-modify-write of the whole record). Single-field edits go through the grbl `$x=val` text path instead,
 // so no partial-update/patch message is needed. If partial updates are wanted later, add an explicit-presence
 // `SettingsPatch` here and a merge step in `firmware-core::settings`.
+
+// The PERSISTENT coordinate data (Phase B, grbl `$#` parameters): the six G54-G59 work-coordinate-system
+// offsets, the active WCS, and the G28/G30 predefined positions. This is a SEPARATE record from `Settings`
+// (stored under its own NVS key) because coordinate data has a different lifecycle from `$n` settings (e.g.
+// `$RST=#` clears it without touching settings) and is written far more often (every G10/G28.1). The session-
+// only G92 and dynamic `G43.1` tool-length offset are DELIBERATELY ABSENT: grbl never persists them, and the
+// firmware restores them to identity on reset. Per-axis values are flat `_x/_y/_z` triples, matching the
+// `Settings` convention, so the generated struct has plain scalar fields convertible to the firmware's
+// fixed-3-axis arrays. A reader applies defaults (all zero, G54 active) before decoding.
+message Coordinates {
+  uint32 active_wcs = 1;  // active coordinate system, 0 = G54 .. 5 = G59.
+
+  // --- G54-G59 work-coordinate-system offsets (machine mm), one X/Y/Z triple per system ---
+  float g54_x = 2;  float g54_y = 3;  float g54_z = 4;
+  float g55_x = 5;  float g55_y = 6;  float g55_z = 7;
+  float g56_x = 8;  float g56_y = 9;  float g56_z = 10;
+  float g57_x = 11; float g57_y = 12; float g57_z = 13;
+  float g58_x = 14; float g58_y = 15; float g58_z = 16;
+  float g59_x = 17; float g59_y = 18; float g59_z = 19;
+
+  // --- G28 / G30 predefined positions (machine mm) ---
+  float g28_x = 20; float g28_y = 21; float g28_z = 22;
+  float g30_x = 23; float g30_y = 24; float g30_z = 25;
+}

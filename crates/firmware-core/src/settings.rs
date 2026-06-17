@@ -11,13 +11,13 @@
 //! - Conversions to the live runtime configs ([`Settings::planner_config`], [`motion_config`], [`tmc_config`],
 //!   [`steps_per_mm`]) that replace the firmware's placeholder accessors.
 //! - [`wire`] — protobuf encode/decode wrapped in a `MAGIC | version | len | payload | CRC32` storage frame,
-//!   plus [`load_or_default`]/[`store_settings`] over the host-testable [`SettingsStore`] trait.
+//!   plus [`load_or_default`]/[`store_settings`] over the host-testable [`RecordStore`] trait.
 //!
 //! The protobuf message ([`galdr_proto::Settings`]) is a pure wire/flash DTO reached only at the encode/decode
 //! boundary; the planner/motion/tmc consumers keep taking their plain `*Config` structs, untouched.
 
 use crate::drivers::tmc2209::manager::{AxisConfig, TmcConfig};
-use crate::hal_traits::{SettingsStore, StoreError};
+use crate::hal_traits::{RecordStore, StoreError};
 use crate::motion::MotionConfig;
 use crate::planner::{PlannerConfig, AXES};
 
@@ -39,6 +39,16 @@ const DEFAULT_HOMING_DEBOUNCE_MS: u32 = 25;
 const DEFAULT_HOMING_PULLOFF_MM: f32 = 1.0;
 /// `$30` maximum spindle RPM default (WS55-220 nominal).
 const DEFAULT_SPINDLE_RPM_MAX: f32 = 12_000.0;
+/// `$481` auto-report interval default, milliseconds. grblHAL ships `DEFAULT_AUTOREPORT_INTERVAL 0`
+/// (disabled), so the firmware comes up with periodic auto-reporting OFF until a host enables it.
+const DEFAULT_AUTO_REPORT_INTERVAL_MS: u32 = 0;
+
+/// The grblHAL `$481` auto-report interval lower bound, milliseconds: grblHAL's documented "allowed range is
+/// 100 - 1000". A non-zero interval below this is rejected (a `$x=val` write) or clamped up (a decoded record),
+/// so the report task can never be asked for an unrealistically tight cadence that would starve the USB writer.
+pub const AUTO_REPORT_INTERVAL_MIN_MS: u32 = 100;
+/// The grblHAL `$481` auto-report interval upper bound, milliseconds ("allowed range is 100 - 1000").
+pub const AUTO_REPORT_INTERVAL_MAX_MS: u32 = 1_000;
 
 /// Largest RMS motor current the sanitizer will accept, milliamps (the TMC2209/Adafruit 6121 ceiling).
 const MAX_MOTOR_CURRENT_MA: u16 = 2_000;
@@ -119,6 +129,12 @@ pub struct Settings {
   pub step_invert_mask: u8,
   /// `$3` direction port invert bitmask.
   pub dir_invert_mask: u8,
+  /// `$6` probe-pin invert (DOC-09, Phase C): set `$6=1` for a Normally-Open touch plate so an untouched plate
+  /// reads "not triggered". Folds into the probe read via [`crate::hal_traits::ProbeConfig`].
+  pub probe_invert: bool,
+  /// `$19` probe-pin pull-up DISABLE (DOC-09, Phase C): `0` keeps the internal pull-up enabled, the default a
+  /// passive touch plate needs. Applied at GPIO config; carried in [`crate::hal_traits::ProbeConfig`].
+  pub probe_pullup_disable: bool,
   /// `$10` status report field bitmask.
   pub status_report_mask: u8,
   /// `$11` junction deviation, millimeters.
@@ -145,6 +161,9 @@ pub struct Settings {
   pub spindle_rpm_max: f32,
   /// `$31` minimum spindle speed, RPM.
   pub spindle_rpm_min: f32,
+  /// `$481` auto-status-report interval, milliseconds (0 = disabled, else `[100, 1000]`). When non-zero the
+  /// firmware pushes a `<...>` status report every interval-ms without the host polling `?` (DOC-08 §5).
+  pub auto_report_interval_ms: u32,
   /// `$100–$102` steps per millimeter, `[X, Y, Z]`.
   pub steps_per_mm: [f32; AXES],
   /// `$110–$112` maximum rate, mm/min, `[X, Y, Z]`.
@@ -184,6 +203,8 @@ impl Default for Settings {
       step_idle_delay_ms: DEFAULT_STEP_IDLE_DELAY_MS,
       step_invert_mask: 0,
       dir_invert_mask: 0,
+      probe_invert: false,
+      probe_pullup_disable: false,
       status_report_mask: 0,
       junction_deviation_mm: planner.junction_deviation_mm,
       arc_tolerance_mm: planner.arc_tolerance_mm,
@@ -197,6 +218,7 @@ impl Default for Settings {
       homing_pulloff_mm: DEFAULT_HOMING_PULLOFF_MM,
       spindle_rpm_max: DEFAULT_SPINDLE_RPM_MAX,
       spindle_rpm_min: 0.0,
+      auto_report_interval_ms: DEFAULT_AUTO_REPORT_INTERVAL_MS,
       steps_per_mm: planner.steps_per_mm,
       max_rate_mm_min: planner.max_rate_mm_min,
       accel_mm_s2: planner.accel_mm_s2,
@@ -259,6 +281,22 @@ impl Settings {
     self.steps_per_mm
   }
 
+  /// The effective `$481` auto-report interval in milliseconds, clamped to a usable cadence: `0` stays `0`
+  /// (disabled), and any non-zero value is held within `[AUTO_REPORT_INTERVAL_MIN_MS, AUTO_REPORT_INTERVAL_MAX_MS]`
+  /// so the report task can never be driven faster than the floor (which would starve the single USB writer) nor
+  /// slower than the documented ceiling. The setter and [`sanitized`](Settings::sanitized) already enforce this
+  /// range, so for a clean record this is the identity; it exists so the firmware can ask for a guaranteed-safe
+  /// interval directly without re-deriving the clamp at the wiring layer.
+  pub fn auto_report_interval_ms(&self) -> u32 {
+    clamp_auto_report_interval(self.auto_report_interval_ms)
+  }
+
+  /// Build the [`ProbeConfig`](crate::hal_traits::ProbeConfig) the probe-cycle reader consumes from `$6`/`$19`,
+  /// so the host-tested probe-trigger logic sees the live invert/pull-up settings (DOC-09, Phase C).
+  pub fn probe_config(&self) -> crate::hal_traits::ProbeConfig {
+    crate::hal_traits::ProbeConfig { invert: self.probe_invert, pullup_disable: self.probe_pullup_disable }
+  }
+
   /// Apply a `$n=value` write, parsing and range-checking `value` for setting `n`. On success the field is
   /// updated (already validated within the same bounds [`sanitized`](Settings::sanitized) enforces); on
   /// failure nothing changes and a [`SettingError`] with a grblHAL code is returned. Both the lookup and the
@@ -280,6 +318,52 @@ impl Settings {
     }
   }
 
+  /// Render the `$ES` enumeration line for setting `n` into `out` (CRLF-terminated), in grblHAL's
+  /// `[SETTING:<id>|<group>|<name>|<unit>|<datatype>|<format>|<min>|<max>]` form. Returns `true` if `n` is a
+  /// known setting, `false` otherwise. The firmware loops `enumeration_setting_numbers()` and calls this per
+  /// number, so the enumeration is driven by the SAME [`SETTING_DESCRIPTORS`] table as `$$`/`$x=val` — a sender
+  /// that builds its UI from `$ES` can never see a setting the live `$$`/setter does not also expose. The value
+  /// itself is NOT in the line (a sender reads `$$` for live values); this line is the static description. Per-
+  /// axis settings enumerate each of their three `$n` numbers as a distinct `[SETTING:]` row.
+  pub fn write_setting_enumeration<const N: usize>(n: u16, out: &mut heapless::String<N>) -> bool {
+    use core::fmt::Write;
+    let Some((desc, _axis)) = lookup_descriptor(n) else {
+      return false;
+    };
+    let meta = &desc.meta;
+    write!(
+      out,
+      "[SETTING:{}|{}|{}|{}|{}|{}|{}|{}]\r\n",
+      n,
+      meta.group,
+      meta.name,
+      meta.unit,
+      meta.datatype.code(),
+      meta.format,
+      meta.min,
+      meta.max,
+    )
+    .is_ok()
+  }
+
+  /// Render the `$SED=<n>` description line for setting `n` into `out` (CRLF-terminated), in grblHAL's
+  /// `[SETTINGDESCR:<id>|<description>]` form. Returns `true` if `n` is a known setting, `false` otherwise.
+  /// The description reuses the enumeration NAME plus the unit (when present) — Phase F does not carry a long
+  /// prose description per setting, so the name/unit is the most useful short description a sender can show.
+  pub fn write_setting_description<const N: usize>(n: u16, out: &mut heapless::String<N>) -> bool {
+    use core::fmt::Write;
+    let Some((desc, _axis)) = lookup_descriptor(n) else {
+      return false;
+    };
+    let meta = &desc.meta;
+    let result = if meta.unit.is_empty() {
+      write!(out, "[SETTINGDESCR:{}|{}]\r\n", n, meta.name)
+    } else {
+      write!(out, "[SETTINGDESCR:{}|{} ({})]\r\n", n, meta.name, meta.unit)
+    };
+    result.is_ok()
+  }
+
   /// Clamp every field to a safe, usable range so neither a corrupt flash record nor a bad host write can
   /// produce a config that wedges motion (zero/negative steps/mm, invalid microstepping, over-current, etc.).
   /// Called after any decode and before applying a bulk host write.
@@ -297,6 +381,9 @@ impl Settings {
     self.homing_pulloff_mm = self.homing_pulloff_mm.max(0.0);
     self.spindle_rpm_max = positive_or(self.spindle_rpm_max, defaults.spindle_rpm_max);
     self.spindle_rpm_min = self.spindle_rpm_min.max(0.0);
+    // `$481` auto-report: keep `0` (disabled) as-is, but pull any non-zero value into the documented range so a
+    // corrupt/legacy record can never ask the report task for a starving cadence or an out-of-range one.
+    self.auto_report_interval_ms = clamp_auto_report_interval(self.auto_report_interval_ms);
     for axis in 0..AXES {
       self.steps_per_mm[axis] = positive_or(self.steps_per_mm[axis], defaults.steps_per_mm[axis]);
       // A zero max rate makes the planner emit a zero-speed never-completing block, and a zero max travel
@@ -337,6 +424,28 @@ fn clamp_microsteps(microsteps: u16) -> u16 {
   match microsteps {
     1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 => microsteps,
     _ => 16,
+  }
+}
+
+/// Clamp a `$481` auto-report interval to a usable cadence: `0` (disabled) is preserved, and a non-zero value
+/// is held within `[AUTO_REPORT_INTERVAL_MIN_MS, AUTO_REPORT_INTERVAL_MAX_MS]`. Shared by the setter, the
+/// sanitizer, and [`Settings::auto_report_interval_ms`] so all three agree on the floor and ceiling.
+fn clamp_auto_report_interval(value: u32) -> u32 {
+  if value == 0 {
+    0
+  } else {
+    value.clamp(AUTO_REPORT_INTERVAL_MIN_MS, AUTO_REPORT_INTERVAL_MAX_MS)
+  }
+}
+
+/// Parse a `$481` auto-report interval in milliseconds. `0` disables auto-reporting; any other value must fall
+/// within grblHAL's documented `[100, 1000]` range, so a typo cannot install a starving or absurd cadence.
+fn parse_auto_report_interval(value: &str) -> Result<u32, SettingError> {
+  let parsed = value.parse::<u32>().map_err(|_| SettingError::BadValue)?;
+  if parsed == 0 || (AUTO_REPORT_INTERVAL_MIN_MS..=AUTO_REPORT_INTERVAL_MAX_MS).contains(&parsed) {
+    Ok(parsed)
+  } else {
+    Err(SettingError::OutOfRange)
   }
 }
 
@@ -430,6 +539,8 @@ enum Field {
   StepIdleDelayMs,
   StepInvertMask,
   DirInvertMask,
+  ProbeInvert,
+  ProbePullupDisable,
   StatusReportMask,
   JunctionDeviationMm,
   ArcToleranceMm,
@@ -443,6 +554,7 @@ enum Field {
   HomingPulloffMm,
   SpindleRpmMax,
   SpindleRpmMin,
+  AutoReportIntervalMs,
   StepsPerMm,
   MaxRateMmMin,
   AccelMmS2,
@@ -471,6 +583,8 @@ impl Field {
       Field::StepIdleDelayMs => settings.step_idle_delay_ms = parse_u32(value)?,
       Field::StepInvertMask => settings.step_invert_mask = parse_u8(value)?,
       Field::DirInvertMask => settings.dir_invert_mask = parse_u8(value)?,
+      Field::ProbeInvert => settings.probe_invert = parse_bool(value)?,
+      Field::ProbePullupDisable => settings.probe_pullup_disable = parse_bool(value)?,
       Field::StatusReportMask => settings.status_report_mask = parse_u8(value)?,
       Field::JunctionDeviationMm => settings.junction_deviation_mm = parse_f32_non_negative(value)?,
       Field::ArcToleranceMm => settings.arc_tolerance_mm = parse_f32_positive(value)?,
@@ -484,6 +598,7 @@ impl Field {
       Field::HomingPulloffMm => settings.homing_pulloff_mm = parse_f32_non_negative(value)?,
       Field::SpindleRpmMax => settings.spindle_rpm_max = parse_f32_positive(value)?,
       Field::SpindleRpmMin => settings.spindle_rpm_min = parse_f32_non_negative(value)?,
+      Field::AutoReportIntervalMs => settings.auto_report_interval_ms = parse_auto_report_interval(value)?,
       Field::StepsPerMm => settings.steps_per_mm[axis] = parse_f32_positive(value)?,
       Field::MaxRateMmMin => settings.max_rate_mm_min[axis] = parse_f32_positive(value)?,
       Field::AccelMmS2 => settings.accel_mm_s2[axis] = parse_f32_positive(value)?,
@@ -504,6 +619,8 @@ impl Field {
       Field::StepIdleDelayMs => write!(out, "${}={}", n, settings.step_idle_delay_ms),
       Field::StepInvertMask => write!(out, "${}={}", n, settings.step_invert_mask),
       Field::DirInvertMask => write!(out, "${}={}", n, settings.dir_invert_mask),
+      Field::ProbeInvert => write!(out, "${}={}", n, settings.probe_invert as u8),
+      Field::ProbePullupDisable => write!(out, "${}={}", n, settings.probe_pullup_disable as u8),
       Field::StatusReportMask => write!(out, "${}={}", n, settings.status_report_mask),
       Field::JunctionDeviationMm => write!(out, "${}={:.3}", n, settings.junction_deviation_mm),
       Field::ArcToleranceMm => write!(out, "${}={:.3}", n, settings.arc_tolerance_mm),
@@ -517,6 +634,7 @@ impl Field {
       Field::HomingPulloffMm => write!(out, "${}={:.3}", n, settings.homing_pulloff_mm),
       Field::SpindleRpmMax => write!(out, "${}={:.3}", n, settings.spindle_rpm_max),
       Field::SpindleRpmMin => write!(out, "${}={:.3}", n, settings.spindle_rpm_min),
+      Field::AutoReportIntervalMs => write!(out, "${}={}", n, settings.auto_report_interval_ms),
       Field::StepsPerMm => write!(out, "${}={:.3}", n, settings.steps_per_mm[axis]),
       Field::MaxRateMmMin => write!(out, "${}={:.3}", n, settings.max_rate_mm_min[axis]),
       Field::AccelMmS2 => write!(out, "${}={:.3}", n, settings.accel_mm_s2[axis]),
@@ -528,42 +646,472 @@ impl Field {
   }
 }
 
-/// One row of the single `$n`→field authority: the base `$n` number and the [`Field`] it drives. A per-axis
-/// field owns the three consecutive numbers `number..number+3`; a scalar owns just `number`.
+/// A grblHAL setting datatype code, emitted as the 5th field of a `[SETTING:...]` enumeration line so a sender
+/// renders the right input control. These are grblHAL's `setting_datatype_t` numeric values: a sender that
+/// builds its UI from `$ES` reads this to choose a checkbox (bool), a numeric spinner (integer/float), or a
+/// bitfield/dropdown (mask). Only the codes this firmware's settings use are named; the rest are out of scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingDatatype {
+  /// grblHAL datatype 0 — a bitfield of named flags (rendered as a set of checkboxes).
+  Bitfield,
+  /// grblHAL datatype 3 — a boolean (rendered as a single checkbox / on-off toggle).
+  Bool,
+  /// grblHAL datatype 5 — an integer (rendered as a whole-number spinner).
+  Integer,
+  /// grblHAL datatype 6 — a decimal / float (rendered as a fractional spinner).
+  Float,
+  /// grblHAL datatype 7 — a raw bitmask integer (rendered as a numeric mask field, e.g. `$2`/`$3`/`$23`).
+  AxisMask,
+}
+
+impl SettingDatatype {
+  /// The grblHAL `setting_datatype_t` numeric code emitted in the `[SETTING:]` line's datatype field.
+  fn code(self) -> u8 {
+    match self {
+      SettingDatatype::Bitfield => 0,
+      SettingDatatype::Bool => 3,
+      SettingDatatype::Integer => 5,
+      SettingDatatype::Float => 6,
+      SettingDatatype::AxisMask => 7,
+    }
+  }
+}
+
+/// The metadata a `[SETTING:<id>|<group>|<name>|<unit>|<datatype>|<format>|<min>|<max>]` enumeration line needs
+/// beyond the live value: the human name, unit string, datatype, an optional grblHAL `format` hint (a bit-flag
+/// label list for a bitfield, or a decimal mask like `#0.000` for a float), and the numeric min/max bounds. The
+/// min/max are rendered verbatim, with an empty string meaning "unbounded" (grblHAL leaves the field empty).
+/// Carried inline in each [`SettingDescriptor`] so the one descriptor table drives `$$`, `$x=val`, AND `$ES`.
+struct SettingMeta {
+  /// The grblHAL setting GROUP id this setting belongs to (the `[SETTINGGROUP:]` `id`), the 2nd `[SETTING:]`
+  /// field. A sender uses it to bucket settings into the same panels grblHAL/ioSender show.
+  group: u16,
+  /// The human-readable setting name (3rd field), e.g. "Step pulse time".
+  name: &'static str,
+  /// The unit string (4th field), e.g. "microseconds" / "mm" / "mm/min"; empty for a unit-less mask/bool.
+  unit: &'static str,
+  /// The grblHAL datatype (5th field) — drives the sender's input control choice.
+  datatype: SettingDatatype,
+  /// The grblHAL `format` hint (6th field): a comma-separated flag-label list for a bitfield, or a decimal mask
+  /// (`#0.000`) for a float; empty when the datatype implies the format (plain integer/bool).
+  format: &'static str,
+  /// The minimum acceptable value, rendered verbatim (7th field); empty string = unbounded.
+  min: &'static str,
+  /// The maximum acceptable value, rendered verbatim (8th field); empty string = unbounded.
+  max: &'static str,
+}
+
+/// One row of the single `$n`→field authority: the base `$n` number, the [`Field`] it drives, and the
+/// enumeration [`SettingMeta`]. A per-axis field owns the three consecutive numbers `number..number+3`; a
+/// scalar owns just `number`. The metadata makes this table ALSO the single source for the `$ES` enumeration,
+/// so the dump (`$$`), the setter (`$x=val`), and the enumeration (`$ES`) can never describe different settings.
 struct SettingDescriptor {
   number: u16,
   field: Field,
+  meta: SettingMeta,
 }
 
-/// The single source of truth mapping every `$n` setting to its field, value policy, and dump format.
-/// [`SETTING_NUMBERS`], [`Settings::set_command`], and [`Settings::write_setting_line`] are ALL derived from
-/// this table, so the dump list, the setter, and the formatter can never disagree. Per-axis groups are one
-/// row each (expanded to their three `$n` numbers), not six copy-pasted arms. Order here is `$$` dump order.
-const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
-  SettingDescriptor { number: 0, field: Field::StepPulseUs },
-  SettingDescriptor { number: 1, field: Field::StepIdleDelayMs },
-  SettingDescriptor { number: 2, field: Field::StepInvertMask },
-  SettingDescriptor { number: 3, field: Field::DirInvertMask },
-  SettingDescriptor { number: 10, field: Field::StatusReportMask },
-  SettingDescriptor { number: 11, field: Field::JunctionDeviationMm },
-  SettingDescriptor { number: 12, field: Field::ArcToleranceMm },
-  SettingDescriptor { number: 20, field: Field::SoftLimitsEnable },
-  SettingDescriptor { number: 21, field: Field::HardLimitsEnable },
-  SettingDescriptor { number: 22, field: Field::HomingEnable },
-  SettingDescriptor { number: 23, field: Field::HomingDirInvertMask },
-  SettingDescriptor { number: 24, field: Field::HomingFeedMmMin },
-  SettingDescriptor { number: 25, field: Field::HomingSeekMmMin },
-  SettingDescriptor { number: 26, field: Field::HomingDebounceMs },
-  SettingDescriptor { number: 27, field: Field::HomingPulloffMm },
-  SettingDescriptor { number: 30, field: Field::SpindleRpmMax },
-  SettingDescriptor { number: 31, field: Field::SpindleRpmMin },
-  SettingDescriptor { number: 100, field: Field::StepsPerMm },
-  SettingDescriptor { number: 110, field: Field::MaxRateMmMin },
-  SettingDescriptor { number: 120, field: Field::AccelMmS2 },
-  SettingDescriptor { number: 130, field: Field::MaxTravelMm },
-  SettingDescriptor { number: 140, field: Field::RunCurrentMa },
-  SettingDescriptor { number: 150, field: Field::Microsteps },
+/// A grblHAL setting GROUP: the `[SETTINGGROUP:<id>|<parent>|<name>]` enumeration row. A sender uses these to
+/// nest the settings panels (`parent` 0 is a root group). The id set here is self-consistent with the `group`
+/// field of every [`SettingMeta`] below — [`setting_groups_cover_all_descriptor_groups`] proves the coverage.
+struct SettingGroup {
+  /// The group id (referenced by each setting's [`SettingMeta::group`]).
+  id: u16,
+  /// The parent group id (`0` = a root group with no parent).
+  parent: u16,
+  /// The human-readable group name.
+  name: &'static str,
+}
+
+/// The setting GROUPS the `$EG` enumeration emits, one `[SETTINGGROUP:id|parent|name]` per row. The ids match
+/// grblHAL's canonical group numbering where it overlaps (so an ioSender that recognizes the standard ids nests
+/// our settings into the familiar panels), and every group referenced by a [`SettingMeta`] appears here.
+const SETTING_GROUPS: &[SettingGroup] = &[
+  SettingGroup { id: GROUP_GENERAL, parent: 0, name: "General" },
+  SettingGroup { id: GROUP_CONTROL, parent: 0, name: "Control signals" },
+  SettingGroup { id: GROUP_STEPPER, parent: 0, name: "Stepper" },
+  SettingGroup { id: GROUP_HOMING, parent: 0, name: "Homing" },
+  SettingGroup { id: GROUP_PROBING, parent: 0, name: "Probing" },
+  SettingGroup { id: GROUP_SPINDLE, parent: 0, name: "Spindle" },
+  SettingGroup { id: GROUP_LIMITS, parent: 0, name: "Limits" },
+  SettingGroup { id: GROUP_AXIS, parent: GROUP_STEPPER, name: "Axis" },
 ];
+
+/// grblHAL setting-group ids, matching its canonical numbering where it overlaps so a standard sender nests our
+/// settings into the familiar panels. Named constants so the descriptor table and the group table reference one
+/// authority (and [`setting_groups_cover_all_descriptor_groups`] can assert the descriptor groups are all defined).
+const GROUP_GENERAL: u16 = 1;
+const GROUP_CONTROL: u16 = 4;
+const GROUP_STEPPER: u16 = 8;
+const GROUP_HOMING: u16 = 6;
+const GROUP_PROBING: u16 = 5;
+const GROUP_SPINDLE: u16 = 9;
+const GROUP_LIMITS: u16 = 3;
+const GROUP_AXIS: u16 = 11;
+
+/// The single source of truth mapping every `$n` setting to its field, value policy, dump format, AND its
+/// `$ES` enumeration metadata. [`SETTING_NUMBERS`], [`Settings::set_command`], [`Settings::write_setting_line`],
+/// and [`Settings::write_setting_enumeration`] are ALL derived from this table, so the dump list, the setter,
+/// the formatter, and the enumeration can never disagree. Per-axis groups are one row each (expanded to their
+/// three `$n` numbers), not six copy-pasted arms. Order here is `$$` dump (and `$ES` enumeration) order.
+const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
+  SettingDescriptor {
+    number: 0,
+    field: Field::StepPulseUs,
+    meta: SettingMeta {
+      group: GROUP_STEPPER,
+      name: "Step pulse time",
+      unit: "microseconds",
+      datatype: SettingDatatype::Integer,
+      format: "",
+      min: "1",
+      max: "1000",
+    },
+  },
+  SettingDescriptor {
+    number: 1,
+    field: Field::StepIdleDelayMs,
+    meta: SettingMeta {
+      group: GROUP_STEPPER,
+      name: "Step idle delay",
+      unit: "milliseconds",
+      datatype: SettingDatatype::Integer,
+      format: "",
+      min: "0",
+      max: "255",
+    },
+  },
+  SettingDescriptor {
+    number: 2,
+    field: Field::StepInvertMask,
+    meta: SettingMeta {
+      group: GROUP_STEPPER,
+      name: "Step pulse invert",
+      unit: "",
+      datatype: SettingDatatype::AxisMask,
+      format: "",
+      min: "0",
+      max: "7",
+    },
+  },
+  SettingDescriptor {
+    number: 3,
+    field: Field::DirInvertMask,
+    meta: SettingMeta {
+      group: GROUP_STEPPER,
+      name: "Step direction invert",
+      unit: "",
+      datatype: SettingDatatype::AxisMask,
+      format: "",
+      min: "0",
+      max: "7",
+    },
+  },
+  SettingDescriptor {
+    number: 6,
+    field: Field::ProbeInvert,
+    meta: SettingMeta {
+      group: GROUP_PROBING,
+      name: "Invert probe pin",
+      unit: "",
+      datatype: SettingDatatype::Bool,
+      format: "",
+      min: "0",
+      max: "1",
+    },
+  },
+  SettingDescriptor {
+    number: 10,
+    field: Field::StatusReportMask,
+    meta: SettingMeta {
+      group: GROUP_GENERAL,
+      name: "Status report options",
+      unit: "",
+      datatype: SettingDatatype::Bitfield,
+      format: "Position in machine coordinates,Buffer state",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 11,
+    field: Field::JunctionDeviationMm,
+    meta: SettingMeta {
+      group: GROUP_GENERAL,
+      name: "Junction deviation",
+      unit: "millimeters",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 12,
+    field: Field::ArcToleranceMm,
+    meta: SettingMeta {
+      group: GROUP_GENERAL,
+      name: "Arc tolerance",
+      unit: "millimeters",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      // Strictly positive (a zero arc tolerance is rejected): no clean exact minimum, so the bound is left
+      // unbounded for display (grblHAL's convention for these positive floats) rather than the misleading "0".
+      min: "",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 19,
+    field: Field::ProbePullupDisable,
+    meta: SettingMeta {
+      group: GROUP_PROBING,
+      name: "Disable probe pin pull-up",
+      unit: "",
+      datatype: SettingDatatype::Bool,
+      format: "",
+      min: "0",
+      max: "1",
+    },
+  },
+  SettingDescriptor {
+    number: 20,
+    field: Field::SoftLimitsEnable,
+    meta: SettingMeta {
+      group: GROUP_LIMITS,
+      name: "Soft limits enable",
+      unit: "",
+      datatype: SettingDatatype::Bool,
+      format: "",
+      min: "0",
+      max: "1",
+    },
+  },
+  SettingDescriptor {
+    number: 21,
+    field: Field::HardLimitsEnable,
+    meta: SettingMeta {
+      group: GROUP_LIMITS,
+      name: "Hard limits enable",
+      unit: "",
+      datatype: SettingDatatype::Bool,
+      format: "",
+      min: "0",
+      max: "1",
+    },
+  },
+  SettingDescriptor {
+    number: 22,
+    field: Field::HomingEnable,
+    meta: SettingMeta {
+      group: GROUP_HOMING,
+      name: "Homing cycle enable",
+      unit: "",
+      datatype: SettingDatatype::Bool,
+      format: "",
+      min: "0",
+      max: "1",
+    },
+  },
+  SettingDescriptor {
+    number: 23,
+    field: Field::HomingDirInvertMask,
+    meta: SettingMeta {
+      group: GROUP_HOMING,
+      name: "Homing direction invert",
+      unit: "",
+      datatype: SettingDatatype::AxisMask,
+      format: "",
+      min: "0",
+      max: "7",
+    },
+  },
+  SettingDescriptor {
+    number: 24,
+    field: Field::HomingFeedMmMin,
+    meta: SettingMeta {
+      group: GROUP_HOMING,
+      name: "Homing locate feed rate",
+      unit: "mm/min",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 25,
+    field: Field::HomingSeekMmMin,
+    meta: SettingMeta {
+      group: GROUP_HOMING,
+      name: "Homing search seek rate",
+      unit: "mm/min",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 26,
+    field: Field::HomingDebounceMs,
+    meta: SettingMeta {
+      group: GROUP_HOMING,
+      name: "Homing switch debounce delay",
+      unit: "milliseconds",
+      datatype: SettingDatatype::Integer,
+      format: "",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 27,
+    field: Field::HomingPulloffMm,
+    meta: SettingMeta {
+      group: GROUP_HOMING,
+      name: "Homing switch pull-off distance",
+      unit: "millimeters",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 30,
+    field: Field::SpindleRpmMax,
+    meta: SettingMeta {
+      group: GROUP_SPINDLE,
+      name: "Maximum spindle speed",
+      unit: "RPM",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 31,
+    field: Field::SpindleRpmMin,
+    meta: SettingMeta {
+      group: GROUP_SPINDLE,
+      name: "Minimum spindle speed",
+      unit: "RPM",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 481,
+    field: Field::AutoReportIntervalMs,
+    meta: SettingMeta {
+      group: GROUP_GENERAL,
+      name: "Autoreport interval",
+      unit: "milliseconds",
+      datatype: SettingDatatype::Integer,
+      format: "",
+      min: "0",
+      max: "1000",
+    },
+  },
+  SettingDescriptor {
+    number: 100,
+    field: Field::StepsPerMm,
+    meta: SettingMeta {
+      group: GROUP_AXIS,
+      name: "Travel resolution",
+      unit: "step/mm",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 110,
+    field: Field::MaxRateMmMin,
+    meta: SettingMeta {
+      group: GROUP_AXIS,
+      name: "Maximum rate",
+      unit: "mm/min",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 120,
+    field: Field::AccelMmS2,
+    meta: SettingMeta {
+      group: GROUP_AXIS,
+      name: "Acceleration",
+      unit: "mm/sec^2",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 130,
+    field: Field::MaxTravelMm,
+    meta: SettingMeta {
+      group: GROUP_AXIS,
+      name: "Maximum travel",
+      unit: "millimeters",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "", // Strictly positive; bound left unbounded for display (see Arc tolerance).
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 140,
+    field: Field::RunCurrentMa,
+    meta: SettingMeta {
+      group: GROUP_AXIS,
+      name: "Motor current",
+      unit: "mA",
+      datatype: SettingDatatype::Integer,
+      format: "",
+      min: "0",
+      max: "2000",
+    },
+  },
+  SettingDescriptor {
+    number: 150,
+    field: Field::Microsteps,
+    meta: SettingMeta {
+      group: GROUP_AXIS,
+      name: "Microsteps",
+      unit: "",
+      datatype: SettingDatatype::Integer,
+      format: "",
+      min: "1",
+      max: "256",
+    },
+  },
+];
+
+/// The number of setting GROUPS the `$EG` enumeration emits, so the firmware can loop `0..SETTING_GROUP_COUNT`
+/// and render one `[SETTINGGROUP:]` line per index through its line-by-line response writer.
+pub const SETTING_GROUP_COUNT: usize = SETTING_GROUPS.len();
+
+/// Render the `$EG` enumeration line for setting-group `index` (`0..`[`SETTING_GROUP_COUNT`]) into `out`
+/// (CRLF-terminated), in grblHAL's `[SETTINGGROUP:<id>|<parent>|<name>]` form. Returns `true` on success,
+/// `false` for an out-of-range `index`. The firmware loops the count and emits each line through the single
+/// USB writer (so a long enumeration never builds one giant buffer), then a terminating `ok`.
+pub fn write_setting_group<const N: usize>(index: usize, out: &mut heapless::String<N>) -> bool {
+  use core::fmt::Write;
+  let Some(group) = SETTING_GROUPS.get(index) else {
+    return false;
+  };
+  write!(out, "[SETTINGGROUP:{}|{}|{}]\r\n", group.id, group.parent, group.name).is_ok()
+}
 
 /// Find the descriptor owning `$n` and the axis index (0 for a scalar, 0..AXES for a per-axis triple) `n`
 /// addresses within it. Returns `None` for an unknown number. This is the one lookup all three derived
@@ -581,7 +1129,7 @@ fn lookup_descriptor(n: u16) -> Option<(&'static SettingDescriptor, usize)> {
 /// Load the persisted settings, falling back to [`Settings::default`] on absence OR any decode failure. This
 /// is the INFALLIBLE loader (DOC-04): a corrupt, truncated, version-skewed, or missing record can never wedge
 /// boot — it silently yields defaults, which the firmware then applies. The decoded record is sanitized.
-pub async fn load_or_default<S: SettingsStore>(store: &mut S) -> Settings {
+pub async fn load_or_default<S: RecordStore>(store: &mut S) -> Settings {
   let mut buf = [0u8; wire::FRAME_MAX_LEN];
   match store.load(&mut buf).await {
     Ok(len) => wire::decode(&buf[..len]).unwrap_or_default(),
@@ -592,7 +1140,7 @@ pub async fn load_or_default<S: SettingsStore>(store: &mut S) -> Settings {
 /// Encode `settings` into a storage frame and persist it via `store`, replacing any prior record. Surfaces
 /// encode/store failures to the caller (a failed `$x=val` persist should still `ok` the line — the in-RAM
 /// value applied — but the firmware logs the failure).
-pub async fn store_settings<S: SettingsStore>(store: &mut S, settings: &Settings) -> Result<(), StoreError> {
+pub async fn store_settings<S: RecordStore>(store: &mut S, settings: &Settings) -> Result<(), StoreError> {
   let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
   // An encode failure here would only happen if the frame buffer were undersized, which the const sizing
   // rules out; map it to a storage `TooLarge` rather than introducing a separate error type at this boundary.
@@ -722,6 +1270,13 @@ impl PbReceiver {
 pub mod wire {
   use super::Settings;
   use crate::planner::AXES;
+  use crate::storage_frame::{self, FRAME_OVERHEAD};
+
+  // The shared framing primitives are re-exported so the public `settings::wire` surface (the `CodecError` /
+  // `FrameProgress` types comms.rs and `PbReceiver` name) is unchanged after the codec was lifted into
+  // `storage_frame`. The encode/decode/frame_progress wrappers below stay settings-specific (they own the
+  // settings magic/version and the protobuf type) and call the shared `frame`/`unframe`/`frame_progress`.
+  pub use crate::storage_frame::{CodecError, FrameProgress};
 
   /// Frame magic, ASCII "GdS1" — identifies a galdr settings record.
   const MAGIC: u32 = 0x4764_5331;
@@ -731,128 +1286,36 @@ pub mod wire {
   /// version is reserved for a genuinely incompatible layout change (a renumbered/retyped/removed field);
   /// bumping it then makes [`decode`] reject the stale record so the loader restores defaults.
   const SCHEMA_VERSION: u8 = 1;
-  /// Bytes of fixed framing overhead around the protobuf payload (magic 4 + version 1 + len 2 + CRC 4).
-  const FRAME_OVERHEAD: usize = 11;
 
-  /// Maximum framed-record length, sized to the largest protobuf payload plus the framing overhead. Buffers
-  /// for load/save and the `$PBX` channel are sized from this.
+  /// Maximum framed-record length, sized to the largest protobuf payload plus the shared framing overhead.
+  /// Buffers for load/save and the `$PBX` channel are sized from this.
   pub const FRAME_MAX_LEN: usize = galdr_proto::SETTINGS_MAX_LEN + FRAME_OVERHEAD;
 
-  /// Failure encoding or decoding a settings storage frame.
-  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-  #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-  pub enum CodecError {
-    /// The destination buffer could not hold the encoded frame.
-    BufferFull,
-    /// The frame was shorter than the fixed overhead, or its declared payload length did not fit.
-    BadLength,
-    /// The leading magic did not match a galdr settings record.
-    BadMagic,
-    /// The schema version did not match this build's [`SCHEMA_VERSION`].
-    BadVersion,
-    /// The trailing CRC32 did not match the computed checksum (corruption / torn write).
-    BadCrc,
-    /// The protobuf payload was malformed.
-    BadPayload,
-  }
-
   /// Encode `settings` into `out` as a complete storage frame (the buffer is cleared first). Builds the
-  /// protobuf payload from the settings, writes the magic/version/length header, appends the payload, then
-  /// appends a CRC32 over everything preceding it.
+  /// protobuf payload from the settings and hands it, with the settings magic/version, to the shared framer,
+  /// which writes the `MAGIC | version | len | payload | CRC32` layout.
   pub fn encode<const N: usize>(settings: &Settings, out: &mut heapless::Vec<u8, N>) -> Result<(), CodecError> {
-    out.clear();
     let proto = settings.to_proto();
     let payload_len = galdr_proto::settings_size(&proto);
-    if payload_len > u16::MAX as usize {
-      return Err(CodecError::BadLength);
-    }
-    push_slice(out, &MAGIC.to_le_bytes())?;
-    push_byte(out, SCHEMA_VERSION)?;
-    push_slice(out, &(payload_len as u16).to_le_bytes())?;
-    galdr_proto::encode_settings_into(&proto, out).map_err(|_| CodecError::BufferFull)?;
-    let crc = crc32(out.as_slice());
-    push_slice(out, &crc.to_le_bytes())?;
-    Ok(())
+    storage_frame::frame(MAGIC, SCHEMA_VERSION, payload_len, out, |buf| {
+      galdr_proto::encode_settings_into(&proto, buf).map_err(|_| CodecError::BufferFull)
+    })
   }
 
-  /// Decode and validate a storage frame, returning the sanitized [`Settings`]. Verifies the magic, schema
-  /// version, declared length, and CRC32 before decoding the protobuf payload; any mismatch is an error so
-  /// the infallible loader falls back to defaults rather than trusting a damaged record.
+  /// Decode and validate a storage frame, returning the sanitized [`Settings`]. The shared [`unframe`] verifies
+  /// the magic, schema version, declared length, and CRC32 and yields the protobuf payload slice; any mismatch
+  /// is an error so the infallible loader falls back to defaults rather than trusting a damaged record.
   pub fn decode(frame: &[u8]) -> Result<Settings, CodecError> {
-    if frame.len() < FRAME_OVERHEAD {
-      return Err(CodecError::BadLength);
-    }
-    let magic = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
-    if magic != MAGIC {
-      return Err(CodecError::BadMagic);
-    }
-    if frame[4] != SCHEMA_VERSION {
-      return Err(CodecError::BadVersion);
-    }
-    let payload_len = u16::from_le_bytes([frame[5], frame[6]]) as usize;
-    let payload_end = 7 + payload_len;
-    if frame.len() != payload_end + 4 {
-      return Err(CodecError::BadLength);
-    }
-    let expected_crc = u32::from_le_bytes([frame[payload_end], frame[payload_end + 1], frame[payload_end + 2], frame[payload_end + 3]]);
-    if crc32(&frame[..payload_end]) != expected_crc {
-      return Err(CodecError::BadCrc);
-    }
-    let proto = galdr_proto::decode_settings(&frame[7..payload_end]).map_err(|_| CodecError::BadPayload)?;
+    let payload = storage_frame::unframe(MAGIC, SCHEMA_VERSION, frame)?;
+    let proto = galdr_proto::decode_settings(payload).map_err(|_| CodecError::BadPayload)?;
     Ok(Settings::from_proto(&proto).sanitized())
   }
 
-  /// How much of a settings frame a partial byte buffer represents, for the chunked `$PBX` host-sync write
-  /// path (which accumulates a frame across several lines).
-  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-  pub enum FrameProgress {
-    /// Fewer than the fixed-header bytes have arrived; the total length is not yet known.
-    NeedMore,
-    /// The header is present but malformed (bad magic/version, or a declared length that cannot be valid).
-    BadHeader,
-    /// The header is valid; the complete frame is exactly this many bytes long.
-    Total(usize),
-  }
-
-  /// Inspect the leading bytes of an accumulating frame: report the full frame length once enough header is
-  /// present and valid, so a chunked receiver knows when it has the whole record. Does NOT verify the CRC or
-  /// payload — that is [`decode`]'s job once the full frame is assembled.
+  /// How much of a settings frame a partial byte buffer represents, for the chunked `$PBX` host-sync write path
+  /// (which accumulates a frame across several lines). Defers to the shared [`storage_frame::frame_progress`]
+  /// with the settings magic/version and this record's [`FRAME_MAX_LEN`].
   pub fn frame_progress(buf: &[u8]) -> FrameProgress {
-    if buf.len() < 7 {
-      return FrameProgress::NeedMore;
-    }
-    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    if magic != MAGIC || buf[4] != SCHEMA_VERSION {
-      return FrameProgress::BadHeader;
-    }
-    let payload_len = u16::from_le_bytes([buf[5], buf[6]]) as usize;
-    let total = 7 + payload_len + 4;
-    if total > FRAME_MAX_LEN {
-      return FrameProgress::BadHeader;
-    }
-    FrameProgress::Total(total)
-  }
-
-  fn push_byte<const N: usize>(out: &mut heapless::Vec<u8, N>, byte: u8) -> Result<(), CodecError> {
-    out.push(byte).map_err(|_| CodecError::BufferFull)
-  }
-
-  fn push_slice<const N: usize>(out: &mut heapless::Vec<u8, N>, bytes: &[u8]) -> Result<(), CodecError> {
-    out.extend_from_slice(bytes).map_err(|_| CodecError::BufferFull)
-  }
-
-  /// CRC-32 (IEEE 802.3, reflected, poly 0xEDB88320) over `data`. Hand-rolled to keep firmware-core's
-  /// dependency set unchanged, mirroring the hand-rolled CRC8 in the TMC2209 codec.
-  fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-      crc ^= byte as u32;
-      for _ in 0..8 {
-        let mask = (crc & 1).wrapping_neg();
-        crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-      }
-    }
-    !crc
+    storage_frame::frame_progress(MAGIC, SCHEMA_VERSION, FRAME_MAX_LEN, buf)
   }
 
   impl Settings {
@@ -879,6 +1342,7 @@ pub mod wire {
       proto.homing_pulloff_mm = self.homing_pulloff_mm;
       proto.spindle_rpm_max = self.spindle_rpm_max;
       proto.spindle_rpm_min = self.spindle_rpm_min;
+      proto.auto_report_interval_ms = self.auto_report_interval_ms;
       proto.steps_per_mm_x = self.steps_per_mm[0];
       proto.steps_per_mm_y = self.steps_per_mm[1];
       proto.steps_per_mm_z = self.steps_per_mm[2];
@@ -905,6 +1369,8 @@ pub mod wire {
       proto.tmc_tpwmthrs = self.tmc_tpwmthrs;
       proto.tmc_send_delay = self.tmc_send_delay as u32;
       proto.tmc_r_sense_ohms = self.tmc_r_sense_ohms;
+      proto.probe_invert = self.probe_invert;
+      proto.probe_pullup_disable = self.probe_pullup_disable;
       proto
     }
 
@@ -920,6 +1386,8 @@ pub mod wire {
         step_idle_delay_ms: proto.step_idle_delay_ms,
         step_invert_mask: saturating_u8(proto.step_invert_mask),
         dir_invert_mask: saturating_u8(proto.dir_invert_mask),
+        probe_invert: proto.probe_invert,
+        probe_pullup_disable: proto.probe_pullup_disable,
         status_report_mask: saturating_u8(proto.status_report_mask),
         junction_deviation_mm: proto.junction_deviation_mm,
         arc_tolerance_mm: proto.arc_tolerance_mm,
@@ -933,6 +1401,7 @@ pub mod wire {
         homing_pulloff_mm: proto.homing_pulloff_mm,
         spindle_rpm_max: proto.spindle_rpm_max,
         spindle_rpm_min: proto.spindle_rpm_min,
+        auto_report_interval_ms: proto.auto_report_interval_ms,
         steps_per_mm: [proto.steps_per_mm_x, proto.steps_per_mm_y, proto.steps_per_mm_z],
         max_rate_mm_min: [proto.max_rate_mm_min_x, proto.max_rate_mm_min_y, proto.max_rate_mm_min_z],
         accel_mm_s2: [proto.accel_mm_s2_x, proto.accel_mm_s2_y, proto.accel_mm_s2_z],
@@ -982,14 +1451,14 @@ pub mod wire {
 mod tests {
   use super::*;
 
-  /// An in-memory [`SettingsStore`] for host tests: holds the last saved frame, like the byte-buffer mocks
-  /// used for `TmcBus`/`StepSink`. Empty until something is saved (so `load` reports `NotFound`).
+  /// An in-memory [`RecordStore`] for host tests: holds the last saved frame, like the byte-buffer mocks used
+  /// for `TmcBus`/`StepSink`. Empty until something is saved (so `load` reports `NotFound`).
   #[derive(Default)]
   struct MockStore {
     record: Option<heapless::Vec<u8, { wire::FRAME_MAX_LEN }>>,
   }
 
-  impl SettingsStore for MockStore {
+  impl RecordStore for MockStore {
     async fn load(&mut self, buf: &mut [u8]) -> Result<usize, StoreError> {
       match &self.record {
         Some(record) => {
@@ -1055,6 +1524,22 @@ mod tests {
     assert!(settings.homing_enable);
     settings.set_command(0, "5").expect("set $0");
     assert_eq!(settings.step_pulse_us, 5);
+  }
+
+  #[test]
+  fn probe_settings_apply_and_build_probe_config() {
+    // `$6` (probe invert) and `$19` (probe pull-up disable) are grbl booleans; they apply to the live settings
+    // and surface through `probe_config()` so the host-tested probe-trigger logic sees them (DOC-09, Phase C).
+    let mut settings = Settings::default();
+    assert_eq!(settings.probe_config(), crate::hal_traits::ProbeConfig::default());
+    settings.set_command(6, "1").expect("set $6");
+    settings.set_command(19, "1").expect("set $19");
+    assert!(settings.probe_invert && settings.probe_pullup_disable);
+    let cfg = settings.probe_config();
+    assert!(cfg.invert && cfg.pullup_disable);
+    // grbl boolean semantics: `$6=0` clears it.
+    settings.set_command(6, "0").expect("clear $6");
+    assert!(!settings.probe_invert);
   }
 
   #[test]
@@ -1207,6 +1692,44 @@ mod tests {
   }
 
   #[test]
+  fn wire_frame_byte_layout_is_stable_after_codec_extraction() {
+    // The on-flash byte layout MUST be byte-for-byte identical to before the shared `storage_frame` codec was
+    // extracted, so records already in flash still decode. Assert the canonical
+    // `GdS1(LE) | VERSION=1 | payload_len(LE) | payload | CRC32(LE)` framing the prior hand-rolled `encode`
+    // produced. The magic ASCII is "GdS1" stored little-endian (0x47645331) and the version is 1.
+    let settings = Settings::default();
+    let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
+    wire::encode(&settings, &mut frame).expect("encode");
+    // Magic: 0x4764_5331 little-endian → bytes [0x31, 0x53, 0x64, 0x47] = b"1SdG" on the wire.
+    assert_eq!(&frame[0..4], &0x4764_5331u32.to_le_bytes());
+    assert_eq!(frame[4], 1, "schema version is 1");
+    // The declared payload length (LE u16 at [5..7]) matches the protobuf size, and the frame is
+    // header(7) + payload + crc(4) bytes long.
+    let payload_len = u16::from_le_bytes([frame[5], frame[6]]) as usize;
+    assert_eq!(frame.len(), 7 + payload_len + 4);
+    // The trailing CRC32 covers everything before it (header + payload), reflected-poly 0xEDB88320.
+    let payload_end = 7 + payload_len;
+    let crc = u32::from_le_bytes([frame[payload_end], frame[payload_end + 1], frame[payload_end + 2], frame[payload_end + 3]]);
+    assert_eq!(crc, firmware_core_crc(&frame[..payload_end]));
+    // And the frame round-trips back to the same settings, confirming the extracted codec accepts what it emits.
+    assert_eq!(wire::decode(&frame).expect("decode"), settings);
+  }
+
+  /// The reference CRC32 (IEEE 802.3, reflected, poly 0xEDB88320) used to pin the frame's checksum byte-for-byte
+  /// against the layout the prior hand-rolled codec produced; recomputed here independently of `storage_frame`.
+  fn firmware_core_crc(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+      crc ^= byte as u32;
+      for _ in 0..8 {
+        let mask = (crc & 1).wrapping_neg();
+        crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+      }
+    }
+    !crc
+  }
+
+  #[test]
   fn wire_decode_rejects_corruption() {
     let settings = Settings::default();
     let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
@@ -1309,5 +1832,119 @@ mod tests {
     let mut hex: heapless::String<{ wire::FRAME_MAX_LEN * 2 }> = heapless::String::new();
     assert!(write_hex(&frame, &mut hex));
     assert_eq!(receiver.accept_hex(&hex), PbChunkResult::Error);
+  }
+
+  // --- Phase F: $481 auto-report setting + $ES/$EG/$SED enumeration ---------------------------------
+
+  #[test]
+  fn auto_report_interval_parses_clamps_and_round_trips() {
+    let mut settings = Settings::default();
+    // Default is disabled (0).
+    assert_eq!(settings.auto_report_interval_ms, 0);
+    assert_eq!(settings.auto_report_interval_ms(), 0);
+    // A valid in-range value applies and the accessor returns it verbatim.
+    settings.set_command(481, "250").expect("set $481=250");
+    assert_eq!(settings.auto_report_interval_ms, 250);
+    assert_eq!(settings.auto_report_interval_ms(), 250);
+    // 0 disables.
+    settings.set_command(481, "0").expect("set $481=0");
+    assert_eq!(settings.auto_report_interval_ms, 0);
+    // Out-of-range non-zero values are rejected by the setter (grblHAL's 100..=1000), leaving the value unchanged.
+    assert_eq!(settings.set_command(481, "50"), Err(SettingError::OutOfRange));
+    assert_eq!(settings.set_command(481, "2000"), Err(SettingError::OutOfRange));
+    assert_eq!(settings.auto_report_interval_ms, 0);
+    // A non-numeric value is a bad value.
+    assert_eq!(settings.set_command(481, "fast"), Err(SettingError::BadValue));
+  }
+
+  #[test]
+  fn auto_report_interval_sanitizer_floors_a_corrupt_record() {
+    // A corrupt/legacy record carrying an out-of-range non-zero interval is pulled into range; 0 stays disabled.
+    // Build each case as a fresh record so the sanitizer is exercised on the raw (un-clamped) field value.
+    let with_interval = |ms: u32| Settings { auto_report_interval_ms: ms, ..Settings::default() };
+    assert_eq!(with_interval(5).sanitized().auto_report_interval_ms, AUTO_REPORT_INTERVAL_MIN_MS);
+    assert_eq!(with_interval(50_000).sanitized().auto_report_interval_ms, AUTO_REPORT_INTERVAL_MAX_MS);
+    assert_eq!(with_interval(0).sanitized().auto_report_interval_ms, 0);
+  }
+
+  #[test]
+  fn auto_report_interval_persists_through_the_wire_frame() {
+    let mut settings = Settings::default();
+    settings.set_command(481, "300").expect("set $481=300");
+    let store = &mut MockStore::default();
+    block_on(store_settings(store, &settings)).expect("store");
+    let loaded = block_on(load_or_default(store));
+    assert_eq!(loaded.auto_report_interval_ms, 300);
+  }
+
+  #[test]
+  fn every_setting_number_enumerates_with_min_max_matching_its_range() {
+    // Every `$$` number must also produce a well-formed `[SETTING:]` line whose 8 fields parse, and whose
+    // min/max (when present) bracket the setting's accepted range — i.e. the descriptor metadata cannot drift
+    // from the setter's validation.
+    let mut settings = Settings::default();
+    for &n in SETTING_NUMBERS {
+      let mut line: heapless::String<160> = heapless::String::new();
+      assert!(Settings::write_setting_enumeration(n, &mut line), "no enumeration for $n={n}");
+      let body = line.as_str().trim_end_matches("\r\n");
+      let inner = body.strip_prefix("[SETTING:").and_then(|s| s.strip_suffix(']')).expect("bracketed [SETTING:]");
+      let fields: heapless::Vec<&str, 8> = inner.split('|').collect();
+      assert_eq!(fields.len(), 8, "[SETTING:] must have 8 pipe-separated fields, got {inner:?}");
+      // Field 0 is the id; it must equal `n`.
+      assert_eq!(fields[0].parse::<u16>().expect("numeric id"), n, "[SETTING:] id mismatch for $n={n}");
+      // Fields 6/7 are min/max; when present they bracket the accepted range — a write of min and of max must be
+      // accepted (or, for an empty bound, skipped). This proves the enumerated bounds are the REAL bounds.
+      if !fields[6].is_empty() {
+        assert!(settings.set_command(n, fields[6]).is_ok(), "$n={n} rejected its enumerated min {:?}", fields[6]);
+      }
+      if !fields[7].is_empty() {
+        assert!(settings.set_command(n, fields[7]).is_ok(), "$n={n} rejected its enumerated max {:?}", fields[7]);
+      }
+    }
+  }
+
+  #[test]
+  fn setting_enumeration_line_wire_format() {
+    // Byte-exact `[SETTING:0|...]` for `$0` (step pulse time) — a sampled line type asserted in full.
+    let mut line: heapless::String<160> = heapless::String::new();
+    assert!(Settings::write_setting_enumeration(0, &mut line));
+    assert_eq!(line.as_str(), "[SETTING:0|8|Step pulse time|microseconds|5||1|1000]\r\n");
+    // An unknown number does not enumerate.
+    let mut none: heapless::String<160> = heapless::String::new();
+    assert!(!Settings::write_setting_enumeration(9999, &mut none));
+    assert!(none.is_empty());
+  }
+
+  #[test]
+  fn setting_groups_cover_all_descriptor_groups() {
+    // Every group id referenced by a descriptor's metadata must have a `[SETTINGGROUP:]` row, so a sender that
+    // buckets settings by group never references an undefined group.
+    for desc in SETTING_DESCRIPTORS {
+      assert!(
+        SETTING_GROUPS.iter().any(|g| g.id == desc.meta.group),
+        "setting $n={} references undefined group {}",
+        desc.number,
+        desc.meta.group,
+      );
+    }
+    // And `$EG` renders one well-formed line per group, byte-exact for the General root group.
+    let mut first: heapless::String<96> = heapless::String::new();
+    assert!(write_setting_group(0, &mut first));
+    assert_eq!(first.as_str(), "[SETTINGGROUP:1|0|General]\r\n");
+    // Out-of-range index does not render.
+    let mut none: heapless::String<96> = heapless::String::new();
+    assert!(!write_setting_group(SETTING_GROUP_COUNT, &mut none));
+    assert!(none.is_empty());
+  }
+
+  #[test]
+  fn setting_description_line_wire_format() {
+    // `$SED=0` renders `[SETTINGDESCR:0|Step pulse time (microseconds)]`; an unknown id does not render.
+    let mut line: heapless::String<96> = heapless::String::new();
+    assert!(Settings::write_setting_description(0, &mut line));
+    assert_eq!(line.as_str(), "[SETTINGDESCR:0|Step pulse time (microseconds)]\r\n");
+    let mut none: heapless::String<96> = heapless::String::new();
+    assert!(!Settings::write_setting_description(9999, &mut none));
+    assert!(none.is_empty());
   }
 }

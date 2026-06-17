@@ -96,6 +96,62 @@ pub trait StepSink {
 // DigitalIn: limit / control digital input (NC limit switches, feed-hold, cycle-start).
 // TODO(DOC-06): pub trait DigitalIn { fn is_active(&self) -> bool; }
 
+/// The runtime configuration of the probe input that the host-tested probe logic needs (DOC-09, Phase C). It
+/// folds the two grblHAL probe `$`-settings the probe READ depends on:
+/// - `$6` (`invert`): a Normally-Open touch plate sits open (pulled high) until contact, so `$6=1` inverts the
+///   raw pin so an UNTOUCHED plate reads "not triggered" and contact reads "triggered" (see `docs/tlo-offsets.md`
+///   Finding #6). The host-tested [`probe_triggered`] applies this, so the trigger sense is unit-tested rather
+///   than buried in the GPIO wiring.
+/// - `$19` (`pullup_disable`): whether the firmware enables the input's internal pull-up. It is a PIN-CONFIG
+///   concern (the GPIO layer applies it at bring-up), not a per-read transform, so it is carried here only so the
+///   firmware bin can read it from one place; [`probe_triggered`] does not consult it. A passive plate needs the
+///   pull-up, so the default is `false` (pull-up enabled), matching grbl's `$19=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ProbeConfig {
+  /// `$6` probe-pin invert. When `true`, the raw electrical level is inverted before the trigger decision, so a
+  /// Normally-Open plate (open/high when untouched) reads "not triggered" until contact. Default `false`.
+  pub invert: bool,
+  /// `$19` probe-pin pull-up DISABLE. `true` disables the input's internal pull-up; a passive touch plate needs
+  /// it enabled, so the default is `false`. Applied by the GPIO layer at pin config, not by [`probe_triggered`].
+  pub pullup_disable: bool,
+}
+
+impl Default for ProbeConfig {
+  /// grbl's probe defaults: pull-up enabled (`$19=0`) and no invert (`$6=0`). A Normally-Open plate then needs
+  /// `$6=1` set explicitly, which `docs/tlo-offsets.md` documents as the common touch-plate configuration.
+  fn default() -> Self {
+    ProbeConfig { invert: false, pullup_disable: false }
+  }
+}
+
+/// Decide whether the probe is currently TRIGGERED (contact made) from its RAW electrical level and the probe
+/// config, applying the `$6` invert. This is the single host-tested place the invert is honored so the firmware
+/// bin's GPIO read and the executor's probe watch agree on the trigger sense. `raw_high` is the pin level
+/// directly off the input (`true` = electrically high); with `$6=0` a high pin is "not triggered" and a low pin
+/// is "triggered" (grbl's NC philosophy), and `$6=1` flips that for a Normally-Open plate.
+pub fn probe_triggered(raw_high: bool, config: &ProbeConfig) -> bool {
+  // The base (`$6=0`) sense follows grbl's documented "pin low/grounded = triggered, pin high = not triggered":
+  // an active touch-plate input idles high (held by the pull-up) and is pulled low on contact. `$6=1` is a pure
+  // electrical INVERT of that decision, so a board whose probe circuit idles low (e.g. an opto-isolated or
+  // hardware-inverted input) reads "not triggered" until the level flips. `docs/tlo-offsets.md` Finding #6 is
+  // explicit that the correct `$6` is hardware-specific and must be verified empirically (the `Pn:P` flag must
+  // be ABSENT with the plate untouched); this keeps `$6` a single, unambiguous invert so that calibration works.
+  let triggered_when_low = !raw_high;
+  triggered_when_low ^ config.invert
+}
+
+/// A probe digital input (DOC-09, Phase C). Implemented over a single GPIO with a pull-up on target (a dedicated
+/// pin separate from the limit switches, per `docs/tlo-offsets.md` Finding #7) and as a scripted recording mock
+/// in host tests. The trait exposes only the RAW electrical level; the `$6` invert is applied by the host-tested
+/// [`probe_triggered`] so the firmware impl carries zero settings knowledge and the trigger sense stays unit-
+/// tested. The probe-cycle executor (in the firmware bin's motion layer) samples this between step bursts.
+pub trait ProbeInput {
+  /// The raw electrical level of the probe pin: `true` = high, `false` = low. The `$6`-adjusted trigger decision
+  /// is made by [`probe_triggered`]; this reader is deliberately invert-agnostic so the policy lives in one place.
+  fn is_high(&self) -> bool;
+}
+
 // DigitalOut: digital output (stepper enable, spindle enable/direction).
 // TODO(DOC-05): pub trait DigitalOut { fn set(&mut self, level: bool) -> Result<(), ()>; }
 
@@ -122,7 +178,7 @@ pub trait StepSink {
 /// its own `async fn` init/poll methods, and the host mock's futures are immediately ready.
 ///
 /// The `async fn`-in-trait lint (auto-trait bounds like `Send` cannot be named on the returned future) is
-/// deliberately allowed, mirroring [`SettingsStore`]: firmware-core only ever drives these futures via static
+/// deliberately allowed, mirroring [`RecordStore`]: firmware-core only ever drives these futures via static
 /// dispatch (`TmcManager<B: TmcBus>`) from its own single-task `async fn` methods — exactly the "use the trait
 /// only in your own code" case the lint calls out, so no boxing or `Send` bound is needed.
 #[allow(async_fn_in_trait)]
@@ -134,13 +190,13 @@ pub trait TmcBus {
   async fn read_reg(&mut self, node: u8, reg: u8) -> Result<u32, TmcError>;
 }
 
-/// Errors a [`SettingsStore`] may return. The store deals only in opaque framed bytes (DOC-04 persistence);
-/// the [`crate::settings::wire`] layer owns the framing/CRC/version, so these are purely about the storage
-/// medium, not the record contents.
+/// Errors a [`RecordStore`] may return. The store deals only in opaque framed bytes (DOC-04 persistence); the
+/// per-record `wire` layer ([`crate::settings::wire`] / [`crate::coords::wire`]) owns the framing/CRC/version,
+/// so these are purely about the storage medium, not the record contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum StoreError {
-  /// No settings record has been persisted yet (a fresh device). The loader treats this as "use defaults".
+  /// No record has been persisted yet (a fresh device). The loader treats this as "use defaults".
   NotFound,
   /// The underlying storage medium failed (on target: a flash read/write/erase error).
   Io,
@@ -148,11 +204,18 @@ pub enum StoreError {
   TooLarge,
 }
 
-/// Persistence backend for the settings record (DOC-04). Implemented over `sequential-storage` on the NVS
-/// flash partition on target, and as an in-memory buffer in host tests — mirroring how [`TmcBus`]/[`StepSink`]
-/// abstract their hardware. The store moves only opaque framed bytes: all protobuf encode/decode, the
-/// magic/version header, and the CRC live in [`crate::settings::wire`], so a store impl carries zero settings
-/// knowledge and the whole load/save/versioning policy stays host-testable.
+/// Persistence backend for ONE framed record (DOC-04 / Phase B). A single trait serves every persisted blob —
+/// the `$`-settings frame ([`crate::settings::wire`]) and the coordinate frame ([`crate::coords::wire`]) — so the
+/// flash plumbing lives once: the firmware bin's `FlashRecordStore` carries the per-record NVS key and backs both
+/// the settings loader and the coordinate loader with the same code. Implemented over `sequential-storage` on the
+/// NVS flash partition on target, and as an in-memory buffer in host tests — mirroring how [`TmcBus`]/[`StepSink`]
+/// abstract their hardware.
+///
+/// The store moves only opaque framed bytes: all protobuf encode/decode, the magic/version header, and the CRC
+/// live in the record's own `wire` module, so a store impl carries zero record knowledge and the whole
+/// load/save/versioning policy stays host-testable. Each store instance targets exactly one record (the firmware
+/// bin builds one per NVS key), so the trait itself stays key-less — the record's identity is the store's, not a
+/// per-call argument.
 ///
 /// The methods are `async` so the firmware can `.await` the (interrupt-driven, erase-before-write) flash
 /// transport directly instead of busy-spinning a `block_on`, which on a single-executor target risks a
@@ -163,13 +226,12 @@ pub enum StoreError {
 /// deliberately allowed: firmware-core only ever drives these futures via static dispatch from its own
 /// single-task `async fn` loaders — exactly the "use the trait only in your own code" case the lint calls out.
 #[allow(async_fn_in_trait)]
-pub trait SettingsStore {
-  /// Read the persisted settings frame into `buf`, returning its length. [`StoreError::NotFound`] if nothing
-  /// has been stored yet; [`StoreError::TooLarge`] if the record does not fit `buf`.
+pub trait RecordStore {
+  /// Read the persisted record frame into `buf`, returning its length. [`StoreError::NotFound`] if nothing has
+  /// been stored yet; [`StoreError::TooLarge`] if the record does not fit `buf`.
   async fn load(&mut self, buf: &mut [u8]) -> Result<usize, StoreError>;
 
-  /// Persist `frame` (a complete, already-framed settings record) to the backing store, replacing any prior
-  /// record.
+  /// Persist `frame` (a complete, already-framed record) to the backing store, replacing any prior record.
   async fn save(&mut self, frame: &[u8]) -> Result<(), StoreError>;
 }
 
@@ -185,5 +247,44 @@ mod tests {
   fn full_burst_plus_end_marker_fits_one_rmt_block() {
     const RMT_BLOCK_SYMBOLS: usize = 48;
     assert_eq!(MAX_SYMBOLS_PER_BURST + 1, RMT_BLOCK_SYMBOLS, "events + end marker must equal one RMT block");
+  }
+
+  // ---- Probe input: `$6` invert / `$19` pull-up semantics ----------------------------------------
+
+  #[test]
+  fn probe_default_config_is_low_triggered_pullup_enabled() {
+    // grbl defaults: no invert (`$6=0`), pull-up enabled (`$19=0`). The base sense is "pin low = triggered": a
+    // touch-plate input idles HIGH (held by the pull-up) and is pulled low on contact, so high reads
+    // not-triggered and low reads triggered.
+    let cfg = ProbeConfig::default();
+    assert!(!cfg.invert);
+    assert!(!cfg.pullup_disable);
+    assert!(!probe_triggered(true, &cfg), "untouched (high) reads not-triggered under $6=0");
+    assert!(probe_triggered(false, &cfg), "contact (low) reads triggered under $6=0");
+  }
+
+  #[test]
+  fn probe_invert_flips_the_trigger_sense() {
+    // `$6=1` is a pure electrical invert: it flips both levels' trigger decision so a board whose probe input
+    // idles LOW (an opto-isolated / hardware-inverted circuit) reads not-triggered until the level rises. The
+    // correct `$6` for a given plate is hardware-specific (verified empirically per `docs/tlo-offsets.md`); what
+    // is unit-tested here is that the bit cleanly inverts the base decision.
+    let inverted = ProbeConfig { invert: true, pullup_disable: false };
+    let base = ProbeConfig::default();
+    assert_eq!(probe_triggered(true, &inverted), !probe_triggered(true, &base), "$6 inverts the high decision");
+    assert_eq!(probe_triggered(false, &inverted), !probe_triggered(false, &base), "$6 inverts the low decision");
+    // Concretely: under `$6=1`, a high pin is triggered and a low pin is not.
+    assert!(probe_triggered(true, &inverted));
+    assert!(!probe_triggered(false, &inverted));
+  }
+
+  #[test]
+  fn probe_pullup_disable_does_not_affect_the_trigger_decision() {
+    // `$19` is a pin-config concern (the GPIO layer enables/disables the pull-up); it must NOT change the
+    // trigger decision, which depends only on the raw level and `$6`.
+    let with = ProbeConfig { invert: false, pullup_disable: true };
+    let without = ProbeConfig { invert: false, pullup_disable: false };
+    assert_eq!(probe_triggered(true, &with), probe_triggered(true, &without));
+    assert_eq!(probe_triggered(false, &with), probe_triggered(false, &without));
   }
 }

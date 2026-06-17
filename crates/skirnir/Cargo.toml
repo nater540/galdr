@@ -3,4 +3,39 @@ name = "skirnir"
 version = "0.1.0"
 edition = "2024"
 
+# `skirnir` is the native Linux GCode sender. The crate is split into a framework-agnostic library (the
+# streaming engine, exported from `lib.rs`) and a thin binary (`main.rs`). The engine talks to the world
+# ONLY through the `Transport` trait, so it is fully host-testable against an in-memory fake and depends on
+# neither a GUI nor `tokio-serial` directly. The future egui UI will drive the engine over channels.
+[lib]
+name = "skirnir"
+path = "src/lib.rs"
+
+[[bin]]
+name = "skirnir"
+path = "src/main.rs"
+
+# The `serial` feature pulls in the real USB-CDC transport (`tokio-serial`). It is default-on so the binary
+# builds and talks to hardware out of the box; tests disable nothing — they run against the in-memory
+# loopback transport, so the engine and protocol layers are fully exercised without a real port present.
+[features]
+default = ["serial"]
+serial = ["dep:tokio-serial"]
+
 [dependencies]
+# Async runtime + primitives for the engine's driver task and the UI<->engine channels. We keep the feature
+# set tight: the multi-threaded runtime, the proc-macros, async I/O helpers, sync channels, and timers.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+# Production `Transport` over USB CDC serial, gated behind the `serial` feature. Kept behind the trait so the
+# engine never references it; only the `transport::serial` adapter touches this crate. `optional` so a
+# loopback-only build (e.g. tests) need not pull the native serialport stack.
+tokio-serial = { version = "5.5", optional = true }
+# Typed engine/transport errors (`thiserror`) and ergonomic app-level error flow in the binary (`anyhow`).
+# Both already exist in the workspace lock at these majors.
+thiserror = "2"
+anyhow    = "1"
+
+[dev-dependencies]
+# The current-thread runtime + test macro are enough to drive the async engine tests; paused-time helpers
+# come from the `time` feature already enabled above.
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "io-util", "time", "test-util"] }
