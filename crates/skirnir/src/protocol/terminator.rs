@@ -30,12 +30,12 @@ impl LineReassembler {
     let mut lines = Vec::new();
     for &byte in chunk {
       // If the previous byte was a lone terminator, a complementary terminator here completes a CRLF/LFCR
-      // pair and is swallowed without emitting a second (empty) line.
-      if let Some(prev) = self.pending_pair.take() {
-        if (prev == b'\r' && byte == b'\n') || (prev == b'\n' && byte == b'\r') {
-          continue;
-        }
-        // Not the pair — fall through and process `byte` normally as the start of the next line.
+      // pair and is swallowed without emitting a second (empty) line. `take()` clears the pending state either
+      // way; only the matching-complement case is swallowed, otherwise `byte` is processed below as usual.
+      if let Some(prev) = self.pending_pair.take()
+        && ((prev == b'\r' && byte == b'\n') || (prev == b'\n' && byte == b'\r'))
+      {
+        continue;
       }
 
       match byte {

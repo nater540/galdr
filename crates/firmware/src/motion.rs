@@ -28,6 +28,23 @@
 //!   enable/disable-on-idle policy is a later refinement (DOC-03/DOC-05).
 //! - `$0`/`$29` and `steps_per_mm` come from the in-memory placeholder settings; esp-storage persistence is
 //!   DOC-00. Feed-hold deceleration is per-block (Stage 1); smooth ramp-down is a later refinement.
+//!
+//! ## Diagnosing a core-1 stall (defmt tracing)
+//! The executor runs ALONE on core 1, so a wedge shows on the wire as a permanent `Run` with `FS:0`. Build a
+//! logging image (`just build --features defmt`, flash it, then `just monitor`), send `G0 X5`, and read the LAST
+//! [`mtrace`] line over RTT. The trace points form a linear chain; the last one seen localizes the fault:
+//!
+//! - (nothing) — the core-1 InterruptExecutor never started the task; investigate `main`'s `start_second_core`.
+//! - `executor loop entered` then silence on `G0 X5` — the wake/enqueue handshake never reached the executor;
+//!   the block sat in the planner queue (so `?` shows `Run` from the `queued` term and `FS:0`). Suspect
+//!   `BLOCK_AVAILABLE` (enqueued without signaling, or the signal consumed elsewhere).
+//! - `hold requested -> parking` — `HOLD_REQUESTED` is wedged set; the block is never popped. NOT the RMT path.
+//! - `popping block (taking PLANNER lock)` with no `PLANNER lock acquired` — the `PLANNER` mutex is held across
+//!   an await on core 0 (cross-core lock contention). NOT the RMT path.
+//! - `block popped` / `feed published` but no `run_block returned` — the stall is inside the generator/RMT emit.
+//!   Then the `emit_burst` / per-axis `transmit` / `wait begin` / `wait ok` lines pin it to the exact RMT axis:
+//!   a `wait begin` with no matching `wait ok`/`wait err` is a never-completing blocking `wait()` (TX-END never
+//!   fired) on that channel — the genuine RMT hardware path.
 
 use core::sync::atomic::Ordering;
 
@@ -46,6 +63,27 @@ use crate::comms::{
   LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
   MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT,
 };
+
+/// Core-1 motion-executor trace point. Expands to a `defmt::trace!` only under the `defmt` feature and to
+/// NOTHING otherwise, so the default non-logging build pays zero cost and stays `#![deny(warnings)]`-clean.
+/// These traces localize a core-1 stall: the executor runs alone on core 1, so the LAST trace line seen over
+/// RTT pinpoints exactly where it wedged (see the module-level "Diagnosing a core-1 stall" notes). Routed over
+/// esp-println's defmt/RTT sink, separate from the grbl USB CDC stream, so tracing never perturbs the protocol
+/// or the host's character-counting flow control.
+///
+/// Every call site traces only values that ALREADY exist on the executing path (never a value computed solely
+/// for the trace), so the no-`defmt` empty expansion can never leave an unused binding — keeping the hot path
+/// allocation-free and warning-clean either way.
+#[cfg(feature = "defmt")]
+macro_rules! mtrace {
+  ($($arg:tt)*) => { defmt::trace!($($arg)*) };
+}
+
+/// No-op counterpart of [`mtrace`] for builds without the `defmt` feature: expands to nothing.
+#[cfg(not(feature = "defmt"))]
+macro_rules! mtrace {
+  ($($arg:tt)*) => {{}};
+}
 
 /// One RMT TX channel per axis, indexed `[X, Y, Z]`. The blocking transmit API consumes the channel and
 /// hands it back from the transaction's `wait()`, so each channel is held as an `Option` and taken /
@@ -209,6 +247,10 @@ impl StepSink for RmtStepSink {
     let len = self.encode_channel(0, ticks);
     let _ = self.encode_channel(1, ticks);
     let _ = self.encode_channel(2, ticks);
+    // Burst boundary: `events` is the per-tick step count, `symbols` = events + 1 end marker (= the slice length
+    // transmitted to each RMT channel). If "emit_burst" prints but a following "wait ok" for some axis never
+    // does, THAT axis's blocking `wait()` is spinning forever (the RMT TX-END never fired) — the RMT path stall.
+    mtrace!("motion: emit_burst (events={=usize}, symbols={=usize})", ticks.len(), len);
 
     // Start all three transmits before waiting any, so the three channels fire together. `transmit`
     // consumes the channel; we take it out of its slot and restore it from the transaction's `wait()`.
@@ -221,8 +263,12 @@ impl StepSink for RmtStepSink {
         return Err(StepError::Transport);
       };
       match channel.transmit(&self.scratch[axis][..len]) {
-        Ok(txn) => *slot = Some(txn),
+        Ok(txn) => {
+          mtrace!("motion: axis {=usize} transmit Ok", axis);
+          *slot = Some(txn);
+        }
         Err(_) => {
+          mtrace!("motion: axis {=usize} transmit Err -> abandoning block", axis);
           // `Channel::transmit` takes the channel BY VALUE and, on the start error path (esp-hal 1.0.0),
           // returns only the `Error` — the channel is moved in and not handed back, so this axis's channel
           // is genuinely lost and its `Option` slot stays `None`; that axis cannot transmit again. This is a
@@ -243,9 +289,16 @@ impl StepSink for RmtStepSink {
     let mut result = Ok(());
     for (axis, slot) in txns.iter_mut().enumerate() {
       if let Some(txn) = slot.take() {
+        // The blocking `wait()` spins on the raw RMT TX-END/threshold status. If "wait begin" prints for an axis
+        // but "wait ok"/"wait err" never does, this is the deadlock: that channel's TX-END never fired.
+        mtrace!("motion: axis {=usize} wait begin", axis);
         match txn.wait() {
-          Ok(channel) => self.channels[axis] = Some(channel),
+          Ok(channel) => {
+            mtrace!("motion: axis {=usize} wait ok", axis);
+            self.channels[axis] = Some(channel);
+          }
           Err((_, channel)) => {
+            mtrace!("motion: axis {=usize} wait err", axis);
             self.channels[axis] = Some(channel);
             result = Err(StepError::Transport);
           }
@@ -301,6 +354,9 @@ pub async fn run(
   // The most-restrictive axis max-rate in mm/s — the conservative ceiling the Phase-E feed-override scale-up is
   // clamped to (squared, since the generator reasons in v²), so a boosted feed never exceeds `$110-112`.
   let max_rate_mm_s = min_max_rate_mm_s(&max_rate_mm_min);
+  // The executor task is alive and entering its drain loop on core 1. If THIS line never appears over RTT, the
+  // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
+  mtrace!("motion: executor loop entered");
   loop {
     // Service a pending soft reset at the top of the loop: drop the live position so MPos returns to the
     // origin in step with the consumer's pipeline reset. `MOTION_RESET_PENDING` is the poll-able flag the
@@ -318,14 +374,22 @@ pub async fn run(
     // authoritative is what makes a hold impossible to miss and a legitimate resume impossible to discard. A
     // pending soft reset breaks the park; loop back to service it at the top.
     if HOLD_REQUESTED.load(Ordering::Acquire) {
+      // A stuck `HOLD_REQUESTED` would park here forever, leaving any queued block unpopped (so `?` shows `Run`
+      // from the `queued` term and `FS:0` because the feed is never published). If this is the last trace line,
+      // the hold level is wedged set, not the RMT path.
+      mtrace!("motion: hold requested -> parking");
       park_on_hold().await;
       continue;
     }
 
     // Pop the next block and peek the one after it for the exit speed, all under one short lock, releasing
-    // it before any transmit so the consumer can keep enqueuing while this block executes.
+    // it before any transmit so the consumer can keep enqueuing while this block executes. If "lock acquired"
+    // never follows "popping block", the `PLANNER` mutex is held across an await on core 0 (cross-core lock
+    // contention), NOT the RMT path.
+    mtrace!("motion: popping block (taking PLANNER lock)");
     let popped = {
       let mut guard = PLANNER.lock().await;
+      mtrace!("motion: PLANNER lock acquired");
       match guard.as_mut() {
         Some(planner) => take_block(planner),
         None => None,
@@ -334,11 +398,22 @@ pub async fn run(
 
     match popped {
       Some((block, exit_speed_sq)) => {
+        // A block was popped: trace its dominant-axis event count and rapid flag so the log shows the block
+        // actually reached the executor. If this prints but "run_block returned" never does, the stall is
+        // INSIDE run_block (the generator + RMT emit path).
+        mtrace!(
+          "motion: block popped (events={=u32}, rapid={=bool}, exit_sq={=f32})",
+          block.step_event_count,
+          block.rapid,
+          exit_speed_sq
+        );
         // Publish "a block is in flight" so `status_responder` reports `Run` for the whole duration of this
         // block — including the tail after the queue drained but the last burst is still emitting. Cleared
         // when the block finishes (or aborts). `AcqRel`/`Acquire` publishes the flag to the core-0 reporter.
         EXECUTOR_RUNNING.store(true, Ordering::Release);
+        mtrace!("motion: EXECUTOR_RUNNING set -> entering run_block");
         run_block(&generator, &block, exit_speed_sq, max_rate_mm_s, sink, &mut counter);
+        mtrace!("motion: run_block returned");
         // Motion stopped (block finished or aborted): zero the published programmed feed so `FS:` reads 0 while
         // idle. The next block republishes it. The override-scaled REALIZED feed is computed by the reporter.
         LIVE_PROGRAMMED_FEED_MM_MIN.store(0, Ordering::Release);
@@ -350,18 +425,25 @@ pub async fn run(
       // request (so a `G38.x` issued while the executor is idle — the common case, since the consumer flushes
       // look-ahead before a probe — wakes it immediately). The probe request `wait()` CONSUMES the request, so
       // it is run inline here rather than looped back to the top-of-loop `try_take` (which would find it gone).
-      None => match select4(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait(), HOLD_WAKE.wait(), PROBE_REQUEST.wait()).await {
-        Either4::First(()) => {}
-        Either4::Second(()) => {
-          MOTION_RESET_PENDING.store(false, Ordering::Release);
-          reset_live_position(&mut counter);
+      None => {
+        // Queue empty: about to await a fresh block. If "block popped" never follows a BLOCK_AVAILABLE wake but
+        // `?` shows a queued block, the wake/enqueue handshake is racing (block enqueued without signaling, or
+        // the signal consumed elsewhere) — not the RMT path.
+        mtrace!("motion: queue empty -> awaiting block/reset/hold/probe");
+        match select4(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait(), HOLD_WAKE.wait(), PROBE_REQUEST.wait()).await {
+          Either4::First(()) => mtrace!("motion: woke on BLOCK_AVAILABLE"),
+          Either4::Second(()) => {
+            mtrace!("motion: woke on MOTION_RESET (idle)");
+            MOTION_RESET_PENDING.store(false, Ordering::Release);
+            reset_live_position(&mut counter);
+          }
+          // A hold-level change while idle: loop back so the top-of-loop hold check re-reads the LEVEL and parks
+          // if it is set (or simply proceeds if a spurious wake found it clear). Re-reading the level — never
+          // acting on the edge — is the Finding #11 invariant.
+          Either4::Third(()) => mtrace!("motion: woke on HOLD_WAKE (idle)"),
+          Either4::Fourth(request) => run_probe(&prober, &request, probe, sink, &mut counter),
         }
-        // A hold-level change while idle: loop back so the top-of-loop hold check re-reads the LEVEL and parks if
-        // it is set (or simply proceeds if a spurious wake found it clear). Re-reading the level — never acting on
-        // the edge — is the Finding #11 invariant.
-        Either4::Third(()) => {}
-        Either4::Fourth(request) => run_probe(&prober, &request, probe, sink, &mut counter),
-      },
+      }
     }
   }
 }
@@ -449,6 +531,10 @@ fn run_block(
   // The block stores nominal speed as mm/s; convert to mm/min for the `FS:` units.
   LIVE_PROGRAMMED_FEED_MM_MIN.store((block.nominal_speed() * 60.0).to_bits(), Ordering::Release);
   LIVE_BLOCK_IS_RAPID.store(block.rapid, Ordering::Relaxed);
+  // The programmed feed is now published, so a `?` from here on should show a non-zero `FS:`. If the log shows
+  // this line but the wire still reports `FS:0`, the stall is BEFORE this point (the feed was never published) —
+  // which means the executor never reached run_block, contradicting an "emit_burst hang" and pointing upstream.
+  mtrace!("motion: feed published ({=f32} mm/min) -> running generator", block.nominal_speed() * 60.0);
 
   // Latch the live counter's direction from the same step signs the generator latches onto the sink, so the
   // counter advances each axis the correct way. A zero-length block never steps, so this is harmless then.

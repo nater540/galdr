@@ -4,20 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Galdr** is a CNC PCB milling system in two halves:
+**Galdr** is a CNC PCB milling system. The workspace has four crates:
 
-- `crates/firmware` — grblHAL-compatible 3-axis CNC firmware for an **ESP32-S3**, `no_std` Rust on esp-hal 1.0 +
-  the Embassy async runtime.
-- `crates/skirnir` — a native **Linux GCode sender** (host app) that streams GCode to the firmware over USB CDC serial.
+- `crates/firmware-core` — pure, `no_std`, **host-tested** logic: the GCode parser, motion planner, segment
+  generator, grblHAL protocol/state machine, coordinate systems, settings model, and the TMC2209 codec. No esp-hal
+  dependency, so it compiles and unit-tests on the host with stock Rust.
+- `crates/firmware` — the **ESP32-S3** binary wiring `firmware-core` to the hardware (esp-hal 1.0 + Embassy on the
+  esp-rtos host): USB CDC comms, the dual-core task split, RMT step generation, the TMC UART bus, flash persistence.
+- `crates/galdr-proto` — the shared Protocol Buffers schema (micropb) for the settings/coordinate wire format, used
+  by both the firmware flash records and the `$PBX` host-sync channel.
+- `crates/skirnir` — a native **Linux GCode sender** (host app) that streams GCode over USB CDC serial.
 
-Both crates are currently empty scaffolds (`fn main() { println!("Hello, world!"); }`). The actual design lives in
-`docs/` and has **not yet been implemented**. Treat `docs/` as the authoritative specification — read the relevant
-doc before implementing a subsystem.
+The firmware side (`firmware-core` + `firmware` + `galdr-proto`) is substantially implemented and host-tested: the
+GCode→planner→motion pipeline, grblHAL streaming, TMC2209 driver, settings + coordinate persistence, G38.x probing,
+jogging, and feed/rapid/spindle overrides all exist. Still stubbed at the hardware boundary (refused or no-op'd, not
+faked): the homing cycle (DOC-06), spindle PWM output (DOC-05), and the limit/coolant GPIO. `crates/skirnir` is still
+an empty scaffold (`fn main() { println!("Hello, world!"); }`). `docs/` remains the authoritative **design** spec —
+read the relevant doc before extending a subsystem.
 
-> Naming note: the docs use generic placeholder crate names (`pcb-mill-fw`, `cnc-core`, `gcode`, `planner`, `motion`,
-> `drivers`, `protocol`, `hal_traits`). The real crates are `firmware` and `skirnir`. The doc workspace layout (many
-> small lib crates) is a *plan*, not the current tree. Confirm the intended crate breakdown before scaffolding it. The
-> docs also say firmware `edition = "2021"`; the actual `Cargo.toml` files use `edition = "2024"`.
+> Naming note: the docs use generic placeholder names (`pcb-mill-fw`, `cnc-core`, `gcode`, `planner`, `motion`,
+> `drivers`, `protocol`, `hal_traits`) for what are now the `firmware-core` modules and the `firmware`/`galdr-proto`/
+> `skirnir` crates. The doc's "many small lib crates" layout was a plan; the real tree folds the pure logic into the
+> single `firmware-core` lib. The docs also say firmware `edition = "2021"`; the actual `Cargo.toml` files use
+> `edition = "2024"`.
 
 ## Where to read first
 
@@ -30,7 +39,8 @@ doc before implementing a subsystem.
 
 ## Build & test
 
-Workspace root is the repo root (`Cargo.toml` declares `members = ["crates/firmware", "crates/skirnir"]`).
+Workspace root is the repo root (`Cargo.toml` `members = ["crates/firmware-core", "crates/firmware", "crates/skirnir",
+"crates/galdr-proto"]`).
 
 ```sh
 cargo build              # current scaffold builds with stock Rust
@@ -52,10 +62,35 @@ espup install
 source $HOME/export-esp.sh    # source in every shell before firmware builds (and in CI)
 ```
 
-Firmware target is `xtensa-esp32s3-none-elf` with `runner = "espflash flash --monitor"` (set in a `.cargo/config.toml`
-that does not yet exist — create it when scaffolding firmware). Pure-logic library code is `no_std` but has **no
-esp-hal dependency**, so it compiles and unit-tests on the host with stock Rust — keep it that way (see "Hardware
-abstraction" below).
+The firmware target (`xtensa-esp32s3-none-elf`), the `espflash flash --monitor --partition-table partitions.csv`
+runner, and `build-std = ["core"]` live in `crates/firmware/.cargo/config.toml`; the `esp` toolchain channel is pinned
+in `crates/firmware/rust-toolchain.toml`. Because both are crate-scoped, firmware **must be built from inside
+`crates/firmware`** — a root `cargo build -p firmware` falls back to the host stock toolchain and fails. The `justfile`
+wraps all of this (it sources the env and `cd`s for you):
+
+```sh
+just build        # cargo build for Xtensa; pass extra args, e.g. `just build --release` / `--features defmt`
+just flash        # build + flash + serial monitor (espflash)
+just monitor      # attach the serial monitor only (e.g. `just monitor --port /dev/ttyACM0`)
+```
+
+> **Pin `esp-bootloader-esp-idf = "=0.4.0"` — do NOT use 0.5.0 with esp-hal 1.0.** esp-hal 1.0.0's linker
+> scripts reserve and KEEP the app descriptor at the FRONT of the DROM segment under the section name
+> `.rodata_desc` (`ld/sections/rodata.x`; `ld/esp32s3/esp32s3.x`: `. = . + SIZEOF(.rodata_desc);`).
+> esp-bootloader-esp-idf 0.5.0 renamed that section to `.flash.appdesc` (CHANGELOG #4745), so the descriptor
+> falls to the END of `.rodata`; the bootloader reads the first 256 bytes of `.rodata` at flash `0x10020` as
+> the descriptor and rejects the image with `Image requires efuse blk rev >= v116.31` → boot loop. 0.4.0 still
+> emits `.rodata_desc`. (esp-hal 1.0.0 does NOT depend on esp-bootloader-esp-idf — the firmware pulls it
+> directly.) Verify without hardware via `espflash save-image --merge` + checking magic `0xabcd5432` /
+> `min_efuse=0` at flash `0x10020`. Revisit (allow 0.5.0+) only when esp-hal moves to a `.flash.appdesc`
+> linker script (the esp-rtos 0.3 / esp-hal 1.1+ bump).
+>
+> **NOTE:** the espflash version was a red herring. The `v116.31` value is a *constant* across flashes and
+> across espflash 4.3.0/4.4.0 — SHA-256 bleed would vary, so it was always fixed `.rodata` bytes, never
+> espflash. The `_espflash-ok` guard in the justfile is now harmless but no longer the real fix.
+
+Pure-logic library code is `no_std` but has **no esp-hal dependency**, so it compiles and unit-tests on the host with
+stock Rust — keep it that way (see "Hardware abstraction" below).
 
 ## Architecture essentials (firmware)
 

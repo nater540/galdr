@@ -18,6 +18,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod app;
 pub mod engine;
 pub mod error;
 pub mod protocol;

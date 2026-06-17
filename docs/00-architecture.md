@@ -67,6 +67,7 @@ three TMC2209 stepper drivers, while controlling a WS55-220 brushless spindle dr
 | RMT TX ch3 (spare)    | —         | GPIO18 | RMT TX ch3       | Reserved for 4th axis or future use    |
 | USB D−                | USB_DM    | GPIO19 | USB Serial/JTAG  | Reserved — do not use                  |
 | USB D+                | USB_DP    | GPIO20 | USB Serial/JTAG  | Reserved — do not use                  |
+| Probe (Z touch-off)   | PROBE     | GPIO21 | GPIO in          | G38.x touch-off; pull-up unless $19; $6 inverts |
 
 ### Peripheral Allocation Table
 
@@ -79,7 +80,7 @@ three TMC2209 stepper drivers, while controlling a WS55-220 brushless spindle dr
 | LEDC low-speed timer0  | Spindle PWM (WS55-220 speed)        | S3 LEDC is low-speed only                         |
 | UART1                  | TMC2209 single-wire UART bus        | Half-duplex, 115200 baud, all three drivers        |
 | USB Serial/JTAG ctrl.  | Host CDC-ACM serial                 | Fixed-function CDC-ACM, internal PHY on GPIO19/20  |
-| GPIO + GPIO IRQ        | Limit switches, control, dir/enable |                                                    |
+| GPIO + GPIO IRQ        | Limit switches, probe, control, dir/enable |                                             |
 | SYSTIMER               | embassy-time driver                 | Three hardware alarms                              |
 | TIMG0                  | Watchdog / backup timer             |                                                    |
 | Flash (esp-storage)    | $-settings persistence              | NVS-like CRC-versioned struct in dedicated region  |

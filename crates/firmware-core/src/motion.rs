@@ -819,6 +819,23 @@ mod tests {
   }
 
   #[test]
+  fn repro_runtime_g0_x5_rapid_low_speed_terminates() {
+    // Faithful repro of the on-device hang: G0 X5 with the real default config (250 steps/mm, 500 mm/min
+    // rapid = 8.333 mm/s nominal, 10 mm/s^2 accel), executed exactly as the firmware executor calls it:
+    // run_block_scaled with override 1.0 and an INFINITY ceiling (a rapid). Must TERMINATE and emit 1250 steps.
+    let generator = SegmentGenerator::new(test_config());
+    let nominal = 500.0f32 / 60.0; // mm/s
+    let mut block = make_block([1250, 0, 0], 5.0, 10.0, 0.0, nominal * nominal);
+    block.rapid = true;
+    let mut sink = RecordingSink::new();
+    let emitted = generator
+      .run_block_scaled(&block, 0.0, 1.0, f32::INFINITY, &mut sink)
+      .expect("runs");
+    assert_eq!(emitted, 1250, "must emit exactly 1250 X steps");
+    assert_eq!(sink.step_totals(), [1250, 0, 0]);
+  }
+
+  #[test]
   fn dominant_axis_steps_on_every_tick() {
     // Y dominates here (600 > 250 > 0). Every emitted tick must carry a Y step; X steps on a subset.
     let generator = SegmentGenerator::new(test_config());

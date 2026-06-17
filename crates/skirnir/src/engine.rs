@@ -39,8 +39,9 @@ const READ_CHUNK: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
   /// Load a program and begin streaming it line-by-line under character-count flow control. Replaces any
-  /// program already loaded.
-  StreamProgram(Vec<String>),
+  /// program already loaded. Shared as an `Arc<[String]>` so the UI hands off the whole file by pointer rather
+  /// than cloning it on every stream start.
+  StreamProgram(std::sync::Arc<[String]>),
   /// Send a single manual line immediately if it fits the window (e.g. `$$`, a jog, a one-off move).
   SendLine(String),
   /// Inject a real-time single-byte command out-of-band (`?`/`!`/`~`/soft-reset/overrides/jog-cancel).
@@ -186,7 +187,7 @@ impl<T: Transport> Driver<T> {
   /// Feed one UI command into the core and carry out the effects. Returns whether the loop should continue.
   async fn handle_command(&mut self, command: Command) -> ControlFlow {
     let effects = match command {
-      Command::StreamProgram(lines) => self.core.on_stream_program(lines),
+      Command::StreamProgram(lines) => self.core.on_stream_program(lines.iter()),
       Command::SendLine(line) => self.core.on_send_line(&line),
       Command::Realtime(cmd) => self.core.on_realtime(cmd),
       // `Disconnect` is handled by the caller (it breaks the loop) and never reaches here.
@@ -286,7 +287,7 @@ mod tests {
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
 
     // Stream two short lines. With the default 1024-byte window both release immediately.
-    assert!(handle.send(Command::StreamProgram(vec!["G0 X1".to_string(), "G0 Y1".to_string()])));
+    assert!(handle.send(Command::StreamProgram(vec!["G0 X1".to_string(), "G0 Y1".to_string()].into())));
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
 
     // Acknowledge both lines; the second `ok` should complete the program back to Idle.
@@ -307,7 +308,7 @@ mod tests {
     // Give the engine a moment to process the OPT before streaming.
     wait_for(&mut handle, |e| matches!(e, Event::Response(Response::Message(_)))).await;
 
-    assert!(handle.send(Command::StreamProgram(vec!["G00".to_string(), "G01".to_string(), "G02".to_string()])));
+    assert!(handle.send(Command::StreamProgram(vec!["G00".to_string(), "G01".to_string(), "G02".to_string()].into())));
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
     // Only the first two lines fit the 8-byte window; the third is held.
     wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 2, .. })).await;
@@ -333,7 +334,7 @@ mod tests {
     assert!(controller.inject_line("[OPT:VNMSL,100,8,3,0]"));
     wait_for(&mut handle, |e| matches!(e, Event::Response(Response::Message(_)))).await;
 
-    assert!(handle.send(Command::StreamProgram(vec!["G00".to_string(), "G01".to_string(), "G02".to_string()])));
+    assert!(handle.send(Command::StreamProgram(vec!["G00".to_string(), "G01".to_string(), "G02".to_string()].into())));
     wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 2, .. })).await;
     assert_eq!(controller.drain_written(), b"G00\nG01\n");
 

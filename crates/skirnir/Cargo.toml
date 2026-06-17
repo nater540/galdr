@@ -15,11 +15,14 @@ path = "src/lib.rs"
 name = "skirnir"
 path = "src/main.rs"
 
-# The `serial` feature pulls in the real USB-CDC transport (`tokio-serial`). It is default-on so the binary
-# builds and talks to hardware out of the box; tests disable nothing — they run against the in-memory
-# loopback transport, so the engine and protocol layers are fully exercised without a real port present.
+# Features. `gui` pulls in egui/eframe + rfd and is default-on, so `cargo run` launches the window out of the
+# box. `serial` pulls in the real USB-CDC transport (`tokio-serial`), also default-on so the app talks to
+# hardware by default. Tests need neither: the protocol/engine/reducer suites run headless against the
+# in-memory loopback transport, fully exercising the streaming contract without a window or a real port. A
+# `--no-default-features` build (e.g. CI logic checks) is headless and loopback-only.
 [features]
-default = ["serial"]
+default = ["gui", "serial"]
+gui = ["dep:eframe", "dep:rfd"]
 serial = ["dep:tokio-serial"]
 
 [dependencies]
@@ -34,6 +37,18 @@ tokio-serial = { version = "5.5", optional = true }
 # Both already exist in the workspace lock at these majors.
 thiserror = "2"
 anyhow    = "1"
+# The egui application framework, gated behind `gui`. We use the lightweight glow (OpenGL) backend rather than
+# wgpu — a 2D toolpath `Painter` needs nothing heavier — and drop accesskit / web-screen-reader. `x11` and
+# `wayland` cover both Linux display stacks. egui itself is consumed via `eframe::egui` (no direct dep).
+eframe = { version = "0.34.3", optional = true, default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "x11",
+  "wayland",
+] }
+# Native open/save file dialogs (G-code load) via the XDG Desktop Portal. 0.17 dropped its tokio runtime, so
+# there is no runtime conflict with our tokio dependency.
+rfd = { version = "0.17.2", optional = true }
 
 [dev-dependencies]
 # The current-thread runtime + test macro are enough to drive the async engine tests; paused-time helpers

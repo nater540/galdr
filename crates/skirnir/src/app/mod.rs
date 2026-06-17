@@ -1,0 +1,40 @@
+//! The GUI layer: the egui/eframe application that drives the streaming [`crate::engine::Engine`].
+//!
+//! The layer is split so the UI stays thin and the logic stays testable:
+//!
+//! - [`view_state`] — a pure, egui-free reducer that folds engine [`crate::engine::Event`]s into the
+//!   [`view_state::ViewState`] the views render. All the decisions (DRO derivation, console capping, banner
+//!   latching, progress) live here and are unit-tested without a window.
+//! - [`intent`] — the one-way UI-intent vocabulary the views emit and the shell translates into engine
+//!   commands and side effects. Also egui-free and host-testable.
+//! - [`badge`] — pure, egui-free presentation logic: the machine-state [`badge::BadgeState`] derivation, the
+//!   Run/Hold/Stop [`badge::TransportGroup`] enable/emphasis matrix, and the alarm/error detail copy. The
+//!   [`theme`] turns a `BadgeState` into a colour; this module decides *which* state it is.
+//!
+//! The egui-touching pieces — the colour [`theme`], the per-panel [`views`], and the eframe [`shell`] — are
+//! gated behind the `gui` feature so a headless build (CI, the engine/protocol/reducer tests) need not pull
+//! egui/eframe at all.
+
+pub mod badge;
+pub mod intent;
+pub mod view_state;
+
+pub use badge::{BadgeState, TransportGroup, alarm_detail, error_detail};
+pub use intent::{Axis, Dir, Intent, IntentSink, work_offset_line, work_zero_line};
+pub use view_state::{Banner, CONSOLE_CAPACITY, LogLine, LogSource, Progress, ViewState};
+
+#[cfg(feature = "gui")]
+pub mod fonts;
+#[cfg(feature = "gui")]
+pub mod metrics;
+#[cfg(feature = "gui")]
+pub mod shell;
+#[cfg(feature = "gui")]
+pub mod theme;
+#[cfg(feature = "gui")]
+pub mod views;
+
+#[cfg(feature = "gui")]
+pub use shell::{SkirnirApp, run};
+#[cfg(feature = "gui")]
+pub use theme::Theme;

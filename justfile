@@ -31,6 +31,12 @@ monitor *args: _esp-env _espflash-ok
   source "$HOME/export-esp.sh"
   espflash monitor {{args}}
 
+# Run the skirnir GCode sender (native host app). Builds on the stock host toolchain, no esp env needed.
+# The `gui` feature is default-on, so a bare `just run` boots the egui window; pass extra cargo args
+# through, e.g. `just run --release` or `just run -- --cli` for the headless smoke path.
+run *args:
+  cargo run -p skirnir {{args}}
+
 # Private helper: fail early with a clear message if the Espressif toolchain env is not installed.
 _esp-env:
   #!/usr/bin/env bash

@@ -44,6 +44,16 @@ impl Transport for SerialTransport {
   }
 }
 
+/// Enumerate the serial ports currently available on the host, as a list of device paths/names for the UI's
+/// port dropdown. Enumeration failures yield an empty list rather than an error — a missing port list is a
+/// recoverable, retryable UI condition, not something to crash on. `tokio-serial` re-exports the underlying
+/// `serialport` enumeration.
+pub fn available_ports() -> Vec<String> {
+  tokio_serial::available_ports()
+    .map(|ports| ports.into_iter().map(|port| port.port_name).collect())
+    .unwrap_or_default()
+}
+
 /// Map a std I/O error to the crate's transport error, distinguishing a closed pipe from a generic failure.
 fn map_io(err: std::io::Error) -> TransportError {
   match err.kind() {
