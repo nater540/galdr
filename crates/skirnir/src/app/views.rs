@@ -13,15 +13,17 @@ use super::metrics::Metrics;
 use super::theme::Theme;
 use super::view_state::{Banner, LogSource, ViewState};
 use crate::protocol::{ConnectionState, RealtimeCommand};
+use crate::transport::ports::PortInfo;
 
 /// Transient widget state the shell owns across frames: selections, text fields, and tunables that belong to
 /// the UI, not to the engine-derived [`ViewState`]. Kept here so the views read and mutate it directly while
 /// the shell persists it.
 #[derive(Debug, Clone)]
 pub struct UiState {
-  /// Serial ports discovered by the last enumeration, shown in the connect dropdown.
-  pub ports: Vec<String>,
-  /// The port path currently selected in the dropdown.
+  /// Serial ports discovered by the last enumeration, shown in the connect dropdown. Structured so the row can
+  /// surface USB product / «likely Galdr» hints and the list arrives cu-preferred and Galdr-ranked.
+  pub ports: Vec<PortInfo>,
+  /// The device path currently selected in the dropdown (the `cu.*` callout path the transport opens).
   pub selected_port: String,
   /// The baud rate to open with (the ESP32-S3 native USB ignores it, but the host driver wants a value).
   pub baud: u32,
@@ -264,19 +266,35 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
         sink.push(Intent::Disconnect);
       }
     } else {
-      // Port dropdown + refresh + connect, only meaningful while disconnected.
+      // Port dropdown + refresh + identify + connect, only meaningful while disconnected. Each row shows the
+      // (cu-preferred) path and, when known, a short USB product / «likely Galdr» hint so the board stands out.
       egui::ComboBox::from_id_salt("port")
         .selected_text(if state.selected_port.is_empty() { "Choose port…" } else { &state.selected_port })
         .show_ui(ui, |ui| {
           for port in &state.ports {
-            ui.selectable_value(&mut state.selected_port, port.clone(), port);
+            // The selectable label carries the path; the hint (if any) trails it dimmed so the row stays
+            // scannable while flagging the likely board.
+            let label = match port.hint() {
+              Some(hint) => format!("{}  ·  {hint}", port.path),
+              None => port.path.clone(),
+            };
+            ui.selectable_value(&mut state.selected_port, port.path.clone(), label);
           }
         });
       if ui.button("⟳").on_hover_text("Refresh ports").clicked() {
         sink.push(Intent::RefreshPorts);
       }
-      let can_connect = !state.selected_port.is_empty();
-      if ui.add_enabled(can_connect, egui::Button::new("Connect")).clicked() {
+      let has_port = !state.selected_port.is_empty();
+      // Identify actively probes the selected port for grblHAL. It is opt-in (opening toggles the board's
+      // auto-reset line) and never part of a refresh, so it sits behind its own button.
+      if ui
+        .add_enabled(has_port, egui::Button::new("Identify"))
+        .on_hover_text("Probe the selected port for grblHAL (sends ?/$I)")
+        .clicked()
+      {
+        sink.push(Intent::IdentifyPort { path: state.selected_port.clone() });
+      }
+      if ui.add_enabled(has_port, egui::Button::new("Connect")).clicked() {
         sink.push(Intent::Connect { path: state.selected_port.clone(), baud: state.baud });
       }
     }
@@ -709,9 +727,14 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
   let label = dock_toggle_label(collapsed);
   let hint = if collapsed { "Expand dock" } else { "Collapse dock" };
   // Square icon button matching the strip's control height, transparent at rest like the §02 icon-button state
-  // (the same ghost treatment as the ⚙ settings and jog-cancel buttons), so it reads as chrome, not a tab.
+  // (the same ghost treatment as the ⚙ settings and jog-cancel buttons), so it reads as chrome, not a tab. Zero
+  // the button padding for this region: the global `BUTTON_PAD` (6px vertical) plus the glyph would inflate the
+  // button past the strip's control height, making it overflow the 30px bar and sit off-centre (the user-flagged
+  // bug). With no padding the button is pinned to the `PANEL_CONTROL_H` square, which the strip's `Align::Center`
+  // layout then centres within the 30px bar. The glyph is held at the header text size so it can't grow the box.
+  ui.spacing_mut().button_padding = Vec2::ZERO;
   let size = Vec2::splat(Metrics::PANEL_CONTROL_H);
-  let button = egui::Button::new(RichText::new(label).size(Metrics::HEADER_TEXT + 2.0).color(Theme::TEXT_DIM))
+  let button = egui::Button::new(RichText::new(label).size(Metrics::HEADER_TEXT).color(Theme::TEXT_DIM))
     .fill(Color32::TRANSPARENT);
   ui.add_sized(size, button).on_hover_text(hint).clicked()
 }

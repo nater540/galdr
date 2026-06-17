@@ -57,6 +57,10 @@ pub enum Intent {
   Disconnect,
   /// Re-enumerate available serial ports (refresh the port dropdown).
   RefreshPorts,
+  /// Actively probe the port at `path` to confirm it speaks grblHAL: open it, send `?`/`$I`, and wait briefly
+  /// for grbl evidence, then surface the verdict. Opt-in only — opening the ESP32-S3 toggles its auto-reset
+  /// line, so this never runs as part of a refresh. Refused while connected (the engine already holds a port).
+  IdentifyPort { path: String },
 
   /// Stream the lines of the file at this path as a program.
   OpenProgram(std::path::PathBuf),

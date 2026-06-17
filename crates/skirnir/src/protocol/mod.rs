@@ -17,6 +17,6 @@ pub use core::{Effect, ProtocolCore};
 pub use flow::{DEFAULT_RX_BUFFER, FlowWindow};
 pub use lifecycle::ConnectionState;
 pub use realtime::RealtimeCommand;
-pub use response::{Response, parse_line};
+pub use response::{Response, is_grbl_evidence, parse_line};
 pub use status::{MachineState, PositionKind, RunState, StatusReport, parse_status};
 pub use terminator::LineReassembler;

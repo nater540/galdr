@@ -40,6 +40,11 @@ pub struct SkirnirApp {
   view: ViewState,
   /// The transient widget state the views read and mutate.
   ui: UiState,
+  /// The result channel of an in-flight on-demand port identify probe, if one is running. The probe runs on
+  /// the runtime (off the UI thread); the verdict arrives here and is drained into the console each frame, so a
+  /// 500ms probe never blocks rendering. `None` when no probe is in flight.
+  #[cfg(feature = "serial")]
+  pending_probe: Option<std::sync::mpsc::Receiver<String>>,
 }
 
 impl SkirnirApp {
@@ -54,6 +59,8 @@ impl SkirnirApp {
       engine: None,
       view: ViewState::default(),
       ui: UiState::default(),
+      #[cfg(feature = "serial")]
+      pending_probe: None,
     };
     app.refresh_ports();
     app
@@ -82,6 +89,7 @@ impl SkirnirApp {
       Intent::Connect { path, baud } => self.connect(&path, baud),
       Intent::Disconnect => self.disconnect(),
       Intent::RefreshPorts => self.refresh_ports(),
+      Intent::IdentifyPort { path } => self.identify_port(&path),
       Intent::OpenProgram(path) => self.open_program(&path),
       Intent::StartStream => self.start_stream(),
       Intent::SendLine(line) => self.send_line(line),
@@ -140,9 +148,80 @@ impl SkirnirApp {
     {
       self.ui.ports = Vec::new();
     }
-    // Keep the selection valid: drop it if the port vanished, else default to the first available.
-    if !self.ui.ports.contains(&self.ui.selected_port) {
-      self.ui.selected_port = self.ui.ports.first().cloned().unwrap_or_default();
+    // Keep the selection valid: drop it if the port vanished, else default to the first available. The list is
+    // already Galdr-ranked, so "first" lands on the likely board when present.
+    if !self.ui.ports.iter().any(|port| port.path == self.ui.selected_port) {
+      self.ui.selected_port = self.ui.ports.first().map(|port| port.path.clone()).unwrap_or_default();
+    }
+  }
+
+  /// Actively probe a port for grblHAL on demand and surface the verdict in the console. Opening a port toggles
+  /// the ESP32-S3's DTR/RTS auto-reset line, so this is user-triggered only and refused while connected — the
+  /// engine already owns the live port and a second open would disturb it. The probe is time-bounded AND runs
+  /// on the runtime (off the UI thread): the verdict returns through a channel drained each frame, so a 500ms
+  /// probe never freezes rendering. Only one probe runs at a time; a second request while one is in flight is
+  /// ignored.
+  fn identify_port(&mut self, path: &str) {
+    #[cfg(feature = "serial")]
+    {
+      if self.engine.is_some() {
+        self.notice("identify skipped: already connected (the port is in use)".to_string());
+        return;
+      }
+      if self.pending_probe.is_some() {
+        self.notice("identify already in progress".to_string());
+        return;
+      }
+      let (tx, rx) = std::sync::mpsc::channel();
+      self.notice(format!("identifying {path}…"));
+      let path = path.to_string();
+      let baud = self.ui.baud;
+      // Run the open + probe on the runtime so the transport's async reads have a reactor and the UI thread
+      // stays free. The verdict is formatted into a console line and sent back; a dropped receiver (the app
+      // closing mid-probe) just discards it.
+      self.runtime.spawn(async move {
+        use crate::transport::probe::{DEFAULT_PROBE_TIMEOUT, ProbeVerdict, probe_grbl};
+        use crate::transport::serial::SerialTransport;
+        let verdict = match SerialTransport::open(&path, baud) {
+          Ok(mut transport) => probe_grbl(&mut transport, DEFAULT_PROBE_TIMEOUT).await,
+          Err(err) => ProbeVerdict::Error(err.to_string()),
+        };
+        let message = match verdict {
+          ProbeVerdict::Confirmed => format!("identify {path}: grblHAL confirmed"),
+          ProbeVerdict::NoResponse => format!("identify {path}: no grbl response (not the board, or busy)"),
+          ProbeVerdict::Error(detail) => format!("identify {path} failed: {detail}"),
+        };
+        let _ = tx.send(message);
+      });
+      self.pending_probe = Some(rx);
+    }
+    #[cfg(not(feature = "serial"))]
+    {
+      let _ = path;
+      self.notice("built without the `serial` feature; cannot identify a port".to_string());
+    }
+  }
+
+  /// Drain a completed identify probe's verdict into the console, if one finished. Non-blocking: `try_recv`
+  /// never waits, so the UI thread is never parked on the probe. Returns whether a verdict was surfaced (so the
+  /// caller can request a prompt repaint). Clears the slot once the probe's sender has dropped.
+  #[cfg(feature = "serial")]
+  fn pump_probe(&mut self) -> bool {
+    let Some(rx) = self.pending_probe.as_ref() else {
+      return false;
+    };
+    match rx.try_recv() {
+      Ok(message) => {
+        self.notice(message);
+        self.pending_probe = None;
+        true
+      }
+      // Sender dropped without a message (should not happen, but clears the slot if it does).
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        self.pending_probe = None;
+        false
+      }
+      Err(std::sync::mpsc::TryRecvError::Empty) => false,
     }
   }
 
@@ -244,6 +323,11 @@ impl eframe::App for SkirnirApp {
     // 1. Drain engine events into the view state before drawing, so the frame reflects the latest telemetry.
     //    Remember whether anything arrived so we can wake promptly for follow-on telemetry (step 4).
     let saw_event = self.pump_events();
+    // Also drain a finished identify probe's verdict (runs off the UI thread; this is a non-blocking poll).
+    #[cfg(feature = "serial")]
+    let saw_probe = self.pump_probe();
+    #[cfg(not(feature = "serial"))]
+    let saw_probe = false;
 
     // 2. Build the frame. Views push intents into a per-frame sink; we act on them after layout so a view
     //    never mutates engine state mid-render. eframe 0.34 hands us the root `Ui`; panels are laid out into
@@ -252,6 +336,7 @@ impl eframe::App for SkirnirApp {
     let mut sink = super::intent::IntentSink::new();
     let ctx = ui.ctx().clone();
     use super::metrics::Metrics;
+    use super::theme::Theme;
 
     // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content.
     egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H).show_inside(ui, |ui| {
@@ -284,25 +369,39 @@ impl eframe::App for SkirnirApp {
     // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
     // Settings) columns are exact widths, not resizable, so the layout matches the mock regardless of window
     // size. Program no longer lives in the right column — it is a dock tab now (design §03).
-    egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).show_inside(ui, |ui| {
-      egui::ScrollArea::vertical().show(ui, |ui| {
-        views::dro(ui, &self.view, &mut self.ui, &mut sink);
-        ui.separator();
-        views::jog(ui, &self.view, &mut self.ui, &mut sink);
+    //
+    // Each panel is given a zero-inner-margin `Frame` (panel-filled) rather than egui's default side-panel frame
+    // (`Margin::symmetric(8, 2)`). The default 8px L/R inset would shrink the usable column to 252px while the
+    // section headers and DRO/Jog bodies already own their padding (`HEADER_PAD_X`, `DRO_PAD`, `JOG_PAD`), so the
+    // content overran the clipped 252px and the rightmost controls ("Zero XYZ", the Z± column) were cut off. With
+    // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
+    let column_frame = egui::Frame::NONE.fill(Theme::PANEL);
+    egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
+      .show_inside(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+          views::dro(ui, &self.view, &mut self.ui, &mut sink);
+          ui.separator();
+          views::jog(ui, &self.view, &mut self.ui, &mut sink);
+        });
       });
-    });
 
-    egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).show_inside(ui, |ui| {
-      egui::ScrollArea::vertical().show(ui, |ui| {
-        views::overrides(ui, &self.view, &mut sink);
-        ui.separator();
-        views::probe(ui, &self.view, &mut self.ui, &mut sink);
-        ui.separator();
-        views::settings_panel(ui, &mut self.ui, &mut sink);
+    egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
+      .show_inside(ui, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+          views::overrides(ui, &self.view, &mut sink);
+          ui.separator();
+          views::probe(ui, &self.view, &mut self.ui, &mut sink);
+          ui.separator();
+          views::settings_panel(ui, &mut self.ui, &mut sink);
+        });
       });
-    });
 
-    egui::CentralPanel::default().show_inside(ui, |ui| {
+    // The central toolpath panel takes a zero-margin frame too. egui's default central-panel frame insets the
+    // content by 8px on every side, which left a black gutter between the left column's right edge and the
+    // viewport (the user-flagged band). With no margin the viewport sits flush against both columns — exactly the
+    // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
+    // its own `INSET` canvas over the rect, so the frame fill never shows through.
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Theme::INSET)).show_inside(ui, |ui| {
       views::toolpath(ui, &self.view, &self.ui);
     });
 
@@ -324,7 +423,18 @@ impl eframe::App for SkirnirApp {
     //    engine's events are polled from this loop), or for one extra frame after an event arrived. When
     //    disconnected there is no engine to poll, so we request no repaint and the UI sleeps until the next
     //    user input rather than waking 20×/sec for nothing.
-    if saw_event || self.engine.is_some() {
+    // A pending probe must keep the timer alive even when disconnected, so its verdict is drained promptly.
+    let probe_pending = {
+      #[cfg(feature = "serial")]
+      {
+        self.pending_probe.is_some()
+      }
+      #[cfg(not(feature = "serial"))]
+      {
+        false
+      }
+    };
+    if saw_event || saw_probe || probe_pending || self.engine.is_some() {
       ctx.request_repaint_after(REPAINT_INTERVAL);
     }
   }

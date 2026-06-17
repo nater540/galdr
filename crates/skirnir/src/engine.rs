@@ -22,6 +22,8 @@
 //! - **Status-report field parsing.** `<...>` reports are surfaced verbatim via [`Event::Response`]; the
 //!   DRO field breakdown is a follow-up in the response layer.
 
+use std::time::Duration;
+
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
@@ -33,6 +35,12 @@ use crate::transport::Transport;
 /// Size of the inbound read buffer. One USB-CDC packet is at most 64 bytes; a slightly larger buffer lets a
 /// burst of status/`ok` lines be drained in a single read without over-allocating.
 const READ_CHUNK: usize = 256;
+
+/// How often the engine polls the firmware with a `?` real-time status request while connected. grbl's docs
+/// recommend senders poll at no more than 5–10 Hz to avoid overwhelming the controller; 5 Hz (200 ms) is the
+/// common sender norm and keeps the DRO / state badge / feed-speed / overrides live without flooding the link.
+/// The `?` rides the out-of-band real-time path (uncounted), so polling never disturbs the send-ahead window.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// A host intent sent from the UI to the engine. Each is fed straight into the [`ProtocolCore`]; the engine
 /// adds no policy of its own beyond carrying out the resulting effects.
@@ -142,6 +150,27 @@ impl<T: Transport> Driver<T> {
     let connect_effects = self.core.on_connected();
     self.apply_effects(connect_effects).await;
 
+    // Actively elicit readiness instead of waiting passively for a banner the board may never send: probe with
+    // `?`/`0x87` and a counted `$I`. Any readiness evidence (status / banner / `ok` / `[VER:]`/`[OPT:]`) leaves
+    // Connecting via the core. A write failure here is a dead connection; end with that error.
+    let handshake_effects = self.core.begin_handshake();
+    if let ControlFlow::Stop(reason) = self.apply_effects(handshake_effects).await {
+      let down = self.core.on_disconnected();
+      self.apply_effects(down).await;
+      let _ = self.event_tx.send(Event::Disconnected(reason));
+      return;
+    }
+
+    // The live status poller: a periodic `?` keeps the DRO / state badge / feed-speed / overrides fresh. The
+    // first tick fires one interval from now (the handshake already sent an initial `?`), and ticks ride the
+    // out-of-band real-time path so polling never touches the character-count window. The interval is owned
+    // here (the only timing the otherwise-pure core cannot do); it stops the instant this loop ends on
+    // disconnect. `MissedTickBehavior::Delay` (the default) avoids a tick storm if the loop was briefly busy.
+    let mut status_poll = tokio::time::interval_at(
+      tokio::time::Instant::now() + STATUS_POLL_INTERVAL,
+      STATUS_POLL_INTERVAL,
+    );
+
     let mut read_buf = [0u8; READ_CHUNK];
     let disconnect_reason = loop {
       tokio::select! {
@@ -172,6 +201,15 @@ impl<T: Transport> Driver<T> {
               }
             }
             Err(err) => break Some(err),
+          }
+        }
+
+        _ = status_poll.tick() => {
+          // Inject a `?` out-of-band through the core (uncounted), then write it. A failed write means the link
+          // dropped; surface it and end the loop.
+          let poll_effects = self.core.on_realtime(RealtimeCommand::StatusReport);
+          if let ControlFlow::Stop(reason) = self.apply_effects(poll_effects).await {
+            break reason;
           }
         }
       }
@@ -282,9 +320,12 @@ mod tests {
   #[tokio::test]
   async fn a_streamed_program_writes_its_lines_and_progresses_to_idle() {
     let (mut handle, mut controller) = connect();
-    // A banner first moves the lifecycle out of Connecting into Idle (and clears the window cleanly).
+    // Settle the connect handshake first: a banner means the board reset, which leaves Connecting for Idle AND
+    // resets the flow window (discarding the in-flight `$I`), so the window is empty before we stream. Drain the
+    // handshake's own writes so we assert only the program bytes below.
     assert!(controller.inject_line("GrblHAL 1.1f ['$' or '$HELP' for help]"));
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+    let _ = controller.drain_written();
 
     // Stream two short lines. With the default 1024-byte window both release immediately.
     assert!(handle.send(Command::StreamProgram(vec!["G0 X1".to_string(), "G0 Y1".to_string()].into())));
@@ -303,10 +344,14 @@ mod tests {
   #[tokio::test]
   async fn flow_control_holds_a_line_until_an_ok_frees_room() {
     let (mut handle, mut controller) = connect();
-    // Shrink the window via an OPT message so only two 4-byte lines fit at once. (`G00\n` == 4 bytes.)
+    // Shrink the window via an OPT message so only two 4-byte lines fit at once. (`G00\n` == 4 bytes.) The OPT
+    // line leaves Connecting; the trailing `ok` is the `$I` reply terminator, which frees the in-flight `$I` so
+    // the 8-byte window is empty before we stream. Drain the handshake's own writes after.
     assert!(controller.inject_line("[OPT:VNMSL,100,8,3,0]"));
-    // Give the engine a moment to process the OPT before streaming.
     wait_for(&mut handle, |e| matches!(e, Event::Response(Response::Message(_)))).await;
+    assert!(controller.inject_line("ok")); // the `$I` reply's terminating `ok`
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+    let _ = controller.drain_written();
 
     assert!(handle.send(Command::StreamProgram(vec!["G00".to_string(), "G01".to_string(), "G02".to_string()].into())));
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
@@ -323,6 +368,9 @@ mod tests {
   #[tokio::test]
   async fn a_realtime_byte_is_written_out_of_band_and_uncounted() {
     let (handle, mut controller) = connect();
+    // Drain the connect handshake writes (`?0x87` then `$I\n`) so the next write is the realtime byte under test.
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?', 0x87]);
+    assert_eq!(wait_for_written(&mut controller).await, b"$I\n");
     assert!(handle.send(Command::Realtime(RealtimeCommand::StatusReport)));
     let written = wait_for_written(&mut controller).await;
     assert_eq!(written, vec![b'?']);
@@ -333,6 +381,9 @@ mod tests {
     let (mut handle, mut controller) = connect();
     assert!(controller.inject_line("[OPT:VNMSL,100,8,3,0]"));
     wait_for(&mut handle, |e| matches!(e, Event::Response(Response::Message(_)))).await;
+    assert!(controller.inject_line("ok")); // the `$I` reply's terminating `ok`, freeing the in-flight `$I`
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+    let _ = controller.drain_written();
 
     assert!(handle.send(Command::StreamProgram(vec!["G00".to_string(), "G01".to_string(), "G02".to_string()].into())));
     wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 2, .. })).await;
@@ -366,5 +417,71 @@ mod tests {
   /// Await the next chunk the engine writes, failing rather than hanging if it never writes.
   async fn wait_for_written(controller: &mut LoopbackController) -> Vec<u8> {
     controller.next_written().await.expect("engine wrote no bytes before ending")
+  }
+
+  #[tokio::test]
+  async fn the_connect_handshake_actively_probes_the_board() {
+    let (_handle, mut controller) = connect();
+    // On connect the engine must elicit readiness: the uncounted real-time probes (`?`, `0x87`) then a counted
+    // `$I` build-info query. It must NOT send a soft reset (`0x18`) — that would clobber any in-progress job.
+    let probes = wait_for_written(&mut controller).await;
+    assert_eq!(probes, vec![b'?', 0x87]);
+    let build_info = wait_for_written(&mut controller).await;
+    assert_eq!(build_info, b"$I\n");
+    assert!(!probes.contains(&0x18) && !build_info.contains(&0x18), "connect must never auto soft-reset");
+  }
+
+  #[tokio::test]
+  async fn a_status_report_leaves_connecting_without_a_banner() {
+    let (mut handle, controller) = connect();
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Connecting))).await;
+    // An already-booted Idle board answers the handshake `?` with a status and never sends a banner. The engine
+    // must still go live — this is the exact bug: previously it hung in Connecting forever.
+    assert!(controller.inject_line("<Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024>"));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+  }
+
+  #[tokio::test]
+  async fn an_already_held_board_is_adopted_as_hold_on_connect() {
+    let (mut handle, controller) = connect();
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Connecting))).await;
+    // The real board was observed booting into Hold; the engine must reflect Hold, not fake Idle.
+    assert!(controller.inject_line("<Hold:0|WPos:5.000,0.000,0.000|FS:0,0|Bf:32,1024>"));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Hold))).await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_status_poller_emits_a_question_mark_every_interval() {
+    let (mut handle, mut controller) = connect();
+    // Drain the connect handshake writes (`?0x87` then `$I\n`) so the next writes are poller traffic.
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?', 0x87]);
+    assert_eq!(wait_for_written(&mut controller).await, b"$I\n");
+    // Become live so the loop is steady-state; the poller runs regardless, but this mirrors a real session.
+    assert!(controller.inject_line("<Idle|MPos:0,0,0|FS:0,0>"));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+
+    // With time paused, no poll has fired yet. Advancing one interval must produce exactly one `?` poll.
+    tokio::time::advance(STATUS_POLL_INTERVAL).await;
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
+    // A second interval produces a second poll, proving the poller is periodic, not one-shot.
+    tokio::time::advance(STATUS_POLL_INTERVAL).await;
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
+  }
+
+  #[tokio::test]
+  async fn the_real_opt_line_sizes_the_flow_window_to_the_advertised_buffer() {
+    let (mut handle, mut controller) = connect();
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Connecting))).await;
+    // The board's `$I` reply advertises a 1024-byte RX buffer; the engine adopts it and goes live. We prove the
+    // sizing took effect by streaming a program whose lines all fit the 1024 window and complete to Idle.
+    assert!(controller.inject_line("[OPT:VNMSL,32,1024,3,0]"));
+    wait_for(&mut handle, |e| matches!(e, Event::Response(Response::Message(_)))).await;
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+    let _ = controller.drain_written();
+
+    assert!(handle.send(Command::StreamProgram(vec!["G0 X1".to_string(), "G0 Y1".to_string()].into())));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
+    // Both lines release immediately into the 1024-byte window (they would not under a tiny default).
+    wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 2, .. })).await;
   }
 }

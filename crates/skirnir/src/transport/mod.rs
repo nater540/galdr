@@ -11,6 +11,8 @@
 use crate::error::TransportError;
 
 pub mod loopback;
+pub mod ports;
+pub mod probe;
 
 #[cfg(feature = "serial")]
 pub mod serial;

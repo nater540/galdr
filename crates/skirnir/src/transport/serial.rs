@@ -9,10 +9,11 @@
 //! Gated behind the `serial` feature so a loopback-only build need not pull the native serialport stack.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_serial::{SerialPortBuilderExt, SerialPortType, SerialStream};
 
 use crate::error::TransportError;
 use crate::transport::Transport;
+use crate::transport::ports::{PortInfo, normalize_ports};
 
 /// A live serial connection to the firmware. Construct it with [`SerialTransport::open`]; from then on the
 /// engine moves bytes through it via the [`Transport`] trait.
@@ -44,14 +45,34 @@ impl Transport for SerialTransport {
   }
 }
 
-/// Enumerate the serial ports currently available on the host, as a list of device paths/names for the UI's
-/// port dropdown. Enumeration failures yield an empty list rather than an error — a missing port list is a
-/// recoverable, retryable UI condition, not something to crash on. `tokio-serial` re-exports the underlying
-/// `serialport` enumeration.
-pub fn available_ports() -> Vec<String> {
-  tokio_serial::available_ports()
-    .map(|ports| ports.into_iter().map(|port| port.port_name).collect())
-    .unwrap_or_default()
+/// Enumerate the serial ports currently available on the host as structured [`PortInfo`] for the UI's port
+/// dropdown, carrying whatever USB metadata the OS exposed (VID/PID/product/manufacturer/serial). The raw
+/// listing is passed through [`normalize_ports`], which prefers the macOS `cu.*` callout over the `tty.*`
+/// dialin (dedup the pair, translate a lone `tty.*`), leaves Linux nodes untouched, and floats Espressif-VID
+/// (likely-Galdr) ports to the front. Enumeration failures yield an empty list rather than an error — a
+/// missing port list is a recoverable, retryable UI condition, not something to crash on. `tokio-serial`
+/// re-exports the underlying `serialport` enumeration.
+pub fn available_ports() -> Vec<PortInfo> {
+  let raw = tokio_serial::available_ports().unwrap_or_default();
+  let infos = raw
+    .into_iter()
+    .map(|port| {
+      // Lift the USB descriptor fields when this is a USB port; otherwise only the path is known. `serialport`
+      // already exposes vid/pid as `u16`, so no parsing is needed — the metadata may simply be absent.
+      match port.port_type {
+        SerialPortType::UsbPort(usb) => PortInfo {
+          path: port.port_name,
+          vid: Some(usb.vid),
+          pid: Some(usb.pid),
+          product: usb.product,
+          manufacturer: usb.manufacturer,
+          serial: usb.serial_number,
+        },
+        _ => PortInfo::bare(port.port_name),
+      }
+    })
+    .collect();
+  normalize_ports(infos)
 }
 
 /// Map a std I/O error to the crate's transport error, distinguishing a closed pipe from a generic failure.

@@ -25,7 +25,8 @@ use crate::error::EngineError;
 use crate::protocol::flow::{DEFAULT_RX_BUFFER, FlowWindow};
 use crate::protocol::lifecycle::ConnectionState;
 use crate::protocol::realtime::RealtimeCommand;
-use crate::protocol::response::{Response, rx_buffer_from_opt};
+use crate::protocol::response::{Response, is_grbl_evidence, rx_buffer_from_opt};
+use crate::protocol::status::{RunState, parse_status};
 
 /// One side effect the core wants the driver to perform or surface. The driver writes [`Effect::Write`]
 /// bytes to the transport and forwards every other variant to the UI event channel.
@@ -120,6 +121,31 @@ impl ProtocolCore {
   pub fn on_connected(&mut self) -> Vec<Effect> {
     let mut out = Vec::new();
     self.transition(ConnectionState::Connecting, &mut out);
+    out
+  }
+
+  /// Begin the active connect handshake: the bytes the driver must send the instant the transport attaches,
+  /// to elicit readiness from a board that may already be booted (an already-running grblHAL does NOT re-emit
+  /// its banner unsolicited, so passively waiting hangs in [`ConnectionState::Connecting`] forever).
+  ///
+  /// Per `docs/gcode-streaming.md` §5 we probe non-destructively and broaden *detection* rather than forcing a
+  /// reset: `?` elicits an immediate `<...>` status, which also reveals the real machine state (Idle/Hold/
+  /// Alarm) so we adopt it instead of faking Idle; `0x87` requests a full real-time report to confirm a
+  /// grblHAL controller; `$I` is then issued as a *counted* line (see below) to learn build info and the RX
+  /// buffer size from `[OPT:...]`. We deliberately do NOT send `0x18` (soft reset): a reset aborts any
+  /// in-progress job and clears board state, clobbering the very state we want to adopt.
+  ///
+  /// The two real-time bytes returned here bypass the character-count window entirely (they are not lines).
+  /// The `$I` build-info query is sent separately through [`Self::on_send_line`] so its `ok` is correctly
+  /// accounted against the window; that keeps flow control honest even during the handshake. Any readiness
+  /// evidence — the `<...>` status, a banner, `[VER:]`/`[OPT:]`, or the `$I` `ok` — leaves Connecting via
+  /// [`Self::on_response`]. Returns the uncounted real-time probe bytes plus the effects of the counted `$I`.
+  pub fn begin_handshake(&mut self) -> Vec<Effect> {
+    let mut out = Vec::new();
+    // Uncounted real-time probes first: a status request and a full-report request, emitted out-of-band.
+    out.push(Effect::Write(vec![RealtimeCommand::StatusReport.byte(), RealtimeCommand::FullReport.byte()]));
+    // Then the counted build-info query, so its `ok` lands against a line we actually tracked.
+    out.extend(self.on_send_line("$I"));
     out
   }
 
@@ -224,6 +250,25 @@ impl ProtocolCore {
   /// the RX buffer is learned (`[OPT:...]`), and the banner/alarm/error reactions fire.
   pub fn on_response(&mut self, response: Response) -> Vec<Effect> {
     let mut out = vec![Effect::Response(response.clone())];
+
+    // Always learn the RX buffer size from `[OPT:...]`, regardless of lifecycle phase — the handshake's `$I`
+    // reply carries it and we want the send-ahead window sized before the first program line is released.
+    if let Response::Message(body) = &response
+      && let Some(rx) = rx_buffer_from_opt(body)
+    {
+      self.flow.set_rx_buffer(rx);
+    }
+
+    // While Connecting, ANY valid readiness evidence ends the handshake and adopts the board's reported state.
+    // An already-booted board sends no banner, so we must leave Connecting on a `<...>` status, a banner, an
+    // `ok`/`error` (e.g. the handshake's `$I`), or a `[VER:]`/`[OPT:]` build-info line — whichever arrives
+    // first. We still fall through to the normal ack/alarm handling below so flow control stays accurate.
+    // `accept_acks = true`: the handshake's solicited `$I` `ok` (and an `error`/`ALARM`) is valid readiness.
+    if self.state == ConnectionState::Connecting && is_grbl_evidence(&response, true) {
+      let adopted = adopted_state_for(&response);
+      self.transition(adopted, &mut out);
+    }
+
     match response {
       Response::Ok => self.on_ack(false, &mut out),
       Response::Error(_) => self.on_ack(true, &mut out),
@@ -232,16 +277,14 @@ impl ProtocolCore {
         self.transition(ConnectionState::Alarm, &mut out);
       }
       Response::Banner(_) => {
-        // A banner means the controller reset: abort any stream, clear the window, return to Idle.
+        // A banner means the controller reset: abort any stream, clear the window, return to Idle. (When this
+        // banner is the readiness evidence above, the Idle transition is already pending; transition() dedupes.)
         self.clear_program();
         self.reset_window();
         self.transition(ConnectionState::Idle, &mut out);
       }
-      Response::Message(body) => {
-        if let Some(rx) = rx_buffer_from_opt(&body) {
-          self.flow.set_rx_buffer(rx);
-        }
-      }
+      // `[OPT:...]` RX sizing already handled above; nothing further for messages.
+      Response::Message(_) => {}
       Response::Status(_) | Response::StartupEcho(_) | Response::Unknown(_) => {}
     }
     out
@@ -352,6 +395,23 @@ impl ProtocolCore {
     self.program_total = 0;
     self.program_sent = 0;
     self.program_acked = 0;
+  }
+}
+
+/// The lifecycle state to adopt when leaving [`ConnectionState::Connecting`] on the given readiness evidence.
+/// A `<...>` status reveals the board's real run state, so we honour it: `Hold` → [`ConnectionState::Hold`],
+/// `Alarm` → [`ConnectionState::Alarm`], and every other live run state → [`ConnectionState::Idle`] (the host
+/// lifecycle has no Jog/Home/Door/Check phase — the badge derives those from the run state separately, so Idle
+/// is the honest host-side value). An `ALARM:N` push adopts Alarm; any other evidence adopts Idle.
+fn adopted_state_for(response: &Response) -> ConnectionState {
+  match response {
+    Response::Status(body) => match parse_status(body).machine_state.state {
+      RunState::Hold => ConnectionState::Hold,
+      RunState::Alarm => ConnectionState::Alarm,
+      _ => ConnectionState::Idle,
+    },
+    Response::Alarm(_) => ConnectionState::Alarm,
+    _ => ConnectionState::Idle,
   }
 }
 
@@ -609,5 +669,81 @@ mod tests {
     assert_eq!(encode_line("G0 X1"), b"G0 X1\n");
     assert_eq!(encode_line("G0 X1\r\n"), b"G0 X1\n");
     assert_eq!(encode_line("G0 X1\n"), b"G0 X1\n");
+  }
+
+  #[test]
+  fn the_handshake_probes_with_status_full_report_then_a_counted_build_info_query() {
+    let mut core = connected_core();
+    let effects = core.begin_handshake();
+    // The first write is the two uncounted real-time probe bytes (`?`, `0x87`), out-of-band.
+    assert_eq!(writes(&effects), vec![vec![b'?', 0x87], b"$I\n".to_vec()]);
+    // `$I` is a counted line: it occupies the window so its `ok` is accounted, not flagged as a spurious ack.
+    assert_eq!(core.flow().inflight_bytes(), 3);
+  }
+
+  #[test]
+  fn a_status_report_while_connecting_advances_to_a_live_state_without_a_banner() {
+    let mut core = connected_core();
+    assert_eq!(core.state(), ConnectionState::Connecting);
+    // An already-booted Idle board answers `?` with a status — no banner is ever sent. We must go live anyway.
+    let effects = core.on_response(Response::Status("Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn a_hold_status_while_connecting_adopts_the_hold_state_not_a_faked_idle() {
+    let mut core = connected_core();
+    // The board booted into Hold (a real observed case): the lifecycle must reflect Hold, not pretend Idle.
+    let effects = core.on_response(Response::Status("Hold:0|WPos:5.000,0.000,0.000|FS:0,0|Bf:32,1024".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Hold));
+    assert_eq!(core.state(), ConnectionState::Hold);
+  }
+
+  #[test]
+  fn an_alarm_status_while_connecting_adopts_the_alarm_state() {
+    let mut core = connected_core();
+    let effects = core.on_response(Response::Status("Alarm:1|MPos:0,0,0".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Alarm));
+    assert_eq!(core.state(), ConnectionState::Alarm);
+  }
+
+  #[test]
+  fn the_handshake_build_info_ok_leaves_connecting_and_is_accounted() {
+    let mut core = connected_core();
+    core.begin_handshake(); // `$I` now in flight (3 bytes)
+    // The board replies `ok` to `$I`. That ack both ends the handshake (-> Idle) and frees the window cleanly,
+    // so it is NOT surfaced as a spurious-ack fault.
+    let effects = core.on_response(Response::Ok);
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::Fault(_))), "the $I ok must not be a spurious ack");
+    assert_eq!(core.flow().inflight_bytes(), 0);
+  }
+
+  #[test]
+  fn a_ver_build_info_line_while_connecting_is_readiness_evidence() {
+    let mut core = connected_core();
+    let effects = core.on_response(Response::Message("VER:1.1f.20260616:".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn an_opt_line_while_connecting_both_sizes_the_window_and_goes_live() {
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(128);
+    // The real board's `$I` reports `[OPT:VNMSL,32,1024,3,0]`: adopt 1024 AND leave Connecting.
+    let effects = core.on_response(Response::Message("OPT:VNMSL,32,1024,3,0".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.flow().rx_buffer(), 1024, "the advertised RX buffer is adopted, not the 128 default");
+  }
+
+  #[test]
+  fn an_incidental_message_alone_does_not_fake_readiness() {
+    let mut core = connected_core();
+    // A bare `[MSG:...]` push is not, on its own, proof the board is ready — we wait for a definitive signal.
+    let effects = core.on_response(Response::Message("MSG:'$H'|'$X' to unlock".to_string()));
+    assert!(!transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Connecting);
   }
 }

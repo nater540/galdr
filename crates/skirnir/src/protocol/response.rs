@@ -84,6 +84,22 @@ pub fn parse_line(line: &str) -> Option<Response> {
   Some(Response::Unknown(line.to_string()))
 }
 
+/// Whether a parsed [`Response`] is evidence of a live grblHAL controller, for the connect handshake and the
+/// on-demand port probe alike. A `<...>` status report, the welcome banner, and `[VER:]`/`[OPT:]` build-info
+/// always qualify. `accept_acks` widens the set to bare `ok` / `error:N` / `ALARM:N` replies: the connect
+/// handshake counts them (its `$I` `ok` is a valid readiness signal, having been solicited), but the port
+/// probe does not (an unsolicited ack from some unrelated device is inconclusive on its own). Keeping both
+/// callers on this one classifier stops the two evidence sets from silently drifting apart.
+pub fn is_grbl_evidence(response: &Response, accept_acks: bool) -> bool {
+  match response {
+    Response::Status(_) | Response::Banner(_) => true,
+    // `$I` build-info comes back as bracketed `[VER:...]` / `[OPT:...]` push messages; other `[MSG:...]` does not.
+    Response::Message(body) => body.starts_with("VER:") || body.starts_with("OPT:"),
+    Response::Ok | Response::Error(_) | Response::Alarm(_) => accept_acks,
+    Response::StartupEcho(_) | Response::Unknown(_) => false,
+  }
+}
+
 /// Extract the RX-buffer size advertised in an `[OPT:...]` message body. The OPT field order is
 /// `options,block_buffer,rx_buffer{,axes{,tools}}`, so the RX buffer is the third comma-separated field.
 /// Returns `None` if the body is not an OPT line or the field is missing / unparseable, leaving the engine
