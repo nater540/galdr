@@ -406,6 +406,14 @@ pub async fn run(
   // work to the real-time burst path, which never touches it. ~50 ms keeps the reported state well inside the
   // ~100 ms freshness budget while costing only three GPIO reads + one atomic store per tick at idle.
   let mut limit_ticker = Ticker::every(Duration::from_millis(50));
+  // The per-axis hard-limit ARMING state (DOC-06): "was this switch triggered at the previous `check_hard_limits`
+  // sample". The alarm is EDGE-armed off this — `hard_limit_alarm_armed` fires only on a not-triggered ->
+  // triggered transition — so a switch the machine is merely PARKED on (e.g. left engaged after an aborted `$H`
+  // seek, which performs no pull-off) never re-fires `ALARM:1`. Seeded to the SETTLED levels at the arming reset
+  // points — a soft reset (below) and after every homing cycle ([`run_homing`]) — so a held switch is "already
+  // known, not a new trip", while a genuine new over-travel during later motion still alarms. The executor is the
+  // single owner of this state; the consumer owns the control state it feeds.
+  let mut limit_armed: [bool; AXES] = sample_limit_triggered(limits);
   // The executor task is alive and entering its drain loop on core 1. If THIS line never appears over RTT, the
   // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
   mtrace!("motion: executor loop entered");
@@ -417,6 +425,11 @@ pub async fn run(
     if MOTION_RESET_PENDING.swap(false, Ordering::AcqRel) {
       MOTION_RESET.try_take();
       reset_live_position(&mut counter);
+      // Re-seed the hard-limit arming to the settled levels: a `0x18` after an aborted `$H` leaves a switch
+      // parked-engaged, and the warm reset returns to Idle / boot-lock, so that held level is "already known" —
+      // re-seeding here means the first post-reset block boundary sees no FRESH edge from it (the principled fix
+      // for the `error:9` re-lock). A genuinely new over-travel during later motion still alarms on its own edge.
+      limit_armed = sample_limit_triggered(limits);
     }
 
     // Honor the hold LEVEL at the block boundary (never mid-block — a burst in flight is never split, matching
@@ -474,8 +487,9 @@ pub async fn run(
         // raise the alarm (halting the queue) if `$21` is on and a switch tripped during normal motion. Sampling
         // at the boundary (not mid-burst — a burst is never split) bounds detection to one block, which is
         // adequate for an over-travel safety abort on short PCB-milling blocks. The shared-pin rule (no alarm
-        // while homing) is enforced inside `check_hard_limits`.
-        check_hard_limits(limits);
+        // while homing) is enforced inside `check_hard_limits`. The arming state is threaded so a switch the
+        // machine was already parked on (held level) never re-fires — only a FRESH over-travel edge alarms.
+        check_hard_limits(limits, &mut limit_armed);
       }
       // Queue empty: await a freshly enqueued block instead of polling, racing the dedicated motion reset (so a
       // reset while idle is observed promptly), the hold-level wake (so a hold latched while idle is honored —
@@ -506,6 +520,8 @@ pub async fn run(
             mtrace!("motion: woke on MOTION_RESET (idle)");
             MOTION_RESET_PENDING.store(false, Ordering::Release);
             reset_live_position(&mut counter);
+            // Re-seed the hard-limit arming on the idle reset path too (same invariant as the top-of-loop reset).
+            limit_armed = sample_limit_triggered(limits);
           }
           // A hold-level change while idle: loop back so the top-of-loop hold check re-reads the LEVEL and parks
           // if it is set (or simply proceeds if a spurious wake found it clear). Re-reading the level — never
@@ -514,11 +530,19 @@ pub async fn run(
           Either::First(Either::First(Either::First(Either4::Fourth(request)))) => {
             run_probe(&prober, &request, probe, sink, &mut counter)
           }
-          Either::First(Either::First(Either::Second(config))) => run_homing(&config, limits, sink, &mut counter),
+          Either::First(Either::First(Either::Second(config))) => {
+            run_homing(&config, limits, sink, &mut counter);
+            // SEED the hard-limit arming to the settled post-cycle levels. A homing seek drives INTO the switch and
+            // an abort/FAIL leaves the axis parked-engaged with no pull-off, so the level can still be asserted when
+            // `HOMING_ACTIVE` clears. Seeding here marks that held level "already known" — the first normal block
+            // boundary after the cycle then sees NO fresh edge from it, so the parked switch never latches a stale
+            // `ALARM:1` (the principled fix). A real new over-travel during a later move still alarms on its edge.
+            limit_armed = sample_limit_triggered(limits);
+          }
           // A debounced limit rising-edge trip while idle: sample the switches and raise the hard-limit alarm if
           // due (DOC-06). `wait_for_limit_trip` already applied the `$26` debounce and signalled `LIMIT_TRIGGERED`.
           // `check_hard_limits` also refreshes the published `Pn:` mask from the freshly-sampled levels.
-          Either::First(Either::Second(())) => check_hard_limits(limits),
+          Either::First(Either::Second(())) => check_hard_limits(limits, &mut limit_armed),
           // The idle limit-level tick: republish the live `Pn:` mask from a level sample so a RELEASE (or a press
           // too subtle to confirm at the debounce, e.g. a switch held without over-travel) is reflected within
           // one tick. Pure publish — no alarm decision here; that stays on the debounced edge path above.
@@ -800,7 +824,7 @@ fn run_homing(config: &HomingConfig, limits: &mut [RmtLimitInput; AXES], sink: &
 ///
 /// This is the idle-path detector ONLY; an in-MOTION over-travel is caught by the block-boundary
 /// [`check_hard_limits`] call (a burst in flight is never split). The shared-pin rule (no alarm while homing) is
-/// applied downstream in [`check_hard_limits`] / [`hard_limit_alarm`], not here.
+/// applied downstream in [`check_hard_limits`] / [`hard_limit_alarm_armed`], not here.
 async fn wait_for_limit_trip(limits: &mut [RmtLimitInput; AXES]) {
   loop {
     // Park on a rising edge from ANY limit pin. `select` over the three borrows races them concurrently; the
@@ -833,12 +857,23 @@ async fn wait_for_limit_trip(limits: &mut [RmtLimitInput; AXES]) {
   }
 }
 
-/// Sample the X/Y/Z limit switches and raise the hard-limit alarm if one tripped during normal motion (DOC-06).
-/// Reads the raw pin levels, applies the live `$5` invert + `$21` enable + the shared-pin (not-homing) rule via
-/// the host-tested [`hard_limit_alarm`](firmware_core::homing::hard_limit_alarm), and on an alarm signals
-/// [`HARD_LIMIT_TRIPPED`] so the consumer enters `ALARM:1` and resets the pipeline. Called at every block
-/// boundary and on the idle limit-ISR wake; a no-op when `$21` is off, while homing, or when nothing is tripped.
-fn check_hard_limits(limits: &[RmtLimitInput; AXES]) {
+/// Sample the X/Y/Z limit switches and raise the hard-limit alarm if one FRESHLY tripped during normal motion
+/// (DOC-06). Reads the raw pin levels, applies the live `$5` invert + `$21` enable + the shared-pin (not-homing)
+/// rule via the host-tested [`hard_limit_alarm_armed`](firmware_core::homing::hard_limit_alarm_armed), and on a
+/// FRESH over-travel edge signals [`HARD_LIMIT_TRIPPED`] so the consumer enters `ALARM:1` and resets the pipeline.
+///
+/// The alarm is EDGE-armed: `armed` carries the per-axis "was triggered at the previous sample" state across
+/// calls, so the alarm fires only on a not-triggered -> triggered transition. A switch the machine is merely
+/// PARKED on (a level already asserted at the previous sample — e.g. left engaged after an aborted `$H` seek, which
+/// performs no pull-off) therefore never re-fires a stale `ALARM:1`. This is the principled fix for the post-homing
+/// `error:9` re-lock: the held level used to latch a spurious trip the instant `HOMING_ACTIVE` cleared, which
+/// survived the soft reset and re-locked the machine after `$X`. Genuine over-travel during a normal move is a
+/// fresh edge and still alarms. `armed` is re-seeded to the settled levels at the reset / post-homing boundaries
+/// in the executor loop, so a held switch is "already known". The published `Pn:` mask stays purely level-based.
+///
+/// Called at every block boundary and on the idle limit-ISR wake; a no-op when `$21` is off, while homing, or when
+/// no axis makes a new triggered transition.
+fn check_hard_limits(limits: &[RmtLimitInput; AXES], armed: &mut [bool; AXES]) {
   // Build the live limit config from the `$5` mirror and read the enable + homing-active flags (all `Relaxed`
   // atomics — a real-time-safe read, no async settings lock).
   let config = crate::comms::limit_config();
@@ -848,19 +883,31 @@ fn check_hard_limits(limits: &[RmtLimitInput; AXES]) {
   // the axis count/order the way a hardcoded `[0, 1, 2]` index list could. Both the alarm decision AND the
   // published `Pn:` mask are derived from this single sample, so they are one coherent read of the same instant.
   let raw_high: [bool; AXES] = core::array::from_fn(|i| limits[i].is_high());
-  // `hard_limit_alarm` applies the `$5` invert internally, returning the post-`$5` logical-triggered array. Feed
-  // the RAW levels here (NOT pre-inverted) and reuse `decision.triggered` for the published mask below — packing
-  // it through `pack_limit_mask` keeps the published `Pn:` state the logical (post-`$5`) view, no double-invert.
-  let decision = firmware_core::homing::hard_limit_alarm(raw_high, &config, enabled, homing);
+  // `hard_limit_alarm_armed` applies the `$5` invert internally, returning the post-`$5` logical-triggered array
+  // and an EDGE-armed alarm keyed on `*armed` (the previous-sample triggered state). Feed the RAW levels here (NOT
+  // pre-inverted); reuse `decision.triggered` for the published mask so the `Pn:` view is the logical (post-`$5`)
+  // state, no double-invert. Carry `decision.next_armed` back so the next call sees this sample as its baseline.
+  let decision = firmware_core::homing::hard_limit_alarm_armed(raw_high, &config, enabled, homing, *armed);
+  *armed = decision.next_armed;
   // Refresh the published `Pn:` limit mask from this same sample, so the host's endstop view is current the
   // instant motion stops — not only after the next idle tick — and it agrees exactly with the alarm decision.
   LIMIT_LEVELS.store(firmware_core::homing::pack_limit_mask(decision.triggered), Ordering::Release);
   if decision.alarm {
-    // A limit tripped during normal motion with `$21` on: halt and raise `ALARM:1`. The consumer locks the
+    // A limit FRESHLY tripped during normal motion with `$21` on: halt and raise `ALARM:1`. The consumer locks the
     // alarm (position is likely lost from the abrupt stop) and resets the pipeline; the executor's reset path
     // zeroes the live position. Signal once — the alarm latches, so a re-trip before service is harmless.
     HARD_LIMIT_TRIPPED.signal(());
   }
+}
+
+/// Sample the X/Y/Z limit pins and return their per-axis LOGICAL-triggered state (post-`$5` invert + NC fail-safe).
+/// This is the seed for the hard-limit ARMING state: at the reset / post-homing boundaries the executor calls this
+/// to mark the currently-asserted switches "already known", so a held level is not mistaken for a fresh over-travel
+/// edge on the next [`check_hard_limits`]. It reads LEVELS, not edges, and raises no alarm and publishes nothing —
+/// it only computes the triggered array, sharing the `$5`/NC logic with [`check_hard_limits`] and the `Pn:` publish.
+fn sample_limit_triggered(limits: &[RmtLimitInput; AXES]) -> [bool; AXES] {
+  let config = crate::comms::limit_config();
+  core::array::from_fn(|axis| firmware_core::hal_traits::limit_triggered(limits[axis].is_high(), &config))
 }
 
 /// Build a probe [`Block`] from the current machine position `start` (steps) to the probe `target` (steps). A

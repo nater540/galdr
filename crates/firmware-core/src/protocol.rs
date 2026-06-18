@@ -472,6 +472,29 @@ impl ControlState {
     matches!(self, ControlState::Hold(_))
   }
 
+  /// Whether a hard-limit trip from the core-1 executor should raise a fresh `ALARM:1` from THIS control state.
+  /// True from the states where a genuine over-travel is meaningful — the machine could actually be MOVING:
+  /// `Normal` (running a program), `Hold` (a held program could resume into a switch), `Jog`, and `Check`. FALSE
+  /// from any `Alarm(_)` and from `Sleep`: in those states the machine is already halted/parked, so a trip is a
+  /// STALE read of a parked switch, not a live over-travel. Re-raising `ALARM:1` over an existing alarm changes
+  /// nothing useful and can only CLOBBER a more-specific state — most damagingly downgrading the boot-lock
+  /// `ALARM:11` (homing required) into the locked `ALARM:1`, losing the "homing required" semantic the host must
+  /// satisfy. Pulled out as a pure predicate so the bin's hard-limit consumer arm can gate the `ALARM:1` raise
+  /// without duplicating the alarm/sleep logic, and so the gate is host-tested here rather than in the untestable
+  /// cross-core wiring. The PRIMARY fix for the post-aborted-homing `error:9` re-lock is the executor's EDGE-armed
+  /// hard-limit alarm (`hard_limit_alarm_armed`): a switch left engaged after a `$H` abort is a HELD level, not a
+  /// fresh edge, so it never signals a stale trip in the first place. This predicate is the single remaining
+  /// DEFENSIVE layer (the soft-reset signal drains were removed once the arming subsumed them): it ensures any
+  /// stray `HARD_LIMIT_TRIPPED` arriving while ALREADY alarmed/asleep cannot downgrade a more-specific lock (most
+  /// damagingly `ALARM:11`) into the locked `ALARM:1`. A legitimately NEW over-travel still alarms because the
+  /// machine is in `Normal`/`Hold`/`Jog`/`Check` while moving, and the executor re-signals on its fresh edge.
+  pub fn hard_limit_alarm_applies(self) -> bool {
+    matches!(
+      self,
+      ControlState::Normal | ControlState::Hold(_) | ControlState::Jog | ControlState::Check
+    )
+  }
+
   /// Apply a soft reset (`0x18`). Per grbl: a reset that aborts an IN-PROGRESS cycle raises
   /// [`AlarmCode::AbortDuringCycle`] (position is suspect after a mid-move halt); a reset from any other
   /// state returns to the boot state — locked in homing-required when `$22` is set, else `Normal`. A reset
@@ -2450,6 +2473,38 @@ mod tests {
     assert!(!ControlState::Hold(false).homing_allowed());
     assert!(!ControlState::Check.homing_allowed());
     assert!(!ControlState::Sleep.homing_allowed());
+  }
+
+  #[test]
+  fn hard_limit_alarm_applies_only_from_unlocked_states() {
+    // A hard-limit trip raises `ALARM:1` only from a state where a genuine over-travel is meaningful — i.e. the
+    // machine could actually be moving. From Normal, Hold, Jog, and Check the trip applies; a real over-travel
+    // happens while a program/jog runs or while a held program could resume into a switch.
+    assert!(ControlState::Normal.hard_limit_alarm_applies());
+    assert!(ControlState::Hold(false).hard_limit_alarm_applies());
+    assert!(ControlState::Hold(true).hard_limit_alarm_applies());
+    assert!(ControlState::Jog.hard_limit_alarm_applies());
+    assert!(ControlState::Check.hard_limit_alarm_applies());
+    // From ANY alarm a trip must NOT apply: the machine is already halted, so the trip is a STALE read of a
+    // parked switch, not a live over-travel. Re-raising `ALARM:1` can only clobber a more-specific state — most
+    // damagingly downgrading the boot-lock `ALARM:11` (HomingRequired) into the locked `ALARM:1`, losing the
+    // "homing required" semantic. This is exactly the post-aborted-homing race the soft-reset drain targets; the
+    // guard is the belt-and-suspenders. Every alarm code — locked and `$X`-clearable alike — must be excluded.
+    for code in [
+      AlarmCode::HomingRequired,
+      AlarmCode::HardLimit,
+      AlarmCode::SoftLimit,
+      AlarmCode::EStop,
+      AlarmCode::HomingFail,
+      AlarmCode::AbortDuringCycle,
+    ] {
+      assert!(
+        !ControlState::Alarm(code).hard_limit_alarm_applies(),
+        "{code:?}: a hard-limit trip must not re-fire from an already-alarmed state",
+      );
+    }
+    // Sleep parks the drivers; a switch reading while asleep is not an over-travel — only a soft reset wakes it.
+    assert!(!ControlState::Sleep.hard_limit_alarm_applies());
   }
 
   #[test]

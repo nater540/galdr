@@ -27,6 +27,37 @@ use crate::engine::Engine;
 /// firmware's auto-report cadence without spinning the CPU between frames.
 const REPAINT_INTERVAL: Duration = Duration::from_millis(50);
 
+/// The motion time one streamed continuous-jog increment is sized for. A held jog is streamed as a run of short
+/// `$J=` moves rather than one long move, so a jog-cancel (`0x85`) on release stops within a single short block
+/// instead of running a 10 m move to its far boundary (the firmware cancels at the active block's boundary; a
+/// mid-block ramp-down is a firmware Stage-2 TODO). Each increment's length is `feed * BLOCK_SECS`, so its
+/// motion time — and thus the worst-case stop latency after release — is ~this regardless of feed.
+const JOG_STREAM_BLOCK_SECS: f64 = 0.12;
+
+/// How often a held continuous jog emits the next increment. Matched to [`JOG_STREAM_BLOCK_SECS`] so the host
+/// produces blocks at roughly the rate the firmware executes them, keeping the planner queue shallow; the `Bf:`
+/// backstop below absorbs any drift.
+const JOG_STREAM_INTERVAL: Duration = Duration::from_millis(120);
+
+/// Stop streaming new increments while the firmware reports fewer than this many planner blocks free, so a held
+/// jog can never overrun the 32-block queue into a `QueueFull` rejection. `Bf:` lags (status polls at ~5 Hz), so
+/// the margin is generous enough to absorb several increments' worth of staleness.
+const JOG_STREAM_MIN_BLOCKS_FREE: u32 = 8;
+
+/// An in-progress continuous (press-and-hold) jog, streamed as short `$J=` increments until the operator
+/// releases. `Copy` so the per-frame pump can snapshot it without holding a borrow across the send.
+#[derive(Clone, Copy)]
+struct JogStream {
+  /// The axis being jogged.
+  axis: Axis,
+  /// The direction along that axis.
+  dir: Dir,
+  /// The feed (mm/min) the increments carry, which also sizes each increment's length.
+  feed: f64,
+  /// Wall-clock instant the next increment is due, so increments pace to one block's motion time.
+  next_send_at: Instant,
+}
+
 /// The skirnir application: state plus the tokio runtime that hosts the engine task.
 pub struct SkirnirApp {
   /// The tokio runtime the engine's driver task runs on. Held for the app's lifetime; `Engine::connect` is
@@ -67,6 +98,9 @@ pub struct SkirnirApp {
   /// `Streaming` and cleared when it leaves; `None` means no stream is timing. Held in the shell (not the pure
   /// reducer) because it is wall-clock state the egui frame owns — the reducer stays free of `Instant::now()`.
   stream_started: Option<Instant>,
+  /// The continuous jog currently being streamed while the operator holds a jog control, or `None`. Owned by the
+  /// shell (not the reducer) because pacing the increments is wall-clock work the egui frame drives.
+  jog_stream: Option<JogStream>,
   /// The result channel of an in-flight on-demand port identify probe, if one is running. The probe runs on
   /// the runtime (off the UI thread); the verdict arrives here and is drained into the console each frame, so a
   /// 500ms probe never blocks rendering. `None` when no probe is in flight.
@@ -96,6 +130,7 @@ impl SkirnirApp {
       ui: UiState::default(),
       override_tracker: super::overrides::OverrideTracker::default(),
       stream_started: None,
+      jog_stream: None,
       #[cfg(feature = "serial")]
       pending_probe: None,
     };
@@ -136,8 +171,10 @@ impl SkirnirApp {
     }
     if dropped {
       // The session ended: drop the transient widget state and the override estimate that belonged to it, so a
-      // reconnect to a (possibly different) board never resumes a stale edit or steps from the old override.
+      // reconnect to a (possibly different) board never resumes a stale edit or steps from the old override. A
+      // held continuous jog belongs to the dead link too — stop streaming increments into a gone engine.
       self.ui.on_disconnected();
+      self.jog_stream = None;
       self.override_tracker = super::overrides::OverrideTracker::default();
       self.on_engine_dropped();
     }
@@ -273,9 +310,7 @@ impl SkirnirApp {
       Intent::SetOverride { axis, target } => self.set_override(axis, target),
       Intent::Jog { axis, dir, distance, feed } => self.jog(axis, dir, distance, feed),
       Intent::JogStart { axis, dir, feed } => self.jog_start(axis, dir, feed),
-      Intent::JogStop => {
-        self.send_command(Command::Realtime(crate::protocol::RealtimeCommand::JogCancel));
-      }
+      Intent::JogStop => self.jog_stop(),
       Intent::DismissBanner => self.view.dismiss_banner(),
       Intent::ProbeZ { depth, feed, plate_thickness } => self.probe_z(depth, feed, plate_thickness),
       Intent::RequestSettings => self.request_settings(),
@@ -544,12 +579,51 @@ impl SkirnirApp {
     self.send_command(Command::SendLine(line));
   }
 
-  /// Begin a continuous (press-and-hold) jog: a single long `$J=` move toward the far sentinel distance at
-  /// `feed`, which the operator stops by releasing (the view fires [`Intent::JogStop`] → jog-cancel). The move
-  /// never completes on its own before the release because the target far exceeds any axis travel.
+  /// Begin a continuous (press-and-hold) jog. Rather than one long move (which a jog-cancel could only stop at
+  /// its far boundary — the runaway bug), the held jog is *streamed* as short `$J=` increments by
+  /// [`Self::pump_jog_stream`]; the operator stops it by releasing, which fires [`Intent::JogStop`]. The first
+  /// increment is due immediately so motion starts without waiting a cadence.
   fn jog_start(&mut self, axis: Axis, dir: Dir, feed: f64) {
-    let line = super::intent::continuous_jog_line(axis, dir, feed);
-    self.view.note_sent(line.clone());
+    self.jog_stream = Some(JogStream { axis, dir, feed, next_send_at: Instant::now() });
+  }
+
+  /// End a continuous jog: stop streaming increments and inject jog-cancel (`0x85`). The firmware flushes the
+  /// queued jog blocks and decelerates the active (short) block at its boundary, so motion halts within one
+  /// increment's travel. Safe to send when not jogging — the firmware ignores it.
+  fn jog_stop(&mut self) {
+    self.jog_stream = None;
+    self.send_command(Command::Realtime(crate::protocol::RealtimeCommand::JogCancel));
+  }
+
+  /// Emit the next increment of a held continuous jog if one is active and due. Paced by wall clock so blocks are
+  /// produced at roughly the firmware's execution rate, and gated by the firmware's reported planner-blocks-free
+  /// (`Bf:`) so a long hold never overruns the queue. Each increment is `feed * BLOCK_SECS` long, so its motion
+  /// time — the worst-case stop latency after release — stays ~[`JOG_STREAM_BLOCK_SECS`] regardless of feed. The
+  /// increments are not echoed to the console: at several per second the echo would bury real traffic.
+  fn pump_jog_stream(&mut self) {
+    let Some(stream) = self.jog_stream else {
+      return;
+    };
+    let now = Instant::now();
+    if now < stream.next_send_at {
+      return;
+    }
+    // Backstop against drift: if the firmware's last-reported planner queue is nearly full, hold off until it
+    // drains rather than risk a `QueueFull` rejection. Re-arm a fresh interval so we resume promptly. A missing
+    // `Bf:` (no status yet) skips the gate — the queue is empty early in a jog, so the first sends are safe.
+    if let Some((blocks_free, _)) = self.view.status.as_ref().and_then(|s| s.buffer)
+      && blocks_free < JOG_STREAM_MIN_BLOCKS_FREE
+    {
+      if let Some(s) = self.jog_stream.as_mut() {
+        s.next_send_at = now + JOG_STREAM_INTERVAL;
+      }
+      return;
+    }
+    let distance = stream.feed / 60.0 * JOG_STREAM_BLOCK_SECS;
+    let line = super::intent::jog_line(stream.axis, stream.dir, distance, stream.feed);
+    if let Some(s) = self.jog_stream.as_mut() {
+      s.next_send_at = now + JOG_STREAM_INTERVAL;
+    }
     self.send_command(Command::SendLine(line));
   }
 
@@ -725,6 +799,10 @@ impl eframe::App for SkirnirApp {
       self.handle_intent(intent);
     }
 
+    // 3b. Service a held continuous jog: a JogStart this frame (or an earlier one still held) streams its next
+    //     short `$J=` increment when due. Runs after the intents so a fresh JogStart emits immediately.
+    self.pump_jog_stream();
+
     // 4. Schedule the next wake. Only spin the steady timer when there is live traffic to expect: while an
     //    engine is attached (the firmware auto-reports and a stream needs prompt progress updates, and the
     //    engine's events are polled from this loop), or for one extra frame after an event arrived. When
@@ -743,7 +821,9 @@ impl eframe::App for SkirnirApp {
         (false, false)
       }
     };
-    if saw_event || saw_probe || fired_reconnect || probe_pending || reconnect_pending || self.engine.is_some() {
+    if saw_event || saw_probe || fired_reconnect || probe_pending || reconnect_pending
+      || self.engine.is_some() || self.jog_stream.is_some()
+    {
       ctx.request_repaint_after(REPAINT_INTERVAL);
     }
   }
@@ -901,5 +981,77 @@ mod tests {
     assert!(app.engine.is_none(), "the engine handle must be released once the terminal event drains");
     assert!(!app.auto_reconnect, "a deliberate disconnect must not re-arm auto-reconnect");
     assert!(app.reconnect_at.is_none(), "a deliberate disconnect must not schedule a reconnect");
+  }
+
+  /// Let the connect handshake's writes flush, then discard everything written so far so a test sees only the
+  /// traffic it provokes afterward.
+  fn flush_handshake(app: &mut SkirnirApp, controller: &mut LoopbackController) {
+    for _ in 0..20 {
+      app.pump_events();
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    controller.drain_written();
+  }
+
+  /// Drive the jog-stream pump across a short window, accumulating everything the engine writes to the transport.
+  /// Drains the controller each step so nothing is lost; sleeps so the wall-clock cadence and async writes advance.
+  fn collect_written(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_jog_stream();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// A held continuous jog must stream repeated SHORT `$J=` increments (so a jog-cancel stops within one block),
+  /// and releasing must end the stream and inject jog-cancel (`0x85`). Regression: the old one-shot 10 m move ran
+  /// to its far boundary because jog-cancel only stops at a block boundary, so a hold-then-release jogged endlessly.
+  #[test]
+  fn a_held_continuous_jog_streams_short_increments_and_cancels_on_release() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Hold a jog at 600 mm/min: each increment is 600/60 * 0.12 = 1.200 mm.
+    app.jog_start(Axis::X, Dir::Pos, 600.0);
+    let streamed = collect_written(&mut app, &mut controller, 80); // ~400 ms of pumping.
+    let text = String::from_utf8_lossy(&streamed);
+    let increments = text.matches("$J=G91 G21 X1.200 F600").count();
+    assert!(increments >= 2, "a held jog must stream repeated short increments; saw {increments} in {text:?}");
+
+    // Release: the stream clears and a jog-cancel byte is injected.
+    app.jog_stop();
+    assert!(app.jog_stream.is_none(), "releasing must end the stream");
+    // Let the cancel (and any last in-flight increment) flush, and confirm the cancel byte was written.
+    let settling = collect_written(&mut app, &mut controller, 40);
+    assert!(settling.contains(&0x85), "release must inject the jog-cancel byte (0x85)");
+
+    // After settling, nothing more should stream: drain clean, then further pumps must emit no new jog lines.
+    controller.drain_written();
+    let after = collect_written(&mut app, &mut controller, 60); // ~300 ms.
+    let after_text = String::from_utf8_lossy(&after);
+    assert!(!after_text.contains("$J="), "no jog increments may stream after release; saw {after_text:?}");
+  }
+
+  /// While the firmware reports its planner queue nearly full (`Bf:` blocks-free below the margin), a held jog
+  /// must stop streaming new increments so it can never overrun the 32-block queue into a `QueueFull` rejection.
+  #[test]
+  fn a_held_jog_throttles_when_the_planner_queue_is_nearly_full() {
+    let (mut app, mut controller) = app_with_engine();
+    // Report a nearly-full planner queue: 2 blocks free, below the margin of `JOG_STREAM_MIN_BLOCKS_FREE`.
+    assert!(controller.inject_line("<Run|MPos:0.000,0.000,0.000|Bf:2,1000>"));
+    assert!(
+      pump_until(&mut app, |a| a.view.status.as_ref().and_then(|s| s.buffer).map(|b| b.0) == Some(2)),
+      "the engine never reported the Bf buffer state",
+    );
+    controller.drain_written();
+
+    // Hold a jog: `collect_written` never ingests a fresh status, so the low blocks-free report stays in force and
+    // must gate off every due increment.
+    app.jog_start(Axis::X, Dir::Pos, 600.0);
+    let streamed = collect_written(&mut app, &mut controller, 60); // ~300 ms.
+    let text = String::from_utf8_lossy(&streamed);
+    assert!(!text.contains("$J="), "a nearly-full planner queue must throttle the jog stream; saw {text:?}");
   }
 }

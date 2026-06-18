@@ -81,12 +81,12 @@ pub enum Intent {
 
   /// Jog `axis` in `dir` by `distance` (mm) at `feed` (mm/min). The shell forms the `$J=` line.
   Jog { axis: Axis, dir: Dir, distance: f64, feed: f64 },
-  /// Begin a continuous (press-and-hold) jog: a single long `$J=` move toward the soft-travel limit at `feed`,
-  /// which the firmware decelerates the instant a [`Intent::JogStop`] (jog-cancel) arrives. The shell forms the
-  /// `$J=` line with a large target distance; the operator holds the button (or arrow key) to keep moving.
+  /// Begin a continuous (press-and-hold) jog. The shell streams short `$J=` increments at `feed` for as long as
+  /// the control is held, rather than one long move — so a jog-cancel on release stops within one short block
+  /// instead of running a long move to its far boundary. Emitted on the press edge; ended by [`Intent::JogStop`].
   JogStart { axis: Axis, dir: Dir, feed: f64 },
-  /// End a continuous jog: inject jog-cancel (`0x85`), which feed-holds and flushes the jog without alarming.
-  /// Safe to send when not jogging — the firmware ignores it. Emitted on button/key release.
+  /// End a continuous jog: stop streaming increments and inject jog-cancel (`0x85`), which flushes the queued jog
+  /// blocks and halts the active one. Safe to send when not jogging — the firmware ignores it. Emitted on release.
   JogStop,
 
   /// Dismiss the latched alarm/error banner.
@@ -139,28 +139,13 @@ pub fn work_zero_line(axes: &[Axis]) -> String {
   work_offset_line(&values)
 }
 
-/// The target distance (mm) a continuous jog travels in one `$J=` move. grblHAL has no "jog forever" command;
-/// the host-side idiom is to issue a single jog toward a distance larger than any axis can reach, then cancel
-/// it (`0x85`) on release so the move stops where the operator let go. 10 m comfortably exceeds any PCB-mill
-/// axis travel while staying well inside grbl's float range, so the move never completes on its own before the
-/// release cancels it.
-pub const CONTINUOUS_JOG_DISTANCE_MM: f64 = 10_000.0;
-
-/// Build the `$J=` line for a step jog: a relative (`G91`), millimetre (`G21`) move of `distance` mm along
-/// `axis` in `dir` at `feed` mm/min. Jog is modal-independent in grblHAL, so the explicit `G91 G21` prefix
-/// keeps it predictable regardless of the running program's modal context. Pure so the wire form is unit-
-/// tested without a window.
+/// Build the `$J=` line for a jog: a relative (`G91`), millimetre (`G21`) move of `distance` mm along `axis` in
+/// `dir` at `feed` mm/min. Jog is modal-independent in grblHAL, so the explicit `G91 G21` prefix keeps it
+/// predictable regardless of the running program's modal context. Pure so the wire form is unit-tested without a
+/// window. Used for both step jogs and the short increments the shell streams for a continuous (held) jog.
 pub fn jog_line(axis: Axis, dir: Dir, distance: f64, feed: f64) -> String {
   let signed = distance * dir.sign();
   format!("$J=G91 G21 {}{:.3} F{:.0}", axis.letter(), signed, feed)
-}
-
-/// Build the `$J=` line for a continuous (press-and-hold) jog: the same relative-millimetre move as
-/// [`jog_line`] but toward [`CONTINUOUS_JOG_DISTANCE_MM`], so it keeps moving until the operator releases and
-/// the shell injects jog-cancel (`0x85`). Delegating to [`jog_line`] keeps a single place that forms the jog
-/// wire syntax.
-pub fn continuous_jog_line(axis: Axis, dir: Dir, feed: f64) -> String {
-  jog_line(axis, dir, CONTINUOUS_JOG_DISTANCE_MM, feed)
 }
 
 /// A keyboard chord the shell lifts out of egui's per-frame input and feeds to [`key_to_intent`]. Kept as a
@@ -302,13 +287,6 @@ mod tests {
     // A step jog is an explicit `G91 G21` relative-mm move so it is independent of the program's modal state.
     assert_eq!(jog_line(Axis::X, Dir::Pos, 1.0, 500.0), "$J=G91 G21 X1.000 F500");
     assert_eq!(jog_line(Axis::Y, Dir::Neg, 0.5, 250.0), "$J=G91 G21 Y-0.500 F250");
-  }
-
-  #[test]
-  fn continuous_jog_targets_the_far_distance() {
-    // A continuous jog reuses the step builder but at the large sentinel distance, cancelled on release.
-    let line = continuous_jog_line(Axis::Z, Dir::Neg, 100.0);
-    assert_eq!(line, format!("$J=G91 G21 Z-{CONTINUOUS_JOG_DISTANCE_MM:.3} F100"));
   }
 
   #[test]

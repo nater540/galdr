@@ -272,7 +272,18 @@ async fn main(spawner: Spawner) {
     FLASH.init(Mutex::new(storage::FlashState::new(FlashStorage::new(peripherals.FLASH))));
   let settings = {
     let mut store = storage::FlashRecordStore::settings(flash);
-    firmware_core::settings::load_or_default(&mut store).await
+    // Use the reporting loader so a present-but-undecodable record (a CRC mismatch, a write the reset button
+    // truncated, or a schema-version skew) is surfaced on the serial monitor instead of silently booting on
+    // factory defaults (homing off). Absence is the legitimate first-boot path and stays quiet. The loader is
+    // still infallible — it always yields a usable `Settings` and never wedges boot.
+    let (settings, outcome) = firmware_core::settings::load_reporting(&mut store).await;
+    #[cfg(feature = "defmt")]
+    if outcome == firmware_core::settings::LoadOutcome::DefaultedCorrupt {
+      defmt::warn!("settings: stored record present but undecodable; booting on factory defaults (homing off)");
+    }
+    // The `outcome` is only consulted under `defmt`; silence the unused binding in the default (no-defmt) build.
+    let _ = outcome;
+    settings
   };
   let planner_config = settings.planner_config();
   let motion_config = settings.motion_config(MOTION_TICK_HZ);

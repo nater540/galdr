@@ -224,12 +224,15 @@ pub static BLOCK_AVAILABLE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// trip. This static is the documented seam; today only the core-1 executor produces and observes it.
 pub static LIMIT_TRIGGERED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Executor → consumer: "a hard limit tripped during normal motion" (DOC-06). The core-1 executor samples the
-/// limit inputs at block boundaries and on the [`LIMIT_TRIGGERED`] wake; when [`firmware_core::homing::hard_limit_alarm`]
-/// says an alarm is due ([`HARD_LIMITS_ENABLED`] set, homing NOT active, a switch triggered) it halts motion and
-/// raises this signal. The consumer enters `ALARM:1` ([`AlarmCode::HardLimit`], a LOCKED alarm — position is
-/// likely lost from the abrupt stop) and runs the pipeline reset. A coalesced `Signal` is sufficient: the alarm
-/// latches, so a second trip before the first is serviced is harmless.
+/// Executor → consumer: "a hard limit FRESHLY tripped during normal motion" (DOC-06). The core-1 executor samples
+/// the limit inputs at block boundaries and on the [`LIMIT_TRIGGERED`] wake; when
+/// [`firmware_core::homing::hard_limit_alarm_armed`] says an alarm is due ([`HARD_LIMITS_ENABLED`] set, homing NOT
+/// active, and an axis made a not-triggered -> triggered EDGE since the last sample) it halts motion and raises this
+/// signal. The edge-arming means a switch the machine is merely parked on (held level — e.g. after an aborted `$H`
+/// seek) never raises it, so no stale trip survives a soft reset to re-lock the machine (the `error:9` fix). The
+/// consumer enters `ALARM:1` ([`AlarmCode::HardLimit`], a LOCKED alarm — position is likely lost from the abrupt
+/// stop) and runs the pipeline reset. A coalesced `Signal` is sufficient: the alarm latches, so a second trip
+/// before the first is serviced is harmless.
 pub static HARD_LIMIT_TRIPPED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// A `G38.x` probe request handed from the core-0 consumer to the core-1 motion executor (Phase C, DOC-09). It
@@ -887,6 +890,13 @@ fn dispatch_realtime(cmd: RealtimeCommand) {
       // probe queued just before `0x18` is superseded by the reset, exactly like the flushed planner blocks.
       HOLD_REQUESTED.store(false, Ordering::Release);
       PROBE_REQUEST.try_take();
+      // NOTE: no `HARD_LIMIT_TRIPPED` drain here anymore. The hard-limit alarm is now EDGE-armed in the executor
+      // (`check_hard_limits` -> `hard_limit_alarm_armed`), and the executor re-seeds its per-axis arming to the
+      // settled levels at every reset / post-homing boundary. A switch left ENGAGED after an aborted `$H` seek is
+      // therefore a HELD level, not a fresh edge, so it never signals `HARD_LIMIT_TRIPPED` in the first place —
+      // there is no stale latch to drain (this was the root of the `error:9` re-lock). A genuinely new over-travel
+      // during later motion still alarms on its own fresh edge, and the consumer's `hard_limit_alarm_applies`
+      // guard remains as the single defensive layer so a stray trip can never downgrade a more-specific alarm.
       LINE_RESET.signal(());
       SOFT_RESET.signal(());
       // Wake the executor (idle case) and raise the poll-able mid-block abort flag (running case). Set the
@@ -999,12 +1009,14 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // the whole burst before blocking for the next event, instead of writing per line. The flush yields the
     // executor while the flash op runs; `is_empty` is the cheap "host paused" signal the brief specifies.
     if SETTINGS_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
-      flush_settings(flash).await;
+      // `false`: this path fires every loop iteration while dirty, so it must NOT re-mark on failure or it would
+      // busy-retry a persistently-failing write each loop. A failed write here is retried by the safety timer.
+      flush_settings(flash, false).await;
     }
     // Coalesced coordinate persist (Phase B): same burst-boundary rule for the persistent G54-G59 / G28 / G30
     // record, so a program that re-zeroes several axes appends the coordinate blob once, not per line.
     if COORDINATES_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
-      flush_coordinates(flash).await;
+      flush_coordinates(flash, false).await;
     }
     // Race the next line against a soft reset AND a periodic safety flush. A `0x18` resets the parser modal
     // state, clears the error-hold, and flushes the planner queue (and persists any pending settings) BEFORE
@@ -1028,8 +1040,10 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
       // A soft reset must not lose a pending settings change: persist before rebuilding the pipeline (grbl
       // applies most settings on the next reset, so they MUST be on flash by the time the reset takes them).
       Either::First(Either4::Second(())) => {
-        flush_settings(flash).await;
-        flush_coordinates(flash).await;
+        // `true`: a failed persist here must be retried (by the safety timer or the next reset), not dropped —
+        // grbl applies settings on the next reset, so a lost write would mean the reset takes stale flash values.
+        flush_settings(flash, true).await;
+        flush_coordinates(flash, true).await;
         apply_soft_reset(&mut parser, &mut state).await;
       }
       // Jog cancel (`0x85`, Phase D): reuse the feed-hold block-boundary stop, flush the jog blocks, sync the
@@ -1039,17 +1053,28 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
       // Safety-interval tick: persist any pending change even if the queue never observably drained. When
       // nothing is dirty these are cheap no-ops and the loop simply re-arms the timer on the next iteration.
       Either::First(Either4::Fourth(())) => {
-        flush_settings(flash).await;
-        flush_coordinates(flash).await;
+        // `true`: the safety interval is the bounded-cadence retry for a failed write — re-marking dirty here lets
+        // the next tick re-attempt, which is exactly the guarantee Bug A defeated (a single failure dropped it).
+        flush_settings(flash, true).await;
+        flush_coordinates(flash, true).await;
       }
       // Hard-limit trip (`$21`, DOC-06): the executor detected a switch trip during normal motion. Enter the
       // LOCKED `ALARM:1` (position is likely lost from the abrupt stop — re-homing recommended) and reset the
       // pipeline so the queue is flushed and the machine sits in a clean, clearly-halted alarm. Only a soft
       // reset clears a locked alarm.
       Either::Second(()) => {
-        set_control_state(ControlState::Alarm(AlarmCode::HardLimit));
-        emit_alarm(AlarmCode::HardLimit).await;
-        reset_pipeline(&mut parser, &mut state).await;
+        // Guard against a STALE trip clobbering an already-halted machine (Finding #5b): raise `ALARM:1` only
+        // from a state where the machine could actually be MOVING (`Normal`/`Hold`/`Jog`/`Check`). The
+        // host-tested `hard_limit_alarm_applies` predicate decides. If we are already in an alarm (or asleep), a
+        // trip here is a stale read of a parked switch — re-raising would only downgrade a more-specific lock,
+        // most damagingly turning the `ALARM:11` boot-lock into the locked `ALARM:1`, which `$X` cannot clear
+        // (the `error:9` wedge). A legitimately NEW over-travel always arrives from a moving state, so this never
+        // suppresses a real trip; the soft-reset drains above are the primary fix and this is the last guard.
+        if control_state().hard_limit_alarm_applies() {
+          set_control_state(ControlState::Alarm(AlarmCode::HardLimit));
+          emit_alarm(AlarmCode::HardLimit).await;
+          reset_pipeline(&mut parser, &mut state).await;
+        }
       }
     }
   }
@@ -1060,12 +1085,16 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
 /// performs the actual flash append once per burst (queue-empty), on the safety interval, and on soft reset.
 ///
 /// The dirty flag is cleared BEFORE the write so a change landing during the (awaited) flash op re-marks dirty
-/// and is caught by the next flush — never silently coalesced away. A failed flush is logged via `defmt` (a
-/// no-op in the default build) and otherwise swallowed: the in-RAM value already applied and the line was
-/// already `ok`'d, matching the existing best-effort `store_settings` error handling — a stalled persist must
-/// never wedge a character-counting sender. (The change is not re-marked on failure: the next dirty write or
-/// the soft-reset flush will re-attempt persistence; re-marking here would spin the failing write every loop.)
-async fn flush_settings(flash: &'static SharedFlash) {
+/// and is caught by the next flush — never silently coalesced away.
+///
+/// On write FAILURE we re-mark the dirty flag when `retry_on_failure` is set, so a transient flash error does not
+/// permanently drop the change (Bug A): the soft-reset and safety-interval guarantees only hold if a failed write
+/// is re-attempted. The burst-boundary caller at the top of the consumer loop passes `false` — it fires every
+/// iteration while `dirty && queue empty`, so re-marking there would busy-retry a persistently-failing write each
+/// loop. The safety-timer and soft-reset arms pass `true`: they re-attempt on a BOUNDED cadence (the next
+/// [`SETTINGS_FLUSH_SAFETY`] tick, or the next reset) rather than spinning. The in-RAM value already applied and
+/// the line was already `ok`'d either way — a stalled persist must never wedge a character-counting sender.
+async fn flush_settings(flash: &'static SharedFlash, retry_on_failure: bool) {
   // Clear first so a concurrent `$n=val` applied during the await re-sets the flag and is not lost.
   if !SETTINGS_DIRTY.swap(false, Ordering::AcqRel) {
     return;
@@ -1075,6 +1104,12 @@ async fn flush_settings(flash: &'static SharedFlash) {
   if settings::store_settings(&mut store, &snapshot).await.is_err() {
     #[cfg(feature = "defmt")]
     defmt::warn!("settings: failed to flush settings to flash");
+    // Re-mark so the next safety-timer tick or soft reset retries; the burst-boundary path passes `false` to
+    // avoid spinning the failing write every loop. The re-mark cannot clobber a concurrent newer `$n=val`: that
+    // write also sets the flag, so the worst case is the same flag already being set.
+    if retry_on_failure {
+      SETTINGS_DIRTY.store(true, Ordering::Release);
+    }
   }
 }
 
@@ -1096,6 +1131,14 @@ async fn apply_soft_reset(parser: &mut Parser, state: &mut ConsumerState) {
   // resulting alarm so a host sees `ALARM:N` and the `[MSG:..]` prompt right after the banner — matching grbl's
   // connect/reset ordering.
   reset_pipeline(parser, state).await;
+  // No `HARD_LIMIT_TRIPPED` drain here anymore (Finding #5b is now fixed at the source). The hard-limit alarm is
+  // EDGE-armed in the executor, which re-seeds its per-axis arming to the settled levels at the reset / post-homing
+  // boundaries — so a switch still parked engaged after an aborted `$H` seek is a HELD level, not a fresh edge, and
+  // the executor's concurrent block-boundary / idle re-samples during this `reset_pipeline` await window can no
+  // longer RE-latch a stale trip. The `error:9` re-lock is prevented by the arming, not by draining a latch after
+  // the fact. The `hard_limit_alarm_applies` guard on the consumer's hard-limit arm stays as the one defensive
+  // layer: a genuinely NEW over-travel re-signals from a moving state and still alarms, while a stray trip arriving
+  // while already alarmed/asleep cannot downgrade a more-specific lock (e.g. `ALARM:11`) into the locked `ALARM:1`.
   if let ControlState::Alarm(code) = next {
     emit_alarm(code).await;
   }
@@ -2396,8 +2439,10 @@ async fn handle_restore_all(parser: &mut Parser, state: &mut ConsumerState, flas
 /// pending, clearing [`COORDINATES_DIRTY`]. The coordinate analogue of [`flush_settings`]: callers mark dirty
 /// per persistent op, and this performs the actual flash append once per burst (queue-empty), on the safety
 /// interval, and on soft reset. The dirty flag is cleared BEFORE the write so a change landing during the await
-/// re-marks dirty and is caught by the next flush; a failed flush is logged and swallowed.
-async fn flush_coordinates(flash: &'static SharedFlash) {
+/// re-marks dirty and is caught by the next flush. On write FAILURE we re-mark dirty when `retry_on_failure` is
+/// set (Bug A) so the change is retried, mirroring [`flush_settings`]: the burst-boundary caller passes `false`
+/// to avoid spinning, while the safety-timer and soft-reset arms pass `true` for a bounded retry.
+async fn flush_coordinates(flash: &'static SharedFlash, retry_on_failure: bool) {
   if !COORDINATES_DIRTY.swap(false, Ordering::AcqRel) {
     return;
   }
@@ -2406,6 +2451,9 @@ async fn flush_coordinates(flash: &'static SharedFlash) {
   if coords::store_coordinates(&mut store, &persistent).await.is_err() {
     #[cfg(feature = "defmt")]
     defmt::warn!("coordinates: failed to flush coordinate record to flash");
+    if retry_on_failure {
+      COORDINATES_DIRTY.store(true, Ordering::Release);
+    }
   }
 }
 

@@ -11,7 +11,7 @@ use super::badge::{BadgeState, TransportGroup};
 use super::intent::{Axis, Dir, Intent, IntentSink};
 use super::metrics::Metrics;
 use super::theme::Theme;
-use super::view_state::{Banner, LogSource, ViewState};
+use super::view_state::{Banner, LogLine, LogSource, ViewState};
 use crate::protocol::{ConnectionState, RealtimeCommand};
 use crate::transport::ports::PortInfo;
 
@@ -70,6 +70,9 @@ pub struct UiState {
   pub show_machine_pos: bool,
   /// Whether the console auto-scrolls to the newest line (the design's "auto-scroll" checkbox).
   pub auto_scroll: bool,
+  /// Whether the console shows every received line. When `false` (the default), bare `ok` acknowledgements are
+  /// hidden so continuous jogging — which acks each `$J=` line — does not bury the log in `‹ ok` noise.
+  pub verbose: bool,
   /// The active tab in the bottom dock: Console or Program (design §03 — the two tabs share one dock surface).
   pub active_tab: DockTab,
   /// Whether the bottom dock is collapsed to just its tab strip, hiding the console/program body so the toolpath
@@ -111,6 +114,7 @@ impl Default for UiState {
       editing_setting: None,
       show_machine_pos: false,
       auto_scroll: true,
+      verbose: false,
       active_tab: DockTab::default(),
       dock_collapsed: false,
     }
@@ -1137,17 +1141,28 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   ui.horizontal(|ui| {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
       ui.checkbox(&mut state.auto_scroll, "auto-scroll");
+      ui.checkbox(&mut state.verbose, "verbose");
     });
   });
+
+  // Map the visible rows back onto the full buffer: in non-verbose mode bare `ok` acks are dropped so the row
+  // virtualisation below counts and indexes only the lines actually drawn.
+  let visible: Vec<usize> = view
+    .console
+    .iter()
+    .enumerate()
+    .filter(|(_, entry)| state.verbose || !is_ok_noise(entry))
+    .map(|(index, _)| index)
+    .collect();
 
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
   ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(state.auto_scroll).show_rows(
     ui,
     row_height,
-    view.console.len(),
+    visible.len(),
     |ui, range| {
-      for index in range {
-        if let Some(entry) = view.console.get(index) {
+      for row in range {
+        if let Some(entry) = visible.get(row).and_then(|&index| view.console.get(index)) {
           let (chevron, color) = console_line_style(entry.source, &entry.text);
           ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -1179,6 +1194,13 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
       response.request_focus();
     }
   });
+}
+
+/// Whether a console line is a bare `ok` acknowledgement — the per-line ack the firmware emits for every consumed
+/// command. These are hidden when `verbose` is off so continuous jogging does not flood the log. Pure so it is
+/// unit-tested. Only `Received` lines count: a literal `ok` the operator typed and we echoed stays visible.
+fn is_ok_noise(entry: &LogLine) -> bool {
+  entry.source == LogSource::Received && entry.text.trim() == "ok"
 }
 
 /// Decide the chevron glyph and colour for one console line, distinguishing status (`<…>`) and info (`[…]`)
@@ -1680,6 +1702,17 @@ mod tests {
     assert_eq!(console_line_style(LogSource::Received, "[MSG:hi]").1, Theme::LOG_INFO);
     assert_eq!(console_line_style(LogSource::Received, "error:9").1, Theme::DANGER);
     assert_eq!(console_line_style(LogSource::Received, "ok").1, Theme::LOG_RECV);
+  }
+
+  #[test]
+  fn ok_noise_filters_only_received_acks() {
+    let recv = |text: &str| LogLine { source: LogSource::Received, text: text.to_string() };
+    assert!(is_ok_noise(&recv("ok")), "a bare received ok is noise");
+    assert!(is_ok_noise(&recv("ok\r")), "trailing whitespace still counts as a bare ok");
+    assert!(!is_ok_noise(&recv("error:9")), "errors are never filtered");
+    assert!(!is_ok_noise(&recv("[MSG:ok]")), "an info line that merely contains ok stays");
+    // A line the operator typed and we echoed is a Sent source, so it is never treated as ack noise.
+    assert!(!is_ok_noise(&LogLine { source: LogSource::Sent, text: "ok".to_string() }));
   }
 
   #[test]

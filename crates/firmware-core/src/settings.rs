@@ -1250,15 +1250,47 @@ fn lookup_descriptor(n: u16) -> Option<(&'static SettingDescriptor, usize)> {
   None
 }
 
-/// Load the persisted settings, falling back to [`Settings::default`] on absence OR any decode failure. This
-/// is the INFALLIBLE loader (DOC-04): a corrupt, truncated, version-skewed, or missing record can never wedge
-/// boot — it silently yields defaults, which the firmware then applies. The decoded record is sanitized.
-pub async fn load_or_default<S: RecordStore>(store: &mut S) -> Settings {
+/// Why the loader produced the [`Settings`] it returned, so the firmware boot path can tell the legitimate
+/// first-boot case apart from a silently-corrupted record. The distinction matters because both yield
+/// [`Settings::default`] (homing off), but only the corrupt case warrants a diagnostic on the serial monitor —
+/// a missing record is the normal pre-provisioned state, while a present-but-undecodable one means a real
+/// `$`-setting change was lost (CRC mismatch, a write the reset button truncated, or a schema-version skew).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum LoadOutcome {
+  /// A stored record was present and decoded cleanly; the returned settings are the persisted values.
+  Loaded,
+  /// No record was stored (the `store.load` returned an error); defaults returned — the normal first-boot path.
+  DefaultedAbsent,
+  /// A record WAS present but failed to decode; defaults returned. This is the lossy case worth surfacing.
+  DefaultedCorrupt,
+}
+
+/// Load the persisted settings and report WHY, so callers can distinguish a clean decode, the benign
+/// "no record yet" first-boot path, and a present-but-undecodable record (a silently-lost change). This is the
+/// INFALLIBLE loader core (DOC-04): a corrupt, truncated, version-skewed, or missing record can never wedge
+/// boot — it always yields a usable [`Settings`] (sanitized when decoded, else compiled defaults) and never
+/// panics or propagates. [`load_or_default`] is the discard-the-outcome convenience wrapper.
+pub async fn load_reporting<S: RecordStore>(store: &mut S) -> (Settings, LoadOutcome) {
   let mut buf = [0u8; wire::FRAME_MAX_LEN];
   match store.load(&mut buf).await {
-    Ok(len) => wire::decode(&buf[..len]).unwrap_or_default(),
-    Err(_) => Settings::default(),
+    // A record is present: decode it. A clean decode is `Loaded`; a decode failure is the lossy `DefaultedCorrupt`
+    // case (CRC/length/magic/version mismatch) — we still return defaults so a bad region never wedges boot.
+    Ok(len) => match wire::decode(&buf[..len]) {
+      Ok(settings) => (settings, LoadOutcome::Loaded),
+      Err(_) => (Settings::default(), LoadOutcome::DefaultedCorrupt),
+    },
+    // No record stored yet: the legitimate first-boot path, silently defaulted.
+    Err(_) => (Settings::default(), LoadOutcome::DefaultedAbsent),
   }
+}
+
+/// Load the persisted settings, falling back to [`Settings::default`] on absence OR any decode failure. This
+/// is the INFALLIBLE loader (DOC-04): a corrupt, truncated, version-skewed, or missing record can never wedge
+/// boot — it silently yields defaults, which the firmware then applies. The decoded record is sanitized. Use
+/// [`load_reporting`] when the caller needs to distinguish absence from corruption (the boot path, to warn).
+pub async fn load_or_default<S: RecordStore>(store: &mut S) -> Settings {
+  load_reporting(store).await.0
 }
 
 /// Encode `settings` into a storage frame and persist it via `store`, replacing any prior record. Surfaces
@@ -1997,6 +2029,35 @@ mod tests {
       record[0] ^= 0xFF;
     }
     assert_eq!(block_on(load_or_default(&mut store)), Settings::default());
+  }
+
+  #[test]
+  fn load_reporting_distinguishes_absent_from_corrupt() {
+    // Absent record: the legitimate first-boot path — defaults, signalled as ABSENT (no warning at the callsite).
+    let mut store = MockStore::default();
+    assert_eq!(block_on(load_reporting(&mut store)), (Settings::default(), LoadOutcome::DefaultedAbsent));
+
+    // A present, well-formed record decodes cleanly and is signalled as LOADED. Use a non-default homing flag so
+    // a regression that silently returns defaults (Bug B) would fail both the value AND the outcome assertion.
+    let mut settings = Settings::default();
+    settings.homing_flags = HOMING_FLAG_ENABLE;
+    block_on(store_settings(&mut store, &settings)).expect("save");
+    assert_eq!(block_on(load_reporting(&mut store)), (settings, LoadOutcome::Loaded));
+
+    // A present-but-corrupt record (a flipped CRC byte, as if a write were truncated by the reset button) returns
+    // defaults — homing OFF — but is now distinguishable as CORRUPT, so the boot path can warn instead of silently
+    // booting on factory defaults. This is the exact scenario Bug B masked.
+    if let Some(record) = store.record.as_mut() {
+      let last = record.len() - 1;
+      record[last] ^= 0xFF;
+    }
+    assert_eq!(block_on(load_reporting(&mut store)), (Settings::default(), LoadOutcome::DefaultedCorrupt));
+
+    // A truncated record (a write interrupted below the framing overhead) is likewise CORRUPT, not absent.
+    if let Some(record) = store.record.as_mut() {
+      record.truncate(3);
+    }
+    assert_eq!(block_on(load_reporting(&mut store)), (Settings::default(), LoadOutcome::DefaultedCorrupt));
   }
 
   #[test]

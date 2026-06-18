@@ -241,6 +241,64 @@ pub struct HardLimitDecision {
   pub alarm: bool,
 }
 
+/// Decide the hard-limit ALARM with EDGE-ARMING, given the raw level of each limit input, the `$5` invert, `$21`
+/// enable, the homing-active flag, AND the per-axis "was this switch triggered at the PREVIOUS sample" state the
+/// caller carries across calls (DOC-06). The alarm fires only on a NEW assertion — an axis that transitions
+/// not-triggered -> triggered — so a switch the machine is merely PARKED on (already triggered at the previous
+/// sample) never re-fires `ALARM:1`. This is the principled fix for the post-aborted-homing `error:9` wedge: a
+/// `$H` seek/abort/fail leaves the axis parked against an engaged switch with no pull-off, so the level stays
+/// asserted; without edge-arming the first block-boundary sample after `HOMING_ACTIVE` clears would latch a STALE
+/// hard-limit trip that survives the soft reset and re-locks the machine into `ALARM:1` after `$X`.
+///
+/// Genuine over-travel is preserved: a switch that newly trips DURING a normal non-homing move is a fresh
+/// not-triggered -> triggered transition and still raises the alarm at the block boundary. Only a level already
+/// asserted at the last sample is suppressed.
+///
+/// The published `triggered` mask is purely LEVEL-based (post-`$5`), identical to [`hard_limit_alarm`], so the
+/// host's `Pn:` endstop view still reflects a held switch — only the `alarm` decision is edge-armed. The returned
+/// `next_armed` is the arming state the caller stores for the next call: it tracks the current level (so a press
+/// arms, a release disarms and re-enables a later fresh-edge alarm). The caller SEEDS `prev_triggered` with the
+/// settled levels at the arming reset points (homing start / `MOTION_RESET`) so a switch held after a cycle is
+/// treated as "already known, not a new trip", while a real new edge during later motion still fires.
+pub fn hard_limit_alarm_armed(
+  raw_high: [bool; AXES],
+  config: &LimitConfig,
+  hard_limits_enabled: bool,
+  homing_active: bool,
+  prev_triggered: [bool; AXES],
+) -> ArmedHardLimitDecision {
+  let mut triggered = [false; AXES];
+  let mut fresh = false;
+  for axis in 0..AXES {
+    triggered[axis] = limit_triggered(raw_high[axis], config);
+    // A FRESH assertion is a not-triggered -> triggered transition on this axis. A persistently-held level
+    // (`prev` already triggered) contributes nothing, so a parked-on switch cannot re-fire the alarm.
+    fresh |= triggered[axis] && !prev_triggered[axis];
+  }
+  // Same gating as the level-based path: an alarm needs `$21` on and NOT mid-homing (the shared-pin rule), but
+  // now keyed on a FRESH edge rather than any held level.
+  let alarm = hard_limits_enabled && !homing_active && fresh;
+  // The arming state carried to the next call IS the current level: a press arms (so the next held sample is
+  // suppressed), a release disarms (so a subsequent re-press is once again a fresh, alarming edge).
+  ArmedHardLimitDecision { triggered, alarm, next_armed: triggered }
+}
+
+/// The result of [`hard_limit_alarm_armed`]: the level-based `triggered` mask (for the `Pn:` publish), the
+/// EDGE-ARMED `alarm` flag, and the `next_armed` per-axis arming state the caller stores for the next call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ArmedHardLimitDecision {
+  /// Per-axis "this axis's limit switch is triggered" mask, `[X, Y, Z]` (after the `$5` invert). Purely
+  /// level-based, so the published `Pn:` view still shows a held switch.
+  pub triggered: [bool; AXES],
+  /// `true` only when a NEW over-travel should raise `ALARM:1` now: `$21` enabled, NOT mid-homing, and at least
+  /// one axis made a not-triggered -> triggered transition since the previous sample. A held level never fires.
+  pub alarm: bool,
+  /// The per-axis arming state to carry into the next [`hard_limit_alarm_armed`] call: the current level, so a
+  /// press arms and a release disarms.
+  pub next_armed: [bool; AXES],
+}
+
 /// Pack a per-axis logical-triggered array into the published `Pn:` limit bitmask: `bit0 = X`, `bit1 = Y`,
 /// `bit2 = Z`. This is the SINGLE definition of that bit layout's encode side; the firmware decodes it with the
 /// mirrored shift in `comms::limit_levels()`. Pass the post-`$5` logical state — typically
@@ -564,6 +622,79 @@ mod tests {
     // No switch triggered => no alarm.
     let d = hard_limit_alarm([false, false, false], &cfg, true, false);
     assert!(!d.alarm);
+  }
+
+  #[test]
+  fn edge_armed_alarm_suppresses_a_held_level() {
+    // The core fix: a switch that was ALREADY triggered at the previous sample (e.g. parked-on after an aborted
+    // homing seek that left no pull-off) must NOT re-fire a fresh `ALARM:1`. With `prev = [_, _, true]` and the
+    // level STILL `true`, no axis makes a not-triggered -> triggered transition, so `alarm` is false — while the
+    // published `triggered` mask STILL reports the held switch so the host's `Pn:` endstop view stays correct.
+    let cfg = LimitConfig::default(); // NC: HIGH = triggered.
+    let d = hard_limit_alarm_armed([false, false, true], &cfg, true, false, [false, false, true]);
+    assert!(!d.alarm, "a switch already triggered at the previous sample must not re-fire the hard-limit alarm");
+    assert_eq!(d.triggered, [false, false, true], "the level mask still reports the held switch for Pn:");
+    assert_eq!(d.next_armed, [false, false, true], "the carried arming state tracks the current level");
+  }
+
+  #[test]
+  fn edge_armed_alarm_fires_on_a_fresh_assertion() {
+    // A genuine over-travel during normal motion: the switch was NOT triggered at the previous sample and now IS.
+    // That not-triggered -> triggered transition MUST raise the alarm — the fix only suppresses a persistently-held
+    // level, never a real new trip.
+    let cfg = LimitConfig::default();
+    let d = hard_limit_alarm_armed([false, false, true], &cfg, true, false, [false, false, false]);
+    assert!(d.alarm, "a fresh not-triggered -> triggered transition raises the hard-limit alarm");
+    assert_eq!(d.triggered, [false, false, true]);
+    assert_eq!(d.next_armed, [false, false, true]);
+  }
+
+  #[test]
+  fn edge_armed_alarm_fires_on_a_new_axis_while_another_is_held() {
+    // A held axis must not mask a NEW trip on a different axis: X held (prev=true) while Y freshly trips. Only Y's
+    // transition counts, so the alarm fires — but the held X is not what triggered it.
+    let cfg = LimitConfig::default();
+    let d = hard_limit_alarm_armed([true, true, false], &cfg, true, false, [true, false, false]);
+    assert!(d.alarm, "a fresh trip on Y still alarms even though X is held from before");
+    assert_eq!(d.triggered, [true, true, false]);
+    assert_eq!(d.next_armed, [true, true, false]);
+  }
+
+  #[test]
+  fn edge_armed_alarm_respects_enable_and_shared_pin_rule() {
+    // The gating rules survive the edge-arming: `$21` off and homing-active both suppress even a FRESH assertion
+    // (prev all-false). A disabled limit or an expected in-cycle trip is never an over-travel alarm.
+    let cfg = LimitConfig::default();
+    let d = hard_limit_alarm_armed([false, false, true], &cfg, false, false, [false, false, false]);
+    assert!(!d.alarm, "a disabled `$21` raises no alarm even on a fresh trip");
+    assert_eq!(d.triggered, [false, false, true], "but the mask still reports the switch");
+    let d = hard_limit_alarm_armed([false, false, true], &cfg, true, true, [false, false, false]);
+    assert!(!d.alarm, "a fresh trip DURING homing is suppressed by the shared-pin rule");
+    assert_eq!(d.triggered, [false, false, true]);
+  }
+
+  #[test]
+  fn edge_armed_alarm_keeps_the_mask_level_based_under_invert() {
+    // The published `triggered` mask is purely level-based (post-`$5`), independent of the arming state: under
+    // `$5=1` an all-low read is all-triggered regardless of `prev`, so the host `Pn:` view never depends on edges.
+    let inverted = LimitConfig { invert: true };
+    let d = hard_limit_alarm_armed([false, false, false], &inverted, true, false, [true, true, true]);
+    assert_eq!(d.triggered, [true, true, true], "$5=1 makes all-low read as all-triggered regardless of arming");
+    assert!(!d.alarm, "all axes were already armed, so the held (inverted) level raises no fresh alarm");
+    assert_eq!(d.next_armed, [true, true, true]);
+  }
+
+  #[test]
+  fn edge_armed_alarm_clears_arming_on_release() {
+    // A switch that RELEASES (triggered -> not) clears its arming bit, so a later RE-press is once again a fresh
+    // edge that alarms. This proves the arming state is not a one-way latch: prev=true, now=false yields no alarm
+    // and clears the bit; feeding that back with a new press alarms again.
+    let cfg = LimitConfig::default();
+    let released = hard_limit_alarm_armed([false, false, false], &cfg, true, false, [false, false, true]);
+    assert!(!released.alarm, "a release is not a trip");
+    assert_eq!(released.next_armed, [false, false, false], "the released axis disarms");
+    let repressed = hard_limit_alarm_armed([false, false, true], &cfg, true, false, released.next_armed);
+    assert!(repressed.alarm, "a fresh press after a release alarms again");
   }
 
   #[test]

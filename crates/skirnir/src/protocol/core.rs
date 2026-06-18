@@ -281,6 +281,19 @@ impl ProtocolCore {
     if self.state == ConnectionState::Connecting && is_grbl_evidence(&response, true) {
       let adopted = adopted_state_for(&response);
       self.transition(adopted, &mut out);
+    } else if let Response::Status(body) = &response {
+      // Past the handshake, the `<...>` run state is grblHAL's authoritative machine state, so we honour it for
+      // the states the host does NOT own: from Alarm (a `<Idle>` after `$X` unlocks must un-grey the controls),
+      // and between Idle/Hold (tracking feed-hold/resume). But ONLY for run states the host can faithfully
+      // reflect (`Idle`/`Hold`/`Alarm`): a busy/transient `<Run>`/`<Jog>`/`<Home>` while alarm-latched means the
+      // board is still clearing the alarm (e.g. mid-`$H`), so we must stay put rather than un-grey the controls.
+      // We deliberately leave Streaming and Error untouched — both are host-driven: a `<Run>`/`<Idle>` poll mid-
+      // stream must not abort Streaming, and the grbl error-hold (Error) clears only on reset / empty line / `$`.
+      if matches!(self.state, ConnectionState::Alarm | ConnectionState::Hold | ConnectionState::Idle)
+        && let Some(adopted) = lifecycle_from_status_runstate(parse_status(body).machine_state.state)
+      {
+        self.transition(adopted, &mut out);
+      }
     }
 
     match response {
@@ -444,6 +457,20 @@ fn adopted_state_for(response: &Response) -> ConnectionState {
     },
     Response::Alarm(_) => ConnectionState::Alarm,
     _ => ConnectionState::Idle,
+  }
+}
+
+/// The lifecycle state a *post-handshake* `<...>` status report may adopt, or `None` to leave the lifecycle
+/// unchanged. Unlike [`adopted_state_for`] (the Connecting handshake's "any evidence leaves Connecting" rule),
+/// this only honours run states the host can faithfully reflect: `Idle`, `Hold`, and `Alarm`. A busy/transient
+/// run state (`Run`/`Jog`/`Home`/`Door`/`Check`/`Sleep`/`Tool`) returns `None` so the current lifecycle stays —
+/// e.g. an alarm-latched board reporting `<Home|...>` mid-`$H` must NOT flip to Idle and un-grey the controls.
+fn lifecycle_from_status_runstate(state: RunState) -> Option<ConnectionState> {
+  match state {
+    RunState::Idle => Some(ConnectionState::Idle),
+    RunState::Hold => Some(ConnectionState::Hold),
+    RunState::Alarm => Some(ConnectionState::Alarm),
+    _ => None,
   }
 }
 
@@ -826,5 +853,131 @@ mod tests {
     let effects = core.on_response(Response::Message("MSG:'$H'|'$X' to unlock".to_string()));
     assert!(!transitioned_to(&effects, ConnectionState::Idle));
     assert_eq!(core.state(), ConnectionState::Connecting);
+  }
+
+  /// Drive a core into [`ConnectionState::Alarm`] the way a real session does: reach Idle, then receive an
+  /// `ALARM:N` push (e.g. a soft-limit trip). The post-handshake status-adoption tests build on this.
+  fn alarmed_core() -> ProtocolCore {
+    let mut core = idle_core();
+    core.on_response(Response::Alarm(1));
+    assert_eq!(core.state(), ConnectionState::Alarm);
+    core
+  }
+
+  #[test]
+  fn an_idle_status_clears_a_latched_alarm_so_controls_re_enable() {
+    // The bug this fixes: after `$X` unlocks the board, the firmware replies `ok` (no lifecycle effect) and
+    // then reports `<Idle|...>` on the next `?` poll. Skirnir must honour that run state and leave Alarm —
+    // otherwise every motion/stream control stays greyed out until a reboot.
+    let mut core = alarmed_core();
+    let effects = core.on_response(Response::Status("Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn a_run_status_keeps_a_latched_alarm_latched() {
+    // A `<Run|...>` while alarm-latched means the board is busy CLEARING the alarm (e.g. mid-`$H`), not idle.
+    // Adopting Idle here would un-grey motion/stream controls while the machine is physically moving, so the
+    // host must stay in Alarm until a genuinely host-faithful run state (`Idle`/`Hold`) is reported.
+    let mut core = alarmed_core();
+    let effects = core.on_response(Response::Status("Run|MPos:1.000,0.000,0.000|FS:500,0".to_string()));
+    assert!(!transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Alarm);
+  }
+
+  #[test]
+  fn a_home_status_keeps_a_latched_alarm_latched_during_homing() {
+    // The regression this fixes: an ALARM:11 homing-required board reports `<Home|...>` at ~5 Hz during the `$H`
+    // cycle while still internally alarm-latched. The host must STAY in Alarm so the controls views.rs gates on
+    // `Idle` (Zero-WCS, Probe Z, transport/stream) remain greyed while the machine is physically homing.
+    let mut core = alarmed_core();
+    let effects = core.on_response(Response::Status("Home|MPos:0.000,0.000,0.000|FS:500,0".to_string()));
+    assert!(!transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Alarm);
+  }
+
+  #[test]
+  fn a_jog_status_keeps_a_latched_alarm_latched() {
+    // A `<Jog|...>` is a busy/transient run state too; like Run/Home it must not un-latch the alarm.
+    let mut core = alarmed_core();
+    let effects = core.on_response(Response::Status("Jog|MPos:0.500,0.000,0.000|FS:500,0".to_string()));
+    assert!(!transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Alarm);
+  }
+
+  #[test]
+  fn a_hold_status_moves_a_latched_alarm_to_hold() {
+    let mut core = alarmed_core();
+    let effects = core.on_response(Response::Status("Hold:0|MPos:0.000,0.000,0.000|FS:0,0".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Hold));
+    assert_eq!(core.state(), ConnectionState::Hold);
+  }
+
+  #[test]
+  fn a_run_status_while_idle_does_not_spuriously_flip_the_lifecycle() {
+    // Continuous-jog streams `$J=` lines while the host is Idle: the board reports `<Run|...>`/`<Jog|...>` during
+    // the move. Those are busy/transient run states the host does not own, so they must NOT flip Idle away —
+    // otherwise the jog would knock the lifecycle around on every poll.
+    let mut core = idle_core();
+    let run = core.on_response(Response::Status("Run|MPos:0.500,0.000,0.000|FS:500,0".to_string()));
+    assert!(!transitioned_to(&run, ConnectionState::Hold) && !transitioned_to(&run, ConnectionState::Alarm));
+    assert_eq!(core.state(), ConnectionState::Idle);
+    let jog = core.on_response(Response::Status("Jog|MPos:0.500,0.000,0.000|FS:500,0".to_string()));
+    assert!(!transitioned_to(&jog, ConnectionState::Hold) && !transitioned_to(&jog, ConnectionState::Alarm));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn idle_and_hold_status_reports_track_a_feed_hold_round_trip() {
+    // Feed-hold tracking via status: Idle + `<Hold:0|...>` adopts Hold, then Hold + `<Idle|...>` (resume) adopts
+    // Idle again. Both are host-faithful run states, so the lifecycle must mirror them.
+    let mut core = idle_core();
+    let held = core.on_response(Response::Status("Hold:0|MPos:0.000,0.000,0.000|FS:0,0".to_string()));
+    assert!(transitioned_to(&held, ConnectionState::Hold));
+    assert_eq!(core.state(), ConnectionState::Hold);
+    let resumed = core.on_response(Response::Status("Idle|MPos:0.000,0.000,0.000|FS:0,0".to_string()));
+    assert!(transitioned_to(&resumed, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn a_run_status_while_connecting_still_adopts_idle_and_leaves_connecting() {
+    // The Connecting handshake path is INTENTIONALLY permissive: any live run state — including a busy `<Run|...>`
+    // — is readiness evidence and must leave Connecting. The handshake collapses it to the honest host value
+    // (Idle); only the post-handshake adoption uses the stricter mapping. This guards that distinction.
+    let mut core = connected_core();
+    assert_eq!(core.state(), ConnectionState::Connecting);
+    let effects = core.on_response(Response::Status("Run|MPos:1.000,0.000,0.000|FS:500,0".to_string()));
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn a_status_must_not_knock_an_active_stream_out_of_streaming() {
+    // Streaming is host-driven: the engine owns when the program is done, not the 5 Hz `?` poll. A mid-stream
+    // `<Run|...>` or `<Idle|...>` status must NOT abort the stream by adopting a run state.
+    let mut core = connected_core();
+    core.on_stream_program(["G0 X1", "G0 Y1"]);
+    assert_eq!(core.state(), ConnectionState::Streaming);
+    let run = core.on_response(Response::Status("Run|MPos:0.500,0.000,0.000|FS:500,0".to_string()));
+    assert!(!transitioned_to(&run, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Streaming);
+    let idle = core.on_response(Response::Status("Idle|MPos:1.000,0.000,0.000|FS:0,0".to_string()));
+    assert!(!transitioned_to(&idle, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Streaming);
+  }
+
+  #[test]
+  fn a_status_must_not_clear_the_grbl_error_hold() {
+    // The Error state is the grblHAL error-hold: it clears only on reset / empty line / `$`, never on a status
+    // report. An incidental `<Idle|...>` poll mid-hold must leave the lifecycle in Error.
+    let mut core = connected_core();
+    core.on_stream_program(["G0 X1"]);
+    core.on_response(Response::Error(9)); // program error -> Error hold
+    assert_eq!(core.state(), ConnectionState::Error);
+    let effects = core.on_response(Response::Status("Idle|MPos:0.000,0.000,0.000|FS:0,0".to_string()));
+    assert!(!transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Error);
   }
 }
