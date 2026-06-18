@@ -179,40 +179,10 @@ impl TransportGroup {
   }
 }
 
-/// A short human gloss for a grbl `ALARM:N` code, for the alarm banner's detail line. The set follows grbl 1.1 /
-/// grblHAL; an unknown code falls back to a generic message so the banner never shows a bare number alone.
-pub fn alarm_detail(code: u32) -> &'static str {
-  match code {
-    1 => "Hard limit triggered. Position likely lost — re-home before continuing.",
-    2 => "Soft limit: a commanded motion exceeded the machine travel.",
-    3 => "Abort during cycle: reset while in motion. Position lost — re-home.",
-    4 => "Probe fail: the probe did not contact within the programmed travel.",
-    5 => "Probe fail: the probe was already triggered before the move started.",
-    6 => "Homing fail: reset during homing.",
-    7 => "Homing fail: safety door opened during homing.",
-    8 => "Homing fail: pull-off did not clear the limit switch.",
-    9 => "Homing fail: a limit switch was not found within the search distance.",
-    10 => "EStop asserted. Clear the emergency stop, then reset.",
-    11 => "Homing required: home the machine before running this command.",
-    _ => "Controller is locked. $X to unlock or $H to home before continuing.",
-  }
-}
-
-/// A short human gloss for a grbl `error:N` code, for the console and the stream-error banner. Covers the codes
-/// a sender hits most; unknown codes fall back to a generic message.
-pub fn error_detail(code: u32) -> &'static str {
-  match code {
-    1 => "Expected G-code word letter but found none.",
-    2 => "Numeric value format is invalid or missing.",
-    3 => "Unsupported or invalid `$` system command.",
-    9 => "G-code locked out during alarm or jog.",
-    15 => "Travel exceeded: a jog target is outside the machine envelope.",
-    20 => "Unsupported or invalid G-code command in the block.",
-    22 => "Feed rate has not been set or is undefined.",
-    33 => "Motion command has an invalid target.",
-    _ => "G-code error: the stream is halted until reset or a `$` command clears it.",
-  }
-}
+// The human glosses for `ALARM:N` / `error:N` codes used to live here as hardcoded `&'static str` tables. They
+// were superseded by [`crate::protocol::codes`], whose canonical static fallback (corrected for the old 4/5
+// probe-alarm inversion) is enriched at runtime from the firmware's `$EE`/`$EA` enumeration via the
+// [`crate::protocol::CodeBook`]. The banner and console now both decode through that single source.
 
 #[cfg(test)]
 mod tests {
@@ -313,12 +283,4 @@ mod tests {
     }
   }
 
-  #[test]
-  fn alarm_and_error_details_are_specific_with_a_generic_fallback() {
-    assert!(alarm_detail(1).contains("Hard limit"));
-    assert!(alarm_detail(9).contains("Homing"));
-    assert!(alarm_detail(9999).contains("locked"), "unknown codes get a generic gloss");
-    assert!(error_detail(9).contains("locked out"));
-    assert!(error_detail(9999).contains("halted"), "unknown error codes get a generic gloss");
-  }
 }

@@ -822,12 +822,7 @@ async fn frame_byte(byte: u8, engine: &mut StreamEngine) {
       // control) without dropping a line. Real-time bytes already bypassed this path entirely.
       LINE_QUEUE.send(owned).await;
     }
-    EngineEvent::Reject(code) => {
-      let mut s = Response::new();
-      if ResponseWriter::error(&mut s, code).is_ok() {
-        enqueue(s).await;
-      }
-    }
+    EngineEvent::Reject(code) => error(code).await,
   }
 }
 
@@ -1113,6 +1108,12 @@ async fn emit_alarm(code: AlarmCode) {
   if ResponseWriter::alarm(&mut a, code).is_ok() {
     enqueue(a).await;
   }
+  // A `[MSG:ALARM:N <name>]` context push so a plain terminal sees what halted the machine, then grbl's
+  // standard unlock/continue prompt as its own `[MSG:]`.
+  let mut ctx = Response::new();
+  if ResponseWriter::alarm_context(&mut ctx, code).is_ok() {
+    enqueue(ctx).await;
+  }
   send_message(code.unlock_hint()).await;
 }
 
@@ -1246,7 +1247,9 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
     // Held by a prior error: reject without parsing until a recovery trigger. Reuse the generic
     // "expected command letter" code, matching how a sender already in error-recovery treats any further
     // rejection — it halts the stream regardless of the specific code (mirrors the engine's hold code).
-    error(ERROR_HOLD_CODE).await;
+    // Emit it bare: the held line may be perfectly valid GCode, so the code's "Expected command letter"
+    // name does not describe the rejection and a `[MSG:..]` annotation would mislead a plain terminal.
+    error_bare(ERROR_HOLD_CODE).await;
     return;
   }
   // Drop a stale `Jog` latch back to Normal if the jog has fully drained, so a program line after a jog finishes
@@ -1597,8 +1600,9 @@ async fn handle_jog(line: &[u8], parser: &mut Parser, state: &mut ConsumerState)
   // Drop a stale jog latch first if the previous jog has fully drained, so the gate below sees the true state.
   refresh_jog_state().await;
   if state.error_hold {
-    // Held by a prior GCode error: reject until a recovery trigger, like any motion line.
-    error(ERROR_HOLD_CODE).await;
+    // Held by a prior GCode error: reject until a recovery trigger, like any motion line. Bare (no `[MSG:..]`
+    // annotation): the hold code's name does not describe why this held line was rejected (see `error_bare`).
+    error_bare(ERROR_HOLD_CODE).await;
     return;
   }
   let control = control_state();
@@ -2620,8 +2624,27 @@ async fn ack() {
 }
 
 /// Queue a single `error:N` for a rejected line. Mirrors [`ack`]; the consumer emits exactly one of the
-/// two per consumed GCode line, preserving the one-response-per-line contract.
+/// two per consumed GCode line, preserving the one-response-per-line contract. A `[MSG:error:N <name>]`
+/// context push is emitted FIRST so a plain terminal sees what the rejection means; it is a push message
+/// (a sender that decodes the code itself ignores it) and the byte-exact `error:N` remains the sole
+/// flow-control response. The context is skipped for a code with no enumerated name (empty buffer).
+///
+/// Use this only when the code's NAME genuinely describes the failure (parser/planner/validation errors,
+/// and the `ERROR_LOCKED` state lockout). For a code reused purely to halt the sender — where its name does
+/// NOT describe the cause — use [`error_bare`] so the annotation does not mislead.
 async fn error(code: u8) {
+  let mut ctx = Response::new();
+  if ResponseWriter::error_context(&mut ctx, code).is_ok() && !ctx.is_empty() {
+    enqueue(ctx).await;
+  }
+  error_bare(code).await;
+}
+
+/// Queue a single `error:N` WITHOUT the `[MSG:error:N <name>]` context push. Used for the post-error hold
+/// rejection, whose code (`ERROR_HOLD_CODE` = 1) is reused purely to halt the sender: its name ("Expected
+/// command letter") does NOT describe why the held line was rejected, so annotating it would mislead a plain
+/// terminal. The byte-exact `error:N` is still emitted as the sole flow-control response.
+async fn error_bare(code: u8) {
   let mut s = Response::new();
   if ResponseWriter::error(&mut s, code).is_ok() {
     enqueue(s).await;

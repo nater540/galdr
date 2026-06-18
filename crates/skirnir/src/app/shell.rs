@@ -498,9 +498,18 @@ impl SkirnirApp {
   /// and acks; the reducer folds the replies into [`ViewState::settings`]. Sending `$ES` first means a row's
   /// label is usually present by the time its value arrives, so the panel never flickers from `$110` to its
   /// real name. The doc directs senders to learn the UI from `$ES` rather than hardcode it, which this does.
+  ///
+  /// Alongside the settings enumeration we fetch the firmware's error/alarm code enumeration (`$EE` dumps every
+  /// `[ERRORCODE:...]`, `$EA` every `[ALARMCODE:...]`), folded into [`ViewState::codes`] so `error:N`/`ALARM:N`
+  /// render with the firmware's own names/descriptions. This is the same operator-triggered "learn the board"
+  /// moment as the settings fetch; the static fallback decodes codes even before this lands, so it is pure
+  /// enrichment. The firmware advertises `ENUMS` in `[NEWOPT:...]`; an older firmware simply `error`s the
+  /// unknown `$EE`/`$EA`, which is surfaced in the console and otherwise harmless.
   fn request_settings(&mut self) {
     self.send_line("$ES".to_string());
     self.send_line("$$".to_string());
+    self.send_line("$EE".to_string());
+    self.send_line("$EA".to_string());
   }
 
   /// Write one setting edit as a `$<n>=<value>` line, then re-dump `$$` so the panel reflects what the firmware
@@ -620,10 +629,14 @@ impl eframe::App for SkirnirApp {
     // shell only does the thin egui→Hotkey translation and the focus guard.
     self.pump_hotkeys(&ctx, &mut sink);
 
-    // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content.
-    egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H).show_inside(ui, |ui| {
-      views::toolbar(ui, &self.view, &mut self.ui, &mut sink);
-    });
+    // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content. It
+    // carries the `panelAlt` (#222222) surface — a shade lighter than the panels below — so the toolbar reads as
+    // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
+    egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
+      .frame(egui::Frame::NONE.fill(Theme::PANEL_ALT))
+      .show_inside(ui, |ui| {
+        views::toolbar(ui, &self.view, &mut self.ui, &mut sink);
+      });
 
     if self.view.banner.is_some() {
       egui::Panel::top("banner").show_inside(ui, |ui| {

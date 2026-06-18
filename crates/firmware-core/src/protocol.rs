@@ -164,7 +164,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
   ErrorCode {
     id: 9,
     name: "G-code lock",
-    description: "G-code locked out during alarm or jog state, or a modal group was violated.",
+    description: "G-code locked out during alarm or jog state.",
   },
   ErrorCode {
     id: 15,
@@ -177,16 +177,32 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     description: "Unsupported or invalid g-code command found in block.",
   },
   ErrorCode {
+    id: 21,
+    name: "Modal group violation",
+    description: "More than one G-code command from the same modal group was found in the block.",
+  },
+  ErrorCode {
     id: 22,
     name: "Undefined feed rate",
     description: "Feed rate has not yet been set or is undefined.",
   },
   ErrorCode {
-    id: 23,
-    name: "Invalid g-code ID:23",
-    description: "G-code command in block requires an integer value, or requires axis words.",
+    id: 26,
+    name: "No axis words in block",
+    description: "A G-code command (or the current modal state) requires axis words, but none were found in the block.",
+  },
+  ErrorCode {
+    id: 33,
+    name: "Invalid target",
+    description: "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled).",
   },
 ];
+
+/// The short name of an `error:N` code from [`ERROR_CODES`], or `None` if the code is not enumerated. Used to
+/// build the `[MSG:error:N <name>]` context line a plain terminal sees alongside the bare `error:N`.
+pub fn error_name(code: u8) -> Option<&'static str> {
+  ERROR_CODES.iter().find(|c| c.id == code).map(|c| c.name)
+}
 
 /// The machine run-state reported as the first field of a `<...>` status report. Stage 1 only ever
 /// reports [`Idle`](MachineState::Idle), but the full grblHAL set is enumerated here so the formatter and
@@ -1159,6 +1175,25 @@ impl ResponseWriter {
   /// `[MSG:Enabled]`). The caller supplies the inner text; this wraps it in the grbl `[MSG:...]` envelope.
   pub fn message<const N: usize>(out: &mut String<N>, text: &str) -> Result<(), FmtError> {
     write!(out, "[MSG:{text}]\r\n").map_err(|_| FmtError)
+  }
+
+  /// A `[MSG:error:N <name>]` context push line, emitted just BEFORE an `error:N` response so a plain terminal
+  /// (one that does not fetch the `$EE` table) still sees what the rejection means. This writes nothing for a
+  /// code with no enumerated name — the caller checks for an empty buffer and skips the enqueue, so a stray
+  /// blank line is never emitted. It is a push message: a sender that decodes the code itself ignores it, and
+  /// the byte-exact `error:N` that follows remains the sole flow-control response.
+  pub fn error_context<const N: usize>(out: &mut String<N>, code: u8) -> Result<(), FmtError> {
+    match error_name(code) {
+      Some(name) => write!(out, "[MSG:error:{code} {name}]\r\n").map_err(|_| FmtError),
+      None => Ok(()),
+    }
+  }
+
+  /// A `[MSG:ALARM:N <name>]` context push line, emitted alongside an `ALARM:N` so a plain terminal sees what
+  /// halted the machine. grbl's unlock/continue prompt (`[MSG:'$H'|'$X' to unlock]` / `[MSG:Reset to
+  /// continue]`) still follows as its own separate `[MSG:]`.
+  pub fn alarm_context<const N: usize>(out: &mut String<N>, code: AlarmCode) -> Result<(), FmtError> {
+    write!(out, "[MSG:ALARM:{} {}]\r\n", code.code(), code.name()).map_err(|_| FmtError)
   }
 
   /// The bare-`$` grbl help line, listing the system commands a sender may probe. grbl answers `$` with this
@@ -3159,6 +3194,30 @@ mod tests {
   }
 
   #[test]
+  fn error_context_line_wire_format() {
+    // The `[MSG:error:N <name>]` context push a plain terminal sees just before the bare `error:N`.
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::error_context(&mut s, 21).unwrap();
+    assert_eq!(s.as_str(), "[MSG:error:21 Modal group violation]\r\n");
+  }
+
+  #[test]
+  fn error_context_writes_nothing_for_an_unknown_code() {
+    // A code with no `ERROR_CODES` row writes nothing, so the caller emits no stray blank line before `error:N`.
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::error_context(&mut s, 250).unwrap();
+    assert!(s.is_empty(), "an unknown code yields an empty context buffer, got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn alarm_context_line_wire_format() {
+    // The `[MSG:ALARM:N <name>]` context push emitted alongside an `ALARM:N`.
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::alarm_context(&mut s, AlarmCode::HardLimit).unwrap();
+    assert_eq!(s.as_str(), "[MSG:ALARM:1 Hard limit]\r\n");
+  }
+
+  #[test]
   fn error_codes_are_ascending_unique_and_cover_emitted_codes() {
     // The `$EE` table is the single error authority: ascending, no duplicate ids, and it must include every
     // code the firmware actually emits (parser, settings, protocol/$-dispatch).
@@ -3174,9 +3233,15 @@ mod tests {
     assert!(has(ERROR_LINE_OVERFLOW), "error:15 (line overflow) must be enumerated");
     assert!(has(ERROR_UNSUPPORTED_COMMAND), "error:3 (unsupported command) must be enumerated");
     assert!(has(ERROR_HOMING_DISABLED), "error:5 (homing disabled) must be enumerated");
-    // GCode parser codes (1, 2, 9, 20, 22, 23) — every code GcodeError::code() can return.
-    for &code in &[1u8, 2, 9, 20, 22, 23] {
+    // The `firmware` comms layer rejects GCode while in an alarm/jog state with `error:9` (its `ERROR_LOCKED`).
+    assert!(has(9), "error:9 (G-code state lock) must be enumerated");
+    // GCode parser codes — every code GcodeError::code() can return (1, 2, 20, 21, 22, 26).
+    for &code in &[1u8, 2, 20, 21, 22, 26] {
       assert!(has(code), "GCode error:{code} must be enumerated");
+    }
+    // Planner codes — every code PlannerError::code() can surface to the host (33 invalid arc, 15 jog travel).
+    for &code in &[33u8, 15] {
+      assert!(has(code), "planner error:{code} must be enumerated");
     }
   }
 

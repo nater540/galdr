@@ -5,6 +5,7 @@
 //! response parser, the real-time command set, the lifecycle enum, and the [`core::ProtocolCore`] state
 //! machine that wires them together. The async [`crate::engine`] is a thin driver over this core.
 
+pub mod codes;
 pub mod core;
 pub mod flow;
 pub mod lifecycle;
@@ -14,6 +15,9 @@ pub mod settings;
 pub mod status;
 pub mod terminator;
 
+pub use codes::{
+  CodeBook, CodeText, alarm_text, error_text, parse_alarm_code_meta, parse_error_code_meta,
+};
 pub use core::{Effect, ProtocolCore};
 pub use flow::{DEFAULT_RX_BUFFER, FlowWindow};
 pub use lifecycle::ConnectionState;

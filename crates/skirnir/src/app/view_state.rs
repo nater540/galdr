@@ -13,7 +13,8 @@ use super::settings_model::SettingsModel;
 use crate::engine::Event;
 use crate::error::TransportError;
 use crate::protocol::{
-  ConnectionState, PinState, PositionKind, Response, SettingValue, StatusReport, parse_setting_meta, parse_status,
+  CodeBook, ConnectionState, PinState, PositionKind, Response, SettingValue, StatusReport, parse_alarm_code_meta,
+  parse_error_code_meta, parse_setting_meta, parse_status,
 };
 
 /// How many console lines to retain. The console is a diagnostic tail, not a transcript — capping it bounds
@@ -100,6 +101,11 @@ pub struct ViewState {
   /// The live firmware settings, merged from `$<n>=<value>` values and `$ES` enumeration metadata. Populated
   /// when the operator requests a `$$` dump (and `$ES`); cleared on disconnect so a reconnect starts clean.
   pub settings: SettingsModel,
+  /// The runtime error/alarm code decodings enumerated from the firmware (`$EE`/`$EA`), overlaying the static
+  /// fallback tables. Used to render `error:N`/`ALARM:N` with a human name in the console and to enrich the
+  /// banner detail. Per-session: cleared on disconnect so a reconnect re-learns the board's set. The static
+  /// fallback means decoding works even before (or without) any enrichment.
+  pub codes: CodeBook,
 }
 
 impl Default for ViewState {
@@ -114,6 +120,7 @@ impl Default for ViewState {
       last_error_code: None,
       console: VecDeque::new(),
       settings: SettingsModel::new(),
+      codes: CodeBook::new(),
     }
   }
 }
@@ -251,10 +258,30 @@ impl ViewState {
           self.settings.apply_meta(meta);
           return;
         }
+        // A `[ERRORCODE:...]`/`[ALARMCODE:...]` enumeration row (the firmware's `$EE`/`$EA` answer) enriches the
+        // codebook and, like the settings dump, is structured data the UI consults — not console noise. Fold it
+        // and skip the console so the enumeration does not flood it.
+        if let Some((code, text)) = parse_error_code_meta(body) {
+          self.codes.apply_error(code, text);
+          return;
+        }
+        if let Some((code, text)) = parse_alarm_code_meta(body) {
+          self.codes.apply_alarm(code, text);
+          return;
+        }
+        // The firmware pushes a context line right before each error/alarm: `[MSG:error:<n> <name>]` /
+        // `[MSG:ALARM:<n> <name>]`. skirnir now decodes the code itself (`error:21 — Modal group violation`), so
+        // that annotation is a redundant duplicate in the console — suppress it. grbl's own `[MSG:...]` pushes
+        // never start with `error:`/`ALARM:`, so the prefix-plus-numeric-code match is safe and won't swallow
+        // legitimate context like `[MSG:Pgm End]`.
+        if is_redundant_error_annotation(body) {
+          return;
+        }
       }
       _ => {}
     }
-    self.log(LogSource::Received, render_response(&response));
+    let text = self.render_response(&response);
+    self.log(LogSource::Received, text);
   }
 
   /// React to the terminal disconnect event.
@@ -270,6 +297,9 @@ impl ViewState {
     self.last_wco.clear();
     // The settings list is the previous board's; clear it so a reconnect re-fetches rather than showing stale.
     self.settings.clear();
+    // The codebook overrides are the previous board's `$EE`/`$EA` enumeration; clear them so a reconnect
+    // re-learns. Lookups still work via the static fallback in the meantime.
+    self.codes.clear();
     match reason {
       Some(err) => self.log(LogSource::Notice, format!("disconnected: {err}")),
       None => self.log(LogSource::Notice, "disconnected".to_string()),
@@ -283,23 +313,58 @@ impl ViewState {
     }
     self.console.push_back(LogLine { source, text });
   }
+
+  /// Render a non-status response as a one-line console string. Status reports are handled separately and never
+  /// reach here. An `error:N`/`ALARM:N` is decoded through the [`CodeBook`] so the operator sees a name beside
+  /// the number (`error:21 — Modal group violation`) — the short name only; the full description lives in the
+  /// banner detail / hover. Every other variant is rendered verbatim as before.
+  fn render_response(&self, response: &Response) -> String {
+    match response {
+      Response::Ok => "ok".to_string(),
+      Response::Error(code) => format!("error:{code} — {}", self.codes.error_name(*code)),
+      Response::Alarm(code) => format!("ALARM:{code} — {}", self.codes.alarm_name(*code)),
+      Response::Message(body) => format!("[{body}]"),
+      Response::Banner(text) => text.clone(),
+      Response::StartupEcho(text) => format!(">{text}"),
+      Response::Unknown(text) => text.clone(),
+      // Status is rendered by the DRO and settings by the panel, not the console; included for exhaustiveness.
+      Response::Status(body) => format!("<{body}>"),
+      Response::Setting { number, value } => format!("${number}={value}"),
+    }
+  }
 }
 
-/// Render a non-status response as a one-line console string. Status reports are handled separately and never
-/// reach here.
-fn render_response(response: &Response) -> String {
-  match response {
-    Response::Ok => "ok".to_string(),
-    Response::Error(code) => format!("error:{code}"),
-    Response::Alarm(code) => format!("ALARM:{code}"),
-    Response::Message(body) => format!("[{body}]"),
-    Response::Banner(text) => text.clone(),
-    Response::StartupEcho(text) => format!(">{text}"),
-    Response::Unknown(text) => text.clone(),
-    // Status is rendered by the DRO and settings by the panel, not the console; included for exhaustiveness.
-    Response::Status(body) => format!("<{body}>"),
-    Response::Setting { number, value } => format!("${number}={value}"),
+/// The firmware's pre-error context-push prefix (after bracket-strip). These MUST track the firmware's
+/// `ResponseWriter::error_context` / `alarm_context` format — `[MSG:error:<N> <name>]` and
+/// `[MSG:ALARM:<N> <name>]` — emitted immediately before each `error:N` / `ALARM:N`. There is no shared type
+/// binding host and firmware here, so if that emitter's surface text changes, these two consts (and the shape
+/// check below) are the coupling point to update.
+const FW_ERROR_ANNOTATION_PREFIX: &str = "MSG:error:";
+const FW_ALARM_ANNOTATION_PREFIX: &str = "MSG:ALARM:";
+
+/// Whether a `[MSG:...]` body (already stripped of brackets) is the firmware's redundant pre-error/alarm
+/// context push — exactly `MSG:error:<digits> <name>` or `MSG:ALARM:<digits> <name>`. skirnir decodes the
+/// following `error:N`/`ALARM:N` itself, so this annotation duplicates the console line and is dropped.
+///
+/// The shape is matched tightly to shrink the false-positive surface: the prefix, then one-or-more ASCII
+/// digits, then a single space, then at least one more character (the name). That rejects near-misses like
+/// `MSG:error:` (no code), `MSG:error:21` (no trailing name), and `MSG:errored sensor` (no digit after the
+/// colon), and a generic `[MSG:...]` push (which never starts with `error:`/`ALARM:`) is never swallowed.
+fn is_redundant_error_annotation(body: &str) -> bool {
+  let Some(tail) = body
+    .strip_prefix(FW_ERROR_ANNOTATION_PREFIX)
+    .or_else(|| body.strip_prefix(FW_ALARM_ANNOTATION_PREFIX))
+  else {
+    return false;
+  };
+  // Consume one-or-more leading ASCII digits (the code). No digit ⇒ not the annotation (`MSG:errored ...`).
+  let digits = tail.trim_start_matches(|c: char| c.is_ascii_digit());
+  if digits.len() == tail.len() {
+    return false;
   }
+  // After the code there must be a single space, then a non-empty name. This rejects `MSG:error:21` (no name)
+  // and anything where the code is not followed by a space-delimited name.
+  matches!(digits.strip_prefix(' '), Some(name) if !name.is_empty())
 }
 
 #[cfg(test)]
@@ -435,7 +500,11 @@ mod tests {
     view.apply(Event::Response(Response::Error(5)));
     assert_eq!(view.banner, None, "a manual-command error must not latch the stream-halted banner");
     // The error is still surfaced to the operator in the console.
-    assert!(view.console.iter().any(|l| l.text == "error:5"), "the error code still reaches the console");
+    // The error is surfaced to the operator in the console, now decoded with the code's human name.
+    assert!(
+      view.console.iter().any(|l| l.text == "error:5 — Setting disabled"),
+      "the error code still reaches the console, decoded with its name"
+    );
   }
 
   #[test]
@@ -527,6 +596,82 @@ mod tests {
     assert!(!view.settings.is_empty());
     view.apply(Event::Disconnected(None));
     assert!(view.settings.is_empty(), "the previous board's settings must not survive a disconnect");
+  }
+
+  #[test]
+  fn an_error_response_renders_with_its_decoded_name_in_the_console() {
+    let mut view = ViewState::default();
+    // Even with no enumeration fetched, the static fallback decodes the code: bare numbers are never shown alone.
+    view.apply(Event::Response(Response::Error(21)));
+    assert_eq!(view.console.back().unwrap().text, "error:21 — Modal group violation");
+    view.apply(Event::Response(Response::Alarm(1)));
+    assert_eq!(view.console.back().unwrap().text, "ALARM:1 — Hard limit");
+  }
+
+  #[test]
+  fn an_errorcode_enumeration_row_enriches_the_codebook_and_skips_the_console() {
+    let mut view = ViewState::default();
+    // The firmware's `$EE` answer arrives as `[ERRORCODE:...]` messages; they enrich the codebook silently.
+    view.apply(Event::Response(Response::Message(
+      "ERRORCODE:21|Modal group violation|More than one G-code command from the same modal group".to_string(),
+    )));
+    assert!(view.console.is_empty(), "an ERRORCODE enumeration row must not flood the console");
+    // A subsequent `error:21` renders with the enumerated name (here matching the static text).
+    view.apply(Event::Response(Response::Error(21)));
+    assert_eq!(view.console.back().unwrap().text, "error:21 — Modal group violation");
+  }
+
+  #[test]
+  fn an_alarmcode_enumeration_override_drives_the_console_render() {
+    let mut view = ViewState::default();
+    // A firmware override with custom text must beat the static fallback when the console renders the code.
+    view.apply(Event::Response(Response::Message(
+      "ALARMCODE:1|Custom hard limit|A firmware-specific hard-limit explanation".to_string(),
+    )));
+    assert!(view.console.is_empty(), "an ALARMCODE enumeration row must not flood the console");
+    view.apply(Event::Response(Response::Alarm(1)));
+    assert_eq!(view.console.back().unwrap().text, "ALARM:1 — Custom hard limit");
+  }
+
+  #[test]
+  fn the_firmwares_redundant_error_annotation_is_suppressed_but_generic_msgs_still_log() {
+    let mut view = ViewState::default();
+    // The firmware pushes `[MSG:error:21 Modal group violation]` right before the `error:21` — skirnir already
+    // decodes the code, so the annotation is a duplicate and must not reach the console.
+    view.apply(Event::Response(Response::Message("MSG:error:21 Modal group violation".to_string())));
+    view.apply(Event::Response(Response::Message("MSG:ALARM:1 Hard limit".to_string())));
+    assert!(view.console.is_empty(), "the firmware's pre-error/alarm context push is suppressed");
+    // The skirnir-decoded error line still appears, so no context is lost.
+    view.apply(Event::Response(Response::Error(21)));
+    assert_eq!(view.console.back().unwrap().text, "error:21 — Modal group violation");
+    // A generic `[MSG:...]` push (which never starts with `error:`/`ALARM:`) must still log normally.
+    view.apply(Event::Response(Response::Message("MSG:Pgm End".to_string())));
+    assert_eq!(view.console.back().unwrap().text, "[MSG:Pgm End]", "a legitimate MSG is never swallowed");
+  }
+
+  #[test]
+  fn redundant_annotation_predicate_matches_only_the_exact_firmware_shape() {
+    // Prefix + digits + space + name: the firmware's annotation, redundant.
+    assert!(is_redundant_error_annotation("MSG:error:21 Modal group violation"));
+    assert!(is_redundant_error_annotation("MSG:ALARM:1 Hard limit"));
+    assert!(is_redundant_error_annotation("MSG:error:9 G-code lock"), "a multi-word name after the space matches");
+    // Near-misses must NOT be swallowed.
+    assert!(!is_redundant_error_annotation("MSG:error: no code"), "the prefix alone, sans digit, is not redundant");
+    assert!(!is_redundant_error_annotation("MSG:error:21"), "a code with no trailing name is not the annotation");
+    assert!(!is_redundant_error_annotation("MSG:error:21 "), "a trailing space but an empty name is not the shape");
+    assert!(!is_redundant_error_annotation("MSG:errored sensor"), "a word starting with the prefix is not a code");
+    assert!(!is_redundant_error_annotation("MSG:Pgm End"));
+    assert!(!is_redundant_error_annotation("MSG:'$H'|'$X' to unlock"));
+  }
+
+  #[test]
+  fn disconnect_clears_the_codebook_overrides() {
+    let mut view = ViewState::default();
+    view.apply(Event::Response(Response::Message("ERRORCODE:21|Renamed|desc".to_string())));
+    assert_eq!(view.codes.error(21).name, "Renamed");
+    view.apply(Event::Disconnected(None));
+    // The override is gone; the static fallback name is restored for the next session.
+    assert_eq!(view.codes.error(21).name, "Modal group violation");
   }
 
   #[test]

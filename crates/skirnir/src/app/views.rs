@@ -258,6 +258,40 @@ fn chip_frame(
     .show(ui, content);
 }
 
+/// Lay out a horizontal row of buttons at exact, vertically-aligned rects, so none of them drift the way
+/// `add_sized` inside a `horizontal` layout does — there each successive button crept a few pixels lower
+/// (the staggered DRO "zero" row the user flagged: same height, but each ~2px below the last). The row claims
+/// the full available width at [`Metrics::PANEL_CONTROL_H`] height, splits it by `weights` with `gap` between
+/// cells, and calls `cell` once per index with the placed rect so the caller paints its own button there (via
+/// [`egui::Ui::put`], which fills the rect exactly) and reads its response.
+fn button_row(ui: &mut egui::Ui, gap: f32, weights: &[f32], mut cell: impl FnMut(&mut egui::Ui, usize, egui::Rect)) {
+  let height = Metrics::PANEL_CONTROL_H;
+  let full = ui.available_width();
+  let sum: f32 = weights.iter().sum::<f32>().max(f32::EPSILON);
+  let avail = (full - gap * (weights.len() as f32 - 1.0)).max(0.0);
+  // Reserve the whole row up front (advancing the cursor below it); the per-cell `put` calls then place buttons
+  // inside this reserved band without moving the cursor, so every cell shares one top and one bottom edge.
+  let (rect, _) = ui.allocate_exact_size(Vec2::new(full, height), egui::Sense::hover());
+  let mut x = rect.left();
+  for (index, weight) in weights.iter().enumerate() {
+    let w = avail * weight / sum;
+    let cell_rect = egui::Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(w, height));
+    cell(ui, index, cell_rect);
+    x += w + gap;
+  }
+}
+
+/// A thin vertical divider for the toolbar: a 1px line at the design's ~22px height with the toolbar gap of
+/// breathing room either side, replacing egui's full-height `separator()` so the toolbar groups read as
+/// distinct without the bar feeling crammed (the user-flagged toolbar styling, design §03's `1px #2E2E2E`
+/// group separators).
+fn toolbar_divider(ui: &mut egui::Ui) {
+  let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, Metrics::TOOLBAR_CONTROL_H), egui::Sense::hover());
+  let center = rect.center();
+  let half = 22.0 * 0.5;
+  ui.painter().vline(center.x, (center.y - half)..=(center.y + half), egui::Stroke::new(1.0, Theme::DIVIDER));
+}
+
 /// Draw the machine-state badge: a coloured dot, the uppercase label, and (when streaming) the feed/speed
 /// suffix. The dot colour is the *second* signal; the label is primary, per the design.
 fn state_badge(ui: &mut egui::Ui, view: &ViewState) {
@@ -294,7 +328,12 @@ fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) {
 /// Render the 40px main toolbar: the connect group, Open, the Run/Hold/Stop segmented transport group, Home,
 /// Settings, and the right-aligned machine-state badge (design §03).
 pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
-  ui.horizontal(|ui| {
+  // 1px bottom divider under the bar (design §03's `border-bottom:1px #2E2E2E`), painted along the panel edge.
+  let bar = ui.max_rect();
+  ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, Theme::DIVIDER));
+  // `horizontal_centered` vertically centres the 26px controls in the 40px bar, giving the design's even
+  // breathing room above and below rather than the top-aligned look the plain `horizontal` produced.
+  ui.horizontal_centered(|ui| {
     // Toolbar controls are 26px tall with 10px side-padding and a 6px gap (design §03); set the region spacing
     // up front so every button/combo in the strip inherits the bar's sizing rather than the panel default.
     ui.spacing_mut().item_spacing.x = Metrics::TOOLBAR_GAP;
@@ -340,7 +379,7 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
       }
     }
 
-    ui.separator();
+    toolbar_divider(ui);
 
     if ui.button("Open…").on_hover_text("Load a G-code program").clicked()
       && let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "ngc", "tap"]).pick_file()
@@ -348,14 +387,17 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
       sink.push(Intent::OpenProgram(path));
     }
 
-    ui.separator();
+    toolbar_divider(ui);
     transport_group(ui, view, state, sink);
-    ui.separator();
+    toolbar_divider(ui);
 
-    // Home runs the firmware homing cycle; safe to offer whenever connected and not already moving.
+    // Home runs the firmware homing cycle; safe to offer whenever connected and not already moving. Drawn as a
+    // ghost button (transparent rest, design §03) so it reads as a secondary action beside the framed groups.
     let badge = view.badge_state();
     let can_home = connected && !matches!(badge, BadgeState::Run | BadgeState::Jog | BadgeState::Home);
-    if ui.add_enabled(can_home, egui::Button::new("⌂ Home")).on_hover_text("Run homing cycle ($H)").clicked() {
+    let home_color = if can_home { Theme::TEXT_DIM } else { Theme::TEXT_DISABLED };
+    let home = egui::Button::new(RichText::new("⌂ Home").color(home_color)).fill(Color32::TRANSPARENT);
+    if ui.add_enabled(can_home, home).on_hover_text("Run homing cycle ($H)").clicked() {
       sink.push(Intent::Home);
     }
 
@@ -390,6 +432,9 @@ fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &
   let left = CornerRadius { nw: r, sw: r, ne: 0, se: 0 };
   let mid = CornerRadius::ZERO;
   let right = CornerRadius { nw: 0, sw: 0, ne: r, se: r };
+  // Zero the gap only between the three joined segments, then restore the toolbar gap on the way out — otherwise
+  // the `item_spacing.x = 0` leaked onto the shared toolbar `ui`, cramming Home/Settings hard against the group.
+  let prev_gap = ui.spacing().item_spacing.x;
   ui.spacing_mut().item_spacing.x = 0.0;
 
   let mut run_button = egui::Button::new(RichText::new(run_label).color(Theme::STATE_RUN)).corner_radius(left);
@@ -407,6 +452,7 @@ fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &
   if ui.add_enabled(group.stop_enabled, stop).on_hover_text("Soft reset (0x18)").clicked() {
     sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
   }
+  ui.spacing_mut().item_spacing.x = prev_gap;
 }
 
 /// Render the digital readout: a WPos/MPos toggle, large per-axis rows (coloured letter + big tabular value +
@@ -444,33 +490,31 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
 
   ui.add_space(4.0);
   // Zero buttons set the active WCS origin to the current position on the chosen axes. The first three are
-  // equal-width; the design gives Zero XYZ a wider (flex 1.4), primary-blue slot, so it draws the eye.
-  ui.horizontal(|ui| {
-    let enabled = view.connection == ConnectionState::Idle;
-    ui.add_enabled_ui(enabled, |ui| {
-      ui.spacing_mut().item_spacing.x = 6.0;
-      // This is a dense four-up row inside the 232px DRO body, so the default 14px button padding (28px/button →
-      // 112px of pure padding) overflows the column. Use a tighter 6px gutter (within the design's 4–8px dense
-      // padding range) so every slot's content fits its allocation and the row totals the 232px body exactly.
-      ui.spacing_mut().button_padding.x = 6.0;
-      // Split the row into four slots (three equal + one ~1.4×) honouring the design's flex ratios. The three
-      // per-axis buttons are single letters (X/Y/Z) so they stay equal-width; the wide "Zero XYZ" slot names the
-      // all-axis action and gives the per-axis letters their "set work zero" context (design §03).
-      let gap = ui.spacing().item_spacing.x;
-      let unit = (ui.available_width() - 3.0 * gap) / 4.4;
-      let h = Metrics::PANEL_CONTROL_H;
-      if ui.add_sized(Vec2::new(unit, h), egui::Button::new("X")).clicked() {
-        sink.push(Intent::SetWorkZero { axes: vec![Axis::X] });
+  // equal-width; the design gives Zero XYZ a wider (flex 1.4), primary-blue slot, so it draws the eye. They are
+  // placed at exact, shared-edge rects via [`button_row`] so the four sit on one horizontal line — the previous
+  // `add_sized`-in-`horizontal` layout crept each successive button a couple of pixels lower (the staggered row
+  // the user flagged).
+  let enabled = view.connection == ConnectionState::Idle;
+  ui.add_enabled_ui(enabled, |ui| {
+    // Trim the horizontal button padding from egui's default 14px so the labels fit their narrow placed cells
+    // (at the default, "Zero XYZ" had no room and wrapped onto two lines inside its slot).
+    ui.spacing_mut().button_padding = Vec2::new(6.0, 0.0);
+    button_row(ui, 6.0, &[1.0, 1.0, 1.0, 1.4], |ui, index, rect| {
+      let (label, axes, primary): (&str, Vec<Axis>, bool) = match index {
+        0 => ("X", vec![Axis::X], false),
+        1 => ("Y", vec![Axis::Y], false),
+        2 => ("Z", vec![Axis::Z], false),
+        _ => ("Zero XYZ", Vec::new(), true),
+      };
+      // Size the label to the design's ~11.5px and never wrap: the placed cell is narrow, and at egui's larger
+      // default button font "Zero XYZ" wrapped onto two lines inside its slot. `Extend` keeps it one line.
+      let text = RichText::new(label).size(11.5).color(Theme::TEXT);
+      let mut button = egui::Button::new(text).wrap_mode(egui::TextWrapMode::Extend);
+      if primary {
+        button = button.fill(Theme::ACCENT);
       }
-      if ui.add_sized(Vec2::new(unit, h), egui::Button::new("Y")).clicked() {
-        sink.push(Intent::SetWorkZero { axes: vec![Axis::Y] });
-      }
-      if ui.add_sized(Vec2::new(unit, h), egui::Button::new("Z")).clicked() {
-        sink.push(Intent::SetWorkZero { axes: vec![Axis::Z] });
-      }
-      let zero_all = egui::Button::new(RichText::new("Zero XYZ").color(Theme::TEXT)).fill(Theme::ACCENT);
-      if ui.add_sized(Vec2::new(unit * 1.4, h), zero_all).clicked() {
-        sink.push(Intent::SetWorkZero { axes: Vec::new() });
+      if ui.put(rect, button).clicked() {
+        sink.push(Intent::SetWorkZero { axes });
       }
     });
   });
@@ -619,38 +663,7 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       ui.add_space(8.0);
       ui.label(RichText::new("Step (mm)").size(10.5).color(Theme::TEXT_DIM));
       ui.add_space(2.0);
-      ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 1.0;
-        // Six chips share the 232px row, so even the 6px body padding overruns each slot; trim to 4px here.
-        ui.spacing_mut().button_padding.x = 4.0;
-        // One slot per numeric step plus the trailing `cont` chip (design §03: `0.01 / 0.10 / 1.00 / 10.0 /
-        // cont`). All slots share the row width so the segmented selector spans the panel evenly.
-        let count = JOG_STEPS.len() + 1;
-        let slot = (ui.available_width() - (count as f32 - 1.0)) / count as f32;
-        for step in JOG_STEPS {
-          // A numeric chip is active only when it is the chosen step AND continuous mode is off — picking `cont`
-          // dims every numeric chip so the selector shows exactly one active mode.
-          let active = !state.jog_continuous && (state.jog_step - step).abs() < f64::EPSILON;
-          let (fill, text) =
-            if active { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::PANEL, Theme::TEXT_DIM) };
-          let button = egui::Button::new(RichText::new(format!("{step}")).monospace().size(11.0).color(text))
-            .fill(fill).corner_radius(0.0);
-          if ui.add_sized(Vec2::new(slot, Metrics::PANEL_CONTROL_H), button).clicked() {
-            state.jog_step = step;
-            state.jog_continuous = false;
-          }
-        }
-        // The `cont` chip: selecting it flips the pad into press-and-hold mode (a held cell drives the axis).
-        let (fill, text) =
-          if state.jog_continuous { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::PANEL, Theme::TEXT_DIM) };
-        let cont = egui::Button::new(RichText::new("cont").monospace().size(11.0).color(text))
-          .fill(fill).corner_radius(0.0);
-        if ui.add_sized(Vec2::new(slot, Metrics::PANEL_CONTROL_H), cont)
-          .on_hover_text("Continuous jog: hold a direction to move, release to stop").clicked()
-        {
-          state.jog_continuous = true;
-        }
-      });
+      step_selector(ui, state);
       ui.add_space(6.0);
       ui.horizontal(|ui| {
         ui.label(RichText::new("Feed").size(11.0).color(Theme::TEXT_DIM));
@@ -658,6 +671,68 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       });
     });
   });
+}
+
+/// Render the jog step selector as a single joined segmented control (design §03), not a row of separate
+/// bordered buttons (the "identical buttons" look the user flagged). The chips sit flush inside a recessed
+/// inset track — the track shows through the 1px gaps as hairline separators — with the per-chip button border
+/// and rounding stripped so the row reads as one control. One chip per numeric [`JOG_STEPS`] value plus a
+/// trailing wider `cont` chip; exactly one is active (accent fill + accent text), the rest dim, so the selected
+/// step is unmistakable. Picking a number turns continuous mode off; picking `cont` flips into press-and-hold.
+fn step_selector(ui: &mut egui::Ui, state: &mut UiState) {
+  egui::Frame::new()
+    .fill(Theme::INSET)
+    .stroke(egui::Stroke::new(1.0, Theme::BORDER_RECESS))
+    .corner_radius(Metrics::CONTROL_RADIUS)
+    .inner_margin(1)
+    .show(ui, |ui| {
+      // Strip the per-button border and rounding inside the track so the chips abut as one segmented control
+      // rather than reading as individual buttons; the 1px inter-chip gap then shows the inset as a separator.
+      {
+        let widgets = &mut ui.visuals_mut().widgets;
+        for visual in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.noninteractive]
+        {
+          visual.bg_stroke = egui::Stroke::NONE;
+          visual.corner_radius = egui::CornerRadius::ZERO;
+        }
+      }
+      // The cells are narrow; egui's default 14px horizontal button padding would leave no room for the label and
+      // wrap "0.01" onto two lines. Trim to a hair of padding so each chip's text fits its slot on one line.
+      ui.spacing_mut().button_padding = Vec2::new(2.0, 0.0);
+      // One slot per numeric step plus a slightly wider (1.2×) `cont` slot, matching the design's flex ratios.
+      let cont_index = JOG_STEPS.len();
+      let weights: Vec<f32> = (0..=cont_index).map(|i| if i == cont_index { 1.2 } else { 1.0 }).collect();
+      button_row(ui, 1.0, &weights, |ui, index, rect| {
+        let is_cont = index == cont_index;
+        // A numeric chip is active only when it is the chosen step AND continuous mode is off; the `cont` chip is
+        // active only in continuous mode — so the selector always shows exactly one active mode.
+        let active = if is_cont {
+          state.jog_continuous
+        } else {
+          !state.jog_continuous && (state.jog_step - JOG_STEPS[index]).abs() < f64::EPSILON
+        };
+        let (fill, text) = if active { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::PANEL, Theme::TEXT_DIM) };
+        let label = if is_cont { "cont".to_string() } else { format!("{}", JOG_STEPS[index]) };
+        let button = egui::Button::new(RichText::new(label).monospace().size(11.0).color(text))
+          .fill(fill)
+          .corner_radius(0.0)
+          .wrap_mode(egui::TextWrapMode::Extend);
+        let response = ui.put(rect, button);
+        let response = if is_cont {
+          response.on_hover_text("Continuous jog: hold a direction to move, release to stop")
+        } else {
+          response
+        };
+        if response.clicked() {
+          if is_cont {
+            state.jog_continuous = true;
+          } else {
+            state.jog_step = JOG_STEPS[index];
+            state.jog_continuous = false;
+          }
+        }
+      });
+    });
 }
 
 /// Whether the jog pad should be enabled for the given machine state. grblHAL only accepts a `$J=` jog while
@@ -789,6 +864,53 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   });
 }
 
+/// A custom override slider matching the design's filled-bar look (design §03/§04): a 6px recessed inset track
+/// with an accent-coloured fill that grows from the left in proportion to the value across the 10–200% span,
+/// plus a thin handle at the fill edge for a grab affordance. egui's stock `Slider` rendered only a grey rail
+/// and a square knob — no colour at all (the user-flagged "missing colors entirely"). The strip is taller than
+/// the 6px track so it is easy to grab; dragging or clicking maps the pointer x onto the value and reports the
+/// change through the returned [`egui::Response`] so the caller's commit/mirror logic is unchanged.
+fn override_slider(ui: &mut egui::Ui, value: &mut u32, fill_color: Color32) -> egui::Response {
+  use super::overrides::{OVERRIDE_MAX, OVERRIDE_MIN, OVERRIDE_NEUTRAL};
+  let width = ui.available_width().max(48.0);
+  let (rect, mut response) = ui.allocate_exact_size(Vec2::new(width, 18.0), egui::Sense::click_and_drag());
+  let track = egui::Rect::from_center_size(rect.center(), Vec2::new(width, Metrics::SLIDER_H));
+  let span = (OVERRIDE_MAX - OVERRIDE_MIN) as f32;
+
+  // Pointer drives the value: map its x across the track onto the 10–200% span while pressed/dragged.
+  if (response.dragged() || response.clicked())
+    && let Some(pos) = response.interact_pointer_pos()
+  {
+    let frac = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+    let next = OVERRIDE_MIN + (frac * span).round() as u32;
+    if next != *value {
+      *value = next;
+      response.mark_changed();
+    }
+  }
+
+  // The coloured fill reads against the *nominal* 100%, so a neutral 100% override shows a full bar (design
+  // §03) and reducing the override shrinks it; at or above 100% the bar saturates full. The handle, by
+  // contrast, sits at the override's true position across the full 10–200% drag span, so it still tracks the
+  // pointer all the way to 200% and the 100–200% range stays adjustable — the fill is the at-a-glance gauge,
+  // the handle is the precise position.
+  let fill_frac = (*value as f32 / OVERRIDE_NEUTRAL as f32).clamp(0.0, 1.0);
+  let pos_frac = (value.saturating_sub(OVERRIDE_MIN)) as f32 / span;
+  let radius = egui::CornerRadius::same(Metrics::CONTROL_RADIUS);
+  let painter = ui.painter();
+  painter.rect_filled(track, radius, Theme::INSET);
+  let mut fill = track;
+  fill.set_width(track.width() * fill_frac);
+  painter.rect_filled(fill, radius, fill_color);
+  painter.rect_stroke(track, radius, egui::Stroke::new(1.0, Theme::BORDER_RECESS), egui::StrokeKind::Inside);
+  // A 2px handle at the override's true position, brightened to the text colour, so the operator sees the grab
+  // point and can read where in the 10–200% span the value sits even while the fill is saturated full.
+  let handle_x = (track.left() + track.width() * pos_frac.clamp(0.0, 1.0)).clamp(track.left(), track.right());
+  let handle = egui::Rect::from_center_size(egui::pos2(handle_x, track.center().y), Vec2::new(2.0, 14.0));
+  painter.rect_filled(handle, egui::CornerRadius::ZERO, Theme::TEXT);
+  response
+}
+
 /// Render one override axis (feed or spindle): a label with the live percentage, a 10–200% slider that emits
 /// an absolute [`Intent::SetOverride`] on release, and a fine/coarse/reset stepper row (`−10 −1 100 +1 +10`)
 /// that emits single relative real-time bytes. The slider and the steppers are two equivalent ways to reach
@@ -803,23 +925,35 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
 fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32,
   drag: &mut Option<u32>, sink: &mut IntentSink, minus1: RealtimeCommand, minus10: RealtimeCommand,
   reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
-  use super::overrides::{OVERRIDE_MAX, OVERRIDE_MIN};
-  ui.label(format!("{label} {live:>3}%"));
+  use super::overrides::OverrideAxis;
 
   // The slider edits a local mirror seeded from the live value while idle; an active drag holds its own value.
   let mut value = drag.unwrap_or(live);
-  let slider = ui.add(egui::Slider::new(&mut value, OVERRIDE_MIN..=OVERRIDE_MAX).suffix("%").show_value(false));
-  if slider.drag_started() || slider.dragged() {
-    // While dragging, remember the operator's position so the live status poll cannot yank the handle back.
-    *drag = Some(value);
-  }
-  if slider.drag_stopped() {
-    // On release, commit the target if it actually moved off the live value, then let the mirror track live again.
-    if value != live {
-      sink.push(Intent::SetOverride { axis, target: value });
-    }
-    *drag = None;
-  }
+  // Feed (and rapid) carry the cool control-blue fill; spindle carries the warm motion-orange, matching the
+  // design's `#0E86D4` feed bar and `#FF7A1A` spindle bar (the colour that was missing entirely before).
+  let fill_color = match axis {
+    OverrideAxis::Feed => Theme::ACCENT,
+    OverrideAxis::Spindle => Theme::ACCENT_MOTION,
+  };
+  // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
+  ui.horizontal(|ui| {
+    ui.label(RichText::new(label).size(11.0).color(Theme::TEXT_DIM));
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+      ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(Theme::TEXT));
+      let slider = override_slider(ui, &mut value, fill_color);
+      if slider.dragged() {
+        // While dragging, remember the operator's position so the live status poll cannot yank the handle back.
+        *drag = Some(value);
+      }
+      if slider.drag_stopped() || slider.clicked() {
+        // On release/click, commit the target if it moved off the live value, then let the mirror track live again.
+        if value != live {
+          sink.push(Intent::SetOverride { axis, target: value });
+        }
+        *drag = None;
+      }
+    });
+  });
 
   // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%.
   ui.horizontal(|ui| {
@@ -1108,10 +1242,16 @@ pub fn alarm_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) 
   let Some(banner) = &view.banner else {
     return;
   };
-  // Headline + secondary detail per banner kind; both share the alarm surface so the strip reads as a fault.
+  // Headline + secondary detail per banner kind; both share the alarm surface so the strip reads as a fault. The
+  // detail resolves through the live codebook so an enumerated (`$EA`/`$EE`) description beats the static text;
+  // absent enrichment, the codebook's static fallback still yields a full sentence rather than a bare number. We
+  // run every repaint while the banner is shown, so we take ONLY the description via the borrowing accessor — it
+  // hands back a `'static` borrow on the static path (no per-frame allocation) and clones only on an override.
   let (headline, detail, is_alarm) = match banner {
-    Banner::Alarm(code) => (format!("⚠ ALARM:{code}"), super::badge::alarm_detail(*code), true),
-    Banner::StreamError(code) => (format!("⚠ error:{code} — stream halted"), super::badge::error_detail(*code), false),
+    Banner::Alarm(code) => (format!("⚠ ALARM:{code}"), view.codes.alarm_description(*code), true),
+    Banner::StreamError(code) => {
+      (format!("⚠ error:{code} — stream halted"), view.codes.error_description(*code), false)
+    }
   };
   egui::Frame::new()
     .fill(Theme::ALARM_BG)

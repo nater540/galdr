@@ -67,6 +67,33 @@ desire (deliberate teardown never reconnects). `pump_events` flags a drained `Ev
 deadline compare, no thread/timer) fires the due open. Policy reset only on `is_connected()` (excludes
 Connecting). Repaint scheduler keeps the loop awake while `reconnect_at.is_some()`. See [[settings-and-overrides]].
 
+**Error/alarm code decoding (DONE):** `src/protocol/codes.rs` (pure) decodes `error:N`/`ALARM:N` into name +
+description. `CodeText { name, description }` fields are `Cow<'static, str>` (static tables `Cow::Borrowed`, parser
+`Cow::Owned`) so the static path is ALLOC-FREE. Two layers: static fallback (`error_text`/`alarm_text` build a
+whole CodeText; `error_static`/`alarm_static` return the raw `(&'static str,&'static str)` pair — common grbl
+1.1/grblHAL set, generic gloss for unknown so a bare number is NEVER shown) matching the firmware's own `$EE`/`$EA`
+text VERBATIM (full-string-equality tests guard drift); plus a runtime `CodeBook` of overrides
+(`apply_error`/`apply_alarm`/`clear`, override beats static). CodeBook accessors: `error()`/`alarm()` return a whole
+`CodeText` (both fields); `error_name`/`error_description`/`alarm_name`/`alarm_description` return ONE `Cow<'static,
+str>` field — borrow on static path, clone only on override — for per-frame callers (banner). GOTCHA fixed: alarm 4
+= probe not in expected initial state (already triggered), 5 = no contact within travel — old `badge.rs` had these
+INVERTED; ALSO firmware's `$EA` text for 4/5 leads with `"Probe fail. "` (static must include it or banner wording
+shifts after Refresh). `badge::alarm_detail`/`error_detail` are DELETED (codes.rs supersedes). `parse_error_code_meta`/
+`parse_alarm_code_meta` mirror `parse_setting_meta` over `ERRORCODE:id|name|desc`/`ALARMCODE:...` (already-debracketed
+`Response::Message` body; desc may contain `|`, taken via `splitn(3,'|')`). Reducer (`view_state.rs`) holds
+`codes: CodeBook`, folds enumeration rows in the `Response::Message` arm + `return`s (skips console, like SETTING),
+clears on disconnect. `render_response` is a `&self` METHOD reading `self.codes` via `error_name`/`alarm_name`:
+console shows `error:21 — Modal group violation` (name only). Banner (`views.rs alarm_banner`) uses
+`alarm_description`/`error_description` (override beats static, borrow on static path — runs every repaint).
+ENRICHMENT TRIGGER: `$EE`/`$EA` are sent in `shell.rs::request_settings` beside `$ES`/`$$` (operator "Refresh"),
+NOT in the engine handshake (which only sends `$I`) — the static fallback means display works pre-fetch.
+DEDUP: firmware (Track 2) pushes a context line `[MSG:error:<n> <name>]` / `[MSG:ALARM:<n> <name>]` right before
+each error/alarm. Since skirnir decodes the code itself, that MSG is redundant — `is_redundant_error_annotation`
+(free fn in view_state.rs) suppresses it (return early in the `Response::Message` arm). Prefixes are named consts
+`FW_ERROR_ANNOTATION_PREFIX = "MSG:error:"` / `FW_ALARM_ANNOTATION_PREFIX = "MSG:ALARM:"` (MUST track firmware's
+`ResponseWriter::error_context`/`alarm_context`). TIGHT shape: prefix + ≥1 digit + single space + ≥1 char (name).
+Rejects `MSG:error:` (no code), `MSG:error:21` (no name), `MSG:errored sensor` (no digit), generic `[MSG:Pgm End]`.
+
 **Settings sync (DONE, text path):** `$PBX` BINARY bulk channel is `[PB:<hex>]` chunks wrapping a
 firmware-core `storage_frame` (MAGIC|ver|len|payload|CRC32) around the galdr-proto `Settings` — skirnir does
 NOT depend on firmware-core/galdr-proto, so that frame codec is NOT available; binary `$PBX` decode is

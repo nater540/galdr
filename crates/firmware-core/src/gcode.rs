@@ -34,20 +34,21 @@ pub enum GcodeError {
   ExpectedCommandLetterValue,
   /// `error:2` — a numeric value was malformed (e.g. `X1.2.3`, lone `-`, empty after the letter).
   BadNumberFormat,
-  /// `error:9` — more than one word from the same modal group appeared on a single line (e.g. two
-  /// motion words `G0 G1`). Maps to grbl's "G-code locked out / modal group violation" family.
+  /// `error:21` — more than one word from the same modal group appeared on a single line (e.g. two
+  /// motion words `G0 G1`). grbl's dedicated "Modal group violation" code (distinct from the `error:9`
+  /// G-code-lock state, which the firmware reserves for rejecting GCode while in an alarm/jog state).
   ModalGroupViolation,
   /// `error:20` — an unsupported or unrecognized command word for the implemented GCode subset.
   UnsupportedCommand,
-  /// `error:23` — a `G38.x` probe command carried no axis word, so there is no direction to probe. grbl's
-  /// "G-code command in block requires axis words" — a probe must name at least one axis to move toward/away.
+  /// `error:26` — a `G38.x` probe command carried no axis word, so there is no direction to probe. grbl's
+  /// "No axis words in block" — a probe must name at least one axis to move toward/away.
   ProbeNoAxis,
   /// `error:22` — a `$J=` jog (or a feed move) carried no `F` word, so the feed rate is undefined. grbl's
   /// "Feed rate has not yet been set or is undefined" — a jog MUST name a feed; there is no modal feed for it.
   FeedRateUndefined,
-  /// `error:23` — a `$J=` jog carried no axis word, so there is no direction to move. Same grbl class as
-  /// [`ProbeNoAxis`](GcodeError::ProbeNoAxis) ("G-code command in block requires axis words"); kept a distinct
-  /// variant so a jog rejection reads clearly at the call site, while sharing the wire code 23.
+  /// `error:26` — a `$J=` jog carried no axis word, so there is no direction to move. Same grbl class as
+  /// [`ProbeNoAxis`](GcodeError::ProbeNoAxis) ("No axis words in block"); kept a distinct variant so a jog
+  /// rejection reads clearly at the call site, while sharing the wire code 26.
   JogNoAxis,
 }
 
@@ -57,11 +58,11 @@ impl GcodeError {
     match self {
       GcodeError::ExpectedCommandLetterValue => 1,
       GcodeError::BadNumberFormat => 2,
-      GcodeError::ModalGroupViolation => 9,
+      GcodeError::ModalGroupViolation => 21,
       GcodeError::UnsupportedCommand => 20,
-      GcodeError::ProbeNoAxis => 23,
+      GcodeError::ProbeNoAxis => 26,
       GcodeError::FeedRateUndefined => 22,
-      GcodeError::JogNoAxis => 23,
+      GcodeError::JogNoAxis => 26,
     }
   }
 }
@@ -1673,9 +1674,9 @@ mod tests {
   #[test]
   fn parse_probe_with_no_axis_word_is_rejected() {
     let mut parser = Parser::new();
-    // A bare G38.2 has no direction to probe; grbl rejects it with error:23 (axis words required).
+    // A bare G38.2 has no direction to probe; grbl rejects it with error:26 (no axis words in block).
     assert_eq!(parser.parse_line(b"G38.2 F50"), Err(GcodeError::ProbeNoAxis));
-    assert_eq!(GcodeError::ProbeNoAxis.code(), 23);
+    assert_eq!(GcodeError::ProbeNoAxis.code(), 26);
   }
 
   #[test]
@@ -1851,10 +1852,13 @@ mod tests {
   fn error_codes_match_grblhal() {
     assert_eq!(GcodeError::ExpectedCommandLetterValue.code(), 1);
     assert_eq!(GcodeError::BadNumberFormat.code(), 2);
-    assert_eq!(GcodeError::ModalGroupViolation.code(), 9);
+    // grbl's dedicated "Modal group violation" code — NOT the `error:9` state-lock code.
+    assert_eq!(GcodeError::ModalGroupViolation.code(), 21);
     assert_eq!(GcodeError::UnsupportedCommand.code(), 20);
     assert_eq!(GcodeError::FeedRateUndefined.code(), 22);
-    assert_eq!(GcodeError::JogNoAxis.code(), 23);
+    // A probe/jog missing its axis word is grbl's "No axis words in block" (26), not the integer-value code 23.
+    assert_eq!(GcodeError::ProbeNoAxis.code(), 26);
+    assert_eq!(GcodeError::JogNoAxis.code(), 26);
   }
 
   // ---- Phase D: `$J=` jog parsing (seed-from-current-then-discard) ------------------------------
@@ -1937,7 +1941,7 @@ mod tests {
   #[test]
   fn parse_jog_missing_axis_is_error_23() {
     let parser = Parser::new();
-    // A jog with a feed but no axis word has no direction to move — error:23 (requires axis words).
+    // A jog with a feed but no axis word has no direction to move — error:26 (no axis words in block).
     assert_eq!(parser.parse_jog(b"F600"), Err(GcodeError::JogNoAxis));
   }
 
