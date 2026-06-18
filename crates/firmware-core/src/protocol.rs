@@ -473,10 +473,12 @@ impl ControlState {
   }
 
   /// Whether a hard-limit trip from the core-1 executor should raise a fresh `ALARM:1` from THIS control state.
-  /// True from the states where a genuine over-travel is meaningful — the machine could actually be MOVING:
-  /// `Normal` (running a program), `Hold` (a held program could resume into a switch), `Jog`, and `Check`. FALSE
-  /// from any `Alarm(_)` and from `Sleep`: in those states the machine is already halted/parked, so a trip is a
-  /// STALE read of a parked switch, not a live over-travel. Re-raising `ALARM:1` over an existing alarm changes
+  /// True from the states where the executor's EDGE-armed detector can produce a genuine NEW assertion worth
+  /// surfacing: `Normal` (running a program), `Hold` (a held program could resume into a switch), `Jog`, and
+  /// `Check`. `Check` never enqueues motion, but the trip is edge-armed (`hard_limit_alarm_armed`), so it fires
+  /// only on a switch NEWLY pressed DURING the dry-run — a real safety event grbl surfaces regardless of mode, not
+  /// a stale parked-switch read. FALSE from any `Alarm(_)` and from `Sleep`: in those states the machine is
+  /// already halted/parked, so a trip is a STALE read of a parked switch. Re-raising `ALARM:1` over an existing alarm changes
   /// nothing useful and can only CLOBBER a more-specific state — most damagingly downgrading the boot-lock
   /// `ALARM:11` (homing required) into the locked `ALARM:1`, losing the "homing required" semantic the host must
   /// satisfy. Pulled out as a pure predicate so the bin's hard-limit consumer arm can gate the `ALARM:1` raise

@@ -44,6 +44,13 @@ const JOG_STREAM_INTERVAL: Duration = Duration::from_millis(120);
 /// the margin is generous enough to absorb several increments' worth of staleness.
 const JOG_STREAM_MIN_BLOCKS_FREE: u32 = 8;
 
+/// How stale the last `<...>` status report may be before its `Bf:` blocks-free reading is no longer trusted to
+/// gate the jog stream. Status polls at ~5 Hz (a ~200 ms interval), so this is ~3 polls' worth of slack: a single
+/// dropped or delayed report still trusts the last reading, but a sustained stall (firmware busy, polling starved)
+/// crosses it. Past this age the queue state is treated as UNKNOWN and the stream HOLDS rather than streaming on a
+/// frozen `Bf:` — otherwise a held jog could overrun the 32-block queue into a `QueueFull` rejection.
+const JOG_STREAM_STATUS_MAX_AGE: Duration = Duration::from_millis(600);
+
 /// An in-progress continuous (press-and-hold) jog, streamed as short `$J=` increments until the operator
 /// releases. `Copy` so the per-frame pump can snapshot it without holding a borrow across the send.
 #[derive(Clone, Copy)]
@@ -101,6 +108,12 @@ pub struct SkirnirApp {
   /// The continuous jog currently being streamed while the operator holds a jog control, or `None`. Owned by the
   /// shell (not the reducer) because pacing the increments is wall-clock work the egui frame drives.
   jog_stream: Option<JogStream>,
+  /// Wall-clock instant the last `<...>` status report was observed, or `None` if none has arrived this session.
+  /// The jog-stream throttle reads this to age the `Bf:` blocks-free reading: a stale report (older than
+  /// [`JOG_STREAM_STATUS_MAX_AGE`]) is no longer trusted, so the stream holds rather than pacing on a frozen queue
+  /// reading. Held in the shell (not the reducer) because it is wall-clock state the egui frame owns; cleared on a
+  /// disconnect so a stale timestamp never carries into the next session.
+  last_status_at: Option<Instant>,
   /// The result channel of an in-flight on-demand port identify probe, if one is running. The probe runs on
   /// the runtime (off the UI thread); the verdict arrives here and is drained into the console each frame, so a
   /// 500ms probe never blocks rendering. `None` when no probe is in flight.
@@ -131,6 +144,7 @@ impl SkirnirApp {
       override_tracker: super::overrides::OverrideTracker::default(),
       stream_started: None,
       jog_stream: None,
+      last_status_at: None,
       #[cfg(feature = "serial")]
       pending_probe: None,
     };
@@ -153,6 +167,11 @@ impl SkirnirApp {
       if matches!(event, crate::engine::Event::Disconnected(_)) {
         dropped = true;
       }
+      // Stamp the arrival of a `<...>` status report so the jog-stream throttle can age its `Bf:` reading. This is
+      // the one place the shell observes incoming status, so freshness is recorded exactly when the report lands.
+      if matches!(event, crate::engine::Event::Response(crate::protocol::Response::Status(_))) {
+        self.last_status_at = Some(Instant::now());
+      }
       self.view.apply(event);
       saw_any = true;
     }
@@ -174,7 +193,8 @@ impl SkirnirApp {
       // reconnect to a (possibly different) board never resumes a stale edit or steps from the old override. A
       // held continuous jog belongs to the dead link too — stop streaming increments into a gone engine.
       self.ui.on_disconnected();
-      self.jog_stream = None;
+      self.clear_jog_stream();
+      self.last_status_at = None;
       self.override_tracker = super::overrides::OverrideTracker::default();
       self.on_engine_dropped();
     }
@@ -190,6 +210,10 @@ impl SkirnirApp {
   /// teardown never re-opens the port. Exhausting the attempt budget settles into a clean disconnected state.
   fn on_engine_dropped(&mut self) {
     self.engine = None;
+    // A held continuous jog belongs to the now-dead link: stop streaming increments so the pump cannot keep
+    // firing `send_command` into a gone engine (which would spam "not connected" notices every frame). This is the
+    // single source of truth for tearing the stream down on an engine drop — both drop sites route through here.
+    self.clear_jog_stream();
     #[cfg(feature = "serial")]
     {
       if !self.auto_reconnect || self.reconnect_at.is_some() {
@@ -591,8 +615,14 @@ impl SkirnirApp {
   /// queued jog blocks and decelerates the active (short) block at its boundary, so motion halts within one
   /// increment's travel. Safe to send when not jogging — the firmware ignores it.
   fn jog_stop(&mut self) {
-    self.jog_stream = None;
+    self.clear_jog_stream();
     self.send_command(Command::Realtime(crate::protocol::RealtimeCommand::JogCancel));
+  }
+
+  /// Tear down any in-progress continuous jog. The single point that clears the streamed-jog state, so every site
+  /// that ends a jog — operator release, a disconnect, an engine drop — stops the increment pump the same way.
+  fn clear_jog_stream(&mut self) {
+    self.jog_stream = None;
   }
 
   /// Emit the next increment of a held continuous jog if one is active and due. Paced by wall clock so blocks are
@@ -601,30 +631,51 @@ impl SkirnirApp {
   /// time — the worst-case stop latency after release — stays ~[`JOG_STREAM_BLOCK_SECS`] regardless of feed. The
   /// increments are not echoed to the console: at several per second the echo would bury real traffic.
   fn pump_jog_stream(&mut self) {
-    let Some(stream) = self.jog_stream else {
+    // No engine means nothing to stream into: clear any lingering jog so the pump cannot keep re-entering a
+    // dead-engine send path frame after frame. Belt-and-suspenders with the clear at the engine-drop sites.
+    if self.engine.is_none() {
+      self.clear_jog_stream();
       return;
-    };
+    }
     let now = Instant::now();
-    if now < stream.next_send_at {
-      return;
-    }
-    // Backstop against drift: if the firmware's last-reported planner queue is nearly full, hold off until it
-    // drains rather than risk a `QueueFull` rejection. Re-arm a fresh interval so we resume promptly. A missing
-    // `Bf:` (no status yet) skips the gate — the queue is empty early in a jog, so the first sends are safe.
-    if let Some((blocks_free, _)) = self.view.status.as_ref().and_then(|s| s.buffer)
-      && blocks_free < JOG_STREAM_MIN_BLOCKS_FREE
-    {
-      if let Some(s) = self.jog_stream.as_mut() {
-        s.next_send_at = now + JOG_STREAM_INTERVAL;
+    // Decide whether this increment is due and what to do, holding a single `&mut` to the stream for the pacing
+    // update. We copy out only the scalar fields needed to build the send line, and re-arm `next_send_at` exactly
+    // once on the paths that "consume" this slot (a send or a backstop hold) so a held jog paces uniformly.
+    let send_line = {
+      let Some(stream) = self.jog_stream.as_mut() else {
+        return;
+      };
+      if now < stream.next_send_at {
+        return; // not yet due — no state change, retry next frame.
       }
-      return;
+      // This slot is due, so re-arm the pacing deadline exactly once here regardless of whether we end up sending
+      // or holding — both outcomes consume the slot and should re-evaluate after one interval.
+      stream.next_send_at = now + JOG_STREAM_INTERVAL;
+      let (axis, dir, feed) = (stream.axis, stream.dir, stream.feed);
+      // Backstop against drift: hold off when the firmware's reported planner queue is nearly full, or when that
+      // reading is too stale to trust, so a held jog can never overrun the 32-block queue into a `QueueFull`
+      // rejection. `view.status.buffer` carries the last `Bf:` blocks-free; `last_status_at` ages it. A missing
+      // `Bf:` (no status yet) skips the gate — the queue is empty early in a jog, so the first sends are safe; a
+      // present-but-stale reading instead HOLDS, since a frozen `Bf:` would let the stream run past a queue we can
+      // no longer observe.
+      let hold = match self.view.status.as_ref().and_then(|s| s.buffer) {
+        Some((blocks_free, _)) => {
+          let stale =
+            self.last_status_at.map(|at| now.duration_since(at) > JOG_STREAM_STATUS_MAX_AGE).unwrap_or(true);
+          stale || blocks_free < JOG_STREAM_MIN_BLOCKS_FREE
+        }
+        None => false, // no `Bf:` yet (fresh connection, queue known-empty): safe to stream.
+      };
+      if hold {
+        None
+      } else {
+        let distance = feed / 60.0 * JOG_STREAM_BLOCK_SECS;
+        Some(super::intent::jog_line(axis, dir, distance, feed))
+      }
+    };
+    if let Some(line) = send_line {
+      self.send_command(Command::SendLine(line));
     }
-    let distance = stream.feed / 60.0 * JOG_STREAM_BLOCK_SECS;
-    let line = super::intent::jog_line(stream.axis, stream.dir, distance, stream.feed);
-    if let Some(s) = self.jog_stream.as_mut() {
-      s.next_send_at = now + JOG_STREAM_INTERVAL;
-    }
-    self.send_command(Command::SendLine(line));
   }
 
   /// Sequence a Z probe: `G38.2` toward `-depth` at `feed`, then set work-Z to the plate thickness via
@@ -646,7 +697,9 @@ impl SkirnirApp {
       Some(engine) if engine.send(command) => true,
       Some(_) => {
         self.notice("engine is gone; reconnect".to_string());
-        self.engine = None;
+        // Route the drop through `on_engine_dropped` rather than nulling `engine` inline, so the same teardown
+        // (clearing a held jog stream so its pump cannot re-enter this dead-engine arm every frame) runs here too.
+        self.on_engine_dropped();
         false
       }
       None => {
