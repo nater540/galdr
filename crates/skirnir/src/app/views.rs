@@ -412,7 +412,6 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       pos_toggle(ui, state, false, "WPos");
     },
   );
-  ui.add_space(2.0);
 
   egui::Frame::new().inner_margin(Metrics::DRO_PAD).show(ui, |ui| {
   let (machine, work) = view.dro();
@@ -437,11 +436,17 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
     let enabled = view.connection == ConnectionState::Idle;
     ui.add_enabled_ui(enabled, |ui| {
       ui.spacing_mut().item_spacing.x = 6.0;
-      // Split the row into four slots (three equal + one ~1.4×) honouring the design's flex ratios.
+      // This is a dense four-up row inside the 232px DRO body, so the default 14px button padding (28px/button →
+      // 112px of pure padding) overflows the column. Use a tighter 6px gutter (within the design's 4–8px dense
+      // padding range) so every slot's content fits its allocation and the row totals the 232px body exactly.
+      ui.spacing_mut().button_padding.x = 6.0;
+      // Split the row into four slots (three equal + one ~1.4×) honouring the design's flex ratios. The three
+      // per-axis buttons are single letters (X/Y/Z) so they stay equal-width; the wide "Zero XYZ" slot names the
+      // all-axis action and gives the per-axis letters their "set work zero" context (design §03).
       let gap = ui.spacing().item_spacing.x;
       let unit = (ui.available_width() - 3.0 * gap) / 4.4;
       let h = Metrics::PANEL_CONTROL_H;
-      if ui.add_sized(Vec2::new(unit, h), egui::Button::new("Zero X")).clicked() {
+      if ui.add_sized(Vec2::new(unit, h), egui::Button::new("X")).clicked() {
         sink.push(Intent::SetWorkZero { axes: vec![Axis::X] });
       }
       if ui.add_sized(Vec2::new(unit, h), egui::Button::new("Y")).clicked() {
@@ -491,11 +496,13 @@ fn pos_toggle(ui: &mut egui::Ui, state: &mut UiState, machine: bool, label: &str
   }
 }
 
-/// Format one axis value as a large monospace tabular fixed-point string, or a dash when not derivable.
+/// Format one axis value as a large monospace tabular fixed-point string, or a dash when not derivable. Padded
+/// to 8 columns (`-999.999` through `9999.999`), which spans a PCB-mill envelope while keeping the row inside the
+/// fixed 268px column — a wider field overflowed the column and pushed the panel edge out (an unpainted gap).
 fn big_axis_value(positions: Option<&Vec<f64>>, axis: usize) -> RichText {
   match positions.and_then(|p| p.get(axis)) {
-    Some(value) => RichText::new(format!("{value:>9.3}")).monospace().size(Metrics::DRO_VALUE).color(Theme::TEXT),
-    None => RichText::new(format!("{:>9}", "—")).monospace().size(Metrics::DRO_VALUE).color(Theme::TEXT_DISABLED),
+    Some(value) => RichText::new(format!("{value:>8.3}")).monospace().size(Metrics::DRO_VALUE).color(Theme::TEXT),
+    None => RichText::new(format!("{:>8}", "—")).monospace().size(Metrics::DRO_VALUE).color(Theme::TEXT_DISABLED),
   }
 }
 
@@ -518,8 +525,19 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   let enabled = jog_enabled(view.badge_state());
   egui::Frame::new().inner_margin(Metrics::JOG_PAD).show(ui, |ui| {
     ui.add_enabled_ui(enabled, |ui| {
+      // These are dense icon/chip controls, so the default 14px button padding (28px/button) blows the cells past
+      // their 32px squares and the segmented step chips past their slots, overflowing the 232px jog body. A tight
+      // 6px gutter keeps every button's content inside its allocation (within the design's 4–8px dense range).
+      ui.spacing_mut().button_padding.x = 6.0;
       // The pad: a 3×3 XY arrow grid of 32px cells (design §03) with a Z± column alongside, mirroring the
       // physical axes — Y+ top, X∓ flanking the centre, Y− bottom; Z+ / Z / Z− stacked to the right.
+      // Derive the Z column's width from the row's own width here, not `available_width()` mid-row: after the
+      // grid, the running layout reports a stale (too-large) remaining width, which sized the Z column wide
+      // enough to overflow the 268px column and leave an unpainted gap beside the panel. The grid spans three
+      // 32px cells with two inter-cell gaps; the Z column then fills what remains after the grid and the 16px
+      // inter-column gap (a `JOG_GAP` item space, the `JOG_GAP*2` separator, and a second `JOG_GAP` item space).
+      let xy_width = 3.0 * Metrics::JOG_CELL + 2.0 * Metrics::JOG_GAP;
+      let zw = (ui.available_width() - xy_width - Metrics::JOG_GAP * 4.0).max(Metrics::JOG_CELL);
       ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(Metrics::JOG_GAP);
         let gap = Vec2::splat(Metrics::JOG_GAP);
@@ -541,7 +559,6 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
         ui.add_space(Metrics::JOG_GAP * 2.0);
         ui.vertical(|ui| {
           ui.spacing_mut().item_spacing.y = Metrics::JOG_GAP;
-          let zw = ui.available_width();
           jog_z(ui, "Z+", zw, state, sink, Some((Axis::Z, Dir::Pos)));
           jog_z(ui, "Z", zw, state, sink, None);
           jog_z(ui, "Z−", zw, state, sink, Some((Axis::Z, Dir::Neg)));
@@ -554,6 +571,8 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       ui.add_space(2.0);
       ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
+        // Six chips share the 232px row, so even the 6px body padding overruns each slot; trim to 4px here.
+        ui.spacing_mut().button_padding.x = 4.0;
         // One slot per numeric step plus the trailing `cont` chip (design §03: `0.01 / 0.10 / 1.00 / 10.0 /
         // cont`). All slots share the row width so the segmented selector spans the panel evenly.
         let count = JOG_STEPS.len() + 1;
@@ -1317,38 +1336,6 @@ pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   settings_list(ui, view, state, sink);
 }
 
-/// Render the right column's inline Settings section (design §03): the live `$NNN` settings list with violet
-/// keys, the enumerated name, and an editable value. The list is fed from [`ViewState::settings`] (the `$$`
-/// values merged with `$ES` metadata); the header's ⚙ opens the roomier settings window and a refresh button
-/// (re)fetches the dump. Editing a value commits a `$<n>=<value>` write. Kept thin: all merge/parse logic lives
-/// in the reducer and the settings model; this only renders rows and forwards edit intents.
-pub fn settings_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
-  header_bar(
-    ui,
-    |ui| {
-      header_title(ui, "Settings");
-      ui.label(RichText::new("($)").monospace().size(10.0).color(Theme::TEXT_DISABLED));
-    },
-    |ui| {
-      if ui.add(egui::Button::new(RichText::new("⚙").size(12.0).color(Theme::TEXT_DIM))
-        .fill(Color32::TRANSPARENT)).on_hover_text("Open settings editor").clicked()
-      {
-        state.settings_open = true;
-      }
-    },
-  );
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    ui.horizontal(|ui| {
-      settings_refresh_button(ui, view, sink);
-      if !view.settings.is_empty() {
-        ui.label(RichText::new(format!("{} settings", view.settings.len())).size(10.5).color(Theme::TEXT_DIM));
-      }
-    });
-    ui.add_space(4.0);
-    settings_list(ui, view, state, sink);
-  });
-}
-
 /// The "fetch settings from the firmware" button: enabled only when connected (a `$$`/`$ES` request would just
 /// error while disconnected). Emits [`Intent::RequestSettings`], which the shell turns into `$ES` + `$$`.
 fn settings_refresh_button(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
@@ -1372,11 +1359,15 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   }
   // The committed edit (if any) is acted on after the row loop so we never mutate `editing_setting` mid-borrow.
   let mut commit: Option<(bool, u32, String)> = None;
-  egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+  // `auto_shrink([false, false])`: fill the host's available height so the surrounding Settings window resizes
+  // vertically instead of snapping back to a fixed list height.
+  egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
     egui::Grid::new("settings_list").num_columns(3).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
       for row in view.settings.rows() {
         ui.label(RichText::new(format!("${}", row.number)).monospace().size(11.0).color(Theme::LOG_STATUS));
-        let label = row.label();
+        // The label disambiguates grblHAL's per-axis settings (e.g. `$150/$151/$152` all named "Microsteps")
+        // by appending the axis letter; a setting with a unique name is shown verbatim.
+        let label = view.settings.display_label(row);
         let unit = row.unit();
         let label_text = if unit.is_empty() { label } else { format!("{label} ({unit})") };
         ui.label(RichText::new(label_text).size(11.0).color(Theme::TEXT_DIM));

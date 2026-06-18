@@ -86,6 +86,10 @@ pub struct ViewState {
   pub progress: Progress,
   /// A latched alarm/error banner, if active.
   pub banner: Option<Banner>,
+  /// The code of the most recent `error:N`, stashed so the stream-error banner can carry it when the lifecycle
+  /// transition into [`ConnectionState::Error`] arrives (the transition event itself carries only the state).
+  /// Not part of the rendered view — purely a one-event bridge from the error response to the halt transition.
+  last_error_code: Option<u32>,
   /// The rolling console buffer, oldest first, capped at [`CONSOLE_CAPACITY`].
   pub console: VecDeque<LogLine>,
   /// The live firmware settings, merged from `$<n>=<value>` values and `$ES` enumeration metadata. Populated
@@ -101,6 +105,7 @@ impl Default for ViewState {
       last_wco: Vec::new(),
       progress: Progress::default(),
       banner: None,
+      last_error_code: None,
       console: VecDeque::new(),
       settings: SettingsModel::new(),
     }
@@ -179,11 +184,17 @@ impl ViewState {
     Some(derived)
   }
 
-  /// React to a lifecycle transition. Reaching a clean running state clears a stale error banner so the UI
-  /// does not show "error" over a recovered connection.
+  /// React to a lifecycle transition. The stream-error banner is bound to the `Error` lifecycle state: it
+  /// latches only when the stream actually halts (a program `error:N` drove the core into
+  /// [`ConnectionState::Error`]) and clears the moment the operator recovers to a running state. A bare
+  /// `error:N` from a manual command (e.g. `$H` rejected with `error:5`) never enters `Error`, so it surfaces
+  /// in the console without raising a misleading "stream halted" strip — and a soft reset, which returns the
+  /// halted lifecycle to `Idle`, drops the banner here rather than relying on a no-op `Idle`→`Idle` transition.
   fn on_state_changed(&mut self, state: ConnectionState) {
     self.connection = state;
     match state {
+      // The stream halted: latch the banner with the code stashed from the preceding `error:N` response.
+      ConnectionState::Error => self.banner = Some(Banner::StreamError(self.last_error_code.unwrap_or(0))),
       // A return to Idle/Streaming means the operator recovered; drop a stale stream-error banner. An alarm
       // banner persists until an explicit clear, since the firmware still reports Alarm until `$X`/`$H`.
       ConnectionState::Idle | ConnectionState::Streaming => {
@@ -213,7 +224,10 @@ impl ViewState {
         return;
       }
       Response::Alarm(code) => self.banner = Some(Banner::Alarm(*code)),
-      Response::Error(code) => self.banner = Some(Banner::StreamError(*code)),
+      // Stash the code but do not latch the banner here: a `error:N` only halts the stream when it belongs to a
+      // program line, which the core signals with a transition to `Error`. `on_state_changed` latches the
+      // banner on that transition, so a manual-command rejection (which never enters `Error`) only logs below.
+      Response::Error(code) => self.last_error_code = Some(*code),
       Response::Setting { number, value } => {
         // A `$<n>=<value>` line merges into the live settings model. Like status telemetry, a `$$` dump is many
         // lines of structured data the settings panel renders, so it does not flood the console.
@@ -366,11 +380,27 @@ mod tests {
   #[test]
   fn a_stream_error_latches_a_banner_cleared_by_recovery() {
     let mut view = ViewState::default();
+    // A program error halts the stream: the core emits the error response then the `Error` transition, in that
+    // order. The banner latches on the transition, carrying the code stashed from the response.
     view.apply(Event::Response(Response::Error(9)));
+    view.apply(Event::StateChanged(ConnectionState::Error));
     assert_eq!(view.banner, Some(Banner::StreamError(9)));
-    // Recovering to Idle clears a stream-error banner.
+    // Recovering to Idle (e.g. a soft reset returning the halted lifecycle to Idle) clears the banner.
     view.apply(Event::StateChanged(ConnectionState::Idle));
     assert_eq!(view.banner, None);
+  }
+
+  #[test]
+  fn a_manual_command_error_does_not_raise_a_stream_halted_banner() {
+    // A manual command rejected with `error:N` (e.g. `$H` → `error:5` when homing is disabled) never drives the
+    // core into `Error`, so it must not raise the "stream halted" strip — only log to the console. This is the
+    // regression behind the `$H` banner that a soft reset could not clear (the lifecycle never actually moved).
+    let mut view = ViewState::default();
+    view.apply(Event::StateChanged(ConnectionState::Idle));
+    view.apply(Event::Response(Response::Error(5)));
+    assert_eq!(view.banner, None, "a manual-command error must not latch the stream-halted banner");
+    // The error is still surfaced to the operator in the console.
+    assert!(view.console.iter().any(|l| l.text == "error:5"), "the error code still reaches the console");
   }
 
   #[test]

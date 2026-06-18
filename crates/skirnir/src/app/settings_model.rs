@@ -20,6 +20,9 @@ use std::collections::BTreeMap;
 
 use crate::protocol::{SettingMeta, SettingValue};
 
+/// Axis letters for grblHAL's per-axis settings, indexed by the setting number's unit digit (X/Y/Z/A/B/C).
+const AXIS_LETTERS: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
+
 /// One row of the settings panel: a setting's number, live value, and (once a `$ES` enumeration has been
 /// received) its human label, unit, and advertised bounds. A value can arrive before or after its metadata,
 /// so either may be present alone; the row is keyed by number and the two streams merge onto it.
@@ -106,6 +109,32 @@ impl SettingsModel {
     self.rows.values()
   }
 
+  /// The display label for `row`, disambiguating grblHAL's per-axis settings. grblHAL groups axis settings into
+  /// decades whose unit digit selects the axis (`$100/$101/$102` = X/Y/Z steps/mm, `$150/$151/$152` = X/Y/Z
+  /// microsteps), and its `$ES` enumeration gives every axis in a decade the same name (e.g. "Microsteps"). When
+  /// a row in the axis range shares its name with a sibling in the same decade — proof it is an axis-templated
+  /// setting, not a one-off — the axis letter is appended so the three rows read distinctly. A setting with a
+  /// unique name (or below the `$100` axis block) is returned verbatim from [`SettingRow::label`].
+  pub fn display_label(&self, row: &SettingRow) -> String {
+    let base = row.label();
+    let Some(meta) = &row.meta else { return base };
+    let axis = (row.number % 10) as usize;
+    if meta.name.is_empty() || row.number < 100 || axis >= AXIS_LETTERS.len() {
+      return base;
+    }
+    let decade = row.number / 10;
+    let shared_in_decade = self.rows.values().any(|other| {
+      other.number != row.number
+        && other.number / 10 == decade
+        && other.meta.as_ref().is_some_and(|m| m.name == meta.name)
+    });
+    if shared_in_decade {
+      format!("{base} {}", AXIS_LETTERS[axis])
+    } else {
+      base
+    }
+  }
+
   /// Drop every known setting. Called on disconnect so a reconnect starts from a clean slate rather than
   /// showing the previous board's settings (report-derived state must not survive a disconnect).
   pub fn clear(&mut self) {
@@ -190,6 +219,36 @@ mod tests {
     let row = model.rows().next().expect("a row");
     assert_eq!(row.label(), "$110");
     assert_eq!(row.unit(), "");
+  }
+
+  #[test]
+  fn per_axis_settings_get_an_axis_letter_appended() {
+    // grblHAL names $150/$151/$152 all "Microsteps"; the axis comes from the unit digit. Sharing the name within
+    // the decade is what marks them as an axis-templated block, so each row reads "Microsteps X/Y/Z".
+    let mut model = SettingsModel::new();
+    for (number, axis_value) in [(150u32, "16"), (151, "16"), (152, "8")] {
+      model.apply_value(value(number, axis_value));
+      model.apply_meta(meta(number, "Microsteps", ""));
+    }
+    let rows: Vec<&SettingRow> = model.rows().collect();
+    assert_eq!(model.display_label(rows[0]), "Microsteps X");
+    assert_eq!(model.display_label(rows[1]), "Microsteps Y");
+    assert_eq!(model.display_label(rows[2]), "Microsteps Z");
+  }
+
+  #[test]
+  fn a_unique_setting_name_is_not_axis_disambiguated() {
+    // A one-off setting (no sibling in its decade sharing the name) is shown verbatim, axis range or not.
+    let mut model = SettingsModel::new();
+    model.apply_value(value(150, "16"));
+    model.apply_meta(meta(150, "Microsteps", ""));
+    // A low-numbered setting is never treated as a per-axis row even if a name coincidence existed.
+    model.apply_value(value(10, "255"));
+    model.apply_meta(meta(10, "Step idle delay", "ms"));
+    let lone_axis = model.rows().find(|r| r.number == 150).expect("row 150");
+    assert_eq!(model.display_label(lone_axis), "Microsteps", "no sibling in the decade → no axis suffix");
+    let low = model.rows().find(|r| r.number == 10).expect("row 10");
+    assert_eq!(model.display_label(low), "Step idle delay", "settings below $100 are never axis-suffixed");
   }
 
   #[test]

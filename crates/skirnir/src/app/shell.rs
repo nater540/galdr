@@ -663,7 +663,9 @@ impl eframe::App for SkirnirApp {
     let column_frame = egui::Frame::NONE.fill(Theme::PANEL);
     egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
       .show_inside(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
+        // area shrink to the widest child, which otherwise leaves an unfilled strip on the column's inner edge.
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
           views::dro(ui, &self.view, &mut self.ui, &mut sink);
           ui.separator();
           views::jog(ui, &self.view, &mut self.ui, &mut sink);
@@ -672,12 +674,13 @@ impl eframe::App for SkirnirApp {
 
     egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
       .show_inside(ui, |ui| {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // `auto_shrink([false, false])`: fill the full fixed column width and height so the content never
+        // collapses to its natural size and leaves a bare strip beside it. Settings live only in the toolbar's
+        // Settings window now, not as a right-column section.
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
           views::overrides(ui, &self.view, &mut self.ui, &mut sink);
           ui.separator();
           views::probe(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          views::settings_panel(ui, &self.view, &mut self.ui, &mut sink);
         });
       });
 
@@ -692,7 +695,10 @@ impl eframe::App for SkirnirApp {
 
     if self.ui.settings_open {
       let mut open = self.ui.settings_open;
-      egui::Window::new("Settings").open(&mut open).show(&ctx, |ui| {
+      // Give the window a real default size and let it resize in both axes; the settings list inside fills the
+      // available height (see `settings`), so dragging the bottom edge actually grows the list rather than
+      // snapping back to a fixed content height (the prior vertical-resize stall).
+      egui::Window::new("Settings").open(&mut open).resizable(true).default_size([340.0, 460.0]).show(&ctx, |ui| {
         views::settings(ui, &self.view, &mut self.ui, &mut sink);
       });
       self.ui.settings_open = open;
