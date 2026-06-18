@@ -77,6 +77,13 @@ pub struct ProtocolCore {
   program_sent: usize,
   /// Program lines acknowledged so far.
   program_acked: usize,
+  /// Trailing acks to tolerate after the firmware emitted a boot banner while lines were still in flight. Those
+  /// lines were counted against our window, but the firmware may still emit one more `ok`/`error` for them *after*
+  /// the banner cleared the window — most commonly the handshake's counted `$I` racing the boot banner. We absorb
+  /// exactly that many unmatched acks so a benign connect race never surfaces a spurious-ack fault, while a
+  /// genuine over-acknowledgement (no preceding banner) does. Tolerance is scoped to the banner path only: a user
+  /// soft-reset (`0x18`) discards its in-flight lines without re-acking them, so it grants no budget here.
+  trailing_acks: usize,
 }
 
 impl Default for ProtocolCore {
@@ -96,6 +103,7 @@ impl ProtocolCore {
       program_total: 0,
       program_sent: 0,
       program_acked: 0,
+      trailing_acks: 0,
     }
   }
 
@@ -120,6 +128,9 @@ impl ProtocolCore {
   /// The driver reports the transport is now attached; move Disconnected -> Connecting.
   pub fn on_connected(&mut self) -> Vec<Effect> {
     let mut out = Vec::new();
+    // A fresh session starts with no tolerated trailing acks, so a budget left over from a previous link's
+    // teardown can never suppress a genuine spurious ack here.
+    self.trailing_acks = 0;
     self.transition(ConnectionState::Connecting, &mut out);
     out
   }
@@ -153,7 +164,8 @@ impl ProtocolCore {
   pub fn on_disconnected(&mut self) -> Vec<Effect> {
     let mut out = Vec::new();
     self.clear_program();
-    self.reset_window();
+    // The session is over and the next `on_connected` zeroes the budget, so a dropped link tolerates nothing.
+    self.reset_window(false);
     self.transition(ConnectionState::Disconnected, &mut out);
     out
   }
@@ -234,9 +246,11 @@ impl ProtocolCore {
         self.transition(ConnectionState::Streaming, &mut out);
       }
       RealtimeCommand::SoftReset => {
-        // A soft reset aborts everything; the firmware will re-emit the banner, which we also react to.
+        // A soft reset aborts everything; the firmware will re-emit the banner, which we also react to. It
+        // discards its in-flight lines without re-acking them, so grant no trailing-ack tolerance here — that
+        // would linger unspent and mask a genuine over-acknowledgement later in the session.
         self.clear_program();
-        self.reset_window();
+        self.reset_window(false);
         if self.state.is_connected() {
           self.transition(ConnectionState::Idle, &mut out);
         }
@@ -279,8 +293,9 @@ impl ProtocolCore {
       Response::Banner(_) => {
         // A banner means the controller reset: abort any stream, clear the window, return to Idle. (When this
         // banner is the readiness evidence above, the Idle transition is already pending; transition() dedupes.)
+        // Tolerate the in-flight lines' trailing acks — this is the connect/reset race the budget exists for.
         self.clear_program();
-        self.reset_window();
+        self.reset_window(true);
         self.transition(ConnectionState::Idle, &mut out);
       }
       // `[OPT:...]` RX sizing already handled above; nothing further for messages.
@@ -299,7 +314,13 @@ impl ProtocolCore {
   /// touches program progress and never aborts the stream. If still streaming, newly-fitting lines release.
   fn on_ack(&mut self, is_error: bool, out: &mut Vec<Effect>) {
     if let Err(err) = self.flow.on_ack() {
-      // More acks than lines sent: a hard counting violation. Surface it; do not corrupt the window.
+      // An ack with nothing in flight. If a line was still counted when the firmware last emitted a boot banner,
+      // this is its harmless trailing ack — absorb one from the budget and move on. Otherwise it is a genuine
+      // over-acknowledgement: surface it; do not corrupt the window.
+      if self.trailing_acks > 0 {
+        self.trailing_acks -= 1;
+        return;
+      }
       out.push(Effect::Fault(err));
       return;
     }
@@ -377,7 +398,15 @@ impl ProtocolCore {
   /// Reset the flow window to a fresh budget and discard the parallel kinds FIFO, keeping the two in lock-step.
   /// Called when the firmware's buffer is implicitly emptied (soft reset, banner, disconnect) so no stale
   /// in-flight bytes or kinds survive into the next session.
-  fn reset_window(&mut self) {
+  fn reset_window(&mut self, tolerate_trailing_acks: bool) {
+    // A boot banner means the firmware cleared its RX buffer but may still emit one more `ok`/`error` for each
+    // line that was in flight when it reset (e.g. the handshake's counted `$I` racing the banner); tolerate that
+    // many trailing unmatched acks so the benign connect race is absorbed rather than faulted. Only the banner
+    // path opts in: a user soft-reset (`0x18`) discards its in-flight lines without re-acking them, so granting
+    // budget there would linger unspent and mask a genuine over-acknowledgement later in the session.
+    if tolerate_trailing_acks {
+      self.trailing_acks = self.trailing_acks.saturating_add(self.inflight_kinds.len());
+    }
     self.flow = FlowWindow::new(self.flow.rx_buffer());
     self.inflight_kinds.clear();
   }
@@ -515,8 +544,57 @@ mod tests {
   #[test]
   fn a_spurious_ack_is_surfaced_as_a_fault_not_a_panic() {
     let mut core = connected_core();
-    let effects = core.on_response(Response::Ok); // nothing in flight
+    let effects = core.on_response(Response::Ok); // nothing in flight, no preceding reset
     assert!(effects.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))));
+  }
+
+  #[test]
+  fn the_handshake_i_ack_racing_a_boot_banner_is_not_a_spurious_ack() {
+    // Reproduces the connect race: the active handshake sends `$I` as a counted line, then the firmware's boot
+    // banner clears the window before the `$I`'s `ok` arrives. The orphaned ack must be absorbed, not faulted.
+    let mut core = ProtocolCore::new();
+    core.on_connected(); // Connecting
+    core.begin_handshake(); // emits `?`/0x87 then the counted `$I` (one line in flight)
+    assert_eq!(core.flow().inflight_bytes(), 3, "the counted `$I` occupies the window");
+
+    // The board answers a fresh boot: banner (resets the window), then its boot alarm + build info.
+    core.on_response(Response::Banner("GrblHAL 1.1f".to_string()));
+    assert_eq!(core.flow().inflight_bytes(), 0, "the banner cleared the in-flight `$I`");
+    core.on_response(Response::Alarm(11));
+    core.on_response(Response::Message("OPT:VNMSL,100,1024,3,0".to_string()));
+
+    // The firmware finally emits the `$I` ok — orphaned by the banner reset. It must be tolerated silently.
+    let effects = core.on_response(Response::Ok);
+    assert!(
+      !effects.iter().any(|e| matches!(e, Effect::Fault(_))),
+      "the `$I` ok orphaned by the boot banner must not surface a spurious-ack fault",
+    );
+
+    // The budget is spent: a *second* unmatched ack (a genuine over-acknowledgement) still faults.
+    let again = core.on_response(Response::Ok);
+    assert!(again.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))));
+  }
+
+  #[test]
+  fn a_soft_reset_grants_no_trailing_ack_tolerance() {
+    // A user soft-reset (`0x18`) discards its in-flight lines without re-acking them, so it must NOT widen the
+    // spurious-ack tolerance. Otherwise the unspent budget would linger across the still-connected session and
+    // mask a genuine over-acknowledgement later — the regression this scoping prevents.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(128);
+    core.on_stream_program(["G0 X10"]); // one line released and in flight
+    assert!(core.flow().inflight_bytes() > 0, "the streamed line occupies the window");
+
+    // The operator hits Stop: the soft reset clears the window but grants no trailing-ack budget.
+    core.on_realtime(RealtimeCommand::SoftReset);
+    assert_eq!(core.flow().inflight_bytes(), 0, "the soft reset cleared the in-flight line");
+
+    // An unmatched ack now (the firmware does not re-ack a discarded line) must surface as a spurious-ack fault.
+    let effects = core.on_response(Response::Ok);
+    assert!(
+      effects.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))),
+      "a soft reset must not tolerate a later unmatched ack",
+    );
   }
 
   #[test]

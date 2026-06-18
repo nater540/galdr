@@ -329,12 +329,15 @@ impl SkirnirApp {
 
   /// Tear the connection down at the operator's request. Clears the auto-reconnect desire and any pending
   /// attempt so a deliberate disconnect is final — only an *unexpected* drop reconnects. Sending `Disconnect`
-  /// ends the engine task; dropping the handle releases it.
+  /// ends the engine task, which emits a terminal [`crate::engine::Event::Disconnected`]; we keep the handle
+  /// attached so the next `pump_events` drains that event and applies it to the view (flipping the lifecycle to
+  /// `Disconnected` and clearing report-derived state such as an alarm). `on_engine_dropped` then releases the
+  /// dead handle — and with the desire already cleared, it does not reconnect. Nulling the handle here instead
+  /// would drop the receiver before that terminal event could be drained, leaving the UI stuck in its last state.
   fn disconnect(&mut self) {
     if let Some(engine) = &self.engine {
       engine.send(Command::Disconnect);
     }
-    self.engine = None;
     #[cfg(feature = "serial")]
     {
       self.auto_reconnect = false;
@@ -830,4 +833,73 @@ fn apply_theme(ctx: &egui::Context) {
   widgets.open.corner_radius = radius;
 
   ctx.set_visuals(visuals);
+}
+
+#[cfg(all(test, feature = "serial"))]
+mod tests {
+  use super::*;
+  use crate::protocol::ConnectionState;
+  use crate::transport::loopback::{LoopbackController, LoopbackTransport};
+  use std::time::Duration;
+
+  /// Build an app with a live engine wired to an in-memory loopback transport, as if the operator had just
+  /// connected. Returns the controller so the test can inject "firmware" bytes the engine will read.
+  fn app_with_engine() -> (SkirnirApp, LoopbackController) {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let (transport, controller) = LoopbackTransport::new();
+    // `Engine::connect` spawns the driver task, so it must run inside the runtime context.
+    let handle = {
+      let _guard = runtime.enter();
+      Engine::connect(transport)
+    };
+    let mut app = SkirnirApp::new(runtime);
+    app.engine = Some(handle);
+    // Mirror a user connect: the desire is armed and an endpoint recorded, so the test proves a deliberate
+    // disconnect clears them rather than scheduling a reconnect.
+    app.auto_reconnect = true;
+    app.last_endpoint = Some(("loopback".to_string(), 115_200));
+    (app, controller)
+  }
+
+  /// Pump engine events repeatedly — the driver task runs on background runtime threads, so events arrive
+  /// asynchronously — until `predicate` holds or a short budget is exhausted. Returns whether it was met.
+  fn pump_until(app: &mut SkirnirApp, predicate: impl Fn(&SkirnirApp) -> bool) -> bool {
+    for _ in 0..200 {
+      app.pump_events();
+      if predicate(app) {
+        return true;
+      }
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    predicate(app)
+  }
+
+  /// A user-initiated disconnect must drive the view all the way to `Disconnected`, even when the firmware is
+  /// latched in `Alarm`. Regression: nulling the engine handle inside `disconnect` dropped the event receiver
+  /// before the engine's terminal `Disconnected` could be drained, so the UI stayed stuck in its last state.
+  #[test]
+  fn a_user_disconnect_from_alarm_drives_the_view_to_disconnected() {
+    let (mut app, controller) = app_with_engine();
+    // Drive the firmware into Alarm so the lifecycle latches there — the operator's "stuck in alarm" start.
+    assert!(controller.inject_line("<Alarm:1|MPos:0.000,0.000,0.000>"));
+    assert!(
+      pump_until(&mut app, |a| a.view.connection == ConnectionState::Alarm),
+      "the engine never reported Alarm; got {:?}",
+      app.view.connection,
+    );
+
+    // The operator clicks Disconnect.
+    app.disconnect();
+
+    // The engine's terminal `Disconnected` event must be drained and applied: the view leaves Alarm for
+    // Disconnected and the dead handle is released without arming a reconnect.
+    assert!(
+      pump_until(&mut app, |a| a.view.connection == ConnectionState::Disconnected),
+      "the view stayed in {:?}; a user disconnect must reach Disconnected",
+      app.view.connection,
+    );
+    assert!(app.engine.is_none(), "the engine handle must be released once the terminal event drains");
+    assert!(!app.auto_reconnect, "a deliberate disconnect must not re-arm auto-reconnect");
+    assert!(app.reconnect_at.is_none(), "a deliberate disconnect must not schedule a reconnect");
+  }
 }

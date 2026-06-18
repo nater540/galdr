@@ -776,7 +776,8 @@ fn jog_z(ui: &mut egui::Ui, label: &str, width: f32, state: &UiState, sink: &mut
 }
 
 /// The egui sense a jog cell needs for the current mode: in continuous mode it must sense drag (press-and-hold)
-/// as well as click so the press and release edges are observable; in fixed-step mode a plain click suffices.
+/// so the press and release edges are observable, plus click so a brief tap still issues a bounded step jog; in
+/// fixed-step mode a plain click suffices.
 fn jog_sense(state: &UiState) -> egui::Sense {
   if state.jog_continuous {
     egui::Sense::click_and_drag()
@@ -786,10 +787,8 @@ fn jog_sense(state: &UiState) -> egui::Sense {
 }
 
 /// Translate a jog cell's [`egui::Response`] into the right jog intent(s) for the current mode. Fixed-step:
-/// a click is one bounded [`Intent::Jog`]. Continuous: the press edge (`drag_started`, or a click that is also
-/// a quick press) starts the long move and the release edge (`drag_stopped`) cancels it, so the axis moves
-/// exactly while the control is held. A bare click in continuous mode (a fast tap that egui reports as a click
-/// without a drag) still brackets a start+stop so a quick nudge is not lost.
+/// a click is one bounded [`Intent::Jog`]. Continuous: the press edge (`drag_started`) starts the long move and
+/// the release edge (`drag_stopped`) cancels it, so the axis moves exactly while the control is held.
 fn emit_jog(response: &egui::Response, state: &UiState, sink: &mut IntentSink, axis: Axis, dir: Dir) {
   if !state.jog_continuous {
     if response.clicked() {
@@ -803,11 +802,13 @@ fn emit_jog(response: &egui::Response, state: &UiState, sink: &mut IntentSink, a
   if response.drag_stopped() {
     sink.push(Intent::JogStop);
   }
-  // A tap too brief to register as a drag is reported as a click with no drag edges; bracket it so a quick
-  // continuous-mode nudge still moves and then stops rather than silently doing nothing.
-  if response.clicked() {
-    sink.push(Intent::JogStart { axis, dir, feed: state.jog_feed });
-    sink.push(Intent::JogStop);
+  // A tap too brief to register as a drag is reported as a click with no drag edges. It must NOT be bracketed as
+  // a continuous start+stop: the queued `$J=` move and the out-of-band jog-cancel (`0x85`) race at the firmware,
+  // and grblHAL drops a cancel that lands before the jog has actually begun — leaving the long move running away
+  // (then a panic Stop soft-resets mid-motion into ALARM:3). Issue one bounded step jog instead, which completes
+  // on its own and needs no cancel, so a quick nudge still moves by the last selected step.
+  if response.clicked() && !response.drag_started() {
+    sink.push(Intent::Jog { axis, dir, distance: state.jog_step, feed: state.jog_feed });
   }
 }
 
