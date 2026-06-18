@@ -19,8 +19,9 @@
 //!   UI decides whether to call [`Engine::connect`] again. Auto-reconnect/backoff is a follow-up.
 //! - **`$PBX` settings sync.** Settings exchange via `galdr-proto` is not wired here yet; the engine streams
 //!   and parses, but does not yet model the settings channel.
-//! - **Status-report field parsing.** `<...>` reports are surfaced verbatim via [`Event::Response`]; the
-//!   DRO field breakdown is a follow-up in the response layer.
+//!
+//! `<...>` status reports are surfaced verbatim via [`Event::Response`]; the reducer decodes their fields
+//! (state, position, `Pn:` pins, overrides, ...) with [`crate::protocol::parse_status`].
 
 use std::time::Duration;
 
@@ -439,6 +440,37 @@ mod tests {
     // must still go live — this is the exact bug: previously it hung in Connecting forever.
     assert!(controller.inject_line("<Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024>"));
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+  }
+
+  #[tokio::test]
+  async fn a_status_report_surfaces_its_decoded_endstop_pins_end_to_end() {
+    use crate::protocol::parse_status;
+    let (mut handle, controller) = connect();
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Connecting))).await;
+
+    // An Alarm report with all three limits tripped must reach the UI verbatim so the reducer/parser can decode
+    // X/Y/Z. We assert on the engine boundary (the `Event::Response` it forwards), then decode it as the reducer
+    // would, proving the structured pin state is recoverable end to end without a real board.
+    assert!(controller.inject_line("<Alarm|MPos:0.000,0.000,0.000|Pn:XYZ>"));
+    let event = wait_for(&mut handle, |e| matches!(e, Event::Response(Response::Status(_)))).await;
+    let Event::Response(Response::Status(body)) = event else {
+      unreachable!("matched a Status response above");
+    };
+    let pins = parse_status(&body).pin_state();
+    assert!(pins.limit_x && pins.limit_y && pins.limit_z, "all three endstops decode as asserted");
+    assert!(pins.any_xyz_limit());
+
+    // A later running report carries no `Pn:` field at all (grblHAL omits it when nothing is asserted); the
+    // decoded set must read all-clear, so the endstop chips drop back to their inactive look.
+    assert!(controller.inject_line("<Run|MPos:1.000,2.000,3.000|FS:500,0>"));
+    let event = wait_for(&mut handle, |e| {
+      matches!(e, Event::Response(Response::Status(b)) if b.starts_with("Run"))
+    }).await;
+    let Event::Response(Response::Status(body)) = event else {
+      unreachable!("matched the Run Status response above");
+    };
+    let pins = parse_status(&body).pin_state();
+    assert!(!pins.any_xyz_limit(), "an absent Pn: field clears every endstop");
   }
 
   #[tokio::test]

@@ -68,6 +68,103 @@ pub struct MachineState {
   pub substate: Option<u32>,
 }
 
+/// The decoded `Pn:` input-pin signal set: which firmware input pins are currently asserted. grblHAL reports
+/// `Pn:` as a string of single-letter signal codes listing only the ASSERTED pins, and omits the whole field
+/// when nothing is asserted — so an absent `Pn:` means every pin here is clear. We model the full grblHAL
+/// letter set (`docs/gcode-streaming.md` §4) as named booleans, with the X/Y/Z limit switches as first-class
+/// fields the endstop UI reads directly; the rotary/extra limits and the auxiliary signals (door, reset, hold,
+/// probe, e-stop, ...) are carried too so probe/door/etc. can be surfaced later without revisiting the parser.
+/// Per grblHAL's sender guidance the decode is order-independent and silently ignores letters it does not know,
+/// so a firmware that grows the signal list never breaks this struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PinState {
+  /// `X` — the X limit switch is asserted.
+  pub limit_x: bool,
+  /// `Y` — the Y limit switch is asserted.
+  pub limit_y: bool,
+  /// `Z` — the Z limit switch is asserted.
+  pub limit_z: bool,
+  /// `A` — the A (rotary) limit switch is asserted.
+  pub limit_a: bool,
+  /// `B` — the B (rotary) limit switch is asserted.
+  pub limit_b: bool,
+  /// `C` — the C (rotary) limit switch is asserted.
+  pub limit_c: bool,
+  /// `U` — the U limit switch is asserted (grblHAL extra linear axis).
+  pub limit_u: bool,
+  /// `V` — the V limit switch is asserted (grblHAL extra linear axis).
+  pub limit_v: bool,
+  /// `W` — the W limit switch is asserted (grblHAL extra linear axis).
+  pub limit_w: bool,
+  /// `P` — the probe input is asserted (triggered).
+  pub probe: bool,
+  /// `O` — the probe is reported disconnected (grblHAL probe-connected sensing).
+  pub probe_disconnected: bool,
+  /// `D` — the safety-door input is asserted (door open / interlock).
+  pub door: bool,
+  /// `R` — the reset input is asserted.
+  pub reset: bool,
+  /// `H` — the feed-hold input is asserted.
+  pub feed_hold: bool,
+  /// `S` — the cycle-start input is asserted.
+  pub cycle_start: bool,
+  /// `E` — the emergency-stop input is asserted.
+  pub e_stop: bool,
+  /// `L` — the block-delete input is asserted.
+  pub block_delete: bool,
+  /// `T` — the optional-stop input is asserted.
+  pub optional_stop: bool,
+  /// `M` — a motor warning is asserted.
+  pub motor_warning: bool,
+  /// `F` — a motor fault is asserted.
+  pub motor_fault: bool,
+  /// `Q` — single-step (single-block) input is asserted.
+  pub single_step: bool,
+}
+
+impl PinState {
+  /// Decode the asserted-pin letters of a `Pn:` field (e.g. `['X', 'Y', 'Z']`) into a typed [`PinState`].
+  /// Order-independent and forward-compatible: a letter we do not model is ignored rather than treated as an
+  /// error, and an empty iterator yields the all-clear default (mirroring an absent `Pn:` field). Letters are
+  /// matched case-sensitively, exactly as grblHAL emits them (all-uppercase).
+  pub fn from_letters<I: IntoIterator<Item = char>>(letters: I) -> Self {
+    let mut pins = PinState::default();
+    for letter in letters {
+      match letter {
+        'X' => pins.limit_x = true,
+        'Y' => pins.limit_y = true,
+        'Z' => pins.limit_z = true,
+        'A' => pins.limit_a = true,
+        'B' => pins.limit_b = true,
+        'C' => pins.limit_c = true,
+        'U' => pins.limit_u = true,
+        'V' => pins.limit_v = true,
+        'W' => pins.limit_w = true,
+        'P' => pins.probe = true,
+        'O' => pins.probe_disconnected = true,
+        'D' => pins.door = true,
+        'R' => pins.reset = true,
+        'H' => pins.feed_hold = true,
+        'S' => pins.cycle_start = true,
+        'E' => pins.e_stop = true,
+        'L' => pins.block_delete = true,
+        'T' => pins.optional_stop = true,
+        'M' => pins.motor_warning = true,
+        'F' => pins.motor_fault = true,
+        'Q' => pins.single_step = true,
+        // An unknown letter (a future grblHAL signal) is ignored, never an error — the list is expected to grow.
+        _ => {}
+      }
+    }
+    pins
+  }
+
+  /// Whether any X/Y/Z limit switch is asserted, for a single at-a-glance "an endstop is hit" signal.
+  pub fn any_xyz_limit(self) -> bool {
+    self.limit_x || self.limit_y || self.limit_z
+  }
+}
+
 /// Whether a reported position vector is machine- or work-coordinate. A report carries exactly one of the
 /// two; the other is derived via `WPos = MPos − WCO` once a [`StatusReport::wco`] is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,13 +195,23 @@ pub struct StatusReport {
   /// `Ov:` override percentages `(feed, rapid, spindle)`, each an integer percent as reported.
   pub overrides: Option<(u32, u32, u32)>,
   /// `Pn:` asserted input-pin signal letters (e.g. `P`, `X`, `D`), in report order. Empty when no `Pn:` field
-  /// (which the firmware omits entirely when nothing is asserted).
+  /// (which the firmware omits entirely when nothing is asserted). This is the raw, verbatim letter list; the
+  /// typed decode is [`StatusReport::pin_state`], which the endstop/probe/door UI reads. Both come from the
+  /// same parse, so they cannot disagree.
   pub pins: Vec<char>,
   /// `Bf:` buffer state `(planner_blocks_free, rx_bytes_free)`. Diagnostics only — never used for flow
   /// control (the host counts characters itself), but some UIs display it.
   pub buffer: Option<(u32, u32)>,
   /// `Ln:` current line number, if the running program carried line numbers.
   pub line: Option<u32>,
+}
+
+impl StatusReport {
+  /// The typed input-pin set decoded from the raw [`Self::pins`] letters. An empty `Pn:` (the firmware omits
+  /// the field when nothing is asserted) yields the all-clear default, so the UI can read this unconditionally.
+  pub fn pin_state(&self) -> PinState {
+    PinState::from_letters(self.pins.iter().copied())
+  }
 }
 
 /// Parse one status-report body (no angle brackets) into a [`StatusReport`]. Always succeeds with at least a
@@ -276,6 +383,84 @@ mod tests {
   fn collects_asserted_pin_letters() {
     let report = parse_status("Alarm|MPos:0,0,0|Pn:PXZ");
     assert_eq!(report.pins, vec!['P', 'X', 'Z']);
+  }
+
+  #[test]
+  fn decodes_all_three_xyz_limits() {
+    let pins = parse_status("Alarm|MPos:0,0,0|Pn:XYZ").pin_state();
+    assert!(pins.limit_x && pins.limit_y && pins.limit_z);
+    assert!(pins.any_xyz_limit());
+    // Nothing else should be asserted by an XYZ list.
+    assert!(!pins.probe && !pins.door && !pins.limit_a);
+  }
+
+  #[test]
+  fn decodes_a_single_limit_leaving_the_others_clear() {
+    let pins = parse_status("Alarm|MPos:0,0,0|Pn:X").pin_state();
+    assert!(pins.limit_x);
+    assert!(!pins.limit_y && !pins.limit_z);
+    assert!(pins.any_xyz_limit());
+  }
+
+  #[test]
+  fn decodes_a_mixed_limit_and_auxiliary_list() {
+    // `Pn:PXYZD` mixes the probe, the X/Y/Z limits, and the door — each must land on its own field.
+    let pins = parse_status("Alarm|MPos:0,0,0|Pn:PXYZD").pin_state();
+    assert!(pins.probe && pins.limit_x && pins.limit_y && pins.limit_z && pins.door);
+    assert!(!pins.probe_disconnected && !pins.e_stop);
+  }
+
+  #[test]
+  fn an_absent_pn_field_clears_every_pin() {
+    // grblHAL omits `Pn:` entirely when nothing is asserted, so the typed set must read all-clear.
+    let pins = parse_status("Run|MPos:0,0,0|FS:500,0").pin_state();
+    assert_eq!(pins, PinState::default());
+    assert!(!pins.any_xyz_limit());
+  }
+
+  #[test]
+  fn decodes_the_full_auxiliary_signal_set() {
+    // Exercise every modelled non-limit signal letter so the decode table cannot silently lose one.
+    let pins = parse_status("Door|MPos:0,0,0|Pn:OPDRHSELTMFQ").pin_state();
+    assert!(pins.probe_disconnected && pins.probe && pins.door && pins.reset && pins.feed_hold);
+    assert!(pins.cycle_start && pins.e_stop && pins.block_delete && pins.optional_stop);
+    assert!(pins.motor_warning && pins.motor_fault && pins.single_step);
+    // No limit letter was present, so the X/Y/Z limits stay clear.
+    assert!(!pins.any_xyz_limit());
+  }
+
+  #[test]
+  fn decodes_the_rotary_and_extra_limit_letters() {
+    let pins = parse_status("Alarm|MPos:0,0,0|Pn:ABCUVW").pin_state();
+    assert!(pins.limit_a && pins.limit_b && pins.limit_c);
+    assert!(pins.limit_u && pins.limit_v && pins.limit_w);
+    // These are not X/Y/Z, so the at-a-glance XYZ summary stays false.
+    assert!(!pins.any_xyz_limit());
+  }
+
+  #[test]
+  fn pin_decode_is_order_independent() {
+    // The wire order of the letters must not matter — `ZYX` decodes identically to `XYZ`.
+    assert_eq!(parse_status("Alarm|MPos:0,0,0|Pn:ZYX").pin_state(),
+      parse_status("Alarm|MPos:0,0,0|Pn:XYZ").pin_state());
+  }
+
+  #[test]
+  fn unknown_pin_letters_are_ignored_not_fatal() {
+    // A future signal letter (`K`, here) must be ignored while the known letters around it still decode — the
+    // list is expected to grow, so an unmodelled code is never an error.
+    let pins = parse_status("Alarm|MPos:0,0,0|Pn:XKY").pin_state();
+    assert!(pins.limit_x && pins.limit_y);
+    assert!(!pins.limit_z);
+  }
+
+  #[test]
+  fn pin_state_survives_an_odd_field_order() {
+    // The `Pn:` field may arrive anywhere after the (fixed) state + position, so decode it from a report whose
+    // tags are shuffled — order-independence at the report level, not just within the letter list.
+    let pins = parse_status("Run|WPos:0,0,0|Ov:100,100,100|Pn:Z|FS:0,0|WCO:0,0,0").pin_state();
+    assert!(pins.limit_z);
+    assert!(!pins.limit_x && !pins.limit_y);
   }
 
   #[test]

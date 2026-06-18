@@ -241,6 +241,21 @@ pub struct HardLimitDecision {
   pub alarm: bool,
 }
 
+/// Pack a per-axis logical-triggered array into the published `Pn:` limit bitmask: `bit0 = X`, `bit1 = Y`,
+/// `bit2 = Z`. This is the SINGLE definition of that bit layout's encode side; the firmware decodes it with the
+/// mirrored shift in `comms::limit_levels()`. Pass the post-`$5` logical state — typically
+/// [`HardLimitDecision::triggered`] from the same sample that drove the alarm — so the published mask and the
+/// alarm decision are one coherent sample of the switches rather than two independent reads.
+pub fn pack_limit_mask(triggered: [bool; AXES]) -> u8 {
+  let mut mask = 0u8;
+  for (axis, &t) in triggered.iter().enumerate() {
+    if t {
+      mask |= 1 << axis;
+    }
+  }
+  mask
+}
+
 /// Run the full single-axis homing cycle for `axis`: fast SEEK (`$25`) into the switch, PULL-OFF (`$27`) to
 /// release it, slow LOCATE (`$24`) re-approach for the repeatable trigger, then a FINAL PULL-OFF so the axis
 /// ends clear of the switch (research findings #3/#4). Each seek/locate walks one tick per burst through the
@@ -558,6 +573,29 @@ mod tests {
     let d = hard_limit_alarm([false, false, false], &inverted, true, false);
     assert_eq!(d.triggered, [true, true, true], "$5=1 makes a low pin read triggered");
     assert!(d.alarm);
+  }
+
+  #[test]
+  fn pack_limit_mask_uses_bit0_x_bit1_y_bit2_z() {
+    // The published `Pn:` layout is bit0 = X, bit1 = Y, bit2 = Z; assert each axis maps to its own bit.
+    assert_eq!(pack_limit_mask([false, false, false]), 0b000, "nothing triggered = 0");
+    assert_eq!(pack_limit_mask([true, false, false]), 0b001, "X => bit0");
+    assert_eq!(pack_limit_mask([false, true, false]), 0b010, "Y => bit1");
+    assert_eq!(pack_limit_mask([false, false, true]), 0b100, "Z => bit2");
+    assert_eq!(pack_limit_mask([true, true, true]), 0b111, "all three set");
+  }
+
+  #[test]
+  fn pack_limit_mask_packs_the_hard_limit_decision_triggered_array() {
+    // The single-sample coherence guarantee: the same `raw_high` that drives the alarm also drives the published
+    // mask, by packing `HardLimitDecision::triggered` (the post-`$5` logical state) straight into the bitmask.
+    let cfg = LimitConfig::default(); // NC: HIGH = triggered.
+    let d = hard_limit_alarm([false, true, false], &cfg, true, false);
+    assert_eq!(pack_limit_mask(d.triggered), 0b010, "Y trip packs to bit1");
+    // Under `$5=1` the logical sense flips, and the packed mask must follow that inverted (logical) state.
+    let inverted = LimitConfig { invert: true };
+    let d = hard_limit_alarm([false, false, false], &inverted, true, false);
+    assert_eq!(pack_limit_mask(d.triggered), 0b111, "$5=1 makes all-low read as all-triggered");
   }
 
   #[test]

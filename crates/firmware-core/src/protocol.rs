@@ -3033,6 +3033,62 @@ mod tests {
     assert_eq!(s.as_str(), "Y");
   }
 
+  #[test]
+  fn pin_report_x_limit_only() {
+    // The lowest limit bit on its own: the bin's `LIMIT_LEVELS` bit0 (X) asserted maps to a bare `X`.
+    let pins = PinReport { limits: [true, false, false], ..PinReport::new_idle() };
+    let mut s = String::<32>::new();
+    pins.write_letters(&mut s).unwrap();
+    assert_eq!(s.as_str(), "X");
+  }
+
+  #[test]
+  fn pin_report_z_limit_only() {
+    // The highest limit bit on its own (the common Z-probe / Z-min over-travel case): a bare `Z`.
+    let pins = PinReport { limits: [false, false, true], ..PinReport::new_idle() };
+    let mut s = String::<32>::new();
+    pins.write_letters(&mut s).unwrap();
+    assert_eq!(s.as_str(), "Z");
+  }
+
+  #[test]
+  fn pin_report_x_and_z_limits_skip_y() {
+    // A non-contiguous limit mask (X+Z, Y released) must emit the letters in axis order with no `Y` between them.
+    let pins = PinReport { limits: [true, false, true], ..PinReport::new_idle() };
+    let mut s = String::<32>::new();
+    pins.write_letters(&mut s).unwrap();
+    assert_eq!(s.as_str(), "XZ");
+  }
+
+  #[test]
+  fn pin_report_probe_and_limits_combine_in_order() {
+    // The probe plus two limits: the probe `P` precedes the limit letters in grbl's documented order.
+    let pins = PinReport { probe: true, limits: [true, true, false], ..PinReport::new_idle() };
+    let mut s = String::<32>::new();
+    pins.write_letters(&mut s).unwrap();
+    assert_eq!(s.as_str(), "PXY");
+  }
+
+  #[test]
+  fn status_report_renders_multiple_limit_letters() {
+    // Wire-level: a `Run` report with X+Z limits asserted (no probe) carries `Pn:XZ` in the documented slot,
+    // after `Bf:` and before `Ov:`. This is the path a host (skirnir) parses to light its endstop indicators.
+    let snap = MachineSnapshot {
+      state: MachineState::Run,
+      feed_mm_min: 500.0,
+      spindle_rpm: 0,
+      pins: PinReport { limits: [true, false, true], ..PinReport::new_idle() },
+      include_ov: false,
+      ..MachineSnapshot::idle()
+    };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::status_report(&mut s, &snap).unwrap();
+    assert_eq!(
+      s.as_str(),
+      "<Run|MPos:0.000,0.000,0.000|FS:500,0|Bf:32,1024|Pn:XZ|WCO:0.000,0.000,0.000>\r\n",
+    );
+  }
+
   // --- Phase E: status report carries override-scaled FS:, Pn:, and Ov: -----------------------------
 
   #[test]

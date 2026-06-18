@@ -53,7 +53,7 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rmt::{Channel, PulseCode, Tx, TxChannelConfig, TxChannelCreator};
 use esp_hal::Blocking;
 use embassy_futures::select::{select, select4, Either, Either4};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 
 use firmware_core::hal_traits::{
   probe_triggered, DigitalIn, DirState, ProbeConfig, ProbeInput, StepError, StepEvent, StepSink,
@@ -65,8 +65,8 @@ use firmware_core::planner::{Block, Planner, AXES};
 
 use crate::comms::{
   overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HARD_LIMITS_ENABLED,
-  HARD_LIMIT_TRIPPED, HOLD_REQUESTED, HOLD_WAKE, HOMING_ACTIVE, HOME_REQUEST, HOME_RESULT, LIMIT_TRIGGERED,
-  LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
+  HARD_LIMIT_TRIPPED, HOLD_REQUESTED, HOLD_WAKE, HOMING_ACTIVE, HOME_REQUEST, HOME_RESULT, LIMIT_LEVELS,
+  LIMIT_TRIGGERED, LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
   MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT,
 };
 
@@ -398,6 +398,14 @@ pub async fn run(
   // The most-restrictive axis max-rate in mm/s — the conservative ceiling the Phase-E feed-override scale-up is
   // clamped to (squared, since the generator reasons in v²), so a boosted feed never exceeds `$110-112`.
   let max_rate_mm_s = min_max_rate_mm_s(&max_rate_mm_min);
+  // A steady idle-cadence ticker for the `Pn:` limit-level publish (DOC-06 / DOC-08). It races the empty-queue
+  // `select` below so a switch RELEASE while the machine sits idle is reflected within one tick: the idle limit
+  // detector only ever wakes on a rising edge (a press), never on a release, so without this periodic level
+  // sample a released switch would leave a stale `Pn:X/Y/Z` latched forever. The ticker is created ONCE here (so
+  // its period stays steady across loop turns) and only ever advanced from the empty-queue idle arm — it adds NO
+  // work to the real-time burst path, which never touches it. ~50 ms keeps the reported state well inside the
+  // ~100 ms freshness budget while costing only three GPIO reads + one atomic store per tick at idle.
+  let mut limit_ticker = Ticker::every(Duration::from_millis(50));
   // The executor task is alive and entering its drain loop on core 1. If THIS line never appears over RTT, the
   // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
   mtrace!("motion: executor loop entered");
@@ -485,14 +493,16 @@ pub async fn run(
         // blocks on the result, so no block ever follows it out of order. The outer `select` consumes the homing
         // request inline (running the whole cycle) rather than looping back, exactly as the probe arm does.
         let idle = select4(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait(), HOLD_WAKE.wait(), PROBE_REQUEST.wait());
-        // Race the four idle wakes against a `$H` homing request AND a debounced limit rising-edge trip (so a
-        // switch pressed while the machine sits idle still raises the hard-limit alarm, DOC-06 / finding #1).
-        // `wait_for_limit_trip` is the genuine interrupt-driven edge wait + `$26` resample, and it SIGNALS
-        // `LIMIT_TRIGGERED` once a confirmed trip is observed, so that documented seam now has a real producer.
+        // Race the four idle wakes against a `$H` homing request, a debounced limit rising-edge trip (so a switch
+        // PRESSED while the machine sits idle still raises the hard-limit alarm, DOC-06 / finding #1), AND the
+        // limit-level ticker (so a switch RELEASE while idle is reflected in `Pn:` within one tick — the edge wait
+        // never fires on release). `wait_for_limit_trip` is the genuine interrupt-driven edge wait + `$26` resample
+        // and SIGNALS `LIMIT_TRIGGERED` on a confirmed trip; the ticker only ever PUBLISHES the live level mask.
         // Nested `select`s keep each arm typed.
-        match select(select(idle, HOME_REQUEST.wait()), wait_for_limit_trip(limits)).await {
-          Either::First(Either::First(Either4::First(()))) => mtrace!("motion: woke on BLOCK_AVAILABLE"),
-          Either::First(Either::First(Either4::Second(()))) => {
+        let edge_or_home = select(select(idle, HOME_REQUEST.wait()), wait_for_limit_trip(limits));
+        match select(edge_or_home, limit_ticker.next()).await {
+          Either::First(Either::First(Either::First(Either4::First(())))) => mtrace!("motion: woke on BLOCK_AVAILABLE"),
+          Either::First(Either::First(Either::First(Either4::Second(())))) => {
             mtrace!("motion: woke on MOTION_RESET (idle)");
             MOTION_RESET_PENDING.store(false, Ordering::Release);
             reset_live_position(&mut counter);
@@ -500,14 +510,19 @@ pub async fn run(
           // A hold-level change while idle: loop back so the top-of-loop hold check re-reads the LEVEL and parks
           // if it is set (or simply proceeds if a spurious wake found it clear). Re-reading the level — never
           // acting on the edge — is the Finding #11 invariant.
-          Either::First(Either::First(Either4::Third(()))) => mtrace!("motion: woke on HOLD_WAKE (idle)"),
-          Either::First(Either::First(Either4::Fourth(request))) => {
+          Either::First(Either::First(Either::First(Either4::Third(())))) => mtrace!("motion: woke on HOLD_WAKE (idle)"),
+          Either::First(Either::First(Either::First(Either4::Fourth(request)))) => {
             run_probe(&prober, &request, probe, sink, &mut counter)
           }
-          Either::First(Either::Second(config)) => run_homing(&config, limits, sink, &mut counter),
+          Either::First(Either::First(Either::Second(config))) => run_homing(&config, limits, sink, &mut counter),
           // A debounced limit rising-edge trip while idle: sample the switches and raise the hard-limit alarm if
           // due (DOC-06). `wait_for_limit_trip` already applied the `$26` debounce and signalled `LIMIT_TRIGGERED`.
-          Either::Second(()) => check_hard_limits(limits),
+          // `check_hard_limits` also refreshes the published `Pn:` mask from the freshly-sampled levels.
+          Either::First(Either::Second(())) => check_hard_limits(limits),
+          // The idle limit-level tick: republish the live `Pn:` mask from a level sample so a RELEASE (or a press
+          // too subtle to confirm at the debounce, e.g. a switch held without over-travel) is reflected within
+          // one tick. Pure publish — no alarm decision here; that stays on the debounced edge path above.
+          Either::Second(()) => publish_limit_levels(limits),
         }
       }
     }
@@ -767,6 +782,9 @@ fn run_homing(config: &HomingConfig, limits: &mut [RmtLimitInput; AXES], sink: &
   }
 
   EXECUTOR_RUNNING.store(false, Ordering::Release);
+  // Refresh the published `Pn:` limit mask from the settled post-pull-off levels: a cycle that finishes with the
+  // switches released (the normal case) must clear any `Pn:X/Y/Z` the in-cycle trips would otherwise have left.
+  publish_limit_levels(limits);
   HOME_RESULT.signal(result);
 }
 
@@ -826,10 +844,17 @@ fn check_hard_limits(limits: &[RmtLimitInput; AXES]) {
   let config = crate::comms::limit_config();
   let enabled = HARD_LIMITS_ENABLED.load(Ordering::Relaxed);
   let homing = HOMING_ACTIVE.load(Ordering::Acquire);
-  // Build the per-axis raw-level array positionally from the inputs (finding #6): `from_fn` over `AXES` cannot
-  // silently desync from the axis count/order the way a hardcoded `[0, 1, 2]` index list could.
+  // Sample the raw pin levels ONCE for this call (finding #6): `from_fn` over `AXES` cannot silently desync from
+  // the axis count/order the way a hardcoded `[0, 1, 2]` index list could. Both the alarm decision AND the
+  // published `Pn:` mask are derived from this single sample, so they are one coherent read of the same instant.
   let raw_high: [bool; AXES] = core::array::from_fn(|i| limits[i].is_high());
+  // `hard_limit_alarm` applies the `$5` invert internally, returning the post-`$5` logical-triggered array. Feed
+  // the RAW levels here (NOT pre-inverted) and reuse `decision.triggered` for the published mask below — packing
+  // it through `pack_limit_mask` keeps the published `Pn:` state the logical (post-`$5`) view, no double-invert.
   let decision = firmware_core::homing::hard_limit_alarm(raw_high, &config, enabled, homing);
+  // Refresh the published `Pn:` limit mask from this same sample, so the host's endstop view is current the
+  // instant motion stops — not only after the next idle tick — and it agrees exactly with the alarm decision.
+  LIMIT_LEVELS.store(firmware_core::homing::pack_limit_mask(decision.triggered), Ordering::Release);
   if decision.alarm {
     // A limit tripped during normal motion with `$21` on: halt and raise `ALARM:1`. The consumer locks the
     // alarm (position is likely lost from the abrupt stop) and resets the pipeline; the executor's reset path
@@ -945,6 +970,25 @@ fn publish_live_position(counter: &StepCounter) {
   for axis in 0..AXES {
     LIVE_POSITION[axis].store(position[axis], Ordering::Release);
   }
+}
+
+/// Sample the three X/Y/Z limit pins and publish their LOGICAL-triggered state into the cross-core
+/// [`LIMIT_LEVELS`](crate::comms::LIMIT_LEVELS) bitmask for the core-0 `Pn:` reader (DOC-06 / DOC-08). Reads the
+/// raw levels, applies the live `$5` invert + NC fail-safe via the host-tested
+/// [`limit_triggered`](firmware_core::hal_traits::limit_triggered), packs them as `bit0 = X`, `bit1 = Y`,
+/// `bit2 = Z`, and `Release`-stores the mask (pairing with the reader's `Acquire`). It reads LEVELS, not edges, so
+/// calling it tracks both press and release — this is the SINGLE writer of the published limit state. Called from
+/// every point that already samples the pins ([`check_hard_limits`] at block boundaries / on the idle trip,
+/// post-homing) and from the idle `Ticker` so a release at idle is reflected within one tick. Synchronous and
+/// allocation-free: the idle-tick call adds no work to the real-time burst path, which never invokes it.
+fn publish_limit_levels(limits: &[RmtLimitInput; AXES]) {
+  let config = crate::comms::limit_config();
+  // Sample each pin once and apply the `$5` invert + NC fail-safe to get the logical-triggered state, then pack
+  // it through the host-tested [`pack_limit_mask`](firmware_core::homing::pack_limit_mask) so the bit layout has
+  // a single definition shared with [`check_hard_limits`] and the `comms::limit_levels()` decode.
+  let triggered: [bool; AXES] =
+    core::array::from_fn(|axis| firmware_core::hal_traits::limit_triggered(limits[axis].is_high(), &config));
+  LIMIT_LEVELS.store(firmware_core::homing::pack_limit_mask(triggered), Ordering::Release);
 }
 
 /// Configure the three RMT TX step channels (ch0/1/2 on GPIO1/2/4) and the three DIR outputs (GPIO5/6/7),

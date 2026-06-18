@@ -13,7 +13,7 @@ use super::settings_model::SettingsModel;
 use crate::engine::Event;
 use crate::error::TransportError;
 use crate::protocol::{
-  ConnectionState, PositionKind, Response, SettingValue, StatusReport, parse_setting_meta, parse_status,
+  ConnectionState, PinState, PositionKind, Response, SettingValue, StatusReport, parse_setting_meta, parse_status,
 };
 
 /// How many console lines to retain. The console is a diagnostic tail, not a transcript — capping it bounds
@@ -79,6 +79,11 @@ pub struct ViewState {
   pub connection: ConnectionState,
   /// The most recent parsed status report, if any has arrived since connect. Drives the DRO/overrides/pins.
   pub status: Option<StatusReport>,
+  /// The typed input-pin set decoded once when each status report is ingested, so the endstop/probe/door UI can
+  /// read it on every immediate-mode frame without re-running [`PinState::from_letters`] over the raw letters. An
+  /// absent or empty `Pn:` (the firmware omits the field when nothing is asserted) leaves this at its all-clear
+  /// default, so the renderer can read it unconditionally.
+  pub pins: PinState,
   /// The last-seen `WCO:` vector, cached across reports (grbl pushes it only intermittently) so we can always
   /// derive the position kind the current report did not carry.
   pub last_wco: Vec<f64>,
@@ -102,6 +107,7 @@ impl Default for ViewState {
     ViewState {
       connection: ConnectionState::Disconnected,
       status: None,
+      pins: PinState::default(),
       last_wco: Vec::new(),
       progress: Progress::default(),
       banner: None,
@@ -219,6 +225,10 @@ impl ViewState {
         if let Some(wco) = &report.wco {
           self.last_wco = wco.clone();
         }
+        // Decode the input pins once here rather than on every render frame: the ~21-arm letter match runs at the
+        // status-report rate (a few Hz) instead of the egui repaint rate (continuous), and the endstop chips just
+        // read the cached typed value.
+        self.pins = report.pin_state();
         self.status = Some(report);
         // Status reports are high-frequency telemetry; echoing each to the console would drown it. Skip them.
         return;
@@ -252,6 +262,9 @@ impl ViewState {
     self.connection = ConnectionState::Disconnected;
     self.progress = Progress::default();
     self.status = None;
+    // Drop the cached pin state with the report it came from, so a reconnect does not show the old board's
+    // endstops asserted before its first status report arrives.
+    self.pins = PinState::default();
     // Drop the cached WCO so a reconnect does not show "WCO set" or derive WPos/MPos from a stale offset before
     // the new session reports its own. Report-derived state must not survive across a disconnect.
     self.last_wco.clear();
@@ -357,6 +370,28 @@ mod tests {
     let (machine, work) = view.dro();
     assert_eq!(machine, Some(vec![1.0, 2.0, 3.0]));
     assert_eq!(work, None);
+  }
+
+  #[test]
+  fn ingesting_a_status_report_caches_the_decoded_pin_state() {
+    let mut view = ViewState::default();
+    // No report yet: the cached pin state reads all-clear so the endstop chips can render unconditionally.
+    assert_eq!(view.pins, PinState::default());
+    // A `Pn:XYZ` report must leave the typed pin state cached, decoded once, ready for per-frame reads.
+    feed_status(&mut view, "Alarm|MPos:0,0,0|Pn:XYZ");
+    assert!(view.pins.limit_x && view.pins.limit_y && view.pins.limit_z, "X/Y/Z limits must be cached as asserted");
+    // A later report without a `Pn:` field clears the cache (nothing asserted), matching the firmware's omission.
+    feed_status(&mut view, "Idle|MPos:0,0,0");
+    assert_eq!(view.pins, PinState::default(), "an absent Pn: field must clear the cached pin state");
+  }
+
+  #[test]
+  fn disconnect_clears_the_cached_pin_state() {
+    let mut view = ViewState::default();
+    feed_status(&mut view, "Alarm|MPos:0,0,0|Pn:Z");
+    assert!(view.pins.limit_z);
+    view.apply(Event::Disconnected(None));
+    assert_eq!(view.pins, PinState::default(), "cached pin state must not survive a disconnect");
   }
 
   #[test]

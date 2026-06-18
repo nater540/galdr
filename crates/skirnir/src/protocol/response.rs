@@ -19,8 +19,10 @@ pub enum Response {
   /// `ALARM:N` — the controller entered an alarm state and will refuse G-code until cleared.
   Alarm(u32),
 
-  /// `<...>` real-time status report. Carried verbatim (sans angle brackets) for now; field parsing is a
-  /// follow-up. The engine uses its arrival to keep the DRO/lifecycle fresh.
+  /// `<...>` real-time status report, carried verbatim (sans angle brackets). The engine uses its arrival to
+  /// keep the lifecycle fresh; consumers decode the fields (state/position/`Pn:` pins/overrides/...) with
+  /// [`crate::protocol::parse_status`], whose [`crate::protocol::StatusReport::pin_state`] yields the typed
+  /// endstop/probe/door signal set.
   Status(String),
 
   /// `[...]` bracketed push message (banner info, `[MSG:]`, `[PRB:]`, `[OPT:]`, `[G54:]`, ...). Carried

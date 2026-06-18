@@ -177,6 +177,30 @@ pub static MOTION_RESET_PENDING: core::sync::atomic::AtomicBool = core::sync::at
 /// the report stays in the host-tested [`steps_to_mm`].
 pub static LIVE_POSITION: [AtomicI32; AXES] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
 
+/// The live LOGICAL limit-switch state as a per-axis bitmask (`bit0 = X`, `bit1 = Y`, `bit2 = Z`), published by
+/// the core-1 motion executor and read by [`status_responder`] to source the `Pn:` X/Y/Z letters (DOC-06 / DOC-08).
+/// Each bit is the TRIGGERED state AFTER the live `$5` invert (and the NC fail-safe) is applied at write time
+/// through the host-tested [`limit_triggered`](firmware_core::hal_traits::limit_triggered) — exactly mirroring how
+/// [`PROBE_ASSERTED`] stores the post-`$6`-invert logical probe state, so the reader carries no settings or
+/// electrical knowledge and the `Pn:` letter assembly stays the pure, host-tested [`PinReport`] path. A single
+/// `AtomicU8` is a native lock-free cross-core publish on the S3 (`Release` store / `Acquire` load).
+///
+/// CRITICAL — this tracks RELEASE, not just assert. The idle limit detector parks on `wait_for_rising_edge`, which
+/// fires only on a press and NEVER on a release, so publishing solely on that edge would latch a stale "triggered"
+/// forever after the switch opens. The executor instead republishes this mask from a level SAMPLE at every point it
+/// already reads the pins — each idle `Ticker` tick (~50 ms), every block boundary, and after homing — so the
+/// reported state follows both press and release within one tick at idle, with NO work added to the real-time
+/// burst path (the tick arm runs only in the empty-queue idle `select`). Defaults to `0` (nothing triggered).
+pub static LIMIT_LEVELS: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Decode the [`LIMIT_LEVELS`] bitmask into the per-axis `[X, Y, Z]` logical-triggered array the [`PinReport`]
+/// expects. An `Acquire` load pairs with the executor's `Release` publish so the core-0 reader sees a coherent
+/// mask. Kept beside the static so the bit layout (`bit0 = X`, `bit1 = Y`, `bit2 = Z`) has a single definition.
+pub fn limit_levels() -> [bool; AXES] {
+  let mask = LIMIT_LEVELS.load(Ordering::Acquire);
+  core::array::from_fn(|axis| mask & (1 << axis) != 0)
+}
+
 /// Planner → motion-executor readiness signal (DOC-01). Set by [`plan_command`] after it enqueues a motion
 /// block, so the core-1 `motion_executor` can AWAIT a fresh block when it finds the queue empty instead of
 /// polling (the Stage-1 stub polled, which the review flagged). Living here in the bin keeps the pure
@@ -2664,14 +2688,15 @@ pub async fn status_responder() -> ! {
     };
     let programmed_rpm = PROGRAMMED_SPINDLE_RPM.load(Ordering::Acquire).min(u16::MAX as u32) as u16;
     snap.spindle_rpm = ov.scaled_rpm(programmed_rpm);
-    // `Pn:` input pins. The probe is the one input wired today (Phase C); its last-sampled logical asserted state
-    // (after `$6` invert, published by the probe cycle) sources `Pn:P`. The limit / door / control inputs are
-    // DOC-06 hardware that is not wired yet, so they stay `false` — a clean stub whose assembly logic is complete
-    // and host-tested, so wiring a real `DigitalIn` is a one-line change here.
+    // `Pn:` input pins. The probe sources `Pn:P` from its last-sampled logical asserted state (after `$6` invert,
+    // published by the probe cycle). X/Y/Z limits source from [`LIMIT_LEVELS`] — the logical-triggered mask (after
+    // `$5` invert) the core-1 executor republishes from a level sample at idle (the `Ticker`), at every block
+    // boundary, and post-homing, so it tracks both press AND release. Door / feed-hold / reset / cycle-start are
+    // optional DOC-06 control-input GPIO that this board does not wire, so they stay `false`; the assembly handles
+    // them when a future board sources them — the path is the same host-tested [`PinReport::write_letters`].
     snap.pins = PinReport {
       probe: PROBE_ASSERTED.load(Ordering::Acquire),
-      // TODO(DOC-06): source X/Y/Z limits, door, feed-hold, reset/e-stop, and cycle-start from the `DigitalIn`
-      // GPIO inputs (with `$5`/`$14` invert handling) once the limit/control-input backend lands.
+      limits: limit_levels(),
       ..PinReport::new_idle()
     };
     // Compose the reported State from the authoritative latched control mode plus whether a block is in

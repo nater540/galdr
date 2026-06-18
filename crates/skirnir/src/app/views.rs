@@ -241,6 +241,23 @@ fn header_title(ui: &mut egui::Ui, title: &str) {
   ui.label(text);
 }
 
+/// The shared "state-toggled chip" frame: a filled, single-pixel-stroked, control-radius inset that both the
+/// machine-state badge and the endstop chips draw. Centralising it keeps the chip theme contract (1px stroke,
+/// [`Metrics::CONTROL_RADIUS`] corners) in one place; callers pass the asserted/clear `fill`/`border`, the inner
+/// margin (badges and endstop chips pad differently), and the chip's content. Visual output is identical to the
+/// per-site frames it replaces.
+fn chip_frame(
+  ui: &mut egui::Ui, fill: Color32, border: Color32, margin: egui::Margin,
+  content: impl FnOnce(&mut egui::Ui),
+) {
+  egui::Frame::new()
+    .fill(fill)
+    .stroke(egui::Stroke::new(1.0, border))
+    .inner_margin(margin)
+    .corner_radius(Metrics::CONTROL_RADIUS)
+    .show(ui, content);
+}
+
 /// Draw the machine-state badge: a coloured dot, the uppercase label, and (when streaming) the feed/speed
 /// suffix. The dot colour is the *second* signal; the label is primary, per the design.
 fn state_badge(ui: &mut egui::Ui, view: &ViewState) {
@@ -250,26 +267,22 @@ fn state_badge(ui: &mut egui::Ui, view: &ViewState) {
     BadgeState::Alarm | BadgeState::Error => (Theme::ALARM_BG, Theme::ALARM_BORDER, Theme::ALARM_TEXT),
     _ => (Theme::INSET, color.gamma_multiply(0.5), Theme::TEXT),
   };
-  egui::Frame::new()
-    .fill(fill)
-    .stroke(egui::Stroke::new(1.0, border))
-    .inner_margin(egui::Margin { left: Metrics::BADGE_PAD.x as i8, right: Metrics::BADGE_PAD.x as i8,
-      top: Metrics::BADGE_PAD.y as i8, bottom: Metrics::BADGE_PAD.y as i8 })
-    .corner_radius(Metrics::CONTROL_RADIUS)
-    .show(ui, |ui| {
-      ui.horizontal(|ui| {
-        dot(ui, color, Metrics::BADGE_DOT);
-        ui.add_space(2.0);
-        ui.label(RichText::new(state.label()).color(text_color).strong());
-        // The realized feed/speed rides along on the badge while a report is in hand and the machine is moving.
-        if matches!(state, BadgeState::Run | BadgeState::Jog)
-          && let Some((feed, rpm, _)) = view.status.as_ref().and_then(|s| s.feed_speed)
-        {
-          ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5)
-            .color(Theme::TEXT_DIM));
-        }
-      });
+  let margin = egui::Margin { left: Metrics::BADGE_PAD.x as i8, right: Metrics::BADGE_PAD.x as i8,
+    top: Metrics::BADGE_PAD.y as i8, bottom: Metrics::BADGE_PAD.y as i8 };
+  chip_frame(ui, fill, border, margin, |ui| {
+    ui.horizontal(|ui| {
+      dot(ui, color, Metrics::BADGE_DOT);
+      ui.add_space(2.0);
+      ui.label(RichText::new(state.label()).color(text_color).strong());
+      // The realized feed/speed rides along on the badge while a report is in hand and the machine is moving.
+      if matches!(state, BadgeState::Run | BadgeState::Jog)
+        && let Some((feed, rpm, _)) = view.status.as_ref().and_then(|s| s.feed_speed)
+      {
+        ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5)
+          .color(Theme::TEXT_DIM));
+      }
     });
+  });
 }
 
 /// Paint a small filled circle inline (a state dot), advancing the cursor by its diameter.
@@ -475,13 +488,50 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       });
   }
 
-  if let Some(status) = &view.status
-    && !status.pins.is_empty()
-  {
-    let pins: String = status.pins.iter().collect();
-    ui.add_space(4.0);
-    ui.label(RichText::new(format!("Pins: {pins}")).color(Theme::WARN));
-  }
+  // Endstop indicator row: three tight X/Y/Z chips that light red when the corresponding limit switch is
+  // asserted in the latest `Pn:` field, and sit dim/inset when clear. Only the X/Y/Z limits are surfaced for
+  // now, but the parsed `PinState` carries the full grblHAL signal set so probe/door/etc. can join this row
+  // later without reopening the parser. Drawn unconditionally so the operator always has an endstop reference;
+  // with no report (or an absent `Pn:`) all three read clear.
+  ui.add_space(6.0);
+  endstop_chips(ui, view);
+  });
+}
+
+/// Render the X/Y/Z endstop indicator chips. Each chip lights red while its limit switch is asserted in the
+/// latest status report and sits dim/inset when clear. Kept deliberately tight — a small per-row item spacing
+/// and chip inset so the three chips plus the `LIMITS` label never overflow the fixed 268px left column (the
+/// panel-overflow lesson). The lit-vs-clear decision comes from the typed [`ViewState::pins`], decoded once when
+/// each status report is ingested rather than re-parsed per frame, so this stays a dumb renderer.
+fn endstop_chips(ui: &mut egui::Ui, view: &ViewState) {
+  let pins = view.pins;
+  ui.horizontal(|ui| {
+    ui.spacing_mut().item_spacing.x = 4.0;
+    ui.label(RichText::new("LIMITS").size(Metrics::HEADER_TEXT).color(Theme::TEXT_DIM)
+      .extra_letter_spacing(Metrics::HEADER_TEXT * Metrics::HEADER_TRACKING_EM));
+    for (letter, asserted) in [("X", pins.limit_x), ("Y", pins.limit_y), ("Z", pins.limit_z)] {
+      endstop_chip(ui, letter, asserted);
+    }
+  });
+}
+
+/// Draw one endstop chip: a small rounded inset with the axis letter, filled with the alarm surface and
+/// labelled in alarm text while asserted, dim/inset while clear. Sized tight (a 6/2 inner margin, no button
+/// chrome) so three fit the left column alongside the `LIMITS` label.
+fn endstop_chip(ui: &mut egui::Ui, letter: &str, asserted: bool) {
+  let (fill, text) = if asserted {
+    (Theme::ALARM_BG, Theme::ALARM_TEXT)
+  } else {
+    (Theme::INSET, Theme::TEXT_DISABLED)
+  };
+  let border = if asserted { Theme::ALARM_BORDER } else { Theme::DIVIDER };
+  // Tight 6/2 inner margin so three chips plus the `LIMITS` label fit the fixed 268px column (overflow lesson).
+  chip_frame(ui, fill, border, egui::Margin { left: 6, right: 6, top: 2, bottom: 2 }, |ui| {
+    let mut label = RichText::new(letter).monospace().size(11.0).color(text);
+    if asserted {
+      label = label.strong();
+    }
+    ui.label(label).on_hover_text(if asserted { "Limit switch asserted" } else { "Limit clear" });
   });
 }
 
