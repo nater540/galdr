@@ -212,6 +212,11 @@ static STEP_SINK: StaticCell<motion::RmtStepSink> = StaticCell::new();
 /// would release it). Borrowed mutably by the `motion_executor` task, which samples it during a `G38.x` cycle.
 static PROBE_INPUT: StaticCell<motion::RmtProbeInput> = StaticCell::new();
 
+/// The X/Y/Z LIMIT inputs (GPIO10/11/12), owned for the program's lifetime so the pins stay configured with
+/// their pull-ups. Borrowed mutably by the `motion_executor` task, which samples them during a `$H` homing cycle
+/// (DOC-06). The hard-limit monitor reads the same pins for the runtime `$21` alarm path.
+static LIMIT_INPUTS: StaticCell<[motion::RmtLimitInput; firmware_core::planner::AXES]> = StaticCell::new();
+
 /// The STEP_EN (GPIO8) output, parked in a `StaticCell` so the pin stays driven for the program's lifetime
 /// (dropping the `Output` would release the pin and let the drivers float). Driven enabled (low) at init.
 static STEP_ENABLE: StaticCell<esp_hal::gpio::Output<'static>> = StaticCell::new();
@@ -230,10 +235,11 @@ static FLASH: StaticCell<storage::SharedFlash> = StaticCell::new();
 async fn motion_executor(
   sink: &'static mut motion::RmtStepSink,
   probe: &'static mut motion::RmtProbeInput,
+  limits: &'static mut [motion::RmtLimitInput; firmware_core::planner::AXES],
   config: MotionConfig,
   max_rate_mm_min: [f32; firmware_core::planner::AXES],
 ) -> ! {
-  motion::run(sink, probe, config, max_rate_mm_min).await
+  motion::run(sink, probe, limits, config, max_rate_mm_min).await
 }
 
 /// Async entry point. `#[esp_rtos::main]` expands to an `#[esp_hal::main]` reset handler that builds the
@@ -271,7 +277,7 @@ async fn main(spawner: Spawner) {
   let planner_config = settings.planner_config();
   let motion_config = settings.motion_config(MOTION_TICK_HZ);
   let tmc_config = settings.tmc_config();
-  let homing_enabled = settings.homing_enable;
+  let homing_enabled = settings.homing_enabled();
   // Phase F: capture the persisted `$481` auto-report interval (clamped) before `settings` is moved into the
   // shared cell, so the auto-report task starts at the configured cadence.
   let auto_report_interval = settings.auto_report_interval_ms();
@@ -283,6 +289,9 @@ async fn main(spawner: Spawner) {
   // required) when homing is enabled — a host must `$H`/`$X` before streaming — else boots Idle. The boot
   // `ALARM:N` push is emitted after the banner below so a sender detects the locked state on connect.
   comms::init_control_state(homing_enabled);
+  // Seed the `$21` hard-limit-enable mirror so the core-1 executor's hard-limit check reads the persisted state
+  // (DOC-06). The limit inputs are configured above; the executor samples them at block boundaries / on the ISR.
+  comms::init_limit_settings(settings.hard_limits_enabled(), settings.limit_invert, settings.homing_debounce_ms);
   // Phase F: seed the live auto-report cadence mirror from the persisted `$481` so the auto-report task pushes
   // periodic status reports at the configured interval (a no-op when `$481=0`, the default).
   comms::init_auto_report(auto_report_interval);
@@ -311,6 +320,15 @@ async fn main(spawner: Spawner) {
   //     `motion_executor` task can borrow it `'static`.
   let probe = motion::init_probe(peripherals.GPIO21, &settings.probe_config());
   let probe: &'static mut motion::RmtProbeInput = PROBE_INPUT.init(probe);
+
+  // 4d. Bring up the X/Y/Z LIMIT inputs on GPIO10/11/12 (DOC-06) for the `$H` homing cycle and the runtime
+  //     hard-limit (`$21`) path. Each pin gets the internal pull-up unconditionally (the NC broken-wire
+  //     fail-safe needs it); the `$5` invert is applied per-sample by `limit_triggered`, not at pin config.
+  //     Parked in a `StaticCell` so the pins stay configured and the `motion_executor` task borrows them
+  //     `'static` (it owns the RMT channels, so the homing cycle — which emits steps — runs there, dispatched
+  //     by `$H` via the `HOME_REQUEST` signal, exactly as a `G38.x` probe is dispatched).
+  let limits = motion::init_limits(peripherals.GPIO10, peripherals.GPIO11, peripherals.GPIO12);
+  let limits: &'static mut [motion::RmtLimitInput; firmware_core::planner::AXES] = LIMIT_INPUTS.init(limits);
 
   // 4b. Bring up UART1 as the single-wire TMC2209 bus on GPIO9 (DOC-03). The bus is owned by the
   //     `tmc_manager` task (spawned below), which runs the per-driver init sequence and then polls
@@ -375,7 +393,7 @@ async fn main(spawner: Spawner) {
       // wiring bug, not a runtime condition. The task takes the `'static` sink/probe by mutable borrow. The axis
       // max-rates (`$110-112`) bound the Phase-E feed-override scale-up so a boosted feed never exceeds the
       // configured rate limit; they are passed alongside the step-timing config.
-      motion_spawner.must_spawn(motion_executor(sink, probe, motion_config, planner_config.max_rate_mm_min));
+      motion_spawner.must_spawn(motion_executor(sink, probe, limits, motion_config, planner_config.max_rate_mm_min));
     },
   );
 

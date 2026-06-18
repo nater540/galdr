@@ -250,6 +250,9 @@ pub enum AlarmCode {
   ProbeFailInitial,
   /// `ALARM:5` probe fail — the probe did not trip within the programmed travel of a `G38.2`/`G38.4` (DOC-09).
   ProbeFailContact,
+  /// `ALARM:8` homing fail — a `$H` seek/locate did not find its limit switch within 1.5× the axis max travel
+  /// (`EXEC_ALARM_HOMING_FAIL_APPROACH`). Recoverable: reset, check the switch/wiring, retry `$H` (DOC-06).
+  HomingFail,
   /// `ALARM:10` e-stop asserted (a locked critical alarm; cleared only by a soft reset once de-asserted).
   EStop,
   /// `ALARM:11` homing required — set on boot when `$22` is enabled; cleared by `$H` (home) or `$X` (unlock).
@@ -265,6 +268,7 @@ impl AlarmCode {
       AlarmCode::AbortDuringCycle => 3,
       AlarmCode::ProbeFailInitial => 4,
       AlarmCode::ProbeFailContact => 5,
+      AlarmCode::HomingFail => 8,
       AlarmCode::EStop => 10,
       AlarmCode::HomingRequired => 11,
     }
@@ -279,6 +283,7 @@ impl AlarmCode {
     AlarmCode::AbortDuringCycle,
     AlarmCode::ProbeFailInitial,
     AlarmCode::ProbeFailContact,
+    AlarmCode::HomingFail,
     AlarmCode::EStop,
     AlarmCode::HomingRequired,
   ];
@@ -291,6 +296,7 @@ impl AlarmCode {
       AlarmCode::AbortDuringCycle => "Abort during cycle",
       AlarmCode::ProbeFailInitial => "Probe fail",
       AlarmCode::ProbeFailContact => "Probe fail",
+      AlarmCode::HomingFail => "Homing fail",
       AlarmCode::EStop => "EStop asserted",
       AlarmCode::HomingRequired => "Homing required",
     }
@@ -307,6 +313,7 @@ impl AlarmCode {
       AlarmCode::AbortDuringCycle => "Reset while in motion. Machine position is likely lost. Re-homing is highly recommended.",
       AlarmCode::ProbeFailInitial => "Probe fail. Probe is not in the expected initial state before starting probe cycle.",
       AlarmCode::ProbeFailContact => "Probe fail. Probe did not contact the workpiece within the programmed travel.",
+      AlarmCode::HomingFail => "Homing fail. Could not find limit switch within search distance.",
       AlarmCode::EStop => "Emergency stop active.",
       AlarmCode::HomingRequired => "Homing is required. Execute homing cycle ($H) to continue.",
     }
@@ -330,10 +337,9 @@ impl AlarmCode {
       AlarmCode::HomingRequired | AlarmCode::HardLimit | AlarmCode::SoftLimit | AlarmCode::EStop => {
         "'$H'|'$X' to unlock"
       }
-      // The recoverable alarms (abort-during-cycle, probe-fail) tell the operator to reset and retry.
-      AlarmCode::AbortDuringCycle | AlarmCode::ProbeFailInitial | AlarmCode::ProbeFailContact => {
-        "Reset to continue"
-      }
+      // The recoverable alarms (abort-during-cycle, probe-fail, homing-fail) tell the operator to reset and retry.
+      AlarmCode::AbortDuringCycle | AlarmCode::ProbeFailInitial | AlarmCode::ProbeFailContact
+      | AlarmCode::HomingFail => "Reset to continue",
     }
   }
 }
@@ -527,6 +533,32 @@ impl ControlState {
     match self {
       ControlState::Jog => ControlState::Normal,
       other => other,
+    }
+  }
+
+  /// Whether a `$H` homing cycle may START from this state (DOC-06). grbl runs `$H` from Idle/Normal AND from
+  /// the homing-required boot alarm (`$H` is THE way to clear `ALARM:11`), but refuses it from the locked
+  /// critical alarms (hard/soft limit, e-stop — those need a soft reset first), from a feed-hold, and from
+  /// check/sleep. Pulled out as a predicate so the bin gates `$H` on it without duplicating the state logic.
+  pub fn homing_allowed(self) -> bool {
+    match self {
+      ControlState::Normal => true,
+      // The boot lock (homing-required) is exactly the state `$H` exists to clear; the other (locked) alarms are
+      // not — they demand a reset before any cycle.
+      ControlState::Alarm(code) => matches!(code, AlarmCode::HomingRequired),
+      _ => false,
+    }
+  }
+
+  /// Apply a successful `$H` homing cycle (DOC-06): machine position is now established, so the machine returns
+  /// to [`Normal`](ControlState::Normal) — clearing the homing-required boot alarm (`ALARM:11`). Only valid from
+  /// a state [`homing_allowed`](ControlState::homing_allowed) cleared; from any other state it is a no-op
+  /// (returns `self`), which is purely defensive since the consumer gates `$H` on `homing_allowed` first.
+  pub fn home_complete(self) -> Self {
+    if self.homing_allowed() {
+      ControlState::Normal
+    } else {
+      self
     }
   }
 }
@@ -2372,6 +2404,40 @@ mod tests {
   }
 
   #[test]
+  fn homing_allowed_from_normal_and_homing_required_only() {
+    // `$H` runs from Idle/Normal and from the homing-required boot lock (the state `$H` exists to clear), but
+    // never from a locked critical alarm, a feed-hold, check, or sleep (DOC-06).
+    assert!(ControlState::Normal.homing_allowed());
+    assert!(ControlState::Alarm(AlarmCode::HomingRequired).homing_allowed());
+    assert!(!ControlState::Alarm(AlarmCode::HardLimit).homing_allowed());
+    assert!(!ControlState::Alarm(AlarmCode::SoftLimit).homing_allowed());
+    assert!(!ControlState::Alarm(AlarmCode::AbortDuringCycle).homing_allowed());
+    assert!(!ControlState::Hold(false).homing_allowed());
+    assert!(!ControlState::Check.homing_allowed());
+    assert!(!ControlState::Sleep.homing_allowed());
+  }
+
+  #[test]
+  fn home_complete_clears_homing_required_to_normal() {
+    // A successful `$H` establishes position and returns to Normal, clearing `ALARM:11`.
+    assert_eq!(ControlState::Alarm(AlarmCode::HomingRequired).home_complete(), ControlState::Normal);
+    // Re-homing from an already-unlocked Normal also lands in Normal.
+    assert_eq!(ControlState::Normal.home_complete(), ControlState::Normal);
+    // From a state where homing is not allowed, `home_complete` is a defensive no-op (the consumer gates first).
+    // This is the invariant the `$H` success arm relies on (finding #2): if the control state was CLOBBERED to a
+    // locked alarm in the post-cycle window, `home_complete` returns that SAME alarm — never `Normal` — so the
+    // consumer can compare against `Normal` and refuse to emit a spurious `ok` / mark a false `HOMED`. Every
+    // locked alarm must round-trip unchanged here.
+    for code in [AlarmCode::HardLimit, AlarmCode::SoftLimit, AlarmCode::HomingFail, AlarmCode::AbortDuringCycle] {
+      assert_eq!(
+        ControlState::Alarm(code).home_complete(),
+        ControlState::Alarm(code),
+        "home_complete from a locked alarm stays locked (no false success window transition)",
+      );
+    }
+  }
+
+  #[test]
   fn normal_derives_run_vs_idle_from_in_flight_blocks() {
     // The Run/Idle distinction is derived, not latched: Normal + running -> Run, Normal + not -> Idle.
     assert_eq!(ControlState::Normal.machine_state(false), MachineState::Idle);
@@ -3072,13 +3138,25 @@ mod tests {
   #[test]
   fn alarm_all_covers_every_code_with_name_and_description() {
     // `$EA` enumerates `AlarmCode::ALL`; every defined alarm code must appear exactly once with non-empty
-    // name/description, and the codes must be the canonical grbl numbers (1,2,3,4,5,10,11).
+    // name/description, and the codes must be the canonical grbl numbers (1,2,3,4,5,8,10,11).
     let codes: StdVec<u8> = AlarmCode::ALL.iter().map(|a| a.code()).collect();
-    assert_eq!(codes, std::vec![1, 2, 3, 4, 5, 10, 11]);
+    assert_eq!(codes, std::vec![1, 2, 3, 4, 5, 8, 10, 11]);
     for alarm in AlarmCode::ALL {
       assert!(!alarm.name().is_empty(), "alarm {} has a name", alarm.code());
       assert!(!alarm.description().is_empty(), "alarm {} has a description", alarm.code());
     }
+  }
+
+  #[test]
+  fn homing_fail_alarm_is_recoverable_code_8() {
+    // ALARM:8 (homing fail) is recoverable, not a locked critical alarm: `$X` clears it and the prompt is
+    // "Reset to continue" (the operator checks the switch/wiring and retries `$H`), distinct from the locked
+    // hard/soft-limit/e-stop codes.
+    assert_eq!(AlarmCode::HomingFail.code(), 8);
+    assert!(!AlarmCode::HomingFail.is_locked());
+    assert_eq!(AlarmCode::HomingFail.unlock_hint(), "Reset to continue");
+    // `$X` clears a non-locked alarm to Normal.
+    assert_eq!(ControlState::Alarm(AlarmCode::HomingFail).unlock(), (ControlState::Normal, UnlockOutcome::Unlocked));
   }
 
   #[test]

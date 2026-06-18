@@ -51,6 +51,7 @@ use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
 use firmware_core::coords::{self, CoordinatePersistent, CoordinateSystems};
+use firmware_core::homing::{HomingConfig, HomingError};
 use firmware_core::gcode::{
   CoordinateOp, DistanceMode as GcodeDistance, ModalState, MotionMode, Parser, Units as GcodeUnits,
 };
@@ -58,7 +59,7 @@ use firmware_core::motion::steps_to_mm;
 use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcome, SoftLimits, AXES};
 use firmware_core::protocol::{
   classify_realtime, probe_response, AlarmCode, CheckToggle, ControlState, CoordinateReport, EngineEvent,
-  LastProbe, MachineSnapshot, Overrides, ParserDistance, ParserMotion, ParserSnapshot, ParserUnits,
+  LastProbe, MachineSnapshot, MachineState, Overrides, ParserDistance, ParserMotion, ParserSnapshot, ParserUnits,
   PinReport, PositionReport, ProbeResponse, RealtimeCommand, RefreshReporter, ResponseWriter, StreamEngine,
   SystemCommand, UnlockOutcome, ERROR_CODES, ERROR_HOMING_DISABLED, ERROR_UNSUPPORTED_COMMAND, MAX_LINE_LEN,
   NGC_PARAMETER_LINES, RX_BUFFER_SIZE, RESPONSE_CAPACITY,
@@ -184,6 +185,29 @@ pub static LIVE_POSITION: [AtomicI32; AXES] = [AtomicI32::new(0), AtomicI32::new
 /// lock after each wake and loops until it is drained, so a coalesced multi-block signal loses no block.
 pub static BLOCK_AVAILABLE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Limit-switch rising-edge trip → executor idle-trip seam (DOC-06). The core-1 executor's idle loop awaits a
+/// rising edge on the X/Y/Z limit pins via the interrupt-driven `Input::wait_for_rising_edge`, runs the `$26`
+/// debounce resample, and on a CONFIRMED trip signals this static (`wait_for_limit_trip` in [`crate::motion`]) —
+/// then samples the switches via `check_hard_limits` and raises `ALARM:1` if `$21` is on and a switch tripped
+/// WHILE IDLE (the in-motion case is already covered by the block-boundary `check_hard_limits` call). The
+/// hard-limit alarm is suppressed while a homing cycle is active (`HOMING_ACTIVE`) — the switches are expected to
+/// trip then (research finding #17).
+///
+/// HARDWARE-BOUNDARY NOTE (compile-checked only, no hardware): the rising-edge interrupt routing, the pull-up
+/// electrical behavior, the broken-wire fail-safe, EMI rejection, and the exact debounce timing are the boundary
+/// the research findings flag as untestable on the host — they must be verified on hardware. The producer
+/// (`wait_for_limit_trip`) IS wired now: the edge wait + `$26` resample run and signal this static on a confirmed
+/// trip. This static is the documented seam; today only the core-1 executor produces and observes it.
+pub static LIMIT_TRIGGERED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Executor → consumer: "a hard limit tripped during normal motion" (DOC-06). The core-1 executor samples the
+/// limit inputs at block boundaries and on the [`LIMIT_TRIGGERED`] wake; when [`firmware_core::homing::hard_limit_alarm`]
+/// says an alarm is due ([`HARD_LIMITS_ENABLED`] set, homing NOT active, a switch triggered) it halts motion and
+/// raises this signal. The consumer enters `ALARM:1` ([`AlarmCode::HardLimit`], a LOCKED alarm — position is
+/// likely lost from the abrupt stop) and runs the pipeline reset. A coalesced `Signal` is sufficient: the alarm
+/// latches, so a second trip before the first is serviced is harmless.
+pub static HARD_LIMIT_TRIPPED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// A `G38.x` probe request handed from the core-0 consumer to the core-1 motion executor (Phase C, DOC-09). It
 /// carries everything the probe-watching execution path needs: the absolute MACHINE step `target` the probe
 /// seeks (the no-contact end of travel), the per-tick `step_period_ticks` derived from the probe feed, and the
@@ -231,6 +255,18 @@ pub static PROBE_REQUEST: Signal<CriticalSectionRawMutex, ProbeRequest> = Signal
 /// from the consumer's view — exactly grbl's synchronized probe semantics.
 pub static PROBE_RESULT: Signal<CriticalSectionRawMutex, ProbeResult> = Signal::new();
 
+/// Consumer → executor: a request to run the `$H` homing cycle (DOC-06). Carries the resolved [`HomingConfig`]
+/// (the consumer builds it from the live settings, which only core 0 reads) so the core-1 executor — which owns
+/// the RMT step channels and the limit inputs — runs the whole Z-then-X+Y cycle without touching settings. Like
+/// the probe request, only one homing cycle is ever in flight: the consumer blocks on [`HOME_RESULT`] until it
+/// finishes before reading the next line, so a `Signal` carrying the config is sufficient.
+pub static HOME_REQUEST: Signal<CriticalSectionRawMutex, HomingConfig> = Signal::new();
+
+/// Executor → consumer: the result of the just-run homing cycle. `Ok(zero_steps)` carries the post-homing
+/// MACHINE step position per axis the consumer syncs into the planner/parser; `Err` is the homing-fail (no
+/// contact within 1.5× travel) or a sink/abort error, which the consumer maps to the homing-fail alarm + reset.
+pub static HOME_RESULT: Signal<CriticalSectionRawMutex, Result<[i32; AXES], HomingError>> = Signal::new();
+
 /// The last `G38.x` probe result (Phase C): the MACHINE position at the trigger instant and the contact flag,
 /// read by the `$#` `[PRB:]` line (replacing the Phase-B zeros/flag-0 stub) and the immediate `[PRB:]` push. It
 /// lives behind a synchronous `Cell` — the [`CONTROL`] / [`COORDINATES`] pattern — because the consumer writes it
@@ -271,11 +307,54 @@ pub static CONTROL: BlockingMutex<CriticalSectionRawMutex, Cell<ControlState>> =
 /// after the queue drains but a burst is still emitting. `AcqRel`/`Acquire` publishes it across cores.
 pub static EXECUTOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// "A `$H` homing cycle is currently running" (DOC-06). Set by [`handle_home`] for the duration of the cycle and
+/// cleared when it ends, so two things happen: the status reporter overrides the wire State to `Home` (grbl
+/// reports `Home` during `$H` and queues live DRO motion — research finding #1), and the hard-limit monitor
+/// SUPPRESSES the `$21` alarm path (the limit switches are EXPECTED to trip while homing — research finding #17,
+/// the shared-pin rule). `AcqRel`/`Acquire` publishes it across cores. A coalesced flag is sufficient: only the
+/// single in-order consumer sets/clears it around one cycle.
+pub static HOMING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// "Homing (`$22`) is enabled" — mirrored here from the live [`SETTINGS`] at boot (and on a `$22=` write) so
 /// the control-state transitions that need it (boot-lock, soft-reset-to-boot, `$H` gating) can read it without
 /// locking the async `SETTINGS` mutex from the synchronous real-time path. `Relaxed` is sufficient: it changes
 /// only via `$22=` and is read for state decisions, never to guard other memory.
 pub static HOMING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// "`$21` hard limits are enabled" — mirrored from the live [`SETTINGS`] at boot (and on a `$21=` write) so the
+/// core-1 executor can read the hard-limit-enable bit without locking the async settings mutex from its
+/// real-time loop. The executor samples the limit inputs at block boundaries / on the [`LIMIT_TRIGGERED`] wake
+/// and raises [`HARD_LIMIT_TRIPPED`] only when this is set AND a homing cycle is not active (DOC-06). `Relaxed`
+/// — it gates a real-time decision, not other memory.
+pub static HARD_LIMITS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// "`$5` limit-pin invert" — mirrored from the live [`SETTINGS`] so the core-1 executor builds the
+/// [`LimitConfig`](firmware_core::hal_traits::LimitConfig) for its homing-seek and hard-limit sampling without
+/// locking the async settings mutex. Seeded at boot and on a `$5=` write / bulk import. `Relaxed` — it feeds a
+/// real-time trigger-sense decision, not other memory.
+pub static LIMIT_INVERT: AtomicBool = AtomicBool::new(false);
+
+/// "`$26` limit-switch debounce, milliseconds" — mirrored from the live [`SETTINGS`] so the core-1 executor's
+/// limit-edge monitor can run the debounce RESAMPLE (wait this long after a rising edge, then confirm the level
+/// persists, rejecting EMI glitches / NC-pull-up settling — research finding #14) without locking the async
+/// settings mutex. Seeded at boot and on a `$26=` write / bulk import. `Relaxed` — it feeds a real-time timing
+/// decision, not other memory.
+pub static LIMIT_DEBOUNCE_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Read the live `$26` debounce in milliseconds for the core-1 limit-edge resample. A synchronous atomic load,
+/// callable from the real-time executor loop.
+pub fn limit_debounce_ms() -> u32 {
+  LIMIT_DEBOUNCE_MS.load(Ordering::Relaxed)
+}
+
+/// "The machine has a known (homed) machine position" (DOC-06). Set on a successful `$H`; cleared on every soft
+/// reset / boot when homing is enabled (the machine returns to the unhomed boot-lock alarm). This is the gate
+/// that makes `$20` soft limits MEANINGFUL: the envelope check is applied only when soft limits are enabled AND
+/// the machine is homed (research finding #16), so an unhomed machine never rejects a move against an
+/// unestablished zero. When homing is DISABLED entirely, the machine is treated as "homed" (position is taken at
+/// face value, grbl's no-homing behavior) so soft limits — which require `$22` to even be enabled — still work
+/// if a user force-enables them. `Relaxed` is sufficient: it gates a plan-time decision, not other memory.
+pub static HOMED: AtomicBool = AtomicBool::new(false);
 
 /// Latched at `0x18` dispatch time: "the executor was mid-cycle when this soft reset landed". Captured in the
 /// non-blocking reader half (reading [`EXECUTOR_RUNNING`] before the executor can clear it) so the consumer's
@@ -348,6 +427,16 @@ pub fn init_auto_report(interval_ms: u32) {
   AUTO_REPORT_SUSPENDED.store(false, Ordering::Relaxed);
 }
 
+/// Set the [`HOMED`] flag to its boot/reset baseline given whether `$22` homing is enabled (finding #8). The
+/// invariant: the machine is UNHOMED unless homing is DISABLED — with homing disabled, position is taken at face
+/// value (grbl's no-homing behavior) so the machine is treated as homed; with homing enabled, a fresh boot or a
+/// soft reset returns to the unhomed `ALARM:11` lock until `$H`. Pulled out so the boot ([`init_control_state`])
+/// and reset ([`apply_soft_reset`]) sites cannot drift apart and the bare `!homing_enabled` encoding is documented
+/// in ONE place. A successful `$H` overrides this with `HOMED = true`.
+fn store_homed_baseline(homing_enabled: bool) {
+  HOMED.store(!homing_enabled, Ordering::Relaxed);
+}
+
 /// Read the live overrides (a synchronous `Cell` load under the blocking mutex). `Copy`, cheap, callable from
 /// any context including the real-time reader half and the core-1 executor.
 pub fn overrides() -> Overrides {
@@ -366,6 +455,25 @@ fn set_overrides(ov: Overrides) {
 pub fn init_control_state(homing_enabled: bool) {
   HOMING_ENABLED.store(homing_enabled, Ordering::Relaxed);
   CONTROL.lock(|c| c.set(ControlState::boot(homing_enabled)));
+  // Seed the homed baseline (finding #8): homed at boot only when homing is DISABLED; with homing enabled it
+  // boots unhomed in the `ALARM:11` lock until `$H` (DOC-06).
+  store_homed_baseline(homing_enabled);
+}
+
+/// Seed the [`HARD_LIMITS_ENABLED`], [`LIMIT_INVERT`], and [`LIMIT_DEBOUNCE_MS`] mirrors at boot from the loaded
+/// `$21` bit0 / `$5` / `$26` (DOC-06). Called once from `main` before any task runs, so the core-1 executor's
+/// hard-limit / homing-seek sampling and the limit-edge debounce read the persisted state without an async lock.
+pub fn init_limit_settings(hard_limits_enabled: bool, limit_invert: bool, debounce_ms: u32) {
+  HARD_LIMITS_ENABLED.store(hard_limits_enabled, Ordering::Relaxed);
+  LIMIT_INVERT.store(limit_invert, Ordering::Relaxed);
+  LIMIT_DEBOUNCE_MS.store(debounce_ms, Ordering::Relaxed);
+}
+
+/// Build the live [`LimitConfig`](firmware_core::hal_traits::LimitConfig) from the [`LIMIT_INVERT`] (`$5`) mirror,
+/// for the core-1 executor's homing-seek / hard-limit sampling. Reads the atomic, not the async settings mutex,
+/// so it is callable from the real-time loop.
+pub fn limit_config() -> firmware_core::hal_traits::LimitConfig {
+  firmware_core::hal_traits::LimitConfig { invert: LIMIT_INVERT.load(Ordering::Relaxed) }
 }
 
 /// Read the current [`ControlState`] (a synchronous `Cell` load under the blocking mutex). Cheap and callable
@@ -893,11 +1001,14 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // remaining window for an in-flight non-back-pressured line would require cancelling `handle_line`
     // mid-await; that is deferred to the alarm-state machine (Stage 2), which is where grbl gates response
     // emission during an abort. The stray response is benign: the host discards pending acks on `0x18`.
-    match select4(LINE_QUEUE.receive(), SOFT_RESET.wait(), JOG_CANCEL.wait(), Timer::after(SETTINGS_FLUSH_SAFETY)).await {
-      Either4::First(line) => handle_line(line.as_slice(), &mut parser, &mut state, flash).await,
+    let events = select4(LINE_QUEUE.receive(), SOFT_RESET.wait(), JOG_CANCEL.wait(), Timer::after(SETTINGS_FLUSH_SAFETY));
+    // Race the four primary events against a hard-limit trip from the core-1 executor (DOC-06): a limit pressed
+    // during normal motion must halt the program and enter `ALARM:1` regardless of what the consumer is waiting on.
+    match select(events, HARD_LIMIT_TRIPPED.wait()).await {
+      Either::First(Either4::First(line)) => handle_line(line.as_slice(), &mut parser, &mut state, flash).await,
       // A soft reset must not lose a pending settings change: persist before rebuilding the pipeline (grbl
       // applies most settings on the next reset, so they MUST be on flash by the time the reset takes them).
-      Either4::Second(()) => {
+      Either::First(Either4::Second(())) => {
         flush_settings(flash).await;
         flush_coordinates(flash).await;
         apply_soft_reset(&mut parser, &mut state).await;
@@ -905,12 +1016,21 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
       // Jog cancel (`0x85`, Phase D): reuse the feed-hold block-boundary stop, flush the jog blocks, sync the
       // planner to the live stop point, and return to Idle. Owned here (the planner owner) so it is race-free
       // with line handling — a cancel and a line never run concurrently in this single in-order consumer.
-      Either4::Third(()) => cancel_jog_cycle().await,
+      Either::First(Either4::Third(())) => cancel_jog_cycle().await,
       // Safety-interval tick: persist any pending change even if the queue never observably drained. When
       // nothing is dirty these are cheap no-ops and the loop simply re-arms the timer on the next iteration.
-      Either4::Fourth(()) => {
+      Either::First(Either4::Fourth(())) => {
         flush_settings(flash).await;
         flush_coordinates(flash).await;
+      }
+      // Hard-limit trip (`$21`, DOC-06): the executor detected a switch trip during normal motion. Enter the
+      // LOCKED `ALARM:1` (position is likely lost from the abrupt stop — re-homing recommended) and reset the
+      // pipeline so the queue is flushed and the machine sits in a clean, clearly-halted alarm. Only a soft
+      // reset clears a locked alarm.
+      Either::Second(()) => {
+        set_control_state(ControlState::Alarm(AlarmCode::HardLimit));
+        emit_alarm(AlarmCode::HardLimit).await;
+        reset_pipeline(&mut parser, &mut state).await;
       }
     }
   }
@@ -949,6 +1069,10 @@ async fn apply_soft_reset(parser: &mut Parser, state: &mut ConsumerState) {
   let homing_enabled = HOMING_ENABLED.load(Ordering::Relaxed);
   let next = control_state().soft_reset(was_in_cycle, homing_enabled);
   set_control_state(next);
+  // A reset returns to the boot baseline (finding #8): with homing enabled the machine is unhomed again (back in
+  // the `ALARM:11` lock until `$H`), so position certainty — and thus `$20` soft-limit enforcement — is lost.
+  // With homing disabled the machine stays "homed" (face-value position), mirroring `init_control_state`.
+  store_homed_baseline(homing_enabled);
   // Rebuild the pipeline FIRST so the banner (the "reset and ready" signal) is emitted, then push any
   // resulting alarm so a host sees `ALARM:N` and the `[MSG:..]` prompt right after the banner — matching grbl's
   // connect/reset ordering.
@@ -1153,6 +1277,13 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
         error(code).await;
         state.error_hold = true;
       }
+      // A program move left the `$20` soft-limit envelope: enter the soft-limit alarm and emit `ALARM:2` (no
+      // `ok`). The block was rejected before any motion, so position is intact, but grbl halts the program; a
+      // soft reset / `$X` clears the alarm. The alarm latches so subsequent GCode is gated until cleared.
+      PlanResult::SoftLimitAlarm => {
+        set_control_state(ControlState::Alarm(AlarmCode::SoftLimit));
+        emit_alarm(AlarmCode::SoftLimit).await;
+      }
       // A soft reset arrived while this command was back-pressured: abort it (the host discards pending
       // acks on `0x18`), emit no response, and run the soft-reset transition whose signal was consumed here.
       PlanResult::Aborted => apply_soft_reset(parser, state).await,
@@ -1182,6 +1313,10 @@ enum PlanResult {
   Coordinate(CoordinateOp),
   /// A non-back-pressure planner error; carries the grblHAL `error:N` code (bad arc geometry).
   Error(u8),
+  /// A program move/arc exceeded the `$20` soft-limit envelope (DOC-06). grbl halts and raises `ALARM:2`
+  /// (position is NOT lost — the move was rejected before any motion — but the program cannot continue). The
+  /// consumer enters the soft-limit alarm and emits `ALARM:2`, no `ok`.
+  SoftLimitAlarm,
   /// A soft reset preempted the command while it was back-pressured; the consumed signal must be honored.
   Aborted,
   /// A `G38.x` probe (Phase C): the planner resolved the machine target and flushed look-ahead. The consumer
@@ -1224,10 +1359,14 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
     // missing planner (an init wiring bug, unreachable in a correctly wired build — see `init_planner`) is
     // surfaced as a distinct internal `error:N` rather than a fabricated `ok`: a silent accepted-but-un-run
     // move would hide the bug, so we fail the line loudly instead.
+    // `$20` soft limits are checked at PLAN time, but only when enabled AND the machine is homed (a known
+    // machine zero is what makes the envelope meaningful — research finding #16). `current_soft_limits` returns
+    // the envelope only when both hold; otherwise `None` skips the check (identical to the pre-DOC-06 behavior).
+    let limits = current_soft_limits().await;
     let result = {
       let mut guard = PLANNER.lock().await;
       match guard.as_mut() {
-        Some(planner) => planner.plan_command(command),
+        Some(planner) => planner.plan_command_with_limits(command, limits),
         None => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
       }
     };
@@ -1268,6 +1407,10 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
           Either::Second(()) => return PlanResult::Aborted,
         }
       }
+      // A program move/arc that left the `$20` soft-limit envelope: this is a SYSTEM ALARM in grbl (`ALARM:2`),
+      // not an `error:N` line — the planner rejected the block before any enqueue, so no motion started. Surface
+      // it as a distinct result the caller routes to the alarm path.
+      Err(PlannerError::MoveExceedsTravel) => return PlanResult::SoftLimitAlarm,
       // A genuine geometry error (bad arc): surface the grblHAL code to the caller.
       Err(other) => return PlanResult::Error(other.code()),
     }
@@ -1478,9 +1621,16 @@ async fn handle_jog(line: &[u8], parser: &mut Parser, state: &mut ConsumerState)
   }
 }
 
-/// Build the `$20`/`$130–$132` soft-limit envelope to check a jog against, or `None` when `$20` is disabled so
-/// the planner skips the check (grbl only enforces soft limits on a jog when they are enabled).
+/// Build the `$20`/`$130–$132` soft-limit envelope to check a move/jog against, or `None` so the planner skips
+/// the check. The envelope is supplied ONLY when `$20` is enabled AND the machine is homed ([`HOMED`]) — a soft
+/// limit is only meaningful once a machine zero is established (research finding #16), so an unhomed machine
+/// never gates a move against an unestablished zero. (`$20` itself can only be enabled with `$22` set, and the
+/// machine is homed after `$H`; when homing is disabled, [`HOMED`] is treated as true so a force-enabled `$20`
+/// still works.) Shared by the program-move path ([`plan_command`]) and the jog path ([`handle_jog`]).
 async fn current_soft_limits() -> Option<SoftLimits> {
+  if !HOMED.load(Ordering::Relaxed) {
+    return None;
+  }
   let settings = settings_snapshot().await;
   settings
     .soft_limits_enable
@@ -1739,7 +1889,7 @@ async fn handle_system_command(rest: &[u8], parser: &mut Parser, state: &mut Con
     SystemCommand::Unlock => handle_unlock().await,
     SystemCommand::ToggleCheck => handle_toggle_check(parser, state).await,
     SystemCommand::Sleep => handle_sleep().await,
-    SystemCommand::Home => handle_home().await,
+    SystemCommand::Home => handle_home(parser, state).await,
     SystemCommand::StartupQuery => handle_startup_query(state).await,
     SystemCommand::StartupSet { index, gcode } => handle_startup_set(index, gcode, state).await,
     SystemCommand::RestoreSettings => handle_restore_settings(parser, state, flash).await,
@@ -1849,19 +1999,103 @@ async fn handle_sleep() {
   }
 }
 
-/// Handle `$H` (run the homing cycle). If `$22` homing is disabled, return `error:5` ("Homing cycle is not
-/// enabled"). If enabled, homing itself is DOC-06 and NOT implemented yet, so return `error:N` with a clear
-/// `[MSG:...]` rather than fake success — a fabricated `ok` would leave the machine UNHOMED but reported as
-/// homed, the worst possible lie. Real homing is a separate later effort (DOC-06).
-async fn handle_home() {
+/// Handle `$H` (run the homing cycle, DOC-06). Sequence:
+/// 1. If `$22` homing is disabled → `error:5` ("Homing cycle is not enabled"), no motion.
+/// 2. If the control state does not allow homing (a locked hard/soft-limit/e-stop alarm, a hold, check, or
+///    sleep) → `error:9` (G-code lock); `$H` runs from Idle/Normal and from the homing-required boot lock only.
+/// 3. Publish the pre-cycle `<Home>` State (set [`HOMING_ACTIVE`] so `?` reports `Home` and the hard-limit
+///    monitor is suppressed) and emit one `<Home|...>` report, mirroring grbl's pre-cycle push.
+/// 4. Dispatch the resolved [`HomingConfig`] to the core-1 executor (which owns the RMT channels + limit
+///    inputs) via [`HOME_REQUEST`] and AWAIT [`HOME_RESULT`], racing a soft reset so a `0x18` mid-cycle aborts.
+/// 5. On SUCCESS: sync the planner's commanded position to the established machine zero, clear `ALARM:11` to
+///    Normal via [`ControlState::home_complete`], and `ok`. On a homing FAIL (no contact) or sink abort: raise
+///    `ALARM:8` (homing fail) + its prompt and force a pipeline reset — never fabricate a homed state.
+async fn handle_home(parser: &mut Parser, state: &mut ConsumerState) {
   if !HOMING_ENABLED.load(Ordering::Relaxed) {
     error(ERROR_HOMING_DISABLED).await;
     return;
   }
-  // TODO(DOC-06): run the real homing cycle (seek → locate → pull-off per axis, then clear the homing-required
-  // alarm). Until then, refuse loudly so no caller mistakes the machine for homed.
-  send_message("Homing not implemented (DOC-06)").await;
-  error(ERROR_UNSUPPORTED_COMMAND).await;
+  // grbl gates `$H`: it runs from Idle/Normal and from the homing-required boot lock, but never from a locked
+  // critical alarm, a feed-hold, check, or sleep. The host-tested predicate decides; reject with the lock code.
+  if !control_state().homing_allowed() {
+    error(ERROR_LOCKED).await;
+    return;
+  }
+
+  // Build the resolved homing config from the live settings on core 0 (only core 0 reads SETTINGS), so the
+  // core-1 executor runs the cycle without touching the async settings mutex — mirroring the probe dispatch.
+  let config = settings_snapshot().await.homing_config(crate::MOTION_TICK_HZ);
+
+  // Pre-cycle `<Home>` push (research finding #1): mark homing active so `?` reports `Home` and the hard-limit
+  // alarm path is suppressed for the cycle's duration, then ask the status responder to emit one report before
+  // the motion begins (it composes the `Home` State from `HOMING_ACTIVE`, set just above).
+  HOMING_ACTIVE.store(true, Ordering::Release);
+  STATUS_REQUEST.signal(());
+
+  let result = run_homing_cycle(config).await;
+  HOMING_ACTIVE.store(false, Ordering::Release);
+
+  match result {
+    Some(Ok(zero_steps)) => {
+      // The executor reported a clean cycle, but the control state can have been CLOBBERED to a locked alarm in
+      // the post-cycle window — `HOMING_ACTIVE` was cleared above, so a limit still engaged when the idle
+      // limit-monitor (finding #1) re-samples, or any other `0x18`/alarm path, can flip `CONTROL` to
+      // `Alarm(..)` across the `PLANNER.lock().await` below. `home_complete()` is a no-op from a non-`Normal`able
+      // state, so it would leave the alarm in place — but unconditionally acking + marking homed would emit a
+      // spurious `ok` and a FALSE `HOMED` over a real alarm (finding #2). So we ACT only when the transition
+      // genuinely reached `Normal`: sync the planner, mark homed, and `ok`. Otherwise we leave the alarm
+      // untouched and emit no `ok` — the alarm's own path already surfaced `ALARM:N` to the host.
+      let before = control_state();
+      let after = before.home_complete();
+      if after == ControlState::Normal {
+        // Position is established: sync the planner's commanded position to the machine zero (grbl's
+        // `plan_sync_position` + `gc_sync_position`), clear the homing-required alarm to Normal, and `ok`.
+        {
+          let mut guard = PLANNER.lock().await;
+          if let Some(planner) = guard.as_mut() {
+            planner.sync_position(zero_steps);
+          }
+        }
+        set_control_state(after);
+        // Mark the machine homed so `$20` soft limits become active (research finding #16). A subsequent soft
+        // reset / `$X` that loses certainty clears this in `apply_soft_reset`.
+        HOMED.store(true, Ordering::Relaxed);
+        ack().await;
+      }
+      // else: the state was clobbered to an alarm during the success window — leave it locked, emit no `ok`, and
+      // do NOT mark homed. The clobbering path (e.g. the hard-limit monitor) owns reporting + the pipeline reset.
+    }
+    Some(Err(_)) => {
+      // Homing failed (no switch contact within 1.5× travel, or a sink abort): position is unknown. Raise
+      // `ALARM:8` (homing fail) and force a pipeline reset so the machine is in a clean, clearly-unhomed alarm
+      // state — never an `ok`. grbl emits no `ok` for a failed homing cycle.
+      set_control_state(ControlState::Alarm(AlarmCode::HomingFail));
+      emit_alarm(AlarmCode::HomingFail).await;
+      reset_pipeline(parser, state).await;
+    }
+    // A soft reset preempted the cycle: honor the consumed reset (rebuild the pipeline, emit the banner). The
+    // executor's own reset path zeroes the live position; `apply_soft_reset` publishes the post-reset state.
+    None => apply_soft_reset(parser, state).await,
+  }
+}
+
+/// Dispatch a homing cycle to the core-1 executor and AWAIT its result, racing a soft reset (DOC-06). Mirrors
+/// [`run_probe_cycle`]: drains any stale result, signals [`HOME_REQUEST`] with the resolved config, then waits
+/// on [`HOME_RESULT`] vs [`SOFT_RESET`]. Returns `Some(result)` on completion, or `None` if a `0x18` landed
+/// mid-cycle (the caller honors the consumed reset signal). Draining a still-latched request on the reset path
+/// prevents an unrequested homing move from running after the pipeline rebuilds.
+async fn run_homing_cycle(config: HomingConfig) -> Option<Result<[i32; AXES], HomingError>> {
+  HOME_RESULT.try_take();
+  HOME_REQUEST.signal(config);
+  match select(HOME_RESULT.wait(), SOFT_RESET.wait()).await {
+    Either::First(result) => Some(result),
+    Either::Second(()) => {
+      // Drain the request we just signalled in case the executor had not yet consumed it, so a still-latched
+      // request cannot run an unrequested homing move from the freshly-zeroed origin after the reset.
+      HOME_REQUEST.try_take();
+      None
+    }
+  }
 }
 
 /// Handle `$N` (query stored startup lines): echo both slots as `$N0=...`/`$N1=...` (empty when unset), then
@@ -1950,8 +2184,11 @@ async fn handle_restore_settings(parser: &mut Parser, state: &mut ConsumerState,
   // Clear the stored startup lines (`$RST=$`/`$RST=*` both drop them in grbl) and update the homing mirror so
   // the post-reset boot state is computed from the restored `$22` (default: disabled → Normal).
   state.startup_lines = [None, None];
-  HOMING_ENABLED.store(defaults.homing_enable, Ordering::Relaxed);
-  set_control_state(ControlState::boot(defaults.homing_enable));
+  HOMING_ENABLED.store(defaults.homing_enabled(), Ordering::Relaxed);
+  HARD_LIMITS_ENABLED.store(defaults.hard_limits_enabled(), Ordering::Relaxed);
+  LIMIT_INVERT.store(defaults.limit_invert, Ordering::Relaxed);
+  LIMIT_DEBOUNCE_MS.store(defaults.homing_debounce_ms, Ordering::Relaxed);
+  set_control_state(ControlState::boot(defaults.homing_enabled()));
   // Soft-reset the pipeline so the restored settings take effect (it rebuilds the planner from the live
   // settings and emits the banner). It does not emit `ok`; grbl's `$RST` is acknowledged by the reset itself.
   reset_pipeline(parser, state).await;
@@ -2018,7 +2255,14 @@ async fn handle_pb_write(hex: &[u8], state: &mut ConsumerState) {
       // append rather than one per chunk. Planner-affecting fields take effect on the next soft reset, as with
       // `$x=val`. Keep the `$22` homing mirror in sync so the boot-lock / `$H` / soft-reset decisions reflect a
       // bulk import that changed it. Acknowledge immediately — the in-RAM value already applied.
-      HOMING_ENABLED.store(new_settings.homing_enable, Ordering::Relaxed);
+      HOMING_ENABLED.store(new_settings.homing_enabled(), Ordering::Relaxed);
+      // Keep the `$21` hard-limit-enable mirror in sync too so the executor's hard-limit check reflects a bulk
+      // import that changed it (DOC-06).
+      HARD_LIMITS_ENABLED.store(new_settings.hard_limits_enabled(), Ordering::Relaxed);
+      LIMIT_INVERT.store(new_settings.limit_invert, Ordering::Relaxed);
+      // Keep the `$26` debounce mirror in sync so a bulk import that retunes it takes effect on the executor's
+      // limit-edge resample without a reboot (DOC-06).
+      LIMIT_DEBOUNCE_MS.store(new_settings.homing_debounce_ms, Ordering::Relaxed);
       // Phase F: a bulk import can change `$481`; re-seed the live auto-report cadence and wake the task so the
       // imported interval (enable/disable/retune) takes effect immediately, no reboot.
       AUTO_REPORT_INTERVAL_MS.store(new_settings.auto_report_interval_ms(), Ordering::Relaxed);
@@ -2268,7 +2512,20 @@ async fn write_setting_command(body: &[u8]) {
       // stalled `ok` would wedge a character-counting sender; here the `ok` never waits on flash at all). Keep
       // the `$22` homing mirror in sync so a `$22=` write changes the boot-lock / `$H` / soft-reset decisions.
       if n == 22 {
-        HOMING_ENABLED.store(settings_snapshot().await.homing_enable, Ordering::Relaxed);
+        HOMING_ENABLED.store(settings_snapshot().await.homing_enabled(), Ordering::Relaxed);
+      }
+      // A `$21=` write changes the hard-limit enable live; mirror it so the executor's hard-limit check reflects
+      // it without a reboot (DOC-06).
+      if n == 21 {
+        HARD_LIMITS_ENABLED.store(settings_snapshot().await.hard_limits_enabled(), Ordering::Relaxed);
+      }
+      // A `$5=` write changes the limit-pin invert live; mirror it for the executor's sampling (DOC-06).
+      if n == 5 {
+        LIMIT_INVERT.store(settings_snapshot().await.limit_invert, Ordering::Relaxed);
+      }
+      // A `$26=` write retunes the limit debounce live; mirror it for the executor's edge resample (DOC-06).
+      if n == 26 {
+        LIMIT_DEBOUNCE_MS.store(settings_snapshot().await.homing_debounce_ms, Ordering::Relaxed);
       }
       // Phase F: a `$481=` write retunes the auto-report cadence live (no reboot). Mirror the CLAMPED interval and
       // wake the auto-report task so an enable takes effect immediately and a disable/retune is picked up at once.
@@ -2423,7 +2680,14 @@ pub async fn status_responder() -> ! {
     // and `Idle` only when truly quiescent. Every non-Normal mode (Hold/Alarm/Check/Sleep) ignores `running`.
     let queued = blocks_free < firmware_core::planner::BLOCK_QUEUE_LEN as u8;
     let running = EXECUTOR_RUNNING.load(Ordering::Acquire) || queued;
-    snap.state = control_state().machine_state(running);
+    // A `$H` cycle in progress overrides the wire State to `Home` regardless of the latched control mode (which
+    // sits in the boot-lock alarm or Normal while homing runs) — grbl reports `Home` for the cycle's duration
+    // (research finding #1). Otherwise the State is the latched control mode + live Run/Idle derivation.
+    snap.state = if HOMING_ACTIVE.load(Ordering::Acquire) {
+      MachineState::Home
+    } else {
+      control_state().machine_state(running)
+    };
     let mut s = Response::new();
     if ResponseWriter::status_report(&mut s, &snap).is_ok() {
       enqueue(s).await;

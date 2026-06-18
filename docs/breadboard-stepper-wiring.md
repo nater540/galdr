@@ -12,40 +12,39 @@ manifest in [`00-architecture.md`](00-architecture.md). If you change a GPIO her
 
 ## 1. Bill of materials
 
-| Qty | Item | Notes |
-|-----|------|-------|
-| 1 | ESP32-S3 devkit | The board the firmware runs on (native USB to host) |
-| 3 | TMC2209 breakout (Adafruit 6121) | 0.05 Ω sense resistors; 5–29 V motor, 3–5 V logic |
-| 3 | NEMA 17 stepper, **bipolar (4-wire)** | Confirm bipolar; 6-wire needs the right pair tapping |
-| 1 | Motor PSU, **12 V (or up to 24 V)** DC | Sized for 3× motor current + margin (≥ 3 A for a start) |
-| 1 | Breadboard + jumper wires | Logic/signal only — see safety note |
-| 3 | 1 kΩ resistor | One per driver, in series on the shared UART line *(see §4)* |
-| 3 | 100 µF electrolytic cap (≥ motor V rating) | One across **VM↔GND at each driver**, close to the chip |
-| — | Heavier gauge wire (e.g. 22–20 AWG) | For VM and motor-coil runs (off the breadboard rails) |
-| 1 | Multimeter | Identify motor coil pairs; verify rails before power-up |
+| Qty | Item                                       | Notes                                                        |
+|-----|--------------------------------------------|--------------------------------------------------------------|
+| 1   | ESP32-S3 devkit                            | The board the firmware runs on (native USB to host)          |
+| 3   | TMC2209 breakout (Adafruit 6121)           | 0.05 Ω sense resistors; 5–29 V motor, 3–5 V logic            |
+| 3   | NEMA 17 stepper, **bipolar (4-wire)**      | Confirm bipolar; 6-wire needs the right pair tapping         |
+| 1   | Motor PSU, **12 V (or up to 24 V)** DC     | Sized for 3× motor current + margin (≥ 3 A for a start)      |
+| 1   | Breadboard + jumper wires                  | Logic/signal only — see safety note                          |
+| 3   | 1 kΩ resistor                              | One per driver, in series on the shared UART line *(see §4)* |
+| 3   | 100 µF electrolytic cap (≥ motor V rating) | One across **VM↔GND at each driver**, close to the chip      |
+| —   | Heavier gauge wire (e.g. 22–20 AWG)        | For VM and motor-coil runs (off the breadboard rails)        |
+| 1   | Multimeter                                 | Identify motor coil pairs; verify rails before power-up      |
 
-The spindle (WS55-220), limit switches, and Z-probe are **not** needed for stepper testing and are
-omitted here.
+The spindle (WS55-220), limit switches, and Z-probe are **not** needed for stepper testing and are omitted here.
 
 ---
 
 ## 2. Pin map (ESP32-S3 → TMC2209)
 
-These are the firmware's fixed assignments. STEP is per-axis; **DIR, EN, and the UART line follow the
-same scheme**. `STEP_EN` (GPIO8) is a **single common enable** wired to *all three* drivers' EN pins.
+These are the firmware's fixed assignments. STEP is per-axis; **DIR, EN, and the UART line follow the same scheme**.
+`STEP_EN` (GPIO8) is a **single common enable** wired to *all three* drivers' EN pins.
 
-| Firmware signal | ESP32-S3 GPIO | Goes to (each TMC2209) | Notes |
-|-----------------|---------------|------------------------|-------|
-| X_STEP | **GPIO1** | X driver `STEP` | RMT TX ch0 |
-| Y_STEP | **GPIO2** | Y driver `STEP` | RMT TX ch1 |
-| Z_STEP | **GPIO4** | Z driver `STEP` | RMT TX ch2 |
-| X_DIR  | **GPIO5** | X driver `DIR` | |
-| Y_DIR  | **GPIO6** | Y driver `DIR` | |
-| Z_DIR  | **GPIO7** | Z driver `DIR` | |
-| STEP_EN | **GPIO8** | **all** drivers `EN` (a.k.a. ENN) | Active-LOW; firmware drives it LOW (enabled) at boot |
-| TMC_UART | **GPIO9** | shared `PDN_UART` bus (via 1 kΩ each) | Single-wire half-duplex, 115200 8N1 — see §4 |
-| 3V3 | ESP32-S3 **3V3** | each driver `VIO` | Logic supply for the drivers |
-| GND | ESP32-S3 **GND** | common ground (see §5) | **All grounds must be common** |
+| Firmware signal | ESP32-S3 GPIO    | Goes to (each TMC2209)                | Notes                                                |
+|-----------------|------------------|---------------------------------------|------------------------------------------------------|
+| X_STEP          | **GPIO1**        | X driver `STEP`                       | RMT TX ch0                                           |
+| Y_STEP          | **GPIO2**        | Y driver `STEP`                       | RMT TX ch1                                           |
+| Z_STEP          | **GPIO4**        | Z driver `STEP`                       | RMT TX ch2                                           |
+| X_DIR           | **GPIO5**        | X driver `DIR`                        |                                                      |
+| Y_DIR           | **GPIO6**        | Y driver `DIR`                        |                                                      |
+| Z_DIR           | **GPIO7**        | Z driver `DIR`                        |                                                      |
+| STEP_EN         | **GPIO8**        | **all** drivers `EN` (a.k.a. ENN)     | Active-LOW; firmware drives it LOW (enabled) at boot |
+| TMC_UART        | **GPIO9**        | shared `PDN_UART` bus (via 1 kΩ each) | Single-wire half-duplex, 115200 8N1 — see §4         |
+| 3V3             | ESP32-S3 **3V3** | each driver `VIO`                     | Logic supply for the drivers                         |
+| GND             | ESP32-S3 **GND** | common ground (see §5)                | **All grounds must be common**                       |
 
 > Strapping pins to avoid: GPIO0/3/45/46. GPIO19/20 are the native USB lines — do not touch.
 > The chosen GPIOs above are all safe, non-strapping pins.
@@ -54,15 +53,15 @@ same scheme**. `STEP_EN` (GPIO8) is a **single common enable** wired to *all thr
 
 ## 3. NEMA 17 motor coil wiring
 
-A bipolar NEMA 17 has two coils → four wires: **A1, A2** (coil A) and **B1, B2** (coil B). They wire to
-the TMC2209 motor outputs, **directly to the driver, not through the breadboard**:
+A bipolar NEMA 17 has two coils → four wires: **A1, A2** (coil A) and **B1, B2** (coil B).
+They wire to the TMC2209 motor outputs, **directly to the driver, not through the breadboard**:
 
 | Motor wire | TMC2209 output (silkscreen varies) |
 |------------|------------------------------------|
-| A1 | OA1 / A2 (one end of coil A) |
-| A2 | OA2 / A1 (other end of coil A) |
-| B1 | OB1 / B2 (one end of coil B) |
-| B2 | OB2 / B1 (other end of coil B) |
+| A1         | OA1 / A2 (one end of coil A)       |
+| A2         | OA2 / A1 (other end of coil A)     |
+| B1         | OB1 / B2 (one end of coil B)       |
+| B2         | OB2 / B1 (other end of coil B)     |
 
 **Find the coil pairs with a multimeter (resistance mode):** the two wires of one coil read a small
 resistance (a few ohms / continuity); wires from different coils read open. Keep each coil's two wires
@@ -94,19 +93,19 @@ Wiring:
 
 ### Node addressing — set MS1/MS2 per driver
 
-In UART mode the **MS1/MS2 pins select the node address** (NOT microstepping — microstepping is set over
-UART). Set them with jumpers to 3V3 (HIGH) or GND (LOW); they have internal pull-downs (floating = LOW).
+In UART mode the **MS1/MS2 pins select the node address** (NOT microstepping — microstepping is set over UART).
+Set them with jumpers to 3V3 (HIGH) or GND (LOW); they have internal pull-downs (floating = LOW).
 Assign one address per axis so the firmware can reach each driver on the shared bus:
 
-| Axis | Node | MS1 | MS2 |
-|------|------|-----|-----|
-| X | 0 | LOW (GND/float) | LOW (GND/float) |
-| Y | 1 | **HIGH (3V3)** | LOW |
-| Z | 2 | LOW | **HIGH (3V3)** |
-| (spare) | 3 | HIGH | HIGH |
+| Axis    | Node | MS1             | MS2             |
+|---------|------|-----------------|-----------------|
+| X       | 0    | LOW (GND/float) | LOW (GND/float) |
+| Y       | 1    | **HIGH (3V3)**  | LOW             |
+| Z       | 2    | LOW             | **HIGH (3V3)**  |
+| (spare) | 3    | HIGH            | HIGH            |
 
-Getting two drivers on the same address will make them collide on the bus → the firmware reports those
-nodes as `absent`. Double-check MS1/MS2 before powering up.
+Getting two drivers on the same address will make them collide on the bus → the firmware reports those nodes as `absent`.
+Double-check MS1/MS2 before powering up.
 
 ---
 
@@ -153,19 +152,18 @@ Leave `DIAG`, `INDEX`, `CLK`, `SPREAD` unconnected (CLK floating = internal osci
 
 ## 7. Firmware defaults & relevant `$` settings
 
-The drivers are configured over UART by the `tmc_manager` task at boot from these settings (live values
-confirmed via `$$`):
+The drivers are configured over UART by the `tmc_manager` task at boot from these settings (live values confirmed via `$$`):
 
-| Setting | Default | Meaning |
-|---------|---------|---------|
-| `$100/$101/$102` | 250.000 | steps per mm (X/Y/Z) |
-| `$110/$111/$112` | 500.000 | max rate mm/min (rapid speed) |
-| `$120/$121/$122` | 10.000 | acceleration mm/s² |
-| `$140/$141/$142` | 800 | **RMS run current, mA** (max clamp 2000) |
-| `$150/$151/$152` | 16 | microstep resolution |
+| Setting          | Default | Meaning                                  |
+|------------------|---------|------------------------------------------|
+| `$100/$101/$102` | 250.000 | steps per mm (X/Y/Z)                     |
+| `$110/$111/$112` | 500.000 | max rate mm/min (rapid speed)            |
+| `$120/$121/$122` | 10.000  | acceleration mm/s²                       |
+| `$140/$141/$142` | 800     | **RMS run current, mA** (max clamp 2000) |
+| `$150/$151/$152` | 16      | microstep resolution                     |
 
-Adjust before/after motion with e.g. `$140=400` (gentler first test) or `$140=1000`. Set, then it
-persists to flash. Hold current, R_sense (0.05 Ω), and other advanced TMC params are defaults / `$PBX`.
+Adjust before/after motion with e.g. `$140=400` (gentler first test) or `$140=1000`. Set, then it persists to flash.
+Hold current, R_sense (0.05 Ω), and other advanced TMC params are defaults / `$PBX`.
 
 > **What `G0 X5` does on the bench:** with 250 steps/mm and 16 microsteps (3200 µsteps/rev), `X5` =
 > 1250 µsteps ≈ **0.39 shaft revolution** (there's no leadscrew, so "mm" is just the configured step
@@ -199,26 +197,24 @@ persists to flash. Hold current, R_sense (0.05 Ω), and other advanced TMC param
    G90          ; back to absolute
    ?            ; expect <Idle|WPos:...> with the axis advanced
    ```
-   A `?` mid-move shows `Run` with `WPos` climbing and `FS` = the rapid rate. Each axis should turn
-   smoothly; reverse with `G0 X-50`.
-6. **Tune.** Raise `$140` toward the motor's rating if torque is low and the driver stays cool; raise
-   `$110` for faster rapids. Re-check thermals — TMC2209s get warm; add airflow/heatsinks for sustained
-   current.
+   A `?` mid-move shows `Run` with `WPos` climbing and `FS` = the rapid rate. Each axis should turn smoothly; reverse with `G0 X-50`.
+6. **Tune.** Raise `$140` toward the motor's rating if torque is low and the driver stays cool; raise `$110` for faster rapids.
+   Re-check thermals — TMC2209s get warm; add airflow/heatsinks for sustained current.
 
 ---
 
 ## 9. Troubleshooting
 
-| Symptom | Likely cause |
-|---------|--------------|
-| Driver `absent` in defmt log | MS1/MS2 address clash or wrong; missing 1 kΩ; GPIO9 not on the bus; no common GND; VIO not 3V3 |
-| All three `absent` | UART line not reaching GPIO9, or GND not common between MCU and drivers |
-| Motor whines / vibrates, no rotation | One coil pair split across A/B; swap so each coil's two wires share an output pair |
-| Motor spins wrong direction | Swap the two wires of **one** coil, or flip `$3` dir-invert later |
-| Motor weak / skips steps | Run current too low (`$140`), accel too high (`$120`), or rapid too fast (`$110`); VM sagging |
-| Driver hot / cuts out | Run current too high for breadboard wiring or no airflow; VM cap missing; lower `$140` |
-| Nothing moves, `Bf` drops, returns to Idle | Steps generated but motor unpowered — VM off, or EN not LOW (check GPIO8 → all EN pins) |
-| Erratic / resets under motion | Motor current through breadboard rails (voltage droop) — move VM/coils off-rail (§5) |
+| Symptom                                    | Likely cause                                                                                   |
+|--------------------------------------------|------------------------------------------------------------------------------------------------|
+| Driver `absent` in defmt log               | MS1/MS2 address clash or wrong; missing 1 kΩ; GPIO9 not on the bus; no common GND; VIO not 3V3 |
+| All three `absent`                         | UART line not reaching GPIO9, or GND not common between MCU and drivers                        |
+| Motor whines / vibrates, no rotation       | One coil pair split across A/B; swap so each coil's two wires share an output pair             |
+| Motor spins wrong direction                | Swap the two wires of **one** coil, or flip `$3` dir-invert later                              |
+| Motor weak / skips steps                   | Run current too low (`$140`), accel too high (`$120`), or rapid too fast (`$110`); VM sagging  |
+| Driver hot / cuts out                      | Run current too high for breadboard wiring or no airflow; VM cap missing; lower `$140`         |
+| Nothing moves, `Bf` drops, returns to Idle | Steps generated but motor unpowered — VM off, or EN not LOW (check GPIO8 → all EN pins)        |
+| Erratic / resets under motion              | Motor current through breadboard rails (voltage droop) — move VM/coils off-rail (§5)           |
 
 ---
 
@@ -229,17 +225,16 @@ persists to flash. Hold current, R_sense (0.05 Ω), and other advanced TMC param
         ┌───────────────────┐                    ┌────────────────────────┐
    USB ─┤ (host)        3V3 ├────────────────────┤ VIO                    │
         │               GND ├───────┬────────────┤ GND                    │
-        │             GPIO1 ├───────┼────────────┤ STEP        OA1 ├──┐    │
+        │             GPIO1 ├───────┼────────────┤ STEP        OA1 ├──┐   │
         │             GPIO5 ├───────┼────────────┤ DIR         OA2 ├──┤ coil A
-        │             GPIO8 ├───────┼────────────┤ EN          OB1 ├──┐    │
+        │             GPIO8 ├───────┼────────────┤ EN          OB1 ├──┐   │
         │             GPIO9 ├──[1kΩ]┼────────────┤ PDN_UART    OB2 ├──┤ coil B
-        └───────────────────┘       │   MS1→GND  ┤ MS1                │    │
-                                    │   MS2→GND  ┤ MS2          VM ├──┼──┐ │
-   12–24V PSU + ──────────────────────────(heavy, off-rail)─────────┘  │ │
+        └───────────────────┘       │   MS1→GND  ┤ MS1                │   │
+                                    │   MS2→GND  ┤ MS2          VM ├──┼──┐│
+   12–24V PSU + ──────────────────────────(heavy, off-rail)─────────┘ │  │
    12–24V PSU − ──────────────────────┴──────────────────────────(common GND)
                                                   100µF across VM↔GND ──┘
         (Y on GPIO2/6, node1 MS1=HIGH; Z on GPIO4/7, node2 MS2=HIGH; EN+UART+GND shared)
 ```
 
-When all three axes jog smoothly off the breadboard, you're ready to move to a soldered harness /
-proper CNC frame.
+When all three axes jog smoothly off the breadboard, you're ready to move to a soldered harness / proper CNC frame.

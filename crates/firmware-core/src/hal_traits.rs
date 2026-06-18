@@ -93,8 +93,61 @@ pub trait StepSink {
 // PwmSink: normalized 0.0..=1.0 spindle duty sink (LEDC PWM on target).
 // TODO(DOC-05): pub trait PwmSink { fn set_duty(&mut self, frac: f32) -> Result<(), PwmError>; }
 
-// DigitalIn: limit / control digital input (NC limit switches, feed-hold, cycle-start).
-// TODO(DOC-06): pub trait DigitalIn { fn is_active(&self) -> bool; }
+/// The runtime configuration of a limit input that the host-tested homing/hard-limit logic needs (DOC-06). It
+/// folds the one grblHAL limit `$`-setting the trigger READ depends on:
+/// - `$5` (`invert`): Galdr wires Normally-Closed (NC) micro-switches to GND with an internal pull-up, so an
+///   intact untriggered switch holds the pin LOW and opening it (or a broken wire) lets the pull-up raise it
+///   HIGH = triggered (the documented broken-wire fail-safe, DOC-06). `$5=1` inverts that decision so a board
+///   wired Normally-Open — or a limit GPIO jumpered to GND during bench bring-up — also reads correctly.
+///
+/// Unlike [`ProbeConfig`] there is no pull-up-disable knob: limit inputs always enable the internal pull-up
+/// (the NC fail-safe depends on it), so this carries only the `$5` invert. The trigger decision lives in the
+/// host-tested [`limit_triggered`] so the firmware bin's GPIO read and the ISR/seek paths agree on one sense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LimitConfig {
+  /// `$5` limit-pin invert. With `$5=0` (default) a HIGH pin reads triggered (NC switch open / broken wire);
+  /// `$5=1` inverts that for a Normally-Open wiring or the bring-up jumper-to-GND case (DOC-06 bring-up note).
+  pub invert: bool,
+}
+
+impl Default for LimitConfig {
+  /// grbl's limit default: no invert (`$5=0`), i.e. the NC convention where an open switch / broken wire reads
+  /// HIGH = triggered. A Normally-Open wiring (or a bring-up GND jumper) needs `$5=1` set explicitly.
+  fn default() -> Self {
+    LimitConfig { invert: false }
+  }
+}
+
+/// Decide whether a limit switch is currently TRIGGERED from its RAW electrical level and the limit config,
+/// applying the `$5` invert. This is the single host-tested place the invert is honored so the firmware bin's
+/// GPIO read, the rising-edge limit ISR, and the homing seek/locate sampling all agree on the trigger sense.
+/// `raw_high` is the pin level directly off the input (`true` = electrically high).
+///
+/// The base (`$5=0`) sense is Galdr's NC convention: a closed (intact, untriggered) switch grounds the pin LOW,
+/// so a HIGH pin means the switch opened (axis at the limit) OR the wire broke — both must read TRIGGERED, which
+/// is the broken-wire fail-safe (DOC-06). This is the OPPOSITE base polarity from [`probe_triggered`] (the probe
+/// idles high), so the two must not be conflated even though both apply their invert in one place. `$5=1` is a
+/// pure electrical invert of the decision for a Normally-Open wiring or the bench jumper-to-GND bring-up case.
+pub fn limit_triggered(raw_high: bool, config: &LimitConfig) -> bool {
+  // NC base: HIGH = triggered (switch open or broken wire), LOW = not triggered (intact closed switch). `$5`
+  // inverts the whole decision so a NO wiring (idles low, rises on trigger only via an external pull-down) or a
+  // GND-jumpered bring-up pin reads correctly. DOC-06's bring-up note documents `$5=1` as the jumper workaround.
+  raw_high ^ config.invert
+}
+
+/// A limit / control digital input (DOC-06). Implemented over a single GPIO with an internal pull-up and a
+/// rising-edge interrupt on target (X/Y/Z limit = GPIO10/11/12 per the DOC-00 manifest) and as a scripted
+/// recording mock in host tests. Like [`ProbeInput`], the trait exposes ONLY the RAW electrical level; the `$5`
+/// invert is applied by the host-tested [`limit_triggered`] so the firmware impl carries zero settings knowledge
+/// and the trigger sense stays unit-tested. The homing seek/locate walker samples this BETWEEN single-step
+/// bursts (mirroring the probe cycle), and the hard-limit ISR turns its rising edge into a `LIMIT_TRIGGERED`
+/// Signal that the firmware bin resamples after the `$26` debounce window before accepting.
+pub trait DigitalIn {
+  /// The raw electrical level of the input pin: `true` = high, `false` = low. The `$5`-adjusted trigger decision
+  /// is made by [`limit_triggered`]; this reader is deliberately invert-agnostic so the policy lives in one place.
+  fn is_high(&self) -> bool;
+}
 
 /// The runtime configuration of the probe input that the host-tested probe logic needs (DOC-09, Phase C). It
 /// folds the two grblHAL probe `$`-settings the probe READ depends on:
@@ -286,5 +339,43 @@ mod tests {
     let without = ProbeConfig { invert: false, pullup_disable: false };
     assert_eq!(probe_triggered(true, &with), probe_triggered(true, &without));
     assert_eq!(probe_triggered(false, &with), probe_triggered(false, &without));
+  }
+
+  // ---- Limit input: `$5` invert / NC fail-safe semantics (DOC-06) ---------------------------------
+
+  #[test]
+  fn limit_default_config_is_nc_high_triggered() {
+    // Galdr wires NC switches to GND with an internal pull-up: an INTACT, untriggered switch holds the pin
+    // LOW; opening the switch OR a broken wire lets the pull-up pull the pin HIGH = triggered. So with `$5=0`
+    // a HIGH pin reads triggered and a LOW pin reads not-triggered — the OPPOSITE of the probe's base sense,
+    // because the probe idles high while a NC limit idles low. This is the documented broken-wire fail-safe.
+    let cfg = LimitConfig::default();
+    assert!(!cfg.invert);
+    assert!(limit_triggered(true, &cfg), "open switch / broken wire (high) reads triggered under $5=0");
+    assert!(!limit_triggered(false, &cfg), "intact closed NC switch (low) reads not-triggered under $5=0");
+  }
+
+  #[test]
+  fn limit_invert_flips_the_trigger_sense() {
+    // `$5=1` is a pure electrical invert of the trigger decision, so a board wired Normally-Open (or jumpered
+    // to GND during bring-up, per DOC-06's bring-up note) reads correctly. It must cleanly flip BOTH levels.
+    let inverted = LimitConfig { invert: true };
+    let base = LimitConfig::default();
+    assert_eq!(limit_triggered(true, &inverted), !limit_triggered(true, &base), "$5 inverts the high decision");
+    assert_eq!(limit_triggered(false, &inverted), !limit_triggered(false, &base), "$5 inverts the low decision");
+    // Concretely: under `$5=1`, a low pin is triggered and a high pin is not (the bring-up jumper-to-GND case).
+    assert!(limit_triggered(false, &inverted));
+    assert!(!limit_triggered(true, &inverted));
+  }
+
+  #[test]
+  fn limit_and_probe_idle_senses_are_opposite_under_no_invert() {
+    // Sanity check that the two inputs genuinely differ at rest: with no invert, the probe idles HIGH and
+    // reads not-triggered high, while the NC limit idles LOW and reads not-triggered low. They share the
+    // single-place-invert pattern but NOT the base polarity — a future author must not copy one onto the other.
+    let limit = LimitConfig::default();
+    let probe = ProbeConfig::default();
+    assert_ne!(limit_triggered(true, &limit), probe_triggered(true, &probe));
+    assert_ne!(limit_triggered(false, &limit), probe_triggered(false, &probe));
   }
 }

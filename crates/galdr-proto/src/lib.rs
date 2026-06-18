@@ -104,7 +104,7 @@ mod tests {
     msg.steps_per_mm_x = 250.0;
     msg.steps_per_mm_y = 251.5;
     msg.steps_per_mm_z = 800.0;
-    msg.homing_enable = true;
+    msg.homing_flags = 1;
     msg.run_current_ma_x = 800;
     msg.microsteps_z = 16;
     msg.tmc_r_sense_ohms = 0.05;
@@ -119,7 +119,7 @@ mod tests {
     assert_eq!(decoded.steps_per_mm_x, 250.0);
     assert_eq!(decoded.steps_per_mm_y, 251.5);
     assert_eq!(decoded.steps_per_mm_z, 800.0);
-    assert!(decoded.homing_enable);
+    assert_eq!(decoded.homing_flags, 1);
     assert_eq!(decoded.run_current_ma_x, 800);
     assert_eq!(decoded.microsteps_z, 16);
     assert_eq!(decoded.tmc_r_sense_ohms, 0.05);
@@ -137,8 +137,8 @@ mod tests {
     msg.junction_deviation_mm = 1.0;
     msg.arc_tolerance_mm = 1.0;
     msg.soft_limits_enable = true;
-    msg.hard_limits_enable = true;
-    msg.homing_enable = true;
+    msg.hard_limit_flags = u32::MAX;
+    msg.homing_flags = u32::MAX;
     msg.homing_dir_invert_mask = u32::MAX;
     msg.homing_feed_mm_min = 1.0;
     msg.homing_seek_mm_min = 1.0;

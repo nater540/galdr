@@ -53,13 +53,19 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rmt::{Channel, PulseCode, Tx, TxChannelConfig, TxChannelCreator};
 use esp_hal::Blocking;
 use embassy_futures::select::{select, select4, Either, Either4};
+use embassy_time::{Duration, Timer};
 
-use firmware_core::hal_traits::{probe_triggered, DirState, ProbeConfig, ProbeInput, StepError, StepEvent, StepSink, MAX_SYMBOLS_PER_BURST};
+use firmware_core::hal_traits::{
+  probe_triggered, DigitalIn, DirState, ProbeConfig, ProbeInput, StepError, StepEvent, StepSink,
+  MAX_SYMBOLS_PER_BURST,
+};
+use firmware_core::homing::{HomingConfig, HomingError, HOMING_GROUPS};
 use firmware_core::motion::{silent_symbol_halves, MotionConfig, ProbeStepper, SegmentGenerator, StepCounter};
 use firmware_core::planner::{Block, Planner, AXES};
 
 use crate::comms::{
-  overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HOLD_REQUESTED, HOLD_WAKE,
+  overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HARD_LIMITS_ENABLED,
+  HARD_LIMIT_TRIPPED, HOLD_REQUESTED, HOLD_WAKE, HOMING_ACTIVE, HOME_REQUEST, HOME_RESULT, LIMIT_TRIGGERED,
   LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
   MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT,
 };
@@ -193,6 +199,43 @@ impl RmtProbeInput {
 impl ProbeInput for RmtProbeInput {
   /// The raw electrical level of the probe pin: `true` = high. The trigger decision (with `$6` invert) is made by
   /// [`probe_triggered`](firmware_core::hal_traits::probe_triggered) in the probe cycle, not here.
+  fn is_high(&self) -> bool {
+    self.pin.is_high()
+  }
+}
+
+/// A limit-switch digital input (DOC-06): one GPIO (X/Y/Z limit = GPIO10/11/12, DOC-00 manifest) read as the
+/// raw electrical level. Mirrors [`RmtProbeInput`] exactly — the `$5` invert is applied by the host-tested
+/// [`limit_triggered`](firmware_core::hal_traits::limit_triggered), so this carries no settings knowledge. The
+/// internal pull-up is always enabled (the NC fail-safe depends on it): an intact closed switch grounds the pin
+/// LOW, and an open switch or a broken wire lets the pull-up raise it HIGH = triggered. The homing seek/locate
+/// walker samples this between single-tick bursts; the bin's limit ISR turns its rising edge into the
+/// [`LIMIT_TRIGGERED`](crate::comms::LIMIT_TRIGGERED) signal for the hard-limit path.
+pub struct RmtLimitInput {
+  /// The limit input pin, configured with the internal pull-up at bring-up (see [`init_limits`]).
+  pin: Input<'static>,
+}
+
+impl RmtLimitInput {
+  /// Wrap a configured limit input pin.
+  pub fn new(pin: Input<'static>) -> Self {
+    RmtLimitInput { pin }
+  }
+
+  /// Await a RISING edge on this limit pin (DOC-06 / research finding #14). esp-hal's `wait_for_rising_edge`
+  /// arms the GPIO rising-edge interrupt for this pad and registers an embassy waker, so this is the genuine
+  /// interrupt-driven edge wait (no hand-written ISR, no polling) — the executor parks until the hardware edge
+  /// fires. Under the NC fail-safe wiring a closed switch holds the pin LOW; opening it (a trip) or a broken
+  /// wire lets the pull-up raise it HIGH, which is exactly the rising edge awaited here.
+  async fn wait_for_rising_edge(&mut self) {
+    self.pin.wait_for_rising_edge().await;
+  }
+}
+
+impl DigitalIn for RmtLimitInput {
+  /// The raw electrical level of the limit pin: `true` = high. The trigger decision (with the `$5` invert and
+  /// the NC fail-safe sense) is made by [`limit_triggered`](firmware_core::hal_traits::limit_triggered) in the
+  /// homing/hard-limit path, not here — this reader is deliberately invert-agnostic.
   fn is_high(&self) -> bool {
     self.pin.is_high()
   }
@@ -345,6 +388,7 @@ impl StepSink for RmtStepSink {
 pub async fn run(
   sink: &mut RmtStepSink,
   probe: &mut RmtProbeInput,
+  limits: &mut [RmtLimitInput; AXES],
   config: MotionConfig,
   max_rate_mm_min: [f32; AXES],
 ) -> ! {
@@ -418,6 +462,12 @@ pub async fn run(
         // idle. The next block republishes it. The override-scaled REALIZED feed is computed by the reporter.
         LIVE_PROGRAMMED_FEED_MM_MIN.store(0, Ordering::Release);
         EXECUTOR_RUNNING.store(false, Ordering::Release);
+        // DOC-06 hard-limit check at the block BOUNDARY: sample the limit switches now that a block finished and
+        // raise the alarm (halting the queue) if `$21` is on and a switch tripped during normal motion. Sampling
+        // at the boundary (not mid-burst — a burst is never split) bounds detection to one block, which is
+        // adequate for an over-travel safety abort on short PCB-milling blocks. The shared-pin rule (no alarm
+        // while homing) is enforced inside `check_hard_limits`.
+        check_hard_limits(limits);
       }
       // Queue empty: await a freshly enqueued block instead of polling, racing the dedicated motion reset (so a
       // reset while idle is observed promptly), the hold-level wake (so a hold latched while idle is honored —
@@ -429,10 +479,20 @@ pub async fn run(
         // Queue empty: about to await a fresh block. If "block popped" never follows a BLOCK_AVAILABLE wake but
         // `?` shows a queued block, the wake/enqueue handshake is racing (block enqueued without signaling, or
         // the signal consumed elsewhere) — not the RMT path.
-        mtrace!("motion: queue empty -> awaiting block/reset/hold/probe");
-        match select4(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait(), HOLD_WAKE.wait(), PROBE_REQUEST.wait()).await {
-          Either4::First(()) => mtrace!("motion: woke on BLOCK_AVAILABLE"),
-          Either4::Second(()) => {
+        mtrace!("motion: queue empty -> awaiting block/reset/hold/probe/home");
+        // Race the existing four idle wakes against a `$H` homing request (DOC-06). Homing, like a probe, is a
+        // synchronized boundary serviced only from the empty-queue branch — the consumer flushes look-ahead and
+        // blocks on the result, so no block ever follows it out of order. The outer `select` consumes the homing
+        // request inline (running the whole cycle) rather than looping back, exactly as the probe arm does.
+        let idle = select4(BLOCK_AVAILABLE.wait(), MOTION_RESET.wait(), HOLD_WAKE.wait(), PROBE_REQUEST.wait());
+        // Race the four idle wakes against a `$H` homing request AND a debounced limit rising-edge trip (so a
+        // switch pressed while the machine sits idle still raises the hard-limit alarm, DOC-06 / finding #1).
+        // `wait_for_limit_trip` is the genuine interrupt-driven edge wait + `$26` resample, and it SIGNALS
+        // `LIMIT_TRIGGERED` once a confirmed trip is observed, so that documented seam now has a real producer.
+        // Nested `select`s keep each arm typed.
+        match select(select(idle, HOME_REQUEST.wait()), wait_for_limit_trip(limits)).await {
+          Either::First(Either::First(Either4::First(()))) => mtrace!("motion: woke on BLOCK_AVAILABLE"),
+          Either::First(Either::First(Either4::Second(()))) => {
             mtrace!("motion: woke on MOTION_RESET (idle)");
             MOTION_RESET_PENDING.store(false, Ordering::Release);
             reset_live_position(&mut counter);
@@ -440,8 +500,14 @@ pub async fn run(
           // A hold-level change while idle: loop back so the top-of-loop hold check re-reads the LEVEL and parks
           // if it is set (or simply proceeds if a spurious wake found it clear). Re-reading the level — never
           // acting on the edge — is the Finding #11 invariant.
-          Either4::Third(()) => mtrace!("motion: woke on HOLD_WAKE (idle)"),
-          Either4::Fourth(request) => run_probe(&prober, &request, probe, sink, &mut counter),
+          Either::First(Either::First(Either4::Third(()))) => mtrace!("motion: woke on HOLD_WAKE (idle)"),
+          Either::First(Either::First(Either4::Fourth(request))) => {
+            run_probe(&prober, &request, probe, sink, &mut counter)
+          }
+          Either::First(Either::Second(config)) => run_homing(&config, limits, sink, &mut counter),
+          // A debounced limit rising-edge trip while idle: sample the switches and raise the hard-limit alarm if
+          // due (DOC-06). `wait_for_limit_trip` already applied the `$26` debounce and signalled `LIMIT_TRIGGERED`.
+          Either::Second(()) => check_hard_limits(limits),
         }
       }
     }
@@ -541,7 +607,7 @@ fn run_block(
   counter.set_direction(DirState {
     dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0],
   });
-  let mut tracking = CountingSink { inner: sink, counter };
+  let mut tracking = CountingSink::live(sink, counter);
   // The generator returns the tick count or a recoverable error; on error we simply stop emitting this
   // block. The error is not surfaced upward because Stage 1 has no alarm state machine yet (DOC-06/Stage 2);
   // the abandoned block leaves the machine where the last published burst put it, which the live MPos shows.
@@ -606,7 +672,7 @@ fn run_probe(prober: &ProbeStepper, request: &ProbeRequest, probe: &RmtProbeInpu
   // Track whether the very first sample was already at the stop edge, so the consumer can distinguish ALARM:4
   // (already-at-edge) from ALARM:5 (no contact). `ProbeStepper` returns `steps_emitted == 0` with a trigger in
   // that case, but we also need the raw position; the counter holds it.
-  let mut tracking = CountingSink { inner: sink, counter };
+  let mut tracking = CountingSink::live(sink, counter);
   let outcome = prober.run_probe(&block, request.step_period_ticks, &mut at_stop_edge, &mut tracking);
 
   // The latched stop position is exactly what the counter shows (the CountingSink advanced it per emitted step).
@@ -626,6 +692,150 @@ fn run_probe(prober: &ProbeStepper, request: &ProbeRequest, probe: &RmtProbeInpu
     Err(_) => (false, false),
   };
   PROBE_RESULT.signal(ProbeResult { triggered, stop_steps, already_at_edge });
+}
+
+/// Run one `$H` homing cycle (DOC-06) on core 1, where the RMT step channels and the limit inputs live. Walks
+/// [`HOMING_GROUPS`](firmware_core::homing::HOMING_GROUPS) in order — Z first, then X and Y — running the pure,
+/// host-tested [`home_axis`](firmware_core::homing::home_axis) primitive for each axis through a [`CountingSink`]
+/// so the live MPos tracks the seek/locate/pull-off motion. On success it SYNCS the live step counter to each
+/// axis's post-homing machine-zero position (the value the consumer also pushes into the planner/parser) and
+/// publishes the result via [`HOME_RESULT`](crate::comms::HOME_RESULT); a no-contact / sink failure publishes the
+/// error so the consumer raises the homing-fail alarm + reset.
+///
+/// ## X+Y run SEQUENTIALLY here, not concurrently
+/// Research finding #10 notes X and Y CAN home concurrently on Galdr's independent RMT channels (each stopping as
+/// its own switch latches). This executor is a single synchronous task, and [`home_axis`] is a blocking per-axis
+/// walk, so the axes in a group are homed one after another rather than interleaved. That is mechanically valid
+/// (grbl supports single-axis homing too) and keeps the cycle simple and verifiable; concurrent X+Y co-motion
+/// (for speed / gantry squaring) is a later refinement that would interleave the two channels' single-tick bursts.
+///
+/// ## Hard limits are suppressed during the cycle (shared-pin rule)
+/// The hard-limit alarm path is gated OFF while `MachineState::Home` is active (the limit switches are EXPECTED
+/// to trip during homing), and re-armed after — the consumer publishes the `Home` control state for the cycle's
+/// duration, so the limit-monitor never raises `ALARM:1` mid-home (research finding #17). This function only
+/// emits the seek/locate motion; the control-state gating lives in the consumer + the limit monitor.
+fn run_homing(config: &HomingConfig, limits: &mut [RmtLimitInput; AXES], sink: &mut RmtStepSink, counter: &mut StepCounter) {
+  // Publish "running" so `?` reports motion for the cycle's duration (the consumer reports `Home` via the control
+  // state; this keeps EXECUTOR_RUNNING truthful so a stale `Idle` is never reported mid-cycle).
+  EXECUTOR_RUNNING.store(true, Ordering::Release);
+
+  let mut zero_steps = counter.position_steps();
+  let mut result: Result<[i32; AXES], HomingError> = Ok(zero_steps);
+
+  // TODO(DOC-06): concurrent intra-group homing. The per-axis independent-RMT-channel design (research finding
+  // #10) supports X+Y seeking together, each channel stopping as its OWN switch latches. Doing it would require
+  // a new firmware-core primitive that interleaves several axes' single-tick bursts under one loop with a
+  // per-axis stop predicate + per-axis phase state — `home_axis` today owns one sink and runs all four phases
+  // linearly for ONE axis, so it cannot be driven concurrently without restructuring its borrow model. That is
+  // not a contained change, so the within-group axes are homed SEQUENTIALLY here. It is mechanically valid
+  // (grbl supports single-axis homing) and keeps the cycle verifiable; concurrency is a speed/squaring refinement.
+  'cycle: for group in HOMING_GROUPS {
+    for &axis in *group {
+      // Split the borrow: `home_axis` needs `&mut sink` (through the CountingSink) and `&limits[axis]`. The
+      // CountingSink wraps the step sink + the live counter so the seek/locate/pull-off motion tracks the live
+      // position. It is the QUIET variant (finding #5): a homing seek emits thousands of single-step bursts, so
+      // publishing per burst would do thousands of 3× atomic stores per seek; we publish at the phase boundary
+      // (after each axis completes) below instead, which is ample DRO resolution for a homing cycle.
+      let outcome = {
+        let mut tracking = CountingSink::quiet(sink, counter);
+        firmware_core::homing::home_axis(config, axis, &mut tracking, &limits[axis])
+      };
+      match outcome {
+        Ok(o) => {
+          zero_steps[axis] = o.zero_steps;
+          // Phase-boundary publish (finding #5): push the live MPos now that this axis has finished all four
+          // homing phases, so `?` reflects the homing progress without the per-burst atomic flood.
+          publish_live_position(counter);
+        }
+        Err(e) => {
+          // A no-contact / sink failure aborts the whole cycle: position is suspect, so publish the error and
+          // stop. The consumer raises the homing-fail alarm + forces a reset; this does not fabricate a homed state.
+          result = Err(e);
+          break 'cycle;
+        }
+      }
+    }
+  }
+
+  // On success, SYNC the live counter to the post-homing machine-zero position so the published MPos snaps to
+  // the established zero (the consumer mirrors this into the planner/parser commanded position). On failure the
+  // live position is left where the aborted seek stopped; the consumer's reset zeroes it.
+  if result.is_ok() {
+    counter.sync_to(zero_steps);
+    publish_live_position(counter);
+    result = Ok(zero_steps);
+  }
+
+  EXECUTOR_RUNNING.store(false, Ordering::Release);
+  HOME_RESULT.signal(result);
+}
+
+/// Await a DEBOUNCED limit-switch trip while the executor is idle (DOC-06 / research findings #1 & #14). Races a
+/// rising edge across all three X/Y/Z limit pins (the genuine interrupt-driven [`Input::wait_for_rising_edge`],
+/// no hand-written ISR, no polling — the executor parks until the hardware edge fires), then runs the `$26`
+/// debounce RESAMPLE: wait `$26` ms, then re-read the live levels and confirm at least one axis still reads
+/// triggered through the host-tested [`limit_triggered`](firmware_core::hal_traits::limit_triggered) (honoring
+/// the live `$5` sense + the NC fail-safe). A confirmed trip SIGNALS [`LIMIT_TRIGGERED`](crate::comms::
+/// LIMIT_TRIGGERED) — giving that documented seam a real producer — and returns so the idle arm samples + alarms.
+/// A glitch that does NOT persist past the debounce (EMI, NC-pull-up settling) is rejected: the function loops
+/// and re-arms the edge wait rather than returning a false trip.
+///
+/// This is the idle-path detector ONLY; an in-MOTION over-travel is caught by the block-boundary
+/// [`check_hard_limits`] call (a burst in flight is never split). The shared-pin rule (no alarm while homing) is
+/// applied downstream in [`check_hard_limits`] / [`hard_limit_alarm`], not here.
+async fn wait_for_limit_trip(limits: &mut [RmtLimitInput; AXES]) {
+  loop {
+    // Park on a rising edge from ANY limit pin. `select` over the three borrows races them concurrently; the
+    // first edge to fire resolves. The borrows are split per element so all three can be awaited at once.
+    {
+      let [x, y, z] = limits;
+      let edge = select(
+        select(x.wait_for_rising_edge(), y.wait_for_rising_edge()),
+        z.wait_for_rising_edge(),
+      );
+      edge.await;
+    }
+    mtrace!("motion: limit rising edge -> debounce resample");
+    // Debounce: wait `$26` ms, then confirm the level persists. A zero `$26` still resamples immediately (one
+    // `Timer::after(0)` yields), so a glitch already cleared by the read is rejected even with debounce disabled.
+    let debounce_ms = crate::comms::limit_debounce_ms();
+    Timer::after(Duration::from_millis(debounce_ms as u64)).await;
+    let config = crate::comms::limit_config();
+    let still_tripped = (0..AXES).any(|i| firmware_core::hal_traits::limit_triggered(limits[i].is_high(), &config));
+    if still_tripped {
+      // A confirmed trip: publish the documented `LIMIT_TRIGGERED` seam and return so the idle arm samples the
+      // switches and raises `ALARM:1` (gated by `$21` + the not-homing shared-pin rule) via `check_hard_limits`.
+      mtrace!("motion: limit trip confirmed after debounce");
+      LIMIT_TRIGGERED.signal(());
+      return;
+    }
+    // The edge did not persist past the debounce — a glitch. Drain any stale `LIMIT_TRIGGERED` we are about to
+    // re-arm against, then loop to wait for the next genuine edge rather than returning a false trip.
+    mtrace!("motion: limit edge rejected by debounce (glitch)");
+  }
+}
+
+/// Sample the X/Y/Z limit switches and raise the hard-limit alarm if one tripped during normal motion (DOC-06).
+/// Reads the raw pin levels, applies the live `$5` invert + `$21` enable + the shared-pin (not-homing) rule via
+/// the host-tested [`hard_limit_alarm`](firmware_core::homing::hard_limit_alarm), and on an alarm signals
+/// [`HARD_LIMIT_TRIPPED`] so the consumer enters `ALARM:1` and resets the pipeline. Called at every block
+/// boundary and on the idle limit-ISR wake; a no-op when `$21` is off, while homing, or when nothing is tripped.
+fn check_hard_limits(limits: &[RmtLimitInput; AXES]) {
+  // Build the live limit config from the `$5` mirror and read the enable + homing-active flags (all `Relaxed`
+  // atomics — a real-time-safe read, no async settings lock).
+  let config = crate::comms::limit_config();
+  let enabled = HARD_LIMITS_ENABLED.load(Ordering::Relaxed);
+  let homing = HOMING_ACTIVE.load(Ordering::Acquire);
+  // Build the per-axis raw-level array positionally from the inputs (finding #6): `from_fn` over `AXES` cannot
+  // silently desync from the axis count/order the way a hardcoded `[0, 1, 2]` index list could.
+  let raw_high: [bool; AXES] = core::array::from_fn(|i| limits[i].is_high());
+  let decision = firmware_core::homing::hard_limit_alarm(raw_high, &config, enabled, homing);
+  if decision.alarm {
+    // A limit tripped during normal motion with `$21` on: halt and raise `ALARM:1`. The consumer locks the
+    // alarm (position is likely lost from the abrupt stop) and resets the pipeline; the executor's reset path
+    // zeroes the live position. Signal once — the alarm latches, so a re-trip before service is harmless.
+    HARD_LIMIT_TRIPPED.signal(());
+  }
 }
 
 /// Build a probe [`Block`] from the current machine position `start` (steps) to the probe `target` (steps). A
@@ -664,12 +874,34 @@ fn probe_block_to(start: [i32; AXES], target: [i32; AXES]) -> Block {
 struct CountingSink<'a> {
   inner: &'a mut RmtStepSink,
   counter: &'a mut StepCounter,
+  /// Publish the live [`LIVE_POSITION`] atomics after EVERY burst when `true` (normal block / probe motion, so
+  /// MPos stays live within a long block). Set `false` for the `$H` homing cycle (finding #5): a homing seek
+  /// emits thousands of single-step bursts, so a per-burst publish would do thousands of 3× `Release` stores per
+  /// seek; homing instead publishes at PHASE boundaries (after each axis + the final zero sync) in [`run_homing`].
+  publish_per_burst: bool,
+}
+
+impl<'a> CountingSink<'a> {
+  /// A [`CountingSink`] that publishes the live position after every burst — the default for normal block and
+  /// probe motion, where bursts are large and MPos must track within a block.
+  fn live(inner: &'a mut RmtStepSink, counter: &'a mut StepCounter) -> Self {
+    CountingSink { inner, counter, publish_per_burst: true }
+  }
+
+  /// A [`CountingSink`] that does NOT publish per burst — for the homing cycle, whose single-step bursts would
+  /// otherwise flood the position atomics (finding #5). The caller publishes at phase boundaries instead.
+  fn quiet(inner: &'a mut RmtStepSink, counter: &'a mut StepCounter) -> Self {
+    CountingSink { inner, counter, publish_per_burst: false }
+  }
 }
 
 impl StepSink for CountingSink<'_> {
   fn set_direction(&mut self, dir: DirState) -> Result<(), StepError> {
-    // The counter's direction is latched in `run_block` from the block's step signs (identical to what the
-    // generator passes here), so forwarding to the hardware is all that is needed.
+    // Latch the counter's direction from the SAME `DirState` the hardware gets, so the live position advances
+    // the right way. For `run_block`/`run_probe` this is identical to the direction they already latched on the
+    // counter (same block step signs), so it is a harmless re-latch; for the multi-phase HOMING cycle — whose
+    // pull-off phases reverse direction mid-cycle — it is what keeps the live MPos correct across the reversals.
+    self.counter.set_direction(dir);
     self.inner.set_direction(dir)
   }
 
@@ -686,9 +918,13 @@ impl StepSink for CountingSink<'_> {
     for event in ticks {
       self.counter.advance(event);
     }
-    // Publish the running step position after the burst, decoupled from the executor's block-level `.await`
-    // so `?` reflects motion as it happens. `Release` stores pair with the reader's `Acquire` loads.
-    publish_live_position(self.counter);
+    // Publish the running step position after the burst (normal motion / probe), decoupled from the executor's
+    // block-level `.await` so `?` reflects motion as it happens. `Release` stores pair with the reader's
+    // `Acquire` loads. Suppressed for homing (finding #5) — its single-step bursts would flood these atomics;
+    // `run_homing` publishes at phase boundaries instead.
+    if self.publish_per_burst {
+      publish_live_position(self.counter);
+    }
     Ok(())
   }
 }
@@ -792,4 +1028,30 @@ pub fn init_probe(probe_pin: esp_hal::peripherals::GPIO21<'static>, config: &Pro
   let pull = if config.pullup_disable { Pull::None } else { Pull::Up };
   let input = Input::new(probe_pin, InputConfig::default().with_pull(pull));
   RmtProbeInput::new(input)
+}
+
+/// Configure the X/Y/Z limit inputs on GPIO10/11/12 (DOC-00 manifest) and wrap each as an [`RmtLimitInput`],
+/// returned `[X, Y, Z]` (DOC-06). Every limit pin gets the internal PULL-UP unconditionally: Galdr wires
+/// Normally-Closed switches to GND, so an intact switch holds the pin LOW and opening it (or a broken wire)
+/// lets the pull-up raise it HIGH = triggered — the documented broken-wire fail-safe. The `$5` invert is a
+/// LOGICAL trigger-sense flip applied per-sample by [`limit_triggered`](firmware_core::hal_traits::limit_triggered),
+/// not a pin-config concern, so it does not change the pull here.
+///
+/// The rising-edge wait that feeds the hard-limit [`LIMIT_TRIGGERED`](crate::comms::LIMIT_TRIGGERED) seam is
+/// driven by the core-1 executor itself, which owns these inputs: its idle loop awaits a rising edge on each pin
+/// via [`RmtLimitInput::wait_for_rising_edge`] (the interrupt-driven esp-hal async edge wait), debounces, and
+/// signals the trip. The homing seek/locate path samples these same inputs between bursts and needs no interrupt.
+pub fn init_limits(
+  x_lim: esp_hal::peripherals::GPIO10<'static>,
+  y_lim: esp_hal::peripherals::GPIO11<'static>,
+  z_lim: esp_hal::peripherals::GPIO12<'static>,
+) -> [RmtLimitInput; AXES] {
+  // The NC fail-safe requires the pull-up on every limit pin regardless of `$5` (which is a logical sense flip,
+  // applied in `limit_triggered`, not a pin-pull setting).
+  let config = InputConfig::default().with_pull(Pull::Up);
+  [
+    RmtLimitInput::new(Input::new(x_lim, config)),
+    RmtLimitInput::new(Input::new(y_lim, config)),
+    RmtLimitInput::new(Input::new(z_lim, config)),
+  ]
 }

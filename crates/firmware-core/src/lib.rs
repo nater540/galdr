@@ -16,6 +16,7 @@ pub mod coords;
 pub mod drivers;
 pub mod gcode;
 pub mod hal_traits;
+pub mod homing;
 pub mod motion;
 pub mod planner;
 pub mod protocol;

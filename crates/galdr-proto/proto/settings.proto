@@ -23,9 +23,12 @@ message Settings {
   float  arc_tolerance_mm      = 7;   // $12 arc chord tolerance, mm.
 
   // --- grbl $20..$27 (limits + homing) ---
-  bool   soft_limits_enable    = 8;   // $20 soft limits enable.
-  bool   hard_limits_enable    = 9;   // $21 hard limits enable.
-  bool   homing_enable         = 10;  // $22 homing cycle enable.
+  // $21/$22 are grblHAL EXCLUSIVE BITMASKS, not booleans (see firmware-core settings). They are uint32 here so
+  // the named flag bits round-trip. Wire-compatible upgrade from the old `bool` fields: a legacy `true` decodes
+  // to 1 (bit0 = enabled), `false`/absent to 0 (disabled) — proto3 bool and uint32 share the varint encoding.
+  bool   soft_limits_enable    = 8;   // $20 soft limits enable (grblHAL keeps this one a boolean).
+  uint32 hard_limit_flags      = 9;   // $21 hard limits bitmask: b0 enable, b1 strict.
+  uint32 homing_flags          = 10;  // $22 homing bitmask: b0 enable, b3 force-set-origin (others reserved).
   uint32 homing_dir_invert_mask = 11; // $23 homing direction invert bitmask.
   float  homing_feed_mm_min    = 12;  // $24 homing feed (locate) rate, mm/min.
   float  homing_seek_mm_min    = 13;  // $25 homing seek rate, mm/min.
@@ -72,6 +75,9 @@ message Settings {
 
   // --- grbl $481 (auto-report interval, DOC-08 Phase F). Additive proto3 field, no version bump. ---
   uint32 auto_report_interval_ms = 56; // $481 auto status report interval, ms (0 = disabled, else 100..=1000).
+
+  // --- grbl $5 (limit-pin invert, DOC-06). Additive proto3 field, no version bump. ---
+  bool   limit_invert          = 57;  // $5  limit-pin invert (0 = NC fail-safe high-triggered, 1 = inverted).
 }
 
 // Note: the `$PBX` host-sync channel transfers a FULL `Settings` message in both directions (the host does a

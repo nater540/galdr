@@ -37,6 +37,19 @@ const DEFAULT_HOMING_SEEK_MM_MIN: f32 = 500.0;
 const DEFAULT_HOMING_DEBOUNCE_MS: u32 = 25;
 /// `$27` homing pull-off default, millimeters.
 const DEFAULT_HOMING_PULLOFF_MM: f32 = 1.0;
+
+/// `$22` homing bitmask bit0: enable the homing cycle (grblHAL `Homing_OnOff`). Set => boot locks in
+/// `ALARM:11` until `$H`/`$X`, `$H` runs, soft limits may be enabled.
+const HOMING_FLAG_ENABLE: u8 = 1 << 0;
+/// `$22` homing bitmask bit3: force machine zero to the origin after homing (grblHAL `HOMING_FORCE_SET_ORIGIN`).
+/// Set => post-homing machine position is `0` on every axis; clear => per-axis from `$23` mask + `$130` + `$27`.
+const HOMING_FLAG_FORCE_SET_ORIGIN: u8 = 1 << 3;
+/// `$21` hard-limit bitmask bit0: enable hard limits (grblHAL `Hardlimits_OnOff`). Set => a limit trigger during
+/// normal motion raises `ALARM:1`.
+const HARD_LIMIT_FLAG_ENABLE: u8 = 1 << 0;
+/// `$21` hard-limit bitmask bit1: strict mode (grblHAL) — limits are also checked on `$X` unlock. Reserved for
+/// the wiring layer; the bit round-trips so a sender that sets it is honored once strict-mode `$X` lands.
+const HARD_LIMIT_FLAG_STRICT: u8 = 1 << 1;
 /// `$30` maximum spindle RPM default (WS55-220 nominal).
 const DEFAULT_SPINDLE_RPM_MAX: f32 = 12_000.0;
 /// `$481` auto-report interval default, milliseconds. grblHAL ships `DEFAULT_AUTOREPORT_INTERVAL 0`
@@ -104,15 +117,22 @@ pub enum SettingError {
   BadValue,
   /// The value parsed but fell outside the acceptable range.
   OutOfRange,
+  /// `$20=1` (enable soft limits) was rejected because `$22` homing is not enabled. grblHAL's
+  /// `Status_SoftLimitError`: soft limits are only meaningful once the machine can establish a homed zero,
+  /// so enabling them without homing is refused (DOC-06). Maps to the grbl "Setting disabled" code.
+  SoftLimitsNeedHoming,
 }
 
 impl SettingError {
   /// The grblHAL `error:N` status code that best represents this failure (3 = unsupported `$` statement,
-  /// 2 = bad numeric value — reused for out-of-range so a sender halts on either).
+  /// 2 = bad numeric value — reused for out-of-range so a sender halts on either; 5 = setting disabled, the
+  /// grbl code whose description is "Homing is not enabled via settings", which is exactly why a soft-limit
+  /// enable is refused).
   pub fn code(self) -> u8 {
     match self {
       SettingError::UnknownSetting => 3,
       SettingError::BadValue | SettingError::OutOfRange => 2,
+      SettingError::SoftLimitsNeedHoming => 5,
     }
   }
 }
@@ -129,6 +149,10 @@ pub struct Settings {
   pub step_invert_mask: u8,
   /// `$3` direction port invert bitmask.
   pub dir_invert_mask: u8,
+  /// `$5` limit-pin invert (DOC-06): `0` is the Normally-Closed fail-safe sense (open switch / broken wire reads
+  /// triggered), `1` inverts it for Normally-Open wiring or the bench jumper-to-GND bring-up case. Folds into the
+  /// limit read via [`crate::hal_traits::LimitConfig`].
+  pub limit_invert: bool,
   /// `$6` probe-pin invert (DOC-09, Phase C): set `$6=1` for a Normally-Open touch plate so an untouched plate
   /// reads "not triggered". Folds into the probe read via [`crate::hal_traits::ProbeConfig`].
   pub probe_invert: bool,
@@ -141,12 +165,18 @@ pub struct Settings {
   pub junction_deviation_mm: f32,
   /// `$12` arc chord tolerance, millimeters.
   pub arc_tolerance_mm: f32,
-  /// `$20` soft limits enable.
+  /// `$20` soft limits enable. grblHAL keeps `$20` a boolean (unlike `$21`/`$22`), but it may only be enabled
+  /// when `$22` homing is enabled — [`set_command`](Settings::set_command) enforces that cross-field rule.
   pub soft_limits_enable: bool,
-  /// `$21` hard limits enable.
-  pub hard_limits_enable: bool,
-  /// `$22` homing cycle enable.
-  pub homing_enable: bool,
+  /// `$21` hard limits EXCLUSIVE BITMASK (grblHAL diverges from legacy grbl's boolean): bit0 enable hard limits,
+  /// bit1 strict mode. Decode it through [`hard_limits_enabled`](Settings::hard_limits_enabled) /
+  /// [`hard_limits_strict`](Settings::hard_limits_strict) rather than treating the whole value as a bool.
+  pub hard_limit_flags: u8,
+  /// `$22` homing EXCLUSIVE BITMASK (grblHAL diverges from legacy grbl's boolean): bit0 enable the homing cycle,
+  /// bit3 force machine zero to the origin after homing (HOMING_FORCE_SET_ORIGIN); the other grblHAL bits
+  /// (single-axis cmds, startup-required, shared-pin, etc.) are reserved here. Decode it through
+  /// [`homing_enabled`](Settings::homing_enabled) / [`homing_force_set_origin`](Settings::homing_force_set_origin).
+  pub homing_flags: u8,
   /// `$23` homing direction invert bitmask.
   pub homing_dir_invert_mask: u8,
   /// `$24` homing feed (locate) rate, mm/min.
@@ -203,14 +233,15 @@ impl Default for Settings {
       step_idle_delay_ms: DEFAULT_STEP_IDLE_DELAY_MS,
       step_invert_mask: 0,
       dir_invert_mask: 0,
+      limit_invert: false,
       probe_invert: false,
       probe_pullup_disable: false,
       status_report_mask: 0,
       junction_deviation_mm: planner.junction_deviation_mm,
       arc_tolerance_mm: planner.arc_tolerance_mm,
       soft_limits_enable: false,
-      hard_limits_enable: false,
-      homing_enable: false,
+      hard_limit_flags: 0,
+      homing_flags: 0,
       homing_dir_invert_mask: 0,
       homing_feed_mm_min: DEFAULT_HOMING_FEED_MM_MIN,
       homing_seek_mm_min: DEFAULT_HOMING_SEEK_MM_MIN,
@@ -258,6 +289,33 @@ impl Settings {
     }
   }
 
+  /// Build the [`HomingConfig`](crate::homing::HomingConfig) the homing cycle consumes from the homing/limit
+  /// `$`-settings (DOC-06). `tick_hz` is the firmware RMT tick rate (the same value passed to
+  /// [`motion_config`](Settings::motion_config)) so the seek/locate periods encode against the real timing. The
+  /// `$23` direction mask is decoded per axis: a clear bit homes toward POSITIVE (grbl default), a set bit
+  /// reverses that axis to home toward NEGATIVE. `$22` bit3 supplies `force_set_origin`.
+  pub fn homing_config(&self, tick_hz: f32) -> crate::homing::HomingConfig {
+    use crate::homing::HomeDirection;
+    let direction = |axis: usize| {
+      if self.homing_dir_invert_mask & (1 << axis) != 0 {
+        HomeDirection::Negative
+      } else {
+        HomeDirection::Positive
+      }
+    };
+    crate::homing::HomingConfig {
+      steps_per_mm: self.steps_per_mm,
+      max_travel_mm: self.max_travel_mm,
+      seek_mm_min: self.homing_seek_mm_min,
+      feed_mm_min: self.homing_feed_mm_min,
+      pulloff_mm: self.homing_pulloff_mm,
+      direction: [direction(0), direction(1), direction(2)],
+      force_set_origin: self.homing_force_set_origin(),
+      motion: self.motion_config(tick_hz),
+      limit: self.limit_config(),
+    }
+  }
+
   /// Build the [`TmcConfig`] the driver manager consumes, supplying the fixed node addresses.
   pub fn tmc_config(&self) -> TmcConfig {
     let axis = |i: usize| AxisConfig {
@@ -297,6 +355,37 @@ impl Settings {
     crate::hal_traits::ProbeConfig { invert: self.probe_invert, pullup_disable: self.probe_pullup_disable }
   }
 
+  /// Build the [`LimitConfig`](crate::hal_traits::LimitConfig) the homing/hard-limit reader consumes from `$5`,
+  /// so the host-tested limit-trigger logic sees the live invert setting (DOC-06). Mirrors [`probe_config`].
+  pub fn limit_config(&self) -> crate::hal_traits::LimitConfig {
+    crate::hal_traits::LimitConfig { invert: self.limit_invert }
+  }
+
+  /// Whether the homing cycle is enabled (`$22` bit0). When set the machine boots locked in `ALARM:11`
+  /// (homing required) and `$H` runs the cycle; this is the bit every homing-gating path consults.
+  pub fn homing_enabled(&self) -> bool {
+    self.homing_flags & HOMING_FLAG_ENABLE != 0
+  }
+
+  /// Whether homing forces machine zero to the origin (`$22` bit3, grblHAL `HOMING_FORCE_SET_ORIGIN`). When set
+  /// the post-homing machine position is `0` on every axis; when clear it is derived per-axis from the `$23`
+  /// direction mask, `$130–$132` max travel, and the `$27` pull-off (see the homing state machine).
+  pub fn homing_force_set_origin(&self) -> bool {
+    self.homing_flags & HOMING_FLAG_FORCE_SET_ORIGIN != 0
+  }
+
+  /// Whether hard limits are enabled (`$21` bit0). When set a limit trigger during normal motion raises
+  /// `ALARM:1` (position lost); the limit ISR's alarm-raising is suppressed while a homing cycle runs (DOC-06).
+  pub fn hard_limits_enabled(&self) -> bool {
+    self.hard_limit_flags & HARD_LIMIT_FLAG_ENABLE != 0
+  }
+
+  /// Whether hard-limit strict mode is enabled (`$21` bit1) — limits are also checked on `$X` unlock. Reserved
+  /// for the wiring layer; surfaced here so it round-trips and is ready when strict-`$X` lands.
+  pub fn hard_limits_strict(&self) -> bool {
+    self.hard_limit_flags & HARD_LIMIT_FLAG_STRICT != 0
+  }
+
   /// Apply a `$n=value` write, parsing and range-checking `value` for setting `n`. On success the field is
   /// updated (already validated within the same bounds [`sanitized`](Settings::sanitized) enforces); on
   /// failure nothing changes and a [`SettingError`] with a grblHAL code is returned. Both the lookup and the
@@ -305,6 +394,15 @@ impl Settings {
   pub fn set_command(&mut self, n: u16, value: &str) -> Result<(), SettingError> {
     let value = value.trim();
     let (desc, axis) = lookup_descriptor(n).ok_or(SettingError::UnknownSetting)?;
+    // `$20` carries a cross-field rule `parse_and_apply` (which sees one field) cannot express: grblHAL refuses
+    // to ENABLE soft limits unless `$22` homing is enabled (`Status_SoftLimitError`). Reject before applying so
+    // the field is left untouched; disabling (`$20=0`) is always allowed.
+    if desc.field == Field::SoftLimitsEnable {
+      let enabling = parse_bool(value)?;
+      if enabling && !self.homing_enabled() {
+        return Err(SettingError::SoftLimitsNeedHoming);
+      }
+    }
     desc.field.parse_and_apply(self, axis, value)
   }
 
@@ -384,6 +482,13 @@ impl Settings {
     // `$481` auto-report: keep `0` (disabled) as-is, but pull any non-zero value into the documented range so a
     // corrupt/legacy record can never ask the report task for a starving cadence or an out-of-range one.
     self.auto_report_interval_ms = clamp_auto_report_interval(self.auto_report_interval_ms);
+    // `$20` soft limits are only meaningful with `$22` homing enabled (grblHAL refuses to enable them otherwise,
+    // and `set_command` enforces that). A corrupt/legacy flash record could still carry soft-limits-on with
+    // homing-off, which would gate moves on a never-established zero — force it off so the invariant the runtime
+    // soft-limit check relies on (enabled ⇒ homed-capable) holds even after a bad decode.
+    if !self.homing_enabled() {
+      self.soft_limits_enable = false;
+    }
     for axis in 0..AXES {
       self.steps_per_mm[axis] = positive_or(self.steps_per_mm[axis], defaults.steps_per_mm[axis]);
       // A zero max rate makes the planner emit a zero-speed never-completing block, and a zero max travel
@@ -539,14 +644,15 @@ enum Field {
   StepIdleDelayMs,
   StepInvertMask,
   DirInvertMask,
+  LimitInvert,
   ProbeInvert,
   ProbePullupDisable,
   StatusReportMask,
   JunctionDeviationMm,
   ArcToleranceMm,
   SoftLimitsEnable,
-  HardLimitsEnable,
-  HomingEnable,
+  HardLimitFlags,
+  HomingFlags,
   HomingDirInvertMask,
   HomingFeedMmMin,
   HomingSeekMmMin,
@@ -583,14 +689,15 @@ impl Field {
       Field::StepIdleDelayMs => settings.step_idle_delay_ms = parse_u32(value)?,
       Field::StepInvertMask => settings.step_invert_mask = parse_u8(value)?,
       Field::DirInvertMask => settings.dir_invert_mask = parse_u8(value)?,
+      Field::LimitInvert => settings.limit_invert = parse_bool(value)?,
       Field::ProbeInvert => settings.probe_invert = parse_bool(value)?,
       Field::ProbePullupDisable => settings.probe_pullup_disable = parse_bool(value)?,
       Field::StatusReportMask => settings.status_report_mask = parse_u8(value)?,
       Field::JunctionDeviationMm => settings.junction_deviation_mm = parse_f32_non_negative(value)?,
       Field::ArcToleranceMm => settings.arc_tolerance_mm = parse_f32_positive(value)?,
       Field::SoftLimitsEnable => settings.soft_limits_enable = parse_bool(value)?,
-      Field::HardLimitsEnable => settings.hard_limits_enable = parse_bool(value)?,
-      Field::HomingEnable => settings.homing_enable = parse_bool(value)?,
+      Field::HardLimitFlags => settings.hard_limit_flags = parse_u8(value)?,
+      Field::HomingFlags => settings.homing_flags = parse_u8(value)?,
       Field::HomingDirInvertMask => settings.homing_dir_invert_mask = parse_u8(value)?,
       Field::HomingFeedMmMin => settings.homing_feed_mm_min = parse_f32_positive(value)?,
       Field::HomingSeekMmMin => settings.homing_seek_mm_min = parse_f32_positive(value)?,
@@ -619,14 +726,15 @@ impl Field {
       Field::StepIdleDelayMs => write!(out, "${}={}", n, settings.step_idle_delay_ms),
       Field::StepInvertMask => write!(out, "${}={}", n, settings.step_invert_mask),
       Field::DirInvertMask => write!(out, "${}={}", n, settings.dir_invert_mask),
+      Field::LimitInvert => write!(out, "${}={}", n, settings.limit_invert as u8),
       Field::ProbeInvert => write!(out, "${}={}", n, settings.probe_invert as u8),
       Field::ProbePullupDisable => write!(out, "${}={}", n, settings.probe_pullup_disable as u8),
       Field::StatusReportMask => write!(out, "${}={}", n, settings.status_report_mask),
       Field::JunctionDeviationMm => write!(out, "${}={:.3}", n, settings.junction_deviation_mm),
       Field::ArcToleranceMm => write!(out, "${}={:.3}", n, settings.arc_tolerance_mm),
       Field::SoftLimitsEnable => write!(out, "${}={}", n, settings.soft_limits_enable as u8),
-      Field::HardLimitsEnable => write!(out, "${}={}", n, settings.hard_limits_enable as u8),
-      Field::HomingEnable => write!(out, "${}={}", n, settings.homing_enable as u8),
+      Field::HardLimitFlags => write!(out, "${}={}", n, settings.hard_limit_flags),
+      Field::HomingFlags => write!(out, "${}={}", n, settings.homing_flags),
       Field::HomingDirInvertMask => write!(out, "${}={}", n, settings.homing_dir_invert_mask),
       Field::HomingFeedMmMin => write!(out, "${}={:.3}", n, settings.homing_feed_mm_min),
       Field::HomingSeekMmMin => write!(out, "${}={:.3}", n, settings.homing_seek_mm_min),
@@ -808,6 +916,19 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
     },
   },
   SettingDescriptor {
+    number: 5,
+    field: Field::LimitInvert,
+    meta: SettingMeta {
+      group: GROUP_LIMITS,
+      name: "Invert limit pins",
+      unit: "",
+      datatype: SettingDatatype::Bool,
+      format: "",
+      min: "0",
+      max: "1",
+    },
+  },
+  SettingDescriptor {
     number: 6,
     field: Field::ProbeInvert,
     meta: SettingMeta {
@@ -889,28 +1010,31 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
   },
   SettingDescriptor {
     number: 21,
-    field: Field::HardLimitsEnable,
+    field: Field::HardLimitFlags,
     meta: SettingMeta {
       group: GROUP_LIMITS,
+      // grblHAL `$21` is a bitfield, not a checkbox: bit0 enable, bit1 strict mode (limits checked on `$X`).
       name: "Hard limits enable",
       unit: "",
-      datatype: SettingDatatype::Bool,
-      format: "",
+      datatype: SettingDatatype::Bitfield,
+      format: "Enable,Strict mode",
       min: "0",
-      max: "1",
+      max: "",
     },
   },
   SettingDescriptor {
     number: 22,
-    field: Field::HomingEnable,
+    field: Field::HomingFlags,
     meta: SettingMeta {
       group: GROUP_HOMING,
+      // grblHAL `$22` is a bitfield: bit0 enable, bit1 single-axis cmds, bit2 startup-required, bit3 set origin
+      // to 0. Only bit0/bit3 are honored by the firmware today; the labels mirror grblHAL so a sender's UI maps.
       name: "Homing cycle enable",
       unit: "",
-      datatype: SettingDatatype::Bool,
-      format: "",
+      datatype: SettingDatatype::Bitfield,
+      format: "Enable,Enable single axis commands,Homing on startup required,Set machine origin to 0",
       min: "0",
-      max: "1",
+      max: "",
     },
   },
   SettingDescriptor {
@@ -1333,8 +1457,8 @@ pub mod wire {
       proto.junction_deviation_mm = self.junction_deviation_mm;
       proto.arc_tolerance_mm = self.arc_tolerance_mm;
       proto.soft_limits_enable = self.soft_limits_enable;
-      proto.hard_limits_enable = self.hard_limits_enable;
-      proto.homing_enable = self.homing_enable;
+      proto.hard_limit_flags = self.hard_limit_flags as u32;
+      proto.homing_flags = self.homing_flags as u32;
       proto.homing_dir_invert_mask = self.homing_dir_invert_mask as u32;
       proto.homing_feed_mm_min = self.homing_feed_mm_min;
       proto.homing_seek_mm_min = self.homing_seek_mm_min;
@@ -1371,6 +1495,7 @@ pub mod wire {
       proto.tmc_r_sense_ohms = self.tmc_r_sense_ohms;
       proto.probe_invert = self.probe_invert;
       proto.probe_pullup_disable = self.probe_pullup_disable;
+      proto.limit_invert = self.limit_invert;
       proto
     }
 
@@ -1386,14 +1511,15 @@ pub mod wire {
         step_idle_delay_ms: proto.step_idle_delay_ms,
         step_invert_mask: saturating_u8(proto.step_invert_mask),
         dir_invert_mask: saturating_u8(proto.dir_invert_mask),
+        limit_invert: proto.limit_invert,
         probe_invert: proto.probe_invert,
         probe_pullup_disable: proto.probe_pullup_disable,
         status_report_mask: saturating_u8(proto.status_report_mask),
         junction_deviation_mm: proto.junction_deviation_mm,
         arc_tolerance_mm: proto.arc_tolerance_mm,
         soft_limits_enable: proto.soft_limits_enable,
-        hard_limits_enable: proto.hard_limits_enable,
-        homing_enable: proto.homing_enable,
+        hard_limit_flags: saturating_u8(proto.hard_limit_flags),
+        homing_flags: saturating_u8(proto.homing_flags),
         homing_dir_invert_mask: saturating_u8(proto.homing_dir_invert_mask),
         homing_feed_mm_min: proto.homing_feed_mm_min,
         homing_seek_mm_min: proto.homing_seek_mm_min,
@@ -1521,9 +1647,108 @@ mod tests {
     settings.set_command(100, "320.5").expect("set $100");
     assert_eq!(settings.steps_per_mm[0], 320.5);
     settings.set_command(22, "1").expect("set $22");
-    assert!(settings.homing_enable);
+    assert!(settings.homing_enabled());
     settings.set_command(0, "5").expect("set $0");
     assert_eq!(settings.step_pulse_us, 5);
+  }
+
+  // ---- DOC-06: `$5` limit invert, `$21`/`$22` exclusive bitmasks, `$20`-needs-`$22` -----------------
+
+  #[test]
+  fn limit_invert_setting_applies_and_builds_limit_config() {
+    // `$5` is a grbl boolean that folds into the host-tested `LimitConfig` the same way `$6` folds into
+    // `ProbeConfig`, so the limit-trigger logic sees it (DOC-06). Default is the NC fail-safe, no invert.
+    let mut settings = Settings::default();
+    assert_eq!(settings.limit_config(), crate::hal_traits::LimitConfig::default());
+    settings.set_command(5, "1").expect("set $5");
+    assert!(settings.limit_invert);
+    assert!(settings.limit_config().invert);
+    settings.set_command(5, "0").expect("clear $5");
+    assert!(!settings.limit_invert);
+  }
+
+  #[test]
+  fn homing_flags_are_an_exclusive_bitmask_not_a_bool() {
+    // grblHAL `$22` is a bitmask, NOT a boolean: bit0 enables homing, bit3 forces machine zero to the origin
+    // (HOMING_FORCE_SET_ORIGIN). The named accessors must decode the bits; a raw `$22=9` (b0|b3) means homing
+    // enabled AND force-set-origin, which a bool field would have collapsed to "true".
+    let mut settings = Settings::default();
+    assert!(!settings.homing_enabled());
+    assert!(!settings.homing_force_set_origin());
+    settings.set_command(22, "9").expect("set $22=9"); // bit0 | bit3
+    assert_eq!(settings.homing_flags, 0b1001);
+    assert!(settings.homing_enabled(), "bit0 set => homing enabled");
+    assert!(settings.homing_force_set_origin(), "bit3 set => force-set-origin");
+    // `$22=1` is the common "enable, don't force origin" case.
+    settings.set_command(22, "1").expect("set $22=1");
+    assert!(settings.homing_enabled());
+    assert!(!settings.homing_force_set_origin());
+  }
+
+  #[test]
+  fn hard_limit_flags_are_an_exclusive_bitmask_not_a_bool() {
+    // grblHAL `$21` is a bitmask: bit0 enables hard limits, bit1 is strict mode. Accessors decode the bits.
+    let mut settings = Settings::default();
+    assert!(!settings.hard_limits_enabled());
+    assert!(!settings.hard_limits_strict());
+    settings.set_command(21, "3").expect("set $21=3"); // bit0 | bit1
+    assert_eq!(settings.hard_limit_flags, 0b11);
+    assert!(settings.hard_limits_enabled(), "bit0 => hard limits on");
+    assert!(settings.hard_limits_strict(), "bit1 => strict mode");
+    settings.set_command(21, "1").expect("set $21=1");
+    assert!(settings.hard_limits_enabled());
+    assert!(!settings.hard_limits_strict());
+  }
+
+  #[test]
+  fn soft_limits_rejected_unless_homing_enabled() {
+    // grblHAL rejects enabling `$20` (soft limits) unless `$22` homing is enabled (Status_SoftLimitError):
+    // soft limits are only meaningful once the machine can establish a homed zero. The reject must leave `$20`
+    // untouched. Disabling `$20` (=0) is always allowed.
+    let mut settings = Settings::default();
+    assert_eq!(settings.set_command(20, "1"), Err(SettingError::SoftLimitsNeedHoming));
+    assert!(!settings.soft_limits_enable, "a rejected $20 must not apply");
+    // Enable homing first, then `$20=1` is accepted.
+    settings.set_command(22, "1").expect("set $22=1");
+    settings.set_command(20, "1").expect("set $20=1 once homing on");
+    assert!(settings.soft_limits_enable);
+    // `$20=0` is always allowed, even with homing off again.
+    settings.set_command(22, "0").expect("set $22=0");
+    settings.set_command(20, "0").expect("clear $20 is always allowed");
+    assert!(!settings.soft_limits_enable);
+  }
+
+  #[test]
+  fn homing_config_decodes_dir_mask_and_force_origin() {
+    use crate::homing::HomeDirection;
+    let mut settings = Settings::default();
+    // `$23=0` => every axis homes positive; `$22` bit3 force-origin off.
+    let cfg = settings.homing_config(1_000_000.0);
+    assert_eq!(cfg.direction, [HomeDirection::Positive; AXES]);
+    assert!(!cfg.force_set_origin);
+    assert_eq!(cfg.seek_mm_min, settings.homing_seek_mm_min);
+    assert_eq!(cfg.feed_mm_min, settings.homing_feed_mm_min);
+    assert_eq!(cfg.pulloff_mm, settings.homing_pulloff_mm);
+    // `$23=2` reverses the Y axis (bit1) to home negative; `$22` bit3 set => force-origin.
+    settings.homing_dir_invert_mask = 0b010;
+    settings.homing_flags = HOMING_FLAG_ENABLE | HOMING_FLAG_FORCE_SET_ORIGIN;
+    let cfg = settings.homing_config(1_000_000.0);
+    assert_eq!(cfg.direction, [HomeDirection::Positive, HomeDirection::Negative, HomeDirection::Positive]);
+    assert!(cfg.force_set_origin);
+  }
+
+  #[test]
+  fn sanitized_forces_soft_limits_off_when_homing_disabled() {
+    // A corrupt/legacy flash record could carry soft-limits-on with homing-off (which `set_command` would have
+    // rejected). `sanitized` must repair it so the runtime soft-limit check never gates on an unestablished
+    // zero. With homing ON the enable is preserved.
+    let mut settings = Settings::default();
+    settings.soft_limits_enable = true;
+    settings.homing_flags = 0; // homing disabled.
+    assert!(!settings.sanitized().soft_limits_enable, "soft limits must be forced off without homing");
+    settings.homing_flags = HOMING_FLAG_ENABLE;
+    settings.soft_limits_enable = true;
+    assert!(settings.sanitized().soft_limits_enable, "soft limits preserved when homing is enabled");
   }
 
   #[test]
@@ -1682,7 +1907,7 @@ mod tests {
   fn wire_frame_round_trips() {
     let mut settings = Settings::default();
     settings.steps_per_mm = [250.0, 251.0, 800.0];
-    settings.homing_enable = true;
+    settings.homing_flags = 1;
     settings.run_current_ma = [900, 900, 1100];
     settings.microsteps = [16, 16, 32];
     let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
@@ -1883,6 +2108,10 @@ mod tests {
     // min/max (when present) bracket the setting's accepted range — i.e. the descriptor metadata cannot drift
     // from the setter's validation.
     let mut settings = Settings::default();
+    // `$20` (soft limits) is the one setting with a cross-field gate: `set_command` refuses to ENABLE it unless
+    // `$22` homing is enabled (DOC-06). Pre-enable homing so this generic "the enumerated bound is an accepted
+    // value" check exercises `$20`'s real range; the gate itself is covered by `soft_limits_rejected_unless_homing_enabled`.
+    settings.homing_flags = HOMING_FLAG_ENABLE;
     for &n in SETTING_NUMBERS {
       let mut line: heapless::String<160> = heapless::String::new();
       assert!(Settings::write_setting_enumeration(n, &mut line), "no enumeration for $n={n}");

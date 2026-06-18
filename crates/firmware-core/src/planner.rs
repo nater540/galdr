@@ -64,6 +64,11 @@ pub enum PlannerError {
   /// D). grbl's `error:15` — "Jog target exceeds machine travel. Command ignored." The jog is rejected BEFORE
   /// any motion or block enqueue, so a soft-limited jog never moves the machine toward the limit.
   JogExceedsTravel,
+  /// A PROGRAM move/arc target exceeded the machine travel envelope while `$20` soft limits are enabled and the
+  /// machine is homed (DOC-06). Unlike a jog (which grbl simply rejects with `error:15`), a program soft-limit
+  /// violation is a SYSTEM ALARM: grbl halts and raises `ALARM:2`. The block is rejected BEFORE any enqueue, so
+  /// no motion toward the limit ever starts; the consumer maps this to `ALARM:2` ([`AlarmCode::SoftLimit`]).
+  MoveExceedsTravel,
 }
 
 impl PlannerError {
@@ -77,6 +82,10 @@ impl PlannerError {
       PlannerError::InvalidArc => 33,
       // grbl's "Travel exceeded" jog rejection code; the jog command is ignored and the host sees error:15.
       PlannerError::JogExceedsTravel => 15,
+      // A program move soft-limit violation is reported as a SYSTEM ALARM (`ALARM:2`), not an `error:N` line, so
+      // this code is a placeholder reused from the jog path; the consumer routes this variant to the alarm, not
+      // to an `error:N` response.
+      PlannerError::MoveExceedsTravel => 15,
     }
   }
 }
@@ -177,6 +186,34 @@ impl Block {
   /// The maximum allowable entry speed in mm/s (lazy `sqrt` of the stored squared value).
   pub fn max_entry_speed(&self) -> f32 {
     libm::sqrtf(self.max_entry_speed_sq)
+  }
+
+  /// Build a fixed-period [`Block`] from explicit per-axis step deltas, for the paths that walk a move at a
+  /// caller-supplied period through the [`ProbeStepper`](crate::motion::ProbeStepper) rather than realizing a
+  /// planned trapezoid — the `G38.x` probe and the `$H` homing seek/locate/pull-off. Only the step deltas, the
+  /// dominant `step_event_count`, and the per-axis signs matter to that stepper (it advances at a fixed period
+  /// with exact-integer Bresenham and ignores the speed / mm / unit-vector fields), so the trapezoid fields are
+  /// set to benign NON-degenerate placeholders. Centralizing them here keeps that "placeholder trapezoid"
+  /// contract in ONE place instead of duplicated at each fixed-period call site. `step_event_count` is derived
+  /// as the dominant axis magnitude, so callers cannot desync it from `steps`.
+  pub fn placeholder(steps: [i32; AXES]) -> Self {
+    let mut step_event_count = 0u32;
+    for delta in steps {
+      step_event_count = step_event_count.max(delta.unsigned_abs());
+    }
+    Block {
+      steps,
+      step_event_count,
+      // The unit vector / mm length / speeds are unused by the fixed-period stepper; benign placeholders.
+      unit_vec: [0.0; AXES],
+      millimeters: 1.0,
+      acceleration: 1.0,
+      nominal_speed_sq: 1.0,
+      max_entry_speed_sq: 1.0,
+      entry_speed_sq: 0.0,
+      rapid: false,
+      jog: false,
+    }
   }
 }
 
@@ -374,13 +411,46 @@ impl Planner {
   /// grbl requires and pass through as a [`PlannerOutcome`]. Returns [`PlannerError::QueueFull`] if a
   /// block cannot be enqueued (back-pressure) or [`PlannerError::InvalidArc`] for bad arc geometry.
   pub fn plan_command(&mut self, command: &PlannerCommand) -> Result<PlannerOutcome, PlannerError> {
+    self.plan_command_with_limits(command, None)
+  }
+
+  /// Plan a [`PlannerCommand`] with an optional `$20` soft-limit envelope (DOC-06). When `limits` is `Some` (i.e.
+  /// `$20` is enabled AND the machine is homed — the consumer supplies it only then), a `Move`/`Arc` whose
+  /// resolved MACHINE endpoint leaves the `[-max_travel, 0]` envelope is rejected with
+  /// [`PlannerError::MoveExceedsTravel`] BEFORE any block is enqueued, so no motion toward the limit ever starts;
+  /// the consumer maps that to `ALARM:2`. With `limits = None` this is identical to [`plan_command`]. Only the
+  /// motion commands (`Move`/`Arc`) are envelope-checked — a dwell/spindle/coordinate op moves nothing, and a
+  /// `G38.x` probe deliberately drives toward a switch (its travel is bounded by the probe cycle, not soft
+  /// limits). An arc is checked at its ENDPOINT here; full mid-arc envelope checking is a later refinement
+  /// (a PCB-milling arc that starts and ends inside the envelope effectively never bulges outside it).
+  pub fn plan_command_with_limits(
+    &mut self,
+    command: &PlannerCommand,
+    limits: Option<SoftLimits>,
+  ) -> Result<PlannerOutcome, PlannerError> {
     match command {
       PlannerCommand::Move { rapid, axes, units, distance, feed, machine_coords } => {
         let target = self.resolve_target(axes, *units, *distance, *machine_coords);
+        if let Some(limits) = limits
+          && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm)
+        {
+          return Err(PlannerError::MoveExceedsTravel);
+        }
         let queued = self.plan_line(target, *feed, *units, *rapid)?;
         Ok(PlannerOutcome::Queued { blocks: queued })
       }
       PlannerCommand::Arc { cw, axes, i, j, units, distance, feed, machine_coords } => {
+        // Check the arc ENDPOINT against the envelope (the start is wherever the machine already is, already
+        // inside the envelope by induction). A degenerate arc still surfaces its `InvalidArc` below.
+        if let Some(limits) = limits
+          && soft_limit_violation(
+            &self.resolve_target(axes, *units, *distance, *machine_coords),
+            &self.config.steps_per_mm,
+            &limits.max_travel_mm,
+          )
+        {
+          return Err(PlannerError::MoveExceedsTravel);
+        }
         let request = ArcRequest {
           cw: *cw,
           axes,
@@ -1156,6 +1226,50 @@ mod tests {
     assert_eq!(planner.queued_len(), 1);
   }
 
+  /// Build a `G53` (machine-coordinate) absolute `Move` command to `x` mm — the pre-check operates on the
+  /// resolved MACHINE target, and `G53` bypasses the work offset so the test target IS the machine target.
+  fn move_to_machine_x(x: f32, feed: f32) -> PlannerCommand {
+    PlannerCommand::Move {
+      rapid: false,
+      axes: AxisWords { x: Some(x), y: None, z: None },
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed,
+      machine_coords: true,
+    }
+  }
+
+  #[test]
+  fn plan_command_with_limits_rejects_a_program_move_outside_the_envelope() {
+    let mut planner = Planner::new(test_config());
+    // 100 steps/mm, 50 mm travel => machine envelope [-50, 0] mm. A program move to machine X+10 (past the home
+    // end) and to X-60 (past -max_travel) both violate → `MoveExceedsTravel` (the consumer maps it to ALARM:2),
+    // and nothing is enqueued. An in-envelope move (X-25) is accepted.
+    let limits = SoftLimits { max_travel_mm: [50.0; AXES] };
+    assert_eq!(
+      planner.plan_command_with_limits(&move_to_machine_x(10.0, 600.0), Some(limits)),
+      Err(PlannerError::MoveExceedsTravel),
+    );
+    assert!(planner.is_empty(), "a rejected program move enqueues nothing");
+    assert_eq!(
+      planner.plan_command_with_limits(&move_to_machine_x(-60.0, 600.0), Some(limits)),
+      Err(PlannerError::MoveExceedsTravel),
+    );
+    assert!(planner.is_empty());
+    planner.plan_command_with_limits(&move_to_machine_x(-25.0, 600.0), Some(limits)).expect("in-envelope move");
+    assert_eq!(planner.queued_len(), 1);
+  }
+
+  #[test]
+  fn plan_command_with_limits_none_matches_plain_plan_command() {
+    // With `limits = None` (soft limits off / unhomed) an out-of-envelope move is accepted, identical to the
+    // plain `plan_command` — the soft-limit gate is purely additive and only active when the consumer supplies
+    // an envelope.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command_with_limits(&move_to_machine_x(10.0, 600.0), None).expect("no-limit move accepted");
+    assert_eq!(planner.queued_len(), 1);
+  }
+
   #[test]
   fn soft_limit_violation_envelope() {
     let steps_per_mm = [100.0; AXES];
@@ -1649,5 +1763,17 @@ mod tests {
     };
     let outcome = planner.plan_command(&cmd).expect("g28");
     assert_eq!(outcome, PlannerOutcome::GoToPredefined { is_g28: true });
+  }
+
+  #[test]
+  fn placeholder_block_derives_dominant_count_and_keeps_benign_trapezoid() {
+    // A fixed-period block: the dominant `step_event_count` is the max axis magnitude, the signs are preserved,
+    // and the trapezoid fields are non-degenerate placeholders the fixed-period stepper ignores.
+    let block = Block::placeholder([-300, 50, 0]);
+    assert_eq!(block.steps, [-300, 50, 0]);
+    assert_eq!(block.step_event_count, 300, "dominant count = max axis magnitude");
+    assert_eq!(block.millimeters, 1.0, "non-degenerate placeholder mm length");
+    assert!(block.acceleration > 0.0 && block.nominal_speed_sq > 0.0, "non-degenerate placeholder trapezoid");
+    assert!(!block.rapid && !block.jog);
   }
 }

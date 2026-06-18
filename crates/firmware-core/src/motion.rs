@@ -492,6 +492,15 @@ impl StepCounter {
   pub fn reset(&mut self) {
     self.position = [0; AXES];
   }
+
+  /// Snap the live position to an arbitrary step position, leaving the latched direction untouched. Used after a
+  /// homing cycle (DOC-06) to set the live MPos to the established machine-zero position so the reported position
+  /// matches the planner/parser commanded position the consumer syncs in lock-step. A `G38.x` probe never needs
+  /// this (its stop position IS the emitted-step position); homing does, because the final machine zero is a
+  /// computed value, not the seek's stop point.
+  pub fn sync_to(&mut self, position: [i32; AXES]) {
+    self.position = position;
+  }
 }
 
 impl Default for StepCounter {
@@ -1307,6 +1316,22 @@ mod tests {
     // Direction is retained: a subsequent step still goes negative until a block re-latches it.
     counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
     assert_eq!(counter.position_steps(), [-1, 0, 0]);
+  }
+
+  /// `sync_to` snaps the live position to an arbitrary value (the homing machine-zero) without disturbing the
+  /// latched direction — subsequent steps advance from the synced position.
+  #[test]
+  fn step_counter_sync_to_sets_arbitrary_position() {
+    let mut counter = StepCounter::new();
+    counter.set_direction(DirState { dir: [true, true, true] });
+    counter.advance(&StepEvent { step: [true, true, true], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [1, 1, 1]);
+    // Snap to the homing machine-zero (e.g. -100 steps on every axis from a positive-home pull-off).
+    counter.sync_to([-100, -100, -100]);
+    assert_eq!(counter.position_steps(), [-100, -100, -100]);
+    // Direction retained: a further positive step advances from the synced position.
+    counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-99, -100, -100]);
   }
 
   /// `steps_to_mm` (the standalone conversion the bin's status reporter uses against the live atomics)
