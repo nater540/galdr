@@ -5,6 +5,8 @@
 //! lower-level commands and side effects (opening a transport, reading a file, echoing to the console). The
 //! views never touch the engine handle directly, which keeps them pure renderers of [`super::ViewState`].
 
+use crate::app::badge::BadgeState;
+use crate::app::overrides::OverrideAxis;
 use crate::protocol::RealtimeCommand;
 
 /// An axis the jog controls target.
@@ -71,15 +73,34 @@ pub enum Intent {
   SendLine(String),
   /// Inject a real-time single-byte command out-of-band.
   Realtime(RealtimeCommand),
+  /// Drive a feed/spindle override slider to an absolute `target` percent. grbl has no "set override to N%"
+  /// command, only relative ±10/±1/reset steps, so the shell reads the live `Ov:` value and emits the minimal
+  /// step sequence via [`crate::app::overrides::override_commands`]. Carries only the intent (axis + target);
+  /// the current value and the byte arithmetic stay out of the view.
+  SetOverride { axis: OverrideAxis, target: u32 },
 
   /// Jog `axis` in `dir` by `distance` (mm) at `feed` (mm/min). The shell forms the `$J=` line.
   Jog { axis: Axis, dir: Dir, distance: f64, feed: f64 },
+  /// Begin a continuous (press-and-hold) jog: a single long `$J=` move toward the soft-travel limit at `feed`,
+  /// which the firmware decelerates the instant a [`Intent::JogStop`] (jog-cancel) arrives. The shell forms the
+  /// `$J=` line with a large target distance; the operator holds the button (or arrow key) to keep moving.
+  JogStart { axis: Axis, dir: Dir, feed: f64 },
+  /// End a continuous jog: inject jog-cancel (`0x85`), which feed-holds and flushes the jog without alarming.
+  /// Safe to send when not jogging — the firmware ignores it. Emitted on button/key release.
+  JogStop,
 
   /// Dismiss the latched alarm/error banner.
   DismissBanner,
   /// Probe Z with `G38.2` toward `depth` (mm, negative) at `feed` (mm/min), then set work-Z to
   /// `plate_thickness`. The shell sequences the probe + zeroing lines.
   ProbeZ { depth: f64, feed: f64, plate_thickness: f64 },
+
+  /// Fetch the firmware's settings: send `$$` (live values) and `$ES` (the enumeration metadata that labels
+  /// each row), so the settings panel populates from the controller rather than a hardcoded table.
+  RequestSettings,
+  /// Write one setting edit back to the firmware as a `$<n>=<value>` line. The firmware validates the value and
+  /// answers `ok`/`error:N`; the shell re-reads the single setting afterwards so the panel reflects the truth.
+  WriteSetting { number: u32, value: String },
 
   /// Run the homing cycle (`$H`).
   Home,
@@ -116,6 +137,112 @@ pub fn work_zero_line(axes: &[Axis]) -> String {
   let targets: &[Axis] = if axes.is_empty() { &[Axis::X, Axis::Y, Axis::Z] } else { axes };
   let values: Vec<(Axis, f64)> = targets.iter().map(|&axis| (axis, 0.0)).collect();
   work_offset_line(&values)
+}
+
+/// The target distance (mm) a continuous jog travels in one `$J=` move. grblHAL has no "jog forever" command;
+/// the host-side idiom is to issue a single jog toward a distance larger than any axis can reach, then cancel
+/// it (`0x85`) on release so the move stops where the operator let go. 10 m comfortably exceeds any PCB-mill
+/// axis travel while staying well inside grbl's float range, so the move never completes on its own before the
+/// release cancels it.
+pub const CONTINUOUS_JOG_DISTANCE_MM: f64 = 10_000.0;
+
+/// Build the `$J=` line for a step jog: a relative (`G91`), millimetre (`G21`) move of `distance` mm along
+/// `axis` in `dir` at `feed` mm/min. Jog is modal-independent in grblHAL, so the explicit `G91 G21` prefix
+/// keeps it predictable regardless of the running program's modal context. Pure so the wire form is unit-
+/// tested without a window.
+pub fn jog_line(axis: Axis, dir: Dir, distance: f64, feed: f64) -> String {
+  let signed = distance * dir.sign();
+  format!("$J=G91 G21 {}{:.3} F{:.0}", axis.letter(), signed, feed)
+}
+
+/// Build the `$J=` line for a continuous (press-and-hold) jog: the same relative-millimetre move as
+/// [`jog_line`] but toward [`CONTINUOUS_JOG_DISTANCE_MM`], so it keeps moving until the operator releases and
+/// the shell injects jog-cancel (`0x85`). Delegating to [`jog_line`] keeps a single place that forms the jog
+/// wire syntax.
+pub fn continuous_jog_line(axis: Axis, dir: Dir, feed: f64) -> String {
+  jog_line(axis, dir, CONTINUOUS_JOG_DISTANCE_MM, feed)
+}
+
+/// A keyboard chord the shell lifts out of egui's per-frame input and feeds to [`key_to_intent`]. Kept as a
+/// small egui-free enum (rather than `egui::Key`) so the keyboard policy is a pure mapping unit-tested without
+/// a window; the shell does the thin translation from `egui::Key` to this on the keys it cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hotkey {
+  /// An arrow key: jog X/Y in the plane (←/→ = X∓, ↑/↓ = Y±).
+  ArrowLeft,
+  /// See [`Hotkey::ArrowLeft`].
+  ArrowRight,
+  /// See [`Hotkey::ArrowLeft`].
+  ArrowUp,
+  /// See [`Hotkey::ArrowLeft`].
+  ArrowDown,
+  /// Page Up: jog Z up (away from the work).
+  PageUp,
+  /// Page Down: jog Z down (toward the work).
+  PageDown,
+  /// Escape: cancel a jog, or — when not jogging — soft-reset/abort.
+  Escape,
+  /// Feed hold (the `!` realtime command), bound to `H` for one-handed pause.
+  FeedHold,
+  /// Cycle start / resume (the `~` realtime command), bound to `R`.
+  CycleResume,
+}
+
+impl Hotkey {
+  /// The `(axis, dir)` a directional hotkey jogs, or `None` for the non-jog chords (Escape/hold/resume). The
+  /// machine-bed convention: ↑ = Y+, ↓ = Y−, → = X+, ← = X−, PageUp = Z+, PageDown = Z−.
+  fn jog_motion(self) -> Option<(Axis, Dir)> {
+    match self {
+      Hotkey::ArrowRight => Some((Axis::X, Dir::Pos)),
+      Hotkey::ArrowLeft => Some((Axis::X, Dir::Neg)),
+      Hotkey::ArrowUp => Some((Axis::Y, Dir::Pos)),
+      Hotkey::ArrowDown => Some((Axis::Y, Dir::Neg)),
+      Hotkey::PageUp => Some((Axis::Z, Dir::Pos)),
+      Hotkey::PageDown => Some((Axis::Z, Dir::Neg)),
+      _ => None,
+    }
+  }
+}
+
+/// Map a pressed [`Hotkey`] to the [`Intent`] it should fire, given the live machine state and the jog
+/// settings. Pure so the keyboard policy is unit-tested without a window.
+///
+/// Rules, all chosen to never command a move the firmware would reject or that would surprise the operator:
+/// - Directional keys issue a **step** jog of `jog_step` mm at `jog_feed`, but only while the machine is in a
+///   state that accepts `$J=` (`Idle`/`Jog`); in any other state they are inert, matching the jog pad's own
+///   enable gate. A step jog (not a continuous one) is used for the keyboard because key-repeat already gives
+///   a natural press-and-hold cadence and a held key that ends without a clean release must never leave the
+///   axis coasting.
+/// - `Escape` cancels a jog while jogging (`0x85`), else issues a soft reset/abort (`0x18`) — the universal
+///   "stop now" reflex. It is always available while connected so it can rescue a runaway.
+/// - `FeedHold`/`CycleResume` map to `!`/`~` whenever connected, mirroring the toolbar Hold/Resume.
+///
+/// Returns `None` when the key has no effect in the current state (e.g. an arrow key while streaming), so the
+/// shell can leave egui's normal handling of that key untouched.
+pub fn key_to_intent(key: Hotkey, badge: BadgeState, jog_step: f64, jog_feed: f64) -> Option<Intent> {
+  let connected = !matches!(badge, BadgeState::Disconnected | BadgeState::Connecting);
+  match key {
+    Hotkey::Escape if connected => {
+      // While a jog is running, Escape cancels just the jog; otherwise it is the panic soft-reset.
+      let cmd = if matches!(badge, BadgeState::Jog) {
+        RealtimeCommand::JogCancel
+      } else {
+        RealtimeCommand::SoftReset
+      };
+      Some(Intent::Realtime(cmd))
+    }
+    Hotkey::FeedHold if connected => Some(Intent::Realtime(RealtimeCommand::FeedHold)),
+    Hotkey::CycleResume if connected => Some(Intent::Realtime(RealtimeCommand::CycleStart)),
+    // Directional jogs only fire where grblHAL accepts `$J=` (Idle/Jog), exactly like the jog pad's gate.
+    _ => {
+      let (axis, dir) = key.jog_motion()?;
+      if matches!(badge, BadgeState::Idle | BadgeState::Jog) {
+        Some(Intent::Jog { axis, dir, distance: jog_step, feed: jog_feed })
+      } else {
+        None
+      }
+    }
+  }
 }
 
 /// A frame-scoped sink the views push [`Intent`]s into. The shell creates one per frame, passes `&mut` to the
@@ -168,6 +295,66 @@ mod tests {
     // The shared builder formats each axis at 3-decimal precision; this is what the Z-probe zeroing uses.
     assert_eq!(work_offset_line(&[(Axis::Z, 1.5)]), "G10 L20 P0 Z1.500");
     assert_eq!(work_offset_line(&[(Axis::X, 2.0), (Axis::Y, -3.25)]), "G10 L20 P0 X2.000 Y-3.250");
+  }
+
+  #[test]
+  fn jog_line_forms_a_relative_mm_move() {
+    // A step jog is an explicit `G91 G21` relative-mm move so it is independent of the program's modal state.
+    assert_eq!(jog_line(Axis::X, Dir::Pos, 1.0, 500.0), "$J=G91 G21 X1.000 F500");
+    assert_eq!(jog_line(Axis::Y, Dir::Neg, 0.5, 250.0), "$J=G91 G21 Y-0.500 F250");
+  }
+
+  #[test]
+  fn continuous_jog_targets_the_far_distance() {
+    // A continuous jog reuses the step builder but at the large sentinel distance, cancelled on release.
+    let line = continuous_jog_line(Axis::Z, Dir::Neg, 100.0);
+    assert_eq!(line, format!("$J=G91 G21 Z-{CONTINUOUS_JOG_DISTANCE_MM:.3} F100"));
+  }
+
+  #[test]
+  fn arrow_keys_step_jog_only_when_jogging_is_allowed() {
+    // In Idle an arrow fires a step jog of the configured step/feed in the matching axis/dir.
+    let intent = key_to_intent(Hotkey::ArrowRight, BadgeState::Idle, 2.0, 400.0);
+    assert_eq!(intent, Some(Intent::Jog { axis: Axis::X, dir: Dir::Pos, distance: 2.0, feed: 400.0 }));
+    // PageDown jogs Z down; PageUp jogs Z up.
+    assert_eq!(
+      key_to_intent(Hotkey::PageDown, BadgeState::Idle, 1.0, 300.0),
+      Some(Intent::Jog { axis: Axis::Z, dir: Dir::Neg, distance: 1.0, feed: 300.0 })
+    );
+    // While running, an arrow key is inert — the firmware would reject a `$J=` there anyway.
+    assert_eq!(key_to_intent(Hotkey::ArrowUp, BadgeState::Run, 1.0, 300.0), None);
+    // Disconnected: nothing to command.
+    assert_eq!(key_to_intent(Hotkey::ArrowLeft, BadgeState::Disconnected, 1.0, 300.0), None);
+  }
+
+  #[test]
+  fn escape_cancels_a_jog_but_soft_resets_otherwise() {
+    // Mid-jog, Escape cancels just the jog (a gentle stop, no alarm).
+    assert_eq!(
+      key_to_intent(Hotkey::Escape, BadgeState::Jog, 1.0, 300.0),
+      Some(Intent::Realtime(RealtimeCommand::JogCancel))
+    );
+    // Not jogging, Escape is the panic soft-reset/abort.
+    assert_eq!(
+      key_to_intent(Hotkey::Escape, BadgeState::Run, 1.0, 300.0),
+      Some(Intent::Realtime(RealtimeCommand::SoftReset))
+    );
+    // Disconnected, there is nothing to reset.
+    assert_eq!(key_to_intent(Hotkey::Escape, BadgeState::Disconnected, 1.0, 300.0), None);
+  }
+
+  #[test]
+  fn hold_and_resume_keys_map_to_their_realtime_bytes_when_connected() {
+    assert_eq!(
+      key_to_intent(Hotkey::FeedHold, BadgeState::Run, 1.0, 300.0),
+      Some(Intent::Realtime(RealtimeCommand::FeedHold))
+    );
+    assert_eq!(
+      key_to_intent(Hotkey::CycleResume, BadgeState::Hold, 1.0, 300.0),
+      Some(Intent::Realtime(RealtimeCommand::CycleStart))
+    );
+    // Both are inert while disconnected.
+    assert_eq!(key_to_intent(Hotkey::FeedHold, BadgeState::Disconnected, 1.0, 300.0), None);
   }
 
   #[test]

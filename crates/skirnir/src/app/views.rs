@@ -39,8 +39,18 @@ pub struct UiState {
   toolpath_bounds: Option<(Vec2, Vec2)>,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
+  /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
+  /// jog button held down issues a long `$J=` move and releasing it injects jog-cancel, so the operator drives
+  /// the axis smoothly to position; the `cont` selector chip toggles this (design §03's `cont` step).
+  pub jog_continuous: bool,
   /// The jog feed rate (mm/min).
   pub jog_feed: f64,
+  /// The feed-override slider's transient drag position (percent), or `None` when the slider is idle (it then
+  /// mirrors the live `Ov:` value). Held here so the slider survives across the immediate-mode frames of a drag
+  /// and the live status poll cannot yank the handle while the operator is dragging it.
+  pub feed_override_drag: Option<u32>,
+  /// The spindle-override slider's transient drag position (percent); see [`Self::feed_override_drag`].
+  pub spindle_override_drag: Option<u32>,
   /// The manual-command input buffer in the console.
   pub console_input: String,
   /// Probe depth (mm, travelled downward as a positive magnitude here; the shell negates it).
@@ -51,6 +61,10 @@ pub struct UiState {
   pub plate_thickness: f64,
   /// Whether the settings window is open.
   pub settings_open: bool,
+  /// The setting currently being edited in the panel, as `(number, edit_buffer)`, or `None` when no row is in
+  /// edit mode. Held here so the in-progress text survives the immediate-mode frames of an edit and the live
+  /// `$$` re-dump cannot overwrite the operator's keystrokes mid-edit; committed (Enter/focus-loss) → cleared.
+  pub editing_setting: Option<(u32, String)>,
   /// DRO coordinate toggle: `true` shows machine position emphasised, `false` shows work position (the design
   /// default — WPos is the active toggle in the mock).
   pub show_machine_pos: bool,
@@ -85,12 +99,16 @@ impl Default for UiState {
       toolpath: Vec::new(),
       toolpath_bounds: None,
       jog_step: 1.0,
+      jog_continuous: false,
       jog_feed: 500.0,
+      feed_override_drag: None,
+      spindle_override_drag: None,
       console_input: String::new(),
       probe_depth: 10.0,
       probe_feed: 50.0,
       plate_thickness: 1.0,
       settings_open: false,
+      editing_setting: None,
       show_machine_pos: false,
       auto_scroll: true,
       active_tab: DockTab::default(),
@@ -100,6 +118,16 @@ impl Default for UiState {
 }
 
 impl UiState {
+  /// Clear the connection-scoped transient widget state when the link drops. An in-progress setting edit and
+  /// the override sliders' drag positions belong to the session that just ended: on a reconnect to a (possibly
+  /// different) board they must not resume editing a stale `$<n>` row or pin a slider to the previous board's
+  /// override. Mirrors `ViewState::on_disconnected` for the transient state the reducer cannot reach.
+  pub fn on_disconnected(&mut self) {
+    self.editing_setting = None;
+    self.feed_override_drag = None;
+    self.spindle_override_drag = None;
+  }
+
   /// Load a program: store its lines (shared, so streaming never re-clones the file) and rebuild the cached
   /// toolpath + bounds once, here, rather than on every frame. `path` is the display name, if any.
   pub fn set_program(&mut self, lines: Vec<String>, path: Option<String>) {
@@ -526,17 +554,32 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       ui.add_space(2.0);
       ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
-        let count = JOG_STEPS.len();
+        // One slot per numeric step plus the trailing `cont` chip (design §03: `0.01 / 0.10 / 1.00 / 10.0 /
+        // cont`). All slots share the row width so the segmented selector spans the panel evenly.
+        let count = JOG_STEPS.len() + 1;
         let slot = (ui.available_width() - (count as f32 - 1.0)) / count as f32;
         for step in JOG_STEPS {
-          let active = (state.jog_step - step).abs() < f64::EPSILON;
+          // A numeric chip is active only when it is the chosen step AND continuous mode is off — picking `cont`
+          // dims every numeric chip so the selector shows exactly one active mode.
+          let active = !state.jog_continuous && (state.jog_step - step).abs() < f64::EPSILON;
           let (fill, text) =
             if active { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::PANEL, Theme::TEXT_DIM) };
           let button = egui::Button::new(RichText::new(format!("{step}")).monospace().size(11.0).color(text))
             .fill(fill).corner_radius(0.0);
           if ui.add_sized(Vec2::new(slot, Metrics::PANEL_CONTROL_H), button).clicked() {
             state.jog_step = step;
+            state.jog_continuous = false;
           }
+        }
+        // The `cont` chip: selecting it flips the pad into press-and-hold mode (a held cell drives the axis).
+        let (fill, text) =
+          if state.jog_continuous { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::PANEL, Theme::TEXT_DIM) };
+        let cont = egui::Button::new(RichText::new("cont").monospace().size(11.0).color(text))
+          .fill(fill).corner_radius(0.0);
+        if ui.add_sized(Vec2::new(slot, Metrics::PANEL_CONTROL_H), cont)
+          .on_hover_text("Continuous jog: hold a direction to move, release to stop").clicked()
+        {
+          state.jog_continuous = true;
         }
       });
       ui.add_space(6.0);
@@ -561,8 +604,9 @@ fn jog_blank(ui: &mut egui::Ui) {
   ui.allocate_exact_size(Vec2::splat(Metrics::JOG_CELL), egui::Sense::hover());
 }
 
-/// One XY jog cell: a fixed 32px square. With an axis/dir it issues a [`Intent::Jog`]; the centre `XY` cell is
-/// an inert label (design §03). The step/feed come from the current jog selection.
+/// One XY jog cell: a fixed 32px square. With an axis/dir it issues a jog; the centre `XY` cell is an inert
+/// label (design §03). In fixed-step mode a click issues a single [`Intent::Jog`]; in continuous mode holding
+/// the cell issues [`Intent::JogStart`] on press and [`Intent::JogStop`] on release (see [`emit_jog`]).
 fn jog_button(ui: &mut egui::Ui, label: &str, state: &UiState, sink: &mut IntentSink, motion: Option<(Axis, Dir)>) {
   let Some((axis, dir)) = motion else {
     // The centre cell is a non-interactive label marking the pad's purpose.
@@ -570,13 +614,12 @@ fn jog_button(ui: &mut egui::Ui, label: &str, state: &UiState, sink: &mut Intent
     ui.add_sized(Vec2::splat(Metrics::JOG_CELL), button);
     return;
   };
-  if ui.add_sized(Vec2::splat(Metrics::JOG_CELL), egui::Button::new(label)).clicked() {
-    sink.push(Intent::Jog { axis, dir, distance: state.jog_step, feed: state.jog_feed });
-  }
+  let response = ui.add_sized(Vec2::splat(Metrics::JOG_CELL), egui::Button::new(label).sense(jog_sense(state)));
+  emit_jog(&response, state, sink, axis, dir);
 }
 
 /// One Z-column jog button: a full-width cell, 32px tall, matching the XY pad's height. The middle `Z` cell is
-/// an inert label between Z+ and Z−.
+/// an inert label between Z+ and Z−. Step vs continuous behaviour matches [`jog_button`].
 fn jog_z(ui: &mut egui::Ui, label: &str, width: f32, state: &UiState, sink: &mut IntentSink,
   motion: Option<(Axis, Dir)>) {
   let size = Vec2::new(width, Metrics::JOG_CELL);
@@ -584,23 +627,67 @@ fn jog_z(ui: &mut egui::Ui, label: &str, width: f32, state: &UiState, sink: &mut
     ui.add_sized(size, egui::Button::new(RichText::new(label).color(Theme::TEXT_DISABLED)));
     return;
   };
-  if ui.add_sized(size, egui::Button::new(label)).clicked() {
-    sink.push(Intent::Jog { axis, dir, distance: state.jog_step, feed: state.jog_feed });
+  let response = ui.add_sized(size, egui::Button::new(label).sense(jog_sense(state)));
+  emit_jog(&response, state, sink, axis, dir);
+}
+
+/// The egui sense a jog cell needs for the current mode: in continuous mode it must sense drag (press-and-hold)
+/// as well as click so the press and release edges are observable; in fixed-step mode a plain click suffices.
+fn jog_sense(state: &UiState) -> egui::Sense {
+  if state.jog_continuous {
+    egui::Sense::click_and_drag()
+  } else {
+    egui::Sense::click()
   }
 }
 
-/// Render the override controls: feed, rapid, and spindle, each with a reset and coarse ± as real-time bytes.
-pub fn overrides(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
+/// Translate a jog cell's [`egui::Response`] into the right jog intent(s) for the current mode. Fixed-step:
+/// a click is one bounded [`Intent::Jog`]. Continuous: the press edge (`drag_started`, or a click that is also
+/// a quick press) starts the long move and the release edge (`drag_stopped`) cancels it, so the axis moves
+/// exactly while the control is held. A bare click in continuous mode (a fast tap that egui reports as a click
+/// without a drag) still brackets a start+stop so a quick nudge is not lost.
+fn emit_jog(response: &egui::Response, state: &UiState, sink: &mut IntentSink, axis: Axis, dir: Dir) {
+  if !state.jog_continuous {
+    if response.clicked() {
+      sink.push(Intent::Jog { axis, dir, distance: state.jog_step, feed: state.jog_feed });
+    }
+    return;
+  }
+  if response.drag_started() {
+    sink.push(Intent::JogStart { axis, dir, feed: state.jog_feed });
+  }
+  if response.drag_stopped() {
+    sink.push(Intent::JogStop);
+  }
+  // A tap too brief to register as a drag is reported as a click with no drag edges; bracket it so a quick
+  // continuous-mode nudge still moves and then stops rather than silently doing nothing.
+  if response.clicked() {
+    sink.push(Intent::JogStart { axis, dir, feed: state.jog_feed });
+    sink.push(Intent::JogStop);
+  }
+}
+
+/// Render the override controls: feed and spindle get a slider plus a fine/coarse/reset stepper row (design
+/// §03's override sliders); rapid stays a 100/50/25 preset picker (grbl exposes no rapid ±). The sliders
+/// express an absolute target; the shell turns that into the minimal relative ±10/±1/reset byte sequence
+/// against the live `Ov:` value, so the view never does the override byte arithmetic.
+pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  use super::overrides::OverrideAxis;
   section_header(ui, "Overrides");
   let (feed, rapid, spindle) = view.status.as_ref().and_then(|s| s.overrides).unwrap_or((100, 100, 100));
 
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    override_row(ui, "Feed", feed, sink, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
-      RealtimeCommand::FeedOverridePlus10);
-    override_row(ui, "Spindle", spindle, sink, RealtimeCommand::SpindleOverrideMinus10,
-      RealtimeCommand::SpindleOverrideReset, RealtimeCommand::SpindleOverridePlus10);
+    override_axis(ui, "Feed", OverrideAxis::Feed, feed, &mut state.feed_override_drag, sink,
+      RealtimeCommand::FeedOverrideMinus1, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
+      RealtimeCommand::FeedOverridePlus10, RealtimeCommand::FeedOverridePlus1);
+    ui.add_space(4.0);
+    override_axis(ui, "Spindle", OverrideAxis::Spindle, spindle, &mut state.spindle_override_drag, sink,
+      RealtimeCommand::SpindleOverrideMinus1, RealtimeCommand::SpindleOverrideMinus10,
+      RealtimeCommand::SpindleOverrideReset, RealtimeCommand::SpindleOverridePlus10,
+      RealtimeCommand::SpindleOverridePlus1);
+    ui.add_space(4.0);
 
-    // Rapid override is preset-only in grbl (100/50/25), so it gets buttons rather than ±.
+    // Rapid override is preset-only in grbl (100/50/25), so it gets buttons rather than a slider.
     ui.horizontal(|ui| {
       ui.label(format!("Rapid {rapid:>3}%"));
       if ui.button("100").clicked() {
@@ -633,19 +720,54 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
   });
 }
 
-/// One ±/reset override row.
-fn override_row(ui: &mut egui::Ui, label: &str, value: u32, sink: &mut IntentSink, minus: RealtimeCommand,
-  reset: RealtimeCommand, plus: RealtimeCommand) {
+/// Render one override axis (feed or spindle): a label with the live percentage, a 10–200% slider that emits
+/// an absolute [`Intent::SetOverride`] on release, and a fine/coarse/reset stepper row (`−10 −1 100 +1 +10`)
+/// that emits single relative real-time bytes. The slider and the steppers are two equivalent ways to reach
+/// the same override; the slider is coarse-grained reach, the steppers are precise nudges including the new
+/// fine ±1%.
+///
+/// `live` is the override the firmware last reported. `drag` is the slider's transient position: it tracks
+/// `live` whenever the slider is idle (so the firmware's truth re-centers it), and the operator's in-progress
+/// drag while held. On release we emit the target only if it moved, so merely touching the slider sends
+/// nothing.
+#[allow(clippy::too_many_arguments)]
+fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32,
+  drag: &mut Option<u32>, sink: &mut IntentSink, minus1: RealtimeCommand, minus10: RealtimeCommand,
+  reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
+  use super::overrides::{OVERRIDE_MAX, OVERRIDE_MIN};
+  ui.label(format!("{label} {live:>3}%"));
+
+  // The slider edits a local mirror seeded from the live value while idle; an active drag holds its own value.
+  let mut value = drag.unwrap_or(live);
+  let slider = ui.add(egui::Slider::new(&mut value, OVERRIDE_MIN..=OVERRIDE_MAX).suffix("%").show_value(false));
+  if slider.drag_started() || slider.dragged() {
+    // While dragging, remember the operator's position so the live status poll cannot yank the handle back.
+    *drag = Some(value);
+  }
+  if slider.drag_stopped() {
+    // On release, commit the target if it actually moved off the live value, then let the mirror track live again.
+    if value != live {
+      sink.push(Intent::SetOverride { axis, target: value });
+    }
+    *drag = None;
+  }
+
+  // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%.
   ui.horizontal(|ui| {
-    ui.label(format!("{label} {value:>3}%"));
     if ui.button("−10").clicked() {
-      sink.push(Intent::Realtime(minus));
+      sink.push(Intent::Realtime(minus10));
+    }
+    if ui.button("−1").clicked() {
+      sink.push(Intent::Realtime(minus1));
     }
     if ui.button("100").clicked() {
       sink.push(Intent::Realtime(reset));
     }
+    if ui.button("+1").clicked() {
+      sink.push(Intent::Realtime(plus1));
+    }
     if ui.button("+10").clicked() {
-      sink.push(Intent::Realtime(plus));
+      sink.push(Intent::Realtime(plus10));
     }
   });
 }
@@ -688,7 +810,8 @@ pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mu
 /// bar · percent) for whichever tab is active, and the body below renders the selected tab. Keeping both tabs
 /// in one dock matches the mock, where Console and Program share the 200px dock rather than sitting in
 /// separate panels.
-pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
+  sink: &mut IntentSink) {
   let active = state.active_tab;
   let tabs = [("Console", active == DockTab::Console), ("Program", active == DockTab::Program)];
   let progress = view.progress;
@@ -700,7 +823,7 @@ pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut
   let mut toggle_clicked = false;
   let clicked = tab_strip(ui, &tabs, |ui| {
     toggle_clicked = dock_collapse_toggle(ui, collapsed);
-    dock_progress(ui, progress);
+    dock_progress(ui, progress, time);
   });
   state.active_tab = dock_tab_for_click(active, clicked);
   if toggle_clicked {
@@ -739,13 +862,20 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
   ui.add_sized(size, button).on_hover_text(hint).clicked()
 }
 
-/// Draw the §03 dock progress readout: `acked / total`, the 260px green bar, and the percent, shown only while
-/// a program is loaded/streaming (`total > 0`). The host has no time estimate yet, so the mock's `m:ss / m:ss`
-/// time pair is omitted until the engine exposes one.
-fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress) {
+/// Draw the §03 dock progress readout: `acked / total`, the 260px green bar, the percent, and the elapsed /
+/// estimated-total `m:ss / m:ss` clock, shown only while a program is loaded/streaming (`total > 0`). The
+/// strip's right closure lays out right-to-left, so the widgets are drawn rightmost-first; that puts the
+/// clock at the left edge of the block and the count nearest the percent, reading left→right as the design's
+/// `acked/total · bar · NN% · m:ss / m:ss`.
+fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time: super::progress::TimeEstimate) {
+  use super::progress::format_mmss;
   if progress.total == 0 {
     return;
   }
+  // Rightmost: the elapsed / estimated-total clock. `total` is `None` until the ETA is projectable, rendering
+  // the elapsed against a `--:--` placeholder rather than a wild early guess.
+  let clock = format!("{} / {}", format_mmss(Some(time.elapsed)), format_mmss(time.total));
+  ui.label(RichText::new(clock).monospace().size(10.5).color(Theme::TEXT_DIM));
   let pct = (progress.fraction() * 100.0).round() as u32;
   ui.label(RichText::new(format!("{pct}%")).monospace().size(11.0).color(Theme::TEXT));
   let (rect, _) = ui.allocate_exact_size(Vec2::new(Metrics::PROGRESS_W, Metrics::PROGRESS_H), egui::Sense::hover());
@@ -1154,25 +1284,45 @@ fn gcode_words(code: &str) -> impl Iterator<Item = (char, &str)> {
   })
 }
 
-/// Render the settings window. `$PBX`/`galdr-proto` settings sync is deferred, so for now this hosts the
-/// connection-level knobs (baud) and a note about the deferred settings channel.
-pub fn settings(ui: &mut egui::Ui, state: &mut UiState, _sink: &mut IntentSink) {
+/// Decide what a committed/abandoned settings edit produces: `Some(WriteSetting)` when the edit was committed
+/// (Enter / focus-loss) AND the buffer actually differs from the live value, else `None`. Pure so the
+/// commit policy — "only write a real change" — is unit-tested without a window. A trimmed-equal buffer is a
+/// no-op (the firmware would just echo the same value), so it sends nothing and the link stays quiet.
+fn commit_setting_edit(committed: bool, number: u32, buffer: &str, live: Option<&str>) -> Option<Intent> {
+  if !committed {
+    return None;
+  }
+  let trimmed = buffer.trim();
+  if trimmed.is_empty() || live == Some(trimmed) {
+    return None;
+  }
+  Some(Intent::WriteSetting { number, value: trimmed.to_string() })
+}
+
+/// Render the settings window: the connection-level baud knob plus the same live `$NNN` settings list the
+/// right-column panel shows, in a roomier form. The list is driven by [`ViewState::settings`], populated from
+/// the firmware's `$$`/`$ES` replies; editing a value writes it back via [`Intent::WriteSetting`].
+pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   ui.label("Connection");
   ui.horizontal(|ui| {
     ui.label("Baud");
     ui.add(egui::DragValue::new(&mut state.baud).speed(100.0).range(9_600..=2_000_000));
   });
   ui.separator();
-  ui.label(RichText::new("Firmware settings sync ($PBX / galdr-proto) is not wired yet.").color(Theme::TEXT_DIM));
+  ui.horizontal(|ui| {
+    ui.label(RichText::new("Firmware settings").color(Theme::TEXT));
+    settings_refresh_button(ui, view, sink);
+  });
+  ui.add_space(4.0);
+  settings_list(ui, view, state, sink);
 }
 
-/// Render the right column's inline Settings section (design §03): the `$NNN` settings list with violet keys,
-/// a name, and a value. The `$PBX`/`galdr-proto` settings channel is not wired yet, so the live list is a
-/// deferred-work placeholder; the section header and an "open editor" affordance route the operator to the
-/// existing baud/connection popup until the firmware settings sync lands. Kept thin: no engine wiring here.
-pub fn settings_panel(ui: &mut egui::Ui, state: &mut UiState, _sink: &mut IntentSink) {
-  // The header carries the `($)` hint and a right-aligned button that opens the connection/settings popup, the
-  // §03 "magnifier" affordance repurposed as the editor entry until the live `$` list is wired.
+/// Render the right column's inline Settings section (design §03): the live `$NNN` settings list with violet
+/// keys, the enumerated name, and an editable value. The list is fed from [`ViewState::settings`] (the `$$`
+/// values merged with `$ES` metadata); the header's ⚙ opens the roomier settings window and a refresh button
+/// (re)fetches the dump. Editing a value commits a `$<n>=<value>` write. Kept thin: all merge/parse logic lives
+/// in the reducer and the settings model; this only renders rows and forwards edit intents.
+pub fn settings_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   header_bar(
     ui,
     |ui| {
@@ -1188,11 +1338,84 @@ pub fn settings_panel(ui: &mut egui::Ui, state: &mut UiState, _sink: &mut Intent
     },
   );
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    ui.label(RichText::new("Live $NNN settings sync ($PBX / galdr-proto) is not wired yet.").size(11.0)
-      .color(Theme::TEXT_DIM));
-    ui.add_space(2.0);
-    ui.label(RichText::new("Use the editor (⚙) for connection settings.").size(10.5).color(Theme::TEXT_DISABLED));
+    ui.horizontal(|ui| {
+      settings_refresh_button(ui, view, sink);
+      if !view.settings.is_empty() {
+        ui.label(RichText::new(format!("{} settings", view.settings.len())).size(10.5).color(Theme::TEXT_DIM));
+      }
+    });
+    ui.add_space(4.0);
+    settings_list(ui, view, state, sink);
   });
+}
+
+/// The "fetch settings from the firmware" button: enabled only when connected (a `$$`/`$ES` request would just
+/// error while disconnected). Emits [`Intent::RequestSettings`], which the shell turns into `$ES` + `$$`.
+fn settings_refresh_button(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
+  let connected = !matches!(view.connection, ConnectionState::Disconnected | ConnectionState::Connecting);
+  ui.add_enabled_ui(connected, |ui| {
+    if ui.button("Refresh ($$)").on_hover_text("Fetch $$ values and $ES labels from the controller").clicked() {
+      sink.push(Intent::RequestSettings);
+    }
+  });
+}
+
+/// Render the live settings rows: each is a violet `$<n>` key, the enumerated label, and an editable value
+/// field. A click into a value enters edit mode (a transient buffer in [`UiState::editing_setting`] seeded from
+/// the live value); Enter or focus-loss commits a [`Intent::WriteSetting`] if the value changed, Escape
+/// abandons it. When no settings are known yet the section prompts the operator to refresh.
+fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  if view.settings.is_empty() {
+    ui.label(RichText::new("No settings loaded — Refresh to fetch the controller's $$ / $ES.").size(11.0)
+      .color(Theme::TEXT_DIM));
+    return;
+  }
+  // The committed edit (if any) is acted on after the row loop so we never mutate `editing_setting` mid-borrow.
+  let mut commit: Option<(bool, u32, String)> = None;
+  egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+    egui::Grid::new("settings_list").num_columns(3).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
+      for row in view.settings.rows() {
+        ui.label(RichText::new(format!("${}", row.number)).monospace().size(11.0).color(Theme::LOG_STATUS));
+        let label = row.label();
+        let unit = row.unit();
+        let label_text = if unit.is_empty() { label } else { format!("{label} ({unit})") };
+        ui.label(RichText::new(label_text).size(11.0).color(Theme::TEXT_DIM));
+
+        // The value cell: an in-edit row binds the transient buffer; an idle row shows the live value, which a
+        // click promotes into edit mode seeded from that value.
+        let editing_this = matches!(&state.editing_setting, Some((n, _)) if *n == row.number);
+        if editing_this {
+          if let Some((_, buffer)) = state.editing_setting.as_mut() {
+            let resp = ui.add(egui::TextEdit::singleline(buffer).desired_width(72.0));
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let abandoned = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            // Leave edit mode on any of: Enter (commit), Escape (abandon), or focus moving elsewhere (commit
+            // the buffer as-is, matching how a spreadsheet cell behaves). `commit_setting_edit` then decides
+            // whether the change is worth a write. Escape forces a non-commit even though it also drops focus.
+            if enter || abandoned || resp.lost_focus() {
+              commit = Some((enter && !abandoned, row.number, buffer.clone()));
+            }
+          }
+        } else {
+          let shown = row.value.clone().unwrap_or_else(|| "—".to_string());
+          if ui.add(egui::Button::new(RichText::new(shown).monospace().size(11.0).color(Theme::TEXT))
+            .fill(Theme::INSET)).on_hover_text("Click to edit").clicked()
+          {
+            state.editing_setting = Some((row.number, row.value.clone().unwrap_or_default()));
+          }
+        }
+        ui.end_row();
+      }
+    });
+  });
+
+  if let Some((committed, number, buffer)) = commit {
+    if let Some(intent) = commit_setting_edit(committed, number, &buffer, view.settings.value_of(number)) {
+      sink.push(intent);
+    }
+    // Leave edit mode whether we wrote or not, so the row returns to showing the live value.
+    state.editing_setting = None;
+  }
 }
 
 #[cfg(test)]
@@ -1204,12 +1427,44 @@ mod tests {
     let state = UiState::default();
     assert_eq!(state.baud, 115_200);
     assert_eq!(state.jog_step, 1.0);
+    assert!(!state.jog_continuous, "the jog pad defaults to fixed-step, not continuous");
     assert!(state.program.is_empty());
     assert!(!state.settings_open);
     assert!(state.auto_scroll, "console auto-scrolls by default");
     assert!(!state.show_machine_pos, "the DRO defaults to work coordinates");
     assert_eq!(state.active_tab, DockTab::Console, "the dock opens on the Console tab");
     assert!(!state.dock_collapsed, "the dock opens expanded at its full height");
+  }
+
+  #[test]
+  fn jog_sense_senses_drag_only_in_continuous_mode() {
+    // egui's `Sense::click()` senses clicks but not drags; `click_and_drag()` senses both. The drag bit must
+    // flip with the mode so the press-and-hold edges become observable only when continuous, while a click is
+    // always sensed (a tap is a bounded jog in step mode and a quick nudge in continuous mode).
+    let mut state = UiState::default();
+    let step_sense = jog_sense(&state);
+    assert!(step_sense.senses_click(), "fixed-step jog senses a click");
+    assert!(!step_sense.senses_drag(), "fixed-step jog must not sense drag");
+    state.jog_continuous = true;
+    let cont_sense = jog_sense(&state);
+    assert!(cont_sense.senses_drag(), "continuous jog must sense drag for press-and-hold");
+    assert!(cont_sense.senses_click(), "continuous jog still senses a click for a quick tap");
+  }
+
+  #[test]
+  fn disconnect_clears_transient_edit_and_drag_state() {
+    // An in-progress setting edit and the override slider drags belong to the ended session; a disconnect must
+    // wipe them so a reconnect never resumes a stale `$<n>` edit or a slider pinned to the old board's override.
+    let mut state = UiState {
+      editing_setting: Some((110, "250".to_string())),
+      feed_override_drag: Some(140),
+      spindle_override_drag: Some(90),
+      ..UiState::default()
+    };
+    state.on_disconnected();
+    assert_eq!(state.editing_setting, None, "an in-progress setting edit must not survive a disconnect");
+    assert_eq!(state.feed_override_drag, None, "the feed-override drag must reset on a disconnect");
+    assert_eq!(state.spindle_override_drag, None, "the spindle-override drag must reset on a disconnect");
   }
 
   #[test]
@@ -1243,6 +1498,26 @@ mod tests {
     assert_eq!(console_line_style(LogSource::Received, "[MSG:hi]").1, Theme::LOG_INFO);
     assert_eq!(console_line_style(LogSource::Received, "error:9").1, Theme::DANGER);
     assert_eq!(console_line_style(LogSource::Received, "ok").1, Theme::LOG_RECV);
+  }
+
+  #[test]
+  fn a_settings_edit_writes_only_a_real_change() {
+    // A committed edit that differs from the live value produces a write.
+    assert_eq!(
+      commit_setting_edit(true, 0, "12", Some("10")),
+      Some(Intent::WriteSetting { number: 0, value: "12".to_string() })
+    );
+    // A committed edit equal to the live value (after trim) is a no-op: nothing is sent.
+    assert_eq!(commit_setting_edit(true, 0, " 10 ", Some("10")), None);
+    // An abandoned edit (Escape / focus-loss without Enter) never writes, even if the value changed.
+    assert_eq!(commit_setting_edit(false, 0, "12", Some("10")), None);
+    // An empty buffer never writes — there is no value to set.
+    assert_eq!(commit_setting_edit(true, 0, "  ", Some("10")), None);
+    // A first-ever value (no live value yet) still writes the change.
+    assert_eq!(
+      commit_setting_edit(true, 5, "1", None),
+      Some(Intent::WriteSetting { number: 5, value: "1".to_string() })
+    );
   }
 
   #[test]

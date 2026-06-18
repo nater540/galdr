@@ -9,9 +9,12 @@
 use std::collections::VecDeque;
 
 use super::badge::BadgeState;
+use super::settings_model::SettingsModel;
 use crate::engine::Event;
 use crate::error::TransportError;
-use crate::protocol::{ConnectionState, PositionKind, Response, StatusReport, parse_status};
+use crate::protocol::{
+  ConnectionState, PositionKind, Response, SettingValue, StatusReport, parse_setting_meta, parse_status,
+};
 
 /// How many console lines to retain. The console is a diagnostic tail, not a transcript — capping it bounds
 /// memory under a long stream and keeps per-frame rendering cheap (egui draws only visible rows anyway).
@@ -85,6 +88,9 @@ pub struct ViewState {
   pub banner: Option<Banner>,
   /// The rolling console buffer, oldest first, capped at [`CONSOLE_CAPACITY`].
   pub console: VecDeque<LogLine>,
+  /// The live firmware settings, merged from `$<n>=<value>` values and `$ES` enumeration metadata. Populated
+  /// when the operator requests a `$$` dump (and `$ES`); cleared on disconnect so a reconnect starts clean.
+  pub settings: SettingsModel,
 }
 
 impl Default for ViewState {
@@ -96,6 +102,7 @@ impl Default for ViewState {
       progress: Progress::default(),
       banner: None,
       console: VecDeque::new(),
+      settings: SettingsModel::new(),
     }
   }
 }
@@ -207,6 +214,20 @@ impl ViewState {
       }
       Response::Alarm(code) => self.banner = Some(Banner::Alarm(*code)),
       Response::Error(code) => self.banner = Some(Banner::StreamError(*code)),
+      Response::Setting { number, value } => {
+        // A `$<n>=<value>` line merges into the live settings model. Like status telemetry, a `$$` dump is many
+        // lines of structured data the settings panel renders, so it does not flood the console.
+        self.settings.apply_value(SettingValue { number: *number, value: value.clone() });
+        return;
+      }
+      Response::Message(body) => {
+        // A `[SETTING:...]` enumeration row enriches the settings model with the setting's label/unit/bounds and
+        // is not console noise; every other bracketed message still reaches the console below.
+        if let Some(meta) = parse_setting_meta(body) {
+          self.settings.apply_meta(meta);
+          return;
+        }
+      }
       _ => {}
     }
     self.log(LogSource::Received, render_response(&response));
@@ -220,6 +241,8 @@ impl ViewState {
     // Drop the cached WCO so a reconnect does not show "WCO set" or derive WPos/MPos from a stale offset before
     // the new session reports its own. Report-derived state must not survive across a disconnect.
     self.last_wco.clear();
+    // The settings list is the previous board's; clear it so a reconnect re-fetches rather than showing stale.
+    self.settings.clear();
     match reason {
       Some(err) => self.log(LogSource::Notice, format!("disconnected: {err}")),
       None => self.log(LogSource::Notice, "disconnected".to_string()),
@@ -246,8 +269,9 @@ fn render_response(response: &Response) -> String {
     Response::Banner(text) => text.clone(),
     Response::StartupEcho(text) => format!(">{text}"),
     Response::Unknown(text) => text.clone(),
-    // Status is rendered by the DRO, not the console; included for exhaustiveness only.
+    // Status is rendered by the DRO and settings by the panel, not the console; included for exhaustiveness.
     Response::Status(body) => format!("<{body}>"),
+    Response::Setting { number, value } => format!("${number}={value}"),
   }
 }
 
@@ -395,6 +419,49 @@ mod tests {
     assert_eq!(view.progress, Progress::default());
     assert!(view.status.is_none());
     assert!(view.last_wco.is_empty(), "cached WCO must not survive a disconnect");
+  }
+
+  #[test]
+  fn setting_lines_fold_into_the_model_and_skip_the_console() {
+    let mut view = ViewState::default();
+    // A `$$` dump of `$<n>=<value>` lines populates the settings model, not the console (it would flood it).
+    view.apply(Event::Response(Response::Setting { number: 0, value: "10".to_string() }));
+    view.apply(Event::Response(Response::Setting { number: 110, value: "500.000".to_string() }));
+    assert!(view.console.is_empty(), "a settings dump must not flood the console");
+    assert_eq!(view.settings.len(), 2);
+    assert_eq!(view.settings.value_of(0), Some("10"));
+    assert_eq!(view.settings.value_of(110), Some("500.000"));
+  }
+
+  #[test]
+  fn setting_enumeration_messages_label_rows_and_skip_the_console() {
+    let mut view = ViewState::default();
+    // A `$ES` enumeration row enriches the model's label/unit and is not console noise.
+    view.apply(Event::Response(Response::Message("SETTING:0|1|Step pulse time|microseconds|2||1|1000".to_string())));
+    view.apply(Event::Response(Response::Setting { number: 0, value: "10".to_string() }));
+    assert!(view.console.is_empty(), "settings metadata must not reach the console");
+    let row = view.settings.rows().next().expect("a settings row");
+    assert_eq!(row.label(), "Step pulse time");
+    assert_eq!(row.unit(), "microseconds");
+    assert_eq!(row.value.as_deref(), Some("10"));
+  }
+
+  #[test]
+  fn a_non_setting_message_still_reaches_the_console() {
+    let mut view = ViewState::default();
+    // A `[MSG:...]` that is not a SETTING row is still surfaced in the console as before.
+    view.apply(Event::Response(Response::Message("MSG:hello".to_string())));
+    assert_eq!(view.console.len(), 1);
+    assert_eq!(view.console.back().unwrap().text, "[MSG:hello]");
+  }
+
+  #[test]
+  fn disconnect_clears_the_settings_model() {
+    let mut view = ViewState::default();
+    view.apply(Event::Response(Response::Setting { number: 0, value: "10".to_string() }));
+    assert!(!view.settings.is_empty());
+    view.apply(Event::Disconnected(None));
+    assert!(view.settings.is_empty(), "the previous board's settings must not survive a disconnect");
   }
 
   #[test]

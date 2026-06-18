@@ -17,10 +17,16 @@
 
 pub mod badge;
 pub mod intent;
+pub mod overrides;
+pub mod progress;
+pub mod settings_model;
 pub mod view_state;
 
 pub use badge::{BadgeState, TransportGroup, alarm_detail, error_detail};
 pub use intent::{Axis, Dir, Intent, IntentSink, work_offset_line, work_zero_line};
+pub use overrides::{OverrideAxis, clamp_override, override_commands};
+pub use progress::{TimeEstimate, estimate, format_mmss};
+pub use settings_model::{SettingRow, SettingsModel};
 pub use view_state::{Banner, CONSOLE_CAPACITY, LogLine, LogSource, Progress, ViewState};
 
 #[cfg(feature = "gui")]

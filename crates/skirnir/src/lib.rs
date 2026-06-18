@@ -10,6 +10,8 @@
 //!   real `tokio-serial` adapter (behind the `serial` feature).
 //! - [`engine`] — the async driver that owns a [`Transport`], pumps it through the protocol core, applies the
 //!   emitted effects, and bridges the UI over command/event channels. The future egui UI drives this.
+//! - [`reconnect`] — the pure host-side backoff schedule the shell consults to auto-reconnect after a drop
+//!   (notably the ESP32-S3's USB re-enumeration on soft reset). No timer/transport — just the delay decision.
 //! - [`error`] — the typed error surface. The engine never panics on a runtime condition; it surfaces these.
 //!
 //! The intended boundary: a UI calls [`engine::Engine::connect`] with a transport, then sends
@@ -22,6 +24,7 @@ pub mod app;
 pub mod engine;
 pub mod error;
 pub mod protocol;
+pub mod reconnect;
 pub mod transport;
 
 // The engine API the UI drives.
@@ -30,5 +33,7 @@ pub use engine::{Command, Engine, EngineHandle, Event};
 pub use transport::Transport;
 // The protocol vocabulary the UI renders and the contract types callers match on.
 pub use protocol::{ConnectionState, RealtimeCommand, Response};
+// The reconnect schedule the shell drives.
+pub use reconnect::{ReconnectConfig, ReconnectPolicy};
 // The typed error surface.
 pub use error::{EngineError, TransportError};

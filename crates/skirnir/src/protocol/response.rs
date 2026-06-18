@@ -34,6 +34,11 @@ pub enum Response {
   /// A startup-line execution echo, e.g. `>G54G20:ok`. Informational.
   StartupEcho(String),
 
+  /// A `$<n>=<value>` settings line from a `$$` dump (or a single setting read). Carries the setting number
+  /// and its value text verbatim. Informational — settings travel as text and are not flow-control responses;
+  /// the reducer folds these into the live settings model and renders them, but never counts them as an `ok`.
+  Setting { number: u32, value: String },
+
   /// A non-empty line we did not recognise. Surfaced verbatim rather than discarded, so nothing is lost.
   Unknown(String),
 }
@@ -73,6 +78,12 @@ pub fn parse_line(line: &str) -> Option<Response> {
     return Some(Response::StartupEcho(rest.to_string()));
   }
 
+  // A `$<n>=<value>` settings line (from a `$$` dump or a single read). `parse_setting_value` rejects the
+  // non-setting `$` commands (`$H`, `$J=`, `$N0=`), so only true settings match here.
+  if let Some(setting) = crate::protocol::settings::parse_setting_value(line) {
+    return Some(Response::Setting { number: setting.number, value: setting.value });
+  }
+
   // The banner is the only bare-text line we special-case; both legacy `Grbl` and `GrblHAL` forms start
   // with `Grbl` (grblHAL drops to `Grbl` at compatibility level >= 1), so a case-insensitive prefix match
   // on `grbl` followed by a version-ish token is a safe, specific signal.
@@ -96,6 +107,10 @@ pub fn is_grbl_evidence(response: &Response, accept_acks: bool) -> bool {
     // `$I` build-info comes back as bracketed `[VER:...]` / `[OPT:...]` push messages; other `[MSG:...]` does not.
     Response::Message(body) => body.starts_with("VER:") || body.starts_with("OPT:"),
     Response::Ok | Response::Error(_) | Response::Alarm(_) => accept_acks,
+    // A `$<n>=<value>` line is firmware output, so it is real evidence of a live grblHAL controller (a `$$`
+    // dump only comes from a board that answered our query) for the connect handshake — but, like an ack, it
+    // is solicited, so the unsolicited port probe (`accept_acks = false`) stays conservative and ignores it.
+    Response::Setting { .. } => accept_acks,
     Response::StartupEcho(_) | Response::Unknown(_) => false,
   }
 }
@@ -164,6 +179,20 @@ mod tests {
   #[test]
   fn parses_startup_echo() {
     assert_eq!(parse_line(">G54G20:ok"), Some(Response::StartupEcho("G54G20:ok".to_string())));
+  }
+
+  #[test]
+  fn parses_a_setting_value_line() {
+    // A `$<n>=<value>` dump line is a dedicated settings response, not Unknown.
+    assert_eq!(parse_line("$0=10"), Some(Response::Setting { number: 0, value: "10".to_string() }));
+    assert_eq!(parse_line("$110=500.000"), Some(Response::Setting { number: 110, value: "500.000".to_string() }));
+  }
+
+  #[test]
+  fn non_setting_dollar_commands_are_not_settings() {
+    // A startup-block write or other `$` command must not parse as a setting (its key is not a bare number).
+    assert!(matches!(parse_line("$N0=G54"), Some(Response::Unknown(_))));
+    assert!(matches!(parse_line("$J=G91 X1"), Some(Response::Unknown(_))));
   }
 
   #[test]

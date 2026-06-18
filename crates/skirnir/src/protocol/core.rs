@@ -285,6 +285,9 @@ impl ProtocolCore {
       }
       // `[OPT:...]` RX sizing already handled above; nothing further for messages.
       Response::Message(_) => {}
+      // A `$<n>=<value>` settings line is push output, not a flow-control response: it is surfaced (above) for
+      // the reducer's settings model but does not touch the window, the program, or the lifecycle.
+      Response::Setting { .. } => {}
       Response::Status(_) | Response::StartupEcho(_) | Response::Unknown(_) => {}
     }
     out
