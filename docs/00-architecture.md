@@ -555,6 +555,18 @@ into each channel's burst array independently.
 
 ## DOC-06: Homing & Limit Switch Subsystem
 
+> **Implementation status (DOC-06 is built, host-tested):** the homing state machine lives in
+> `crates/firmware-core/src/homing.rs` (per-axis seek → pull-off → locate → final pull-off, the `$23` direction mask,
+> the 1.5× search-distance no-contact bound, and machine-zero math), driven by the core-1 executor's `run_homing`
+> (`crates/firmware/src/motion.rs`) and the `$H` handler `handle_home` (`crates/firmware/src/comms.rs`). Hard limits
+> (`$21` → `ALARM:1`), soft limits (`$20` → `ALARM:2`, gated on a homed machine), the homing-required boot lock
+> (`ALARM:11`), and limit-switch `Pn:` status reporting are all implemented and unit-tested off-target. The
+> **hardware boundary is not yet bench-verified**: the rising-edge limit IRQ + `$26` debounce, the NC broken-wire
+> fail-safe, and real seek/locate timing are compile-checked only — run `docs/homing-bench-checklist.md` on the board
+> to validate. The grblHAL behavioral contract the implementation follows is captured in
+> `docs/homing-research-findings.md`. Intra-group X+Y homing currently runs sequentially (a documented
+> `TODO(DOC-06)`); true concurrent co-motion is a future refinement. The text below is the original design spec.
+
 ### Homing cycle sequence (grblHAL convention)
 Default order: **Z homes first** (lifts the tool clear of the workpiece), then **X and Y home
 together**. Each axis phase:

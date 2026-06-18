@@ -7,20 +7,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Galdr** is a CNC PCB milling system. The workspace has four crates:
 
 - `crates/firmware-core` — pure, `no_std`, **host-tested** logic: the GCode parser, motion planner, segment
-  generator, grblHAL protocol/state machine, coordinate systems, settings model, and the TMC2209 codec. No esp-hal
-  dependency, so it compiles and unit-tests on the host with stock Rust.
+  generator, grblHAL protocol/state machine, the homing state machine (DOC-06), coordinate systems, settings model,
+  and the TMC2209 codec. No esp-hal dependency, so it compiles and unit-tests on the host with stock Rust.
 - `crates/firmware` — the **ESP32-S3** binary wiring `firmware-core` to the hardware (esp-hal 1.0 + Embassy on the
-  esp-rtos host): USB CDC comms, the dual-core task split, RMT step generation, the TMC UART bus, flash persistence.
+  esp-rtos host): USB CDC comms, the dual-core task split, RMT step generation, the TMC UART bus, flash persistence,
+  and the limit-switch inputs.
 - `crates/galdr-proto` — the shared Protocol Buffers schema (micropb) for the settings/coordinate wire format, used
   by both the firmware flash records and the `$PBX` host-sync channel.
 - `crates/skirnir` — a native **Linux GCode sender** (host app) that streams GCode over USB CDC serial.
 
 The firmware side (`firmware-core` + `firmware` + `galdr-proto`) is substantially implemented and host-tested: the
 GCode→planner→motion pipeline, grblHAL streaming, TMC2209 driver, settings + coordinate persistence, G38.x probing,
-jogging, and feed/rapid/spindle overrides all exist. Still stubbed at the hardware boundary (refused or no-op'd, not
-faked): the homing cycle (DOC-06), spindle PWM output (DOC-05), and the limit/coolant GPIO. `crates/skirnir` is still
-an empty scaffold (`fn main() { println!("Hello, world!"); }`). `docs/` remains the authoritative **design** spec —
-read the relevant doc before extending a subsystem.
+jogging, feed/rapid/spindle overrides, the **`$H` homing cycle**, **hard/soft limits**, and **limit-switch `Pn:`
+status reporting** (all DOC-06) exist and are unit-tested off-target. The DOC-06 homing/limit *logic* is host-tested,
+but its hardware boundary — the rising-edge limit IRQ + `$26` debounce, the NC broken-wire fail-safe, and the real
+seek/locate timing — is compile-checked only and **not yet verified on the board** (see
+`docs/homing-bench-checklist.md`). Genuinely stubbed at the hardware boundary (logic exists, no peripheral output):
+**spindle PWM** (DOC-07 — the LEDC drive on GPIO13 is a `TODO` in `main`) and the coolant GPIO. `crates/skirnir` is
+now a real app, not a scaffold: an egui/eframe GUI plus a framework-agnostic `tokio-serial` streaming engine
+(character-counting flow control, `<...>`/`Pn:` status parsing, reconnection, endstop indicators), with ~229 host
+tests run over a loopback transport. `docs/` remains the authoritative **design** spec — read the relevant doc
+before extending a subsystem.
 
 > Naming note: the docs use generic placeholder names (`pcb-mill-fw`, `cnc-core`, `gcode`, `planner`, `motion`,
 > `drivers`, `protocol`, `hal_traits`) for what are now the `firmware-core` modules and the `firmware`/`galdr-proto`/
@@ -35,7 +42,9 @@ read the relevant doc before extending a subsystem.
 | `docs/00-architecture.md` | Full firmware spec, DOC-00–DOC-09: hardware/GPIO manifest, Embassy task split, RMT step generation, TMC2209 driver, GCode parser, motion planner, homing, spindle, USB CDC, testing. **Start here for firmware work.** |
 | `docs/gcode-streaming.md` | grblHAL streaming protocol: character-counting flow control, real-time commands, status reports, handshake, `$`-settings, probing. Shared contract between firmware and `skirnir`. |
 | `docs/tlo-offsets.md` | Tool-length-offset / Z-probe workflow (G38.x, WPos/MPos/WCO/TLO) for no-touch-plate PCB probing. |
-| `docs/native-app.md` | `skirnir` design: GUI framework analysis. **egui (eframe) is the chosen UI**; isolate the serial/streaming engine into its own framework-agnostic module built on `tokio-serial`. |
+| `docs/native-app.md` + `docs/skirnir-design-brief.md` | `skirnir` design. egui (eframe) is the UI; the serial/streaming engine is a framework-agnostic module on `tokio-serial`. **Now built** — read these for intent, but `crates/skirnir/src/` is the source of truth. |
+| `docs/homing-research-findings.md` | DOC-06 background: the verified grblHAL homing/limit behavioral contract that the implementation follows (cited research synthesis). Read before changing homing/limit semantics. |
+| `docs/homing-bench-checklist.md` | Hardware-in-the-loop bring-up procedure for the homing cycle + limit switches. The DOC-06 hardware path is unverified until this is run on the board. |
 
 ## Build & test
 
@@ -43,13 +52,16 @@ Workspace root is the repo root (`Cargo.toml` `members = ["crates/firmware-core"
 "crates/galdr-proto"]`).
 
 ```sh
-cargo build              # current scaffold builds with stock Rust
-cargo test               # host tests
+cargo build              # builds firmware-core + skirnir + galdr-proto on stock Rust (firmware is excluded)
+cargo test               # host tests (run with RUSTFLAGS="-D warnings" to match CI)
 cargo test -p <crate>    # single crate
 cargo test -p <crate> <test_name>   # single test
 ```
 
 `firmware` is excluded from `default-members`, so the bare commands above stay on the host toolchain and skip it.
+`skirnir` has two default-on features — `gui` (eframe + rfd; `cargo run -p skirnir` launches the window) and `serial`
+(`tokio-serial`; `cargo run -p skirnir -- --cli <port>` is the headless streaming path). Its tests run over an
+in-memory loopback transport and need no hardware; build the UI explicitly with `cargo build -p skirnir --features gui`.
 **`--workspace`/`--all` ignore `default-members`** and will try to build `firmware` on the host (which fails) — pass
 `--exclude firmware` with those flags, or build `firmware` on its own from within `crates/firmware` (see below).
 
@@ -96,7 +108,12 @@ stock Rust — keep it that way (see "Hardware abstraction" below).
 
 - **Dual-core split.** Core 1 (`APP_CPU`) runs *only* the `motion_executor` task on a high-priority `InterruptExecutor`
   for real-time step generation — uncontested CPU, preempts nothing. Core 0 (`PRO_CPU`) runs everything else (USB
-  comms, GCode parser, planner, TMC manager, spindle, status reporter, homing) on a thread-mode executor.
+  comms, GCode parser, planner, TMC manager, spindle, status reporter) on a thread-mode executor. The `$H` homing
+  cycle and G38 probing are *commanded/gated* on core 0 (`handle_home` in `comms`) but their seek/locate **motion runs
+  on the core-1 executor** — it owns the RMT channels and limit inputs — dispatched via `HOME_REQUEST`/`PROBE_REQUEST`
+  signals and answered with `HOME_RESULT`/`PROBE_RESULT`. The executor also samples the limit inputs (block
+  boundaries, a 50 ms idle ticker, the debounced edge wait) and publishes their levels to the core-0 status reporter
+  via a `LIMIT_LEVELS` atomic that sources the `Pn:` field.
 - **Step generation via RMT.** Each axis (X/Y/Z) gets its own dedicated RMT TX channel (ch0/1/2); ch3 is spare. Keep
   `mem_block_symbols ≤ 48` (one memory block) per channel or the driver borrows the adjacent channel's block. esp-hal
   1.0 exposes no RMT DMA backend yet — use the interrupt path.
@@ -123,11 +140,15 @@ stock Rust — keep it that way (see "Hardware abstraction" below).
   behavior, differs from legacy grbl).
 - `skirnir`'s streaming engine implements host-side character counting against the advertised RX buffer size, injects
   real-time single-byte commands out-of-band, and parses `ok`/`error`/`<...>`.
+- The `<...>` status report carries asserted input pins in the grblHAL `Pn:` field (`X`/`Y`/`Z` limit switches, `P`
+  probe), and is omitted entirely when nothing is asserted. The firmware sources the limit letters from `LIMIT_LEVELS`
+  (logical state after `$5` invert); `skirnir` decodes `Pn:` into a typed pin-state and shows the X/Y/Z endstops.
 
 ## Hardware abstraction & code style (from DOC-09)
 
-- All hardware access goes behind traits (`StepSink`, `PwmSink`, `DigitalIn`/`DigitalOut`, `TmcBus`) so
-  planner/parser/driver logic is host-testable with recording/mock impls. Only the firmware wiring layer touches esp-hal.
+- All hardware access goes behind traits so planner/parser/driver/homing logic is host-testable with recording/mock
+  impls; only the firmware wiring layer touches esp-hal. `StepSink`, `TmcBus`, `ProbeInput`, and `DigitalIn` (limit
+  inputs) are implemented; `PwmSink`/`DigitalOut` await the spindle/coolant wiring (DOC-07).
 - **No `unwrap()`/`expect()` in library code** — propagate via `Result`. `expect` is allowed only in `main`/init paths
   where failure is genuinely unrecoverable.
 - **Two-space indentation** (enforced by `.editorconfig`), LF line endings, final newline.

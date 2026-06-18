@@ -1,0 +1,20 @@
+# Firmware Engineer Memory — Galdr
+
+- [Project Overview](project-galdr-overview.md) — Galdr = ESP32-S3 grblHAL CNC firmware (`firmware`) + Linux egui GCode sender (`skirnir`); docs/ is the spec.
+- [Workspace Build Constraints](project-build-constraints.md) — Xtensa toolchain via espup, workspace target-mixing pitfall, edition 2024, host-testable lib split.
+- [Hardware & Peripheral Map](project-hardware-map.md) — GPIO/peripheral allocation, RMT/TMC/LEDC/USB assignments, sense-resistor + strapping-pin gotchas.
+- [Dependency Pins & Runtime](project-dependency-pins.md) — esp-rtos hosts Embassy on stable esp-hal 1.0; vetted pin set; DOC-00 versions wrong; default-members host-build scoping (forced-target is nightly-only).
+- [Planner Contracts](project-planner-contracts.md) — DOC-05 planner decisions: PlannerCommand stays in gcode.rs, arc back-pressure all-or-nothing, squared speeds, lone-block entry=0, planner owns all geometry.
+- [Motion Contracts](project-motion-contracts.md) — DOC-02 segment generator: StepEvent is per-tick all-axes, dir latched once/block, MotionConfig owns $0/$29, run_block(exit_speed_sq), exact Bresenham, ≤47-event bursts (47+marker=48-symbol block).
+- [Protocol Contracts](project-protocol-contracts.md) — DOC-08 streaming: sans-io StreamEngine, one-ok-per-line via EngineEvent, driver-armed error-hold, wire-format constants, comms.rs task topology.
+- [Firmware Bring-up](project-firmware-bringup.md) — Xtensa bring-up: #[esp_rtos::main]+esp_rtos::start(timer), USB Serial/JTAG split, MANDATORY -Tlinkall.x rustflag, rust-toolchain.toml esp pin.
+- [Consumer Pipeline](project-consumer-pipeline.md) — Real parser→planner consumer: fused task, consumer-owned error-hold (engine note_line_error unused), block-and-retry back-pressure, shared PLANNER mutex, stub block-drain placeholder for motion_executor.
+- [Motion Executor](project-motion-executor.md) — DOC-02 core-1 reality: esp_rtos::start_second_core (consumes SWI0/1) + InterruptExecutor<2>@Prio3; esp-hal blocking RMT (move-ownership transmit/wait); sync StepSink; BLOCK_AVAILABLE/feed-hold/soft-reset/live-MPos wiring.
+- [Motion Executor Review Fixes](project-motion-executor-review-fixes.md) — 2026-06-16 bug fixes: RMT end-marker showstopper (silent_symbol_halves), 15-bit period clamp, busy-block planner freeze, dedicated MOTION_RESET, live-position atomics, 47-event cap.
+- [Hold/Quiesce Protocol](project-hold-quiesce-protocol.md) — LEVEL-based hold (HOLD_REQUESTED) + HOLD_WAKE nudge + MOTION_PARKED quiesce-ack; resumes_on_cycle_start gating; replaced edge FEED_HOLD/CYCLE_START (fixed findings #1-#5/#7/#10).
+- [Settings Contracts](project-settings-contracts.md) — DOC-04 settings: single SETTING_DESCRIPTORS authority (numbers/setter/formatter derived), set_command rejects out-of-range, positive_or sanitize policy, saturating from_proto, async SettingsStore + inline Waker::noop test block_on.
+- [Settings/TMC Persistence Wiring](project-settings-persistence-wiring.md) — firmware-side async SettingsStore/TmcBus integration: persistent KeyPointerCache<16,u8,1> via destroy/recover, dirty-flag coalesced writes in comms_consumer, crate-scoped build invocation gotcha.
+- [Storage/Codec Unification](project-storage-codec-unification.md) — 2026-06-16 refactors: shared storage_frame codec, generic RefreshReporter<T>, single RecordStore/FlashRecordStore, StatusCfg cache (refresh at 4 SETTINGS-writer sites).
+- [Second-Core Bring-up (FIXED+CLEANED)](project-second-core-reentrancy.md) — real root = Xtensa over-top stack spill; fixed by AppCoreStackArena trailing ABI headroom; ALL replay/guard/re-arm/deferral/diagnostics removed; G0 X5 confirmed on HW.
+- [RMT Clock & TX Completion](project-rmt-clock-and-tx-completion.md) — verified esp-hal 1.0.0: S3 1µs-tick divider chain correct, 48-symbol single-block TX safe, wait() polls int_raw (no ISR); Run+FS:0+Bf:31 mis-diagnosis; mtrace! defmt chain + decision tree.
+- [Homing Contracts](project-homing-contracts.md) — DOC-06: DigitalIn mirrors ProbeInput, homing reuses ProbeStepper, $5 added, $21/$22 are bitmasks not bools, $20-reject-unless-$22, ALARM:11/1/2 mapping, shared-pin rule, resolved Q4/Q5.

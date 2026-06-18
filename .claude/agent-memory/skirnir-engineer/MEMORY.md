@@ -1,0 +1,6 @@
+- [Engine architecture](engine-architecture.md) — channel topology, ProtocolCore/engine split, serial feature gating, status parser, deferred work
+- [GUI architecture](gui-architecture.md) — egui/eframe 0.34 layer: pure reducer + thin views + intents, shell/runtime, metrics module, header/tab strips, dep pins, API quirks
+- [Design spec](design-spec.md) — Skirnir.dc.html visual source-of-truth: tokens, type, layout dims, component states, state colors, alarm banner
+- [Serial enumeration](serial-enumeration.md) — macOS cu/tty dual-listing, ESP32-S3 vid/pid IS populated on macOS, ports.rs/probe.rs pure modules, Identify probe
+- [Jog/keyboard/progress-time](jog-keyboard-progress-time.md) — continuous press-hold jog, key_to_intent hotkeys, app/progress.rs ETA clock; do NOT run cargo fmt (4-space)
+- [Settings/overrides/reconnect](settings-and-overrides.md) — override sliders + fine ±1% stepping, live $-settings text-path model ($$/$ES/write), auto-reconnect backoff policy

@@ -298,8 +298,9 @@ async fn main(spawner: Spawner) {
 
   // TODO(DOC-07): configure LEDC ch0 on GPIO13 for spindle PWM + SPIN_EN/SPIN_DIR GPIO (act on the
   //   planner's Spindle outcome, currently passed through).
-  // TODO(DOC-06): configure limit/control GPIO (pull-ups, rising-edge IRQ) and spawn the homing task (act
-  //   on the planner's GoToPredefined outcome, currently passed through).
+  // TODO(DOC-06): the X/Y/Z limit inputs, `$H` homing, and hard/soft limits are wired below (step 4d); what
+  //   remains is the optional feed-hold / cycle-start control-input GPIO (GPIO16/17) and acting on the planner's
+  //   GoToPredefined (G28/G30) outcome, currently passed through.
 
   // 4. Bring up the RMT step channels + DIR/STEP_EN GPIO and build the step sink. STEP_EN is driven enabled
   //    (active-low → low) so the steppers hold. Both the sink and STEP_EN are parked in `StaticCell`s so
