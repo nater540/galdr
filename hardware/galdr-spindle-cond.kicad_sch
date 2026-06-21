@@ -1,15 +1,16 @@
 (kicad_sch
 	(version 20260306)
-	(generator "galdr-gen")
+	(generator "eeschema")
 	(generator_version "10.0")
 	(uuid "0fd514f9-2d7c-41e2-8dd8-b65e53467510")
 	(paper "A3")
 	(title_block
 		(title "Galdr Spindle 0-10 V Conditioning")
 		(company "Galdr")
-		(comment 1 "PWM->0-10 V op-amp + EN/DIR open-drain for the WS55-220 (DOC-07)"))
+		(comment 1 "PWM->0-10 V op-amp + EN/DIR open-drain for the WS55-220 (DOC-07)")
+	)
 	(lib_symbols
-	(symbol "Connector_Generic:Conn_01x04"
+		(symbol "Connector_Generic:Conn_01x04"
 			(pin_names
 				(offset 1.016)
 				(hide yes)
@@ -225,7 +226,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Connector_Generic:Conn_01x06"
+		(symbol "Connector_Generic:Conn_01x06"
 			(pin_names
 				(offset 1.016)
 				(hide yes)
@@ -499,7 +500,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Device:C"
+		(symbol "Device:C"
 			(pin_numbers
 				(hide yes)
 			)
@@ -654,7 +655,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Device:LED"
+		(symbol "Device:LED"
 			(pin_numbers
 				(hide yes)
 			)
@@ -855,7 +856,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Device:Q_NMOS"
+		(symbol "Device:Q_NMOS"
 			(pin_numbers
 				(hide yes)
 			)
@@ -1159,7 +1160,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Device:R"
+		(symbol "Device:R"
 			(pin_numbers
 				(hide yes)
 			)
@@ -1299,7 +1300,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Device:R_Potentiometer"
+		(symbol "Device:R_Potentiometer"
 			(pin_names
 				(offset 1.016)
 				(hide yes)
@@ -1512,7 +1513,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "Galdr:OpAmp_Dual_DIP8"
+		(symbol "Galdr:OpAmp_Dual_DIP8"
 			(pin_names
 				(offset 1.016)
 			)
@@ -1735,7 +1736,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "power:+12V"
+		(symbol "power:+12V"
 			(power global)
 			(pin_numbers
 				(hide yes)
@@ -1874,7 +1875,7 @@
 			)
 			(embedded_fonts no)
 		)
-	(symbol "power:GND"
+		(symbol "power:GND"
 			(power global)
 			(pin_numbers
 				(hide yes)
@@ -1990,304 +1991,4014 @@
 			(embedded_fonts no)
 		)
 	)
-	(symbol (lib_id "Connector_Generic:Conn_01x06") (at 30.48 73.66 180) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "b7bf25da-6b21-4879-b40e-357258f684ac")
-		(property "Reference" "J_CIN" (at 33.02 72.39 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "FROM_CARRIER" (at 33.02 74.93 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Connector_JST:JST_XH_B6B-XH-A_1x06_P2.50mm_Vertical" (at 30.48 73.66 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "J_CIN") (unit 1)))))
-	(wire (pts (xy 35.56 78.74) (xy 38.1 78.74)) (stroke (width 0) (type default)) (uuid "dcd8b8d2-1865-46e7-821d-54ab808f31e1"))
-	(global_label "SPIN_PWM" (shape bidirectional) (at 38.1 78.74 0) (effects (font (size 1.016 1.016)) (justify left)) (uuid "45a7408e-8547-42ba-9a3d-5686fcd64323"))
-	(wire (pts (xy 35.56 76.2) (xy 38.1 76.2)) (stroke (width 0) (type default)) (uuid "dc8e40b5-2cac-4b90-a6c8-a914618c9d94"))
-	(global_label "SPIN_EN" (shape bidirectional) (at 38.1 76.2 0) (effects (font (size 1.016 1.016)) (justify left)) (uuid "f2b8f3fe-14ca-4ecb-9049-e25858498da9"))
-	(wire (pts (xy 35.56 73.66) (xy 38.1 73.66)) (stroke (width 0) (type default)) (uuid "a3d97aa2-2b06-4fa1-a502-465b481c4d3f"))
-	(global_label "SPIN_DIR" (shape bidirectional) (at 38.1 73.66 0) (effects (font (size 1.016 1.016)) (justify left)) (uuid "821869a9-b23a-423f-8cdc-e9ea6012479d"))
-	(wire (pts (xy 35.56 71.12) (xy 38.1 71.12)) (stroke (width 0) (type default)) (uuid "f93a48d1-3c32-40fb-b091-015397c413fb"))
-	(symbol (lib_id "power:+12V") (at 38.1 71.12 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "5d2ec615-f6d3-45c3-a94e-27294f398f6b")
-		(property "Reference" "#PWR076" (at 38.1 76.2 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "+12V" (at 38.1 73.66000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR076") (unit 1)))))
-	(wire (pts (xy 35.56 68.58) (xy 38.1 68.58)) (stroke (width 0) (type default)) (uuid "1ff30d39-bd13-4ca6-b517-5c0ae00fdfda"))
-	(symbol (lib_id "power:GND") (at 38.1 68.58 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "de1ca37e-6a51-4e65-b22e-ba9fef9a3007")
-		(property "Reference" "#PWR077" (at 38.1 73.66 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 38.1 71.12 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR077") (unit 1)))))
-	(wire (pts (xy 35.56 66.04) (xy 38.1 66.04)) (stroke (width 0) (type default)) (uuid "eb16fe95-91fa-4ff3-8c32-cb63ca1f57bd"))
-	(symbol (lib_id "power:GND") (at 38.1 66.04 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "90f176d4-3fb8-49ee-9708-5010dff492e6")
-		(property "Reference" "#PWR078" (at 38.1 71.12 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 38.1 68.58000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR078") (unit 1)))))
-	(symbol (lib_id "Device:R") (at 52.07 66.04 90) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "c92bae72-349a-4c92-b7d7-9d995956fca8")
-		(property "Reference" "R_LP1" (at 52.07 62.230000000000004 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "10k" (at 52.07 69.85 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 52.07 66.04 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_LP1") (unit 1)))))
-	(wire (pts (xy 48.26 66.04) (xy 45.72 66.04)) (stroke (width 0) (type default)) (uuid "b999d0e7-82f6-48fc-8159-a68c6dd3143d"))
-	(global_label "SPIN_PWM" (shape bidirectional) (at 45.72 66.04 180) (effects (font (size 1.016 1.016)) (justify right)) (uuid "f5c98c6d-0bc0-477c-abd6-b3f3af3f4119"))
-	(symbol (lib_id "Device:R") (at 66.04 66.04 90) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "55959e2f-5ae9-4fcc-aaf8-911f64e4564f")
-		(property "Reference" "R_LP2" (at 66.04 62.230000000000004 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "10k" (at 66.04 69.85 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 66.04 66.04 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_LP2") (unit 1)))))
-	(wire (pts (xy 55.88 66.04) (xy 62.230000000000004 66.04)) (stroke (width 0) (type default)) (uuid "aa47f30e-0ba5-4191-9312-7549494e6980"))
-	(symbol (lib_id "Device:C") (at 55.88 73.66 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "87f8948d-5ecb-4d3f-a7c9-f214e9ded84c")
-		(property "Reference" "C_LP1" (at 58.42 72.39 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "1u" (at 58.42 74.93 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm" (at 55.88 73.66 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "C_LP1") (unit 1)))))
-	(wire (pts (xy 55.88 69.85) (xy 55.88 66.04)) (stroke (width 0) (type default)) (uuid "629a1f58-70b6-41fc-b878-c630893c0729"))
-	(junction (at 55.88 66.04) (diameter 0) (color 0 0 0 0) (uuid "907297fd-1b3a-4d8d-9790-df50a8a7bdb3"))
-	(wire (pts (xy 55.88 77.47) (xy 55.88 80.01)) (stroke (width 0) (type default)) (uuid "eb291cc7-f9a9-4405-addf-8d06c0ec529f"))
-	(symbol (lib_id "power:GND") (at 55.88 80.01 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "be813416-046e-4c73-967e-fff661a0b63f")
-		(property "Reference" "#PWR079" (at 55.88 85.09 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 55.88 82.55000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR079") (unit 1)))))
-	(symbol (lib_id "Device:C") (at 69.85 73.66 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "1ff39048-0c5e-444d-9d9b-e1f362a0b6ed")
-		(property "Reference" "C_LP2" (at 72.39 72.39 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "1u" (at 72.39 74.93 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm" (at 69.85 73.66 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "C_LP2") (unit 1)))))
-	(wire (pts (xy 69.85 69.85) (xy 69.85 66.04)) (stroke (width 0) (type default)) (uuid "c9351549-3a25-4b78-8c1b-a73159234c6a"))
-	(junction (at 69.85 66.04) (diameter 0) (color 0 0 0 0) (uuid "fffe1f9a-c1a2-4421-89b2-6e41214538f2"))
-	(wire (pts (xy 69.85 77.47) (xy 69.85 80.01)) (stroke (width 0) (type default)) (uuid "1479253c-1cc8-46ab-b372-2882ba69ccfd"))
-	(symbol (lib_id "power:GND") (at 69.85 80.01 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "eda2fe28-6e37-4b75-8dc8-de4e3bfc8778")
-		(property "Reference" "#PWR080" (at 69.85 85.09 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 69.85 82.55000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR080") (unit 1)))))
-	(wire (pts (xy 69.85 66.04) (xy 72.39 66.04)) (stroke (width 0) (type default)) (uuid "17686a49-c268-4e51-84e5-91db2b57fd5c"))
-	(label "SP_DC" (at 72.39 66.04 0) (effects (font (size 1.016 1.016)) (justify left bottom)) (uuid "9a4e9a33-ea8d-4911-a724-293857cba6b0"))
-	(symbol (lib_id "Galdr:OpAmp_Dual_DIP8") (at 119.38 80.01 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "bb2cfd0e-2409-4a4e-becb-1ed091b146dd")
-		(property "Reference" "U_OA" (at 114.3 71.12 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "LMC6482IN" (at 114.3 73.66 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Package_DIP:DIP-8_W7.62mm" (at 119.38 80.01 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "U_OA") (unit 1)))))
-	(wire (pts (xy 129.54 76.2) (xy 132.08 76.2)) (stroke (width 0) (type default)) (uuid "9e39fd2e-3de0-47fb-adbc-d76ce7587d29"))
-	(symbol (lib_id "power:+12V") (at 132.08 76.2 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "bf9f6ac4-951d-4908-b630-116845d5f157")
-		(property "Reference" "#PWR081" (at 132.08 81.28 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "+12V" (at 132.08 78.74000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR081") (unit 1)))))
-	(wire (pts (xy 109.22 83.82000000000001) (xy 106.68 83.82000000000001)) (stroke (width 0) (type default)) (uuid "f8cd91ef-7e65-4afb-92b4-5bbb4252828e"))
-	(symbol (lib_id "power:GND") (at 106.68 83.82000000000001 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "95f04868-5386-48aa-a5cf-4132c63fc5a9")
-		(property "Reference" "#PWR082" (at 106.68 88.9 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 106.68 86.36000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR082") (unit 1)))))
-	(wire (pts (xy 129.54 83.82000000000001) (xy 132.08 83.82000000000001)) (stroke (width 0) (type default)) (uuid "4c9e6ca5-c1ca-4b79-b4e5-1269b9b40330"))
-	(symbol (lib_id "power:GND") (at 132.08 83.82000000000001 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "2f2de838-8487-4f10-bc42-21e7bf992b95")
-		(property "Reference" "#PWR083" (at 132.08 88.9 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 132.08 86.36000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR083") (unit 1)))))
-	(wire (pts (xy 129.54 81.28) (xy 132.08 81.28)) (stroke (width 0) (type default)) (uuid "201aaa3f-8a42-4e79-a54b-d3df10e75c36"))
-	(wire (pts (xy 129.54 78.74) (xy 132.08 78.74)) (stroke (width 0) (type default)) (uuid "d55e5b8f-5bc6-40b6-89dc-e2d78d594a3f"))
-	(wire (pts (xy 132.08 81.28) (xy 132.08 78.74)) (stroke (width 0) (type default)) (uuid "29adf426-195f-4dba-9eae-69e3d5f436a4"))
-	(wire (pts (xy 109.22 81.28) (xy 106.68 81.28)) (stroke (width 0) (type default)) (uuid "79b3a7dd-ff34-4a13-816b-9e15a6fe0cdd"))
-	(label "SP_DC" (at 106.68 81.28 180) (effects (font (size 1.016 1.016)) (justify right bottom)) (uuid "a56c8acd-8f93-4f12-9708-63e1b707c919"))
-	(wire (pts (xy 109.22 78.74) (xy 106.68 78.74)) (stroke (width 0) (type default)) (uuid "fde09180-1f9c-46bd-888b-5e3e9d5aff19"))
-	(label "SP_FB" (at 106.68 78.74 180) (effects (font (size 1.016 1.016)) (justify right bottom)) (uuid "d5957560-a679-4a0c-bb59-b5a0b8f35487"))
-	(wire (pts (xy 109.22 76.2) (xy 106.68 76.2)) (stroke (width 0) (type default)) (uuid "aa65a470-ba8b-49e9-8bae-6617e74b840d"))
-	(label "SP_SVRAW" (at 106.68 76.2 180) (effects (font (size 1.016 1.016)) (justify right bottom)) (uuid "9624a927-df3f-4dd7-91aa-4fffb46f665d"))
-	(symbol (lib_id "Device:R") (at 100.33 68.58 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "5f6755c1-6436-4e6a-82d0-c922cbdc4fa0")
-		(property "Reference" "R_FB" (at 102.87 67.31 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "15k" (at 102.87 69.85 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 100.33 68.58 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_FB") (unit 1)))))
-	(wire (pts (xy 100.33 64.77) (xy 100.33 62.230000000000004)) (stroke (width 0) (type default)) (uuid "a3658c8d-73e0-4257-a9d4-9c6545e3e8c3"))
-	(label "SP_SVRAW" (at 100.33 62.230000000000004 90) (effects (font (size 1.016 1.016)) (justify left bottom)) (uuid "dd6e5ca7-19f1-44ca-9d29-4740442cb2e0"))
-	(symbol (lib_id "Device:R_Potentiometer") (at 100.33 80.01 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "87ad0280-4c31-4608-b429-ae23558acbc1")
-		(property "Reference" "RV_CAL" (at 102.87 78.74 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "10k" (at 102.87 81.28 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Potentiometer_THT:Potentiometer_Bourns_3296W_Vertical" (at 100.33 80.01 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "RV_CAL") (unit 1)))))
-	(wire (pts (xy 100.33 72.39) (xy 100.33 76.2)) (stroke (width 0) (type default)) (uuid "e517c337-3ed2-48e0-886f-d7f9f6df5fc6"))
-	(symbol (lib_id "Device:R") (at 100.33 91.44 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "83bb8684-c8c7-46b2-9365-cc55fad51bec")
-		(property "Reference" "R_G" (at 102.87 90.17 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "10k" (at 102.87 92.71000000000001 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 100.33 91.44 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_G") (unit 1)))))
-	(wire (pts (xy 100.33 83.82000000000001) (xy 100.33 87.63)) (stroke (width 0) (type default)) (uuid "3c362e7f-5a76-450c-9551-c4752e92e944"))
-	(wire (pts (xy 104.14 80.01) (xy 104.14 83.82000000000001)) (stroke (width 0) (type default)) (uuid "ff4c88bd-a0e1-47b7-bed3-7942cee3d61a"))
-	(wire (pts (xy 104.14 83.82000000000001) (xy 100.33 83.82000000000001)) (stroke (width 0) (type default)) (uuid "ca6fa42c-814b-46d7-b6a1-69004e55aadc"))
-	(junction (at 100.33 83.82000000000001) (diameter 0) (color 0 0 0 0) (uuid "4ff0affd-6db7-4f93-9a48-ff45257ee9a6"))
-	(label "SP_FB" (at 100.33 87.63 90) (effects (font (size 1.016 1.016)) (justify left bottom)) (uuid "2ef39bf6-c240-4859-9d3f-216bdc8266c0"))
-	(wire (pts (xy 100.33 95.25) (xy 100.33 97.79)) (stroke (width 0) (type default)) (uuid "8cbebc07-2d38-4875-9ff3-ed2d50a74864"))
-	(symbol (lib_id "power:GND") (at 100.33 97.79 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "e5ef9c00-93df-496a-83a3-721aff228d37")
-		(property "Reference" "#PWR084" (at 100.33 102.87 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 100.33 100.33000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR084") (unit 1)))))
-	(symbol (lib_id "Device:R") (at 149.86 76.2 90) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "f40af64e-6de7-4b0c-8e94-cf0687807467")
-		(property "Reference" "R_OS" (at 149.86 72.39 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100" (at 149.86 80.01 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 149.86 76.2 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_OS") (unit 1)))))
-	(wire (pts (xy 146.05 76.2) (xy 143.51 76.2)) (stroke (width 0) (type default)) (uuid "34a79bc5-7cd3-4088-bcd6-6aba4db3b741"))
-	(label "SP_SVRAW" (at 143.51 76.2 180) (effects (font (size 1.016 1.016)) (justify right bottom)) (uuid "72a95ede-5999-4f93-876e-8e5b2433cdfd"))
-	(symbol (lib_id "Device:C") (at 153.67000000000002 83.82000000000001 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "a2ac3503-f349-40ae-8c51-c32c53a16825")
-		(property "Reference" "C_OS" (at 156.21 82.55 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100n" (at 156.21 85.09 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm" (at 153.67000000000002 83.82000000000001 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "C_OS") (unit 1)))))
-	(wire (pts (xy 153.67000000000002 80.01) (xy 153.67000000000002 76.2)) (stroke (width 0) (type default)) (uuid "79e3f5a0-062f-498c-a91f-e3076080b73f"))
-	(junction (at 153.67000000000002 76.2) (diameter 0) (color 0 0 0 0) (uuid "22495ce3-3fad-4d8f-9a83-9daef2a9a356"))
-	(wire (pts (xy 153.67000000000002 87.63) (xy 153.67000000000002 90.17)) (stroke (width 0) (type default)) (uuid "76053fad-f20f-41d7-884f-0b586e61a6eb"))
-	(symbol (lib_id "power:GND") (at 153.67000000000002 90.17 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "cb0a45e5-98dd-4fb2-9db6-3ac93bf1efc1")
-		(property "Reference" "#PWR085" (at 153.67000000000002 95.25 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 153.67000000000002 92.71000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR085") (unit 1)))))
-	(wire (pts (xy 153.67000000000002 76.2) (xy 156.21 76.2)) (stroke (width 0) (type default)) (uuid "cfca8fdd-4908-494d-8301-e017af29dbc0"))
-	(global_label "SP_SV" (shape bidirectional) (at 156.21 76.2 0) (effects (font (size 1.016 1.016)) (justify left)) (uuid "2f6af409-5e6c-4854-ba1e-a91b799b9047"))
-	(symbol (lib_id "Device:R") (at 58.42 119.38 90) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "e6058326-c6eb-4e67-89dc-ad23df6bceca")
-		(property "Reference" "R_GE" (at 58.42 115.57000000000001 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100" (at 58.42 123.19 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 58.42 119.38 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_GE") (unit 1)))))
-	(wire (pts (xy 54.61 119.38) (xy 52.07 119.38)) (stroke (width 0) (type default)) (uuid "b302fb62-5e1c-4b34-bb49-71c877ac8bb0"))
-	(global_label "SPIN_EN" (shape bidirectional) (at 52.07 119.38 180) (effects (font (size 1.016 1.016)) (justify right)) (uuid "f9110042-1edc-44bf-9374-94428150381c"))
-	(symbol (lib_id "Device:Q_NMOS") (at 69.85 119.38 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "7ad8de1a-5f48-40bd-b2ba-aa1bf1524157")
-		(property "Reference" "Q_EN" (at 72.39 118.11 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "2N7000" (at 72.39 120.65 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Package_TO_SOT_THT:TO-92_Inline" (at 69.85 119.38 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "Q_EN") (unit 1)))))
-	(wire (pts (xy 62.230000000000004 119.38) (xy 64.77 119.38)) (stroke (width 0) (type default)) (uuid "4fa20c1d-910a-4b39-aafa-7a8dd20045b5"))
-	(symbol (lib_id "Device:R") (at 64.77 129.54 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "9433418e-82ad-4207-b395-5f8f2c3273b9")
-		(property "Reference" "R_PDE" (at 67.31 128.27 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100k" (at 67.31 130.81 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 64.77 129.54 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_PDE") (unit 1)))))
-	(wire (pts (xy 64.77 125.73) (xy 64.77 119.38)) (stroke (width 0) (type default)) (uuid "2fca3a6e-011f-45e4-8560-d231ec3ba86a"))
-	(junction (at 64.77 119.38) (diameter 0) (color 0 0 0 0) (uuid "94ddf7ec-1840-4037-8a2a-359d82c2fdf6"))
-	(wire (pts (xy 64.77 133.35) (xy 64.77 135.89000000000001)) (stroke (width 0) (type default)) (uuid "06827e05-57ea-44e8-8584-ab5aee25053c"))
-	(symbol (lib_id "power:GND") (at 64.77 135.89000000000001 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "53ee0803-d1e7-448f-a9db-889dde0c5467")
-		(property "Reference" "#PWR086" (at 64.77 140.97000000000003 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 64.77 138.43 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR086") (unit 1)))))
-	(wire (pts (xy 72.39 124.46000000000001) (xy 72.39 127.0)) (stroke (width 0) (type default)) (uuid "1cf40559-7d74-44cd-91f4-021f7efd481f"))
-	(symbol (lib_id "power:GND") (at 72.39 127.0 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "5ad7c508-11f9-4220-b59d-617120903189")
-		(property "Reference" "#PWR087" (at 72.39 132.08 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 72.39 129.54 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR087") (unit 1)))))
-	(wire (pts (xy 72.39 114.3) (xy 72.39 111.76)) (stroke (width 0) (type default)) (uuid "b3c4829e-d976-4ba4-996a-87751a25b6f8"))
-	(global_label "SP_ENDRV" (shape bidirectional) (at 72.39 111.76 90) (effects (font (size 1.016 1.016)) (justify right)) (uuid "488d8848-bdbf-413e-bd8c-113b539aa679"))
-	(symbol (lib_id "Device:R") (at 96.52 119.38 90) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "d7a40f90-3ca3-4748-b559-1b4e2feb38a7")
-		(property "Reference" "R_GD" (at 96.52 115.57000000000001 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100" (at 96.52 123.19 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 96.52 119.38 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_GD") (unit 1)))))
-	(wire (pts (xy 92.71000000000001 119.38) (xy 90.17 119.38)) (stroke (width 0) (type default)) (uuid "418c9407-0f6e-4737-92eb-9be002b6ae65"))
-	(global_label "SPIN_DIR" (shape bidirectional) (at 90.17 119.38 180) (effects (font (size 1.016 1.016)) (justify right)) (uuid "ee6a0b56-4cb7-488e-b97a-2b58c5f1c08d"))
-	(symbol (lib_id "Device:Q_NMOS") (at 107.95 119.38 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "268694f7-5687-4a1f-9253-758467caa8c7")
-		(property "Reference" "Q_DIR" (at 110.49 118.11 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "2N7000" (at 110.49 120.65 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Package_TO_SOT_THT:TO-92_Inline" (at 107.95 119.38 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "Q_DIR") (unit 1)))))
-	(wire (pts (xy 100.33 119.38) (xy 102.87 119.38)) (stroke (width 0) (type default)) (uuid "ff9a48cc-3fd7-459d-a6d6-25ba06dab4f7"))
-	(symbol (lib_id "Device:R") (at 102.87 129.54 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "ba25312c-bc8c-4271-873a-3fed1ddb16fa")
-		(property "Reference" "R_PDD" (at 105.41 128.27 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100k" (at 105.41 130.81 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 102.87 129.54 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_PDD") (unit 1)))))
-	(wire (pts (xy 102.87 125.73) (xy 102.87 119.38)) (stroke (width 0) (type default)) (uuid "0956aea2-628a-48d1-9786-e68e81515e2f"))
-	(junction (at 102.87 119.38) (diameter 0) (color 0 0 0 0) (uuid "3c7675c4-123e-449c-9475-bb910fd7c3c9"))
-	(wire (pts (xy 102.87 133.35) (xy 102.87 135.89000000000001)) (stroke (width 0) (type default)) (uuid "00f25963-c6df-4645-82af-753878533fff"))
-	(symbol (lib_id "power:GND") (at 102.87 135.89000000000001 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "589709a8-458b-4a9c-b00d-51f855bc0259")
-		(property "Reference" "#PWR088" (at 102.87 140.97000000000003 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 102.87 138.43 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR088") (unit 1)))))
-	(wire (pts (xy 110.49 124.46000000000001) (xy 110.49 127.0)) (stroke (width 0) (type default)) (uuid "3e3f49c0-27ba-488b-a0cd-25eef72e412a"))
-	(symbol (lib_id "power:GND") (at 110.49 127.0 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "68180122-0c29-42a5-a332-779c4c520950")
-		(property "Reference" "#PWR089" (at 110.49 132.08 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 110.49 129.54 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR089") (unit 1)))))
-	(wire (pts (xy 110.49 114.3) (xy 110.49 111.76)) (stroke (width 0) (type default)) (uuid "4aec5e9d-153d-4d4f-b8bb-3edf0d92428e"))
-	(global_label "SP_DIRDRV" (shape bidirectional) (at 110.49 111.76 90) (effects (font (size 1.016 1.016)) (justify right)) (uuid "aec1b9a8-d0d8-4050-886a-c74ffe78baab"))
-	(symbol (lib_id "Connector_Generic:Conn_01x04") (at 175.26 119.38 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "01319686-86e7-420b-9d0f-3d67d8661ddd")
-		(property "Reference" "J_WS" (at 177.8 118.11 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "TO_WS55-220" (at 177.8 120.65 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "TerminalBlock_Phoenix:TerminalBlock_Phoenix_MKDS-1-4-3.81_1x04_P3.81mm_Horizontal" (at 175.26 119.38 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "J_WS") (unit 1)))))
-	(wire (pts (xy 170.18 116.84) (xy 167.64000000000001 116.84)) (stroke (width 0) (type default)) (uuid "717e1108-18b2-4e2a-bf7b-99bae37b5cab"))
-	(global_label "SP_SV" (shape bidirectional) (at 167.64000000000001 116.84 180) (effects (font (size 1.016 1.016)) (justify right)) (uuid "e82bef2a-0449-4f36-aa63-649fd5d6487b"))
-	(wire (pts (xy 170.18 119.38) (xy 167.64000000000001 119.38)) (stroke (width 0) (type default)) (uuid "0e2d2881-849a-41f0-9dfb-14a38f0858a5"))
-	(global_label "SP_ENDRV" (shape bidirectional) (at 167.64000000000001 119.38 180) (effects (font (size 1.016 1.016)) (justify right)) (uuid "1531d478-a8ed-4a15-a7f5-c4e61b5a467b"))
-	(wire (pts (xy 170.18 121.92) (xy 167.64000000000001 121.92)) (stroke (width 0) (type default)) (uuid "2e389436-f3b5-4645-9ae2-49908b4cf45b"))
-	(global_label "SP_DIRDRV" (shape bidirectional) (at 167.64000000000001 121.92 180) (effects (font (size 1.016 1.016)) (justify right)) (uuid "45bf0626-1396-4df4-b442-e691ac417edc"))
-	(wire (pts (xy 170.18 124.46000000000001) (xy 167.64000000000001 124.46000000000001)) (stroke (width 0) (type default)) (uuid "c3adf73d-885a-4044-9a51-9b97892ddc23"))
-	(symbol (lib_id "power:GND") (at 167.64000000000001 124.46000000000001 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "2fc753f9-3c12-458d-bd0e-680be6120f09")
-		(property "Reference" "#PWR090" (at 167.64000000000001 129.54000000000002 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 167.64000000000001 127.00000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR090") (unit 1)))))
-	(symbol (lib_id "Device:C") (at 134.62 96.52 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "227578c6-37af-48db-afb8-03daa29eec4d")
-		(property "Reference" "C_BYP" (at 137.16 95.25 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "100n" (at 137.16 97.79 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm" (at 134.62 96.52 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "C_BYP") (unit 1)))))
-	(wire (pts (xy 134.62 92.71000000000001) (xy 134.62 90.17)) (stroke (width 0) (type default)) (uuid "9e4d17d4-36a6-49cc-8b49-31299d2b8e83"))
-	(symbol (lib_id "power:+12V") (at 134.62 90.17 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "ec75a7f6-4433-4663-bfff-d071c488cdae")
-		(property "Reference" "#PWR091" (at 134.62 95.25 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "+12V" (at 134.62 92.71000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR091") (unit 1)))))
-	(wire (pts (xy 134.62 100.33) (xy 134.62 102.87)) (stroke (width 0) (type default)) (uuid "c310e497-ade2-4949-be55-bfb79e887327"))
-	(symbol (lib_id "power:GND") (at 134.62 102.87 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "6efb7333-543c-4f14-92a0-9798d7b7d608")
-		(property "Reference" "#PWR092" (at 134.62 107.95 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 134.62 105.41000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR092") (unit 1)))))
-	(symbol (lib_id "Device:R") (at 39.37 119.38 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "69511441-20c3-4e95-b997-1d0b58a3cd51")
-		(property "Reference" "R_PL" (at 41.910000000000004 118.11 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "4k7" (at 41.910000000000004 120.65 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal" (at 39.37 119.38 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "R_PL") (unit 1)))))
-	(wire (pts (xy 39.37 115.57000000000001) (xy 39.37 113.03)) (stroke (width 0) (type default)) (uuid "90511b39-ddc3-49e1-926b-b271707b1044"))
-	(symbol (lib_id "power:+12V") (at 39.37 113.03 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "e4383b95-73e0-408d-b87f-885e7e0b71c2")
-		(property "Reference" "#PWR093" (at 39.37 118.11 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "+12V" (at 39.37 115.57000000000001 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR093") (unit 1)))))
-	(symbol (lib_id "Device:LED") (at 39.37 128.27 270) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "68068128-03d5-49f6-b04b-9f936ccb0802")
-		(property "Reference" "D_PL" (at 39.37 124.46000000000001 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Value" "PWR" (at 39.37 132.08 0) (effects (font (size 1.016 1.016)) (justify left)))
-		(property "Footprint" "LED_THT:LED_D5.0mm" (at 39.37 128.27 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "D_PL") (unit 1)))))
-	(wire (pts (xy 39.37 123.19) (xy 39.37 124.46000000000001)) (stroke (width 0) (type default)) (uuid "a5c84e90-9bcd-478f-a47e-a42476361bb9"))
-	(wire (pts (xy 39.37 132.08) (xy 39.37 134.62)) (stroke (width 0) (type default)) (uuid "bcfda401-a409-477d-a124-a7fc2b1553a4"))
-	(symbol (lib_id "power:GND") (at 39.37 134.62 0) (unit 1)
-		(exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (uuid "8e917974-1e5a-4105-b2b8-0522fae010f2")
-		(property "Reference" "#PWR094" (at 39.37 139.70000000000002 0) (effects (font (size 1.016 1.016)) (hide yes)))
-		(property "Value" "GND" (at 39.37 137.16 0) (effects (font (size 1.016 1.016))))
-		(instances (project "galdr-carrier" (path "/3415d5ba-5b0d-4f54-8957-3faaa96eaddc/da920581-48fb-46e6-bcb2-7d797dd21ccc" (reference "#PWR094") (unit 1)))))
-	(embedded_fonts no)
+	(junction
+		(at 153.67 76.2)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "22495ce3-3fad-4d8f-9a83-9daef2a9a356")
+	)
+	(junction
+		(at 102.87 119.38)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "3c7675c4-123e-449c-9475-bb910fd7c3c9")
+	)
+	(junction
+		(at 100.33 83.82)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "4ff0affd-6db7-4f93-9a48-ff45257ee9a6")
+	)
+	(junction
+		(at 55.88 66.04)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "907297fd-1b3a-4d8d-9790-df50a8a7bdb3")
+	)
+	(junction
+		(at 64.77 119.38)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "94ddf7ec-1840-4037-8a2a-359d82c2fdf6")
+	)
+	(junction
+		(at 69.85 66.04)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "fffe1f9a-c1a2-4421-89b2-6e41214538f2")
+	)
+	(wire
+		(pts
+			(xy 102.87 133.35) (xy 102.87 135.89)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "00f25963-c6df-4645-82af-753878533fff")
+	)
+	(wire
+		(pts
+			(xy 64.77 133.35) (xy 64.77 135.89)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "06827e05-57ea-44e8-8584-ab5aee25053c")
+	)
+	(wire
+		(pts
+			(xy 102.87 125.73) (xy 102.87 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "0956aea2-628a-48d1-9786-e68e81515e2f")
+	)
+	(wire
+		(pts
+			(xy 170.18 119.38) (xy 167.64 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "0e2d2881-849a-41f0-9dfb-14a38f0858a5")
+	)
+	(wire
+		(pts
+			(xy 69.85 77.47) (xy 69.85 80.01)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1479253c-1cc8-46ab-b372-2882ba69ccfd")
+	)
+	(wire
+		(pts
+			(xy 69.85 66.04) (xy 72.39 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "17686a49-c268-4e51-84e5-91db2b57fd5c")
+	)
+	(wire
+		(pts
+			(xy 72.39 124.46) (xy 72.39 127)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1cf40559-7d74-44cd-91f4-021f7efd481f")
+	)
+	(wire
+		(pts
+			(xy 35.56 68.58) (xy 38.1 68.58)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1ff30d39-bd13-4ca6-b517-5c0ae00fdfda")
+	)
+	(wire
+		(pts
+			(xy 129.54 81.28) (xy 132.08 81.28)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "201aaa3f-8a42-4e79-a54b-d3df10e75c36")
+	)
+	(wire
+		(pts
+			(xy 132.08 81.28) (xy 132.08 78.74)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "29adf426-195f-4dba-9eae-69e3d5f436a4")
+	)
+	(wire
+		(pts
+			(xy 170.18 121.92) (xy 167.64 121.92)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "2e389436-f3b5-4645-9ae2-49908b4cf45b")
+	)
+	(wire
+		(pts
+			(xy 64.77 125.73) (xy 64.77 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "2fca3a6e-011f-45e4-8560-d231ec3ba86a")
+	)
+	(wire
+		(pts
+			(xy 146.05 76.2) (xy 143.51 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "34a79bc5-7cd3-4088-bcd6-6aba4db3b741")
+	)
+	(wire
+		(pts
+			(xy 100.33 83.82) (xy 100.33 87.63)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "3c362e7f-5a76-450c-9551-c4752e92e944")
+	)
+	(wire
+		(pts
+			(xy 110.49 124.46) (xy 110.49 127)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "3e3f49c0-27ba-488b-a0cd-25eef72e412a")
+	)
+	(wire
+		(pts
+			(xy 92.71 119.38) (xy 90.17 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "418c9407-0f6e-4737-92eb-9be002b6ae65")
+	)
+	(wire
+		(pts
+			(xy 110.49 114.3) (xy 110.49 111.76)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "4aec5e9d-153d-4d4f-b8bb-3edf0d92428e")
+	)
+	(wire
+		(pts
+			(xy 129.54 83.82) (xy 132.08 83.82)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "4c9e6ca5-c1ca-4b79-b4e5-1269b9b40330")
+	)
+	(wire
+		(pts
+			(xy 62.23 119.38) (xy 64.77 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "4fa20c1d-910a-4b39-aafa-7a8dd20045b5")
+	)
+	(wire
+		(pts
+			(xy 55.88 69.85) (xy 55.88 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "629a1f58-70b6-41fc-b878-c630893c0729")
+	)
+	(wire
+		(pts
+			(xy 170.18 116.84) (xy 167.64 116.84)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "717e1108-18b2-4e2a-bf7b-99bae37b5cab")
+	)
+	(wire
+		(pts
+			(xy 153.67 87.63) (xy 153.67 90.17)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "76053fad-f20f-41d7-884f-0b586e61a6eb")
+	)
+	(wire
+		(pts
+			(xy 109.22 81.28) (xy 106.68 81.28)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "79b3a7dd-ff34-4a13-816b-9e15a6fe0cdd")
+	)
+	(wire
+		(pts
+			(xy 153.67 80.01) (xy 153.67 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "79e3f5a0-062f-498c-a91f-e3076080b73f")
+	)
+	(wire
+		(pts
+			(xy 100.33 95.25) (xy 100.33 97.79)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "8cbebc07-2d38-4875-9ff3-ed2d50a74864")
+	)
+	(wire
+		(pts
+			(xy 39.37 115.57) (xy 39.37 113.03)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "90511b39-ddc3-49e1-926b-b271707b1044")
+	)
+	(wire
+		(pts
+			(xy 129.54 76.2) (xy 132.08 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "9e39fd2e-3de0-47fb-adbc-d76ce7587d29")
+	)
+	(wire
+		(pts
+			(xy 134.62 92.71) (xy 134.62 90.17)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "9e4d17d4-36a6-49cc-8b49-31299d2b8e83")
+	)
+	(wire
+		(pts
+			(xy 100.33 64.77) (xy 100.33 62.23)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "a3658c8d-73e0-4257-a9d4-9c6545e3e8c3")
+	)
+	(wire
+		(pts
+			(xy 35.56 73.66) (xy 38.1 73.66)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "a3d97aa2-2b06-4fa1-a502-465b481c4d3f")
+	)
+	(wire
+		(pts
+			(xy 39.37 123.19) (xy 39.37 124.46)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "a5c84e90-9bcd-478f-a47e-a42476361bb9")
+	)
+	(wire
+		(pts
+			(xy 55.88 66.04) (xy 62.23 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "aa47f30e-0ba5-4191-9312-7549494e6980")
+	)
+	(wire
+		(pts
+			(xy 109.22 76.2) (xy 106.68 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "aa65a470-ba8b-49e9-8bae-6617e74b840d")
+	)
+	(wire
+		(pts
+			(xy 54.61 119.38) (xy 52.07 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "b302fb62-5e1c-4b34-bb49-71c877ac8bb0")
+	)
+	(wire
+		(pts
+			(xy 72.39 114.3) (xy 72.39 111.76)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "b3c4829e-d976-4ba4-996a-87751a25b6f8")
+	)
+	(wire
+		(pts
+			(xy 48.26 66.04) (xy 45.72 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "b999d0e7-82f6-48fc-8159-a68c6dd3143d")
+	)
+	(wire
+		(pts
+			(xy 39.37 132.08) (xy 39.37 134.62)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "bcfda401-a409-477d-a124-a7fc2b1553a4")
+	)
+	(wire
+		(pts
+			(xy 134.62 100.33) (xy 134.62 102.87)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "c310e497-ade2-4949-be55-bfb79e887327")
+	)
+	(wire
+		(pts
+			(xy 170.18 124.46) (xy 167.64 124.46)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "c3adf73d-885a-4044-9a51-9b97892ddc23")
+	)
+	(wire
+		(pts
+			(xy 69.85 69.85) (xy 69.85 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "c9351549-3a25-4b78-8c1b-a73159234c6a")
+	)
+	(wire
+		(pts
+			(xy 104.14 83.82) (xy 100.33 83.82)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "ca6fa42c-814b-46d7-b6a1-69004e55aadc")
+	)
+	(wire
+		(pts
+			(xy 153.67 76.2) (xy 156.21 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "cfca8fdd-4908-494d-8301-e017af29dbc0")
+	)
+	(wire
+		(pts
+			(xy 129.54 78.74) (xy 132.08 78.74)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "d55e5b8f-5bc6-40b6-89dc-e2d78d594a3f")
+	)
+	(wire
+		(pts
+			(xy 35.56 76.2) (xy 38.1 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "dc8e40b5-2cac-4b90-a6c8-a914618c9d94")
+	)
+	(wire
+		(pts
+			(xy 35.56 78.74) (xy 38.1 78.74)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "dcd8b8d2-1865-46e7-821d-54ab808f31e1")
+	)
+	(wire
+		(pts
+			(xy 100.33 72.39) (xy 100.33 76.2)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "e517c337-3ed2-48e0-886f-d7f9f6df5fc6")
+	)
+	(wire
+		(pts
+			(xy 35.56 66.04) (xy 38.1 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "eb16fe95-91fa-4ff3-8c32-cb63ca1f57bd")
+	)
+	(wire
+		(pts
+			(xy 55.88 77.47) (xy 55.88 80.01)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "eb291cc7-f9a9-4405-addf-8d06c0ec529f")
+	)
+	(wire
+		(pts
+			(xy 109.22 83.82) (xy 106.68 83.82)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "f8cd91ef-7e65-4afb-92b4-5bbb4252828e")
+	)
+	(wire
+		(pts
+			(xy 35.56 71.12) (xy 38.1 71.12)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "f93a48d1-3c32-40fb-b091-015397c413fb")
+	)
+	(wire
+		(pts
+			(xy 109.22 78.74) (xy 106.68 78.74)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "fde09180-1f9c-46bd-888b-5e3e9d5aff19")
+	)
+	(wire
+		(pts
+			(xy 104.14 80.01) (xy 104.14 83.82)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "ff4c88bd-a0e1-47b7-bed3-7942cee3d61a")
+	)
+	(wire
+		(pts
+			(xy 100.33 119.38) (xy 102.87 119.38)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "ff9a48cc-3fd7-459d-a6d6-25ba06dab4f7")
+	)
+	(label "SP_FB"
+		(at 100.33 87.63 90)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left bottom)
+		)
+		(uuid "2ef39bf6-c240-4859-9d3f-216bdc8266c0")
+	)
+	(label "SP_SVRAW"
+		(at 143.51 76.2 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right bottom)
+		)
+		(uuid "72a95ede-5999-4f93-876e-8e5b2433cdfd")
+	)
+	(label "SP_SVRAW"
+		(at 106.68 76.2 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right bottom)
+		)
+		(uuid "9624a927-df3f-4dd7-91aa-4fffb46f665d")
+	)
+	(label "SP_DC"
+		(at 72.39 66.04 0)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left bottom)
+		)
+		(uuid "9a4e9a33-ea8d-4911-a724-293857cba6b0")
+	)
+	(label "SP_DC"
+		(at 106.68 81.28 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right bottom)
+		)
+		(uuid "a56c8acd-8f93-4f12-9708-63e1b707c919")
+	)
+	(label "SP_FB"
+		(at 106.68 78.74 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right bottom)
+		)
+		(uuid "d5957560-a679-4a0c-bb59-b5a0b8f35487")
+	)
+	(label "SP_SVRAW"
+		(at 100.33 62.23 90)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left bottom)
+		)
+		(uuid "dd6e5ca7-19f1-44ca-9d29-4740442cb2e0")
+	)
+	(global_label "SP_ENDRV"
+		(shape bidirectional)
+		(at 167.64 119.38 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "1531d478-a8ed-4a15-a7f5-c4e61b5a467b")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 167.64 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SP_SV"
+		(shape bidirectional)
+		(at 156.21 76.2 0)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left)
+		)
+		(uuid "2f6af409-5e6c-4854-ba1e-a91b799b9047")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 156.21 76.2 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SPIN_PWM"
+		(shape bidirectional)
+		(at 38.1 78.74 0)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left)
+		)
+		(uuid "45a7408e-8547-42ba-9a3d-5686fcd64323")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 38.1 78.74 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SP_DIRDRV"
+		(shape bidirectional)
+		(at 167.64 121.92 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "45bf0626-1396-4df4-b442-e691ac417edc")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 167.64 121.92 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SP_ENDRV"
+		(shape bidirectional)
+		(at 72.39 111.76 270)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "488d8848-bdbf-413e-bd8c-113b539aa679")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 72.39 111.76 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SPIN_DIR"
+		(shape bidirectional)
+		(at 38.1 73.66 0)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left)
+		)
+		(uuid "821869a9-b23a-423f-8cdc-e9ea6012479d")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 38.1 73.66 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SP_DIRDRV"
+		(shape bidirectional)
+		(at 110.49 111.76 270)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "aec1b9a8-d0d8-4050-886a-c74ffe78baab")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 110.49 111.76 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SP_SV"
+		(shape bidirectional)
+		(at 167.64 116.84 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "e82bef2a-0449-4f36-aa63-649fd5d6487b")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 167.64 116.84 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SPIN_DIR"
+		(shape bidirectional)
+		(at 90.17 119.38 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "ee6a0b56-4cb7-488e-b97a-2b58c5f1c08d")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 90.17 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SPIN_EN"
+		(shape bidirectional)
+		(at 38.1 76.2 0)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify left)
+		)
+		(uuid "f2b8f3fe-14ca-4ecb-9049-e25858498da9")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 38.1 76.2 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SPIN_PWM"
+		(shape bidirectional)
+		(at 45.72 66.04 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "f5c98c6d-0bc0-477c-abd6-b3f3af3f4119")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 45.72 66.04 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(global_label "SPIN_EN"
+		(shape bidirectional)
+		(at 52.07 119.38 180)
+		(effects
+			(font
+				(size 1.016 1.016)
+			)
+			(justify right)
+		)
+		(uuid "f9110042-1edc-44bf-9374-94428150381c")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 52.07 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector_Generic:Conn_01x04")
+		(at 175.26 119.38 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "01319686-86e7-420b-9d0f-3d67d8661ddd")
+		(property "Reference" "J_WS"
+			(at 177.8 118.11 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "TO_WS55-220"
+			(at 177.8 120.65 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TerminalBlock_Phoenix:TerminalBlock_Phoenix_MKDS-1-4-3.81_1x04_P3.81mm_Horizontal"
+			(at 175.26 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 175.26 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 175.26 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "8ab536d4-c022-4437-971e-c7e2a6a80cca")
+		)
+		(pin "2"
+			(uuid "eb182cd3-35b9-4f7a-afad-56242dad747c")
+		)
+		(pin "3"
+			(uuid "8836c46f-1164-4edb-8fce-4e6f86934830")
+		)
+		(pin "4"
+			(uuid "9188d443-839b-4d24-a54e-34bdeef745cc")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "J_WS")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:C")
+		(at 69.85 73.66 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "1ff39048-0c5e-444d-9d9b-e1f362a0b6ed")
+		(property "Reference" "C_LP2"
+			(at 72.39 72.39 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "1u"
+			(at 72.39 74.93 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm"
+			(at 69.85 73.66 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 69.85 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 69.85 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "2b846832-3dfa-4de2-8ff5-029154a56be9")
+		)
+		(pin "2"
+			(uuid "4a7d28a7-1332-4164-ba4b-19b72067817b")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "C_LP2")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:C")
+		(at 134.62 96.52 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "227578c6-37af-48db-afb8-03daa29eec4d")
+		(property "Reference" "C_BYP"
+			(at 137.16 95.25 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100n"
+			(at 137.16 97.79 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm"
+			(at 134.62 96.52 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 134.62 96.52 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 134.62 96.52 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "c02a5241-d31d-4f7a-90ef-11fba4fdc123")
+		)
+		(pin "2"
+			(uuid "07ab9516-ba92-4754-80e4-403590a5e3f9")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "C_BYP")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:Q_NMOS")
+		(at 107.95 119.38 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "268694f7-5687-4a1f-9253-758467caa8c7")
+		(property "Reference" "Q_DIR"
+			(at 110.49 118.11 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "2N7000"
+			(at 110.49 120.65 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Package_TO_SOT_THT:TO-92_Inline"
+			(at 107.95 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 107.95 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 107.95 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "D"
+			(uuid "1610bbfe-6c72-4279-aca7-4bb7a3fc2725")
+		)
+		(pin "G"
+			(uuid "86c8d6ff-1412-4d55-8abb-af7ea601837b")
+		)
+		(pin "S"
+			(uuid "09d0d278-68fc-40e3-b1c0-1ef3a8f17b2e")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "Q_DIR")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 132.08 83.82 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "2f2de838-8487-4f10-bc42-21e7bf992b95")
+		(property "Reference" "#PWR083"
+			(at 132.08 88.9 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 132.08 86.36 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 132.08 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 132.08 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 132.08 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "7b40d601-25b7-4b65-9a49-5d23c671f0c1")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR083")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 167.64 124.46 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "2fc753f9-3c12-458d-bd0e-680be6120f09")
+		(property "Reference" "#PWR090"
+			(at 167.64 129.54 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 167.64 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 167.64 124.46 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 167.64 124.46 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 167.64 124.46 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "f0ccda0d-612d-47f9-bfb2-882373cf837c")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR090")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 64.77 135.89 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "53ee0803-d1e7-448f-a9db-889dde0c5467")
+		(property "Reference" "#PWR086"
+			(at 64.77 140.97 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 64.77 138.43 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 64.77 135.89 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 64.77 135.89 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 64.77 135.89 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "66b904ad-3b5a-46dd-bafb-9b689495ad24")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR086")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 66.04 66.04 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "55959e2f-5ae9-4fcc-aaf8-911f64e4564f")
+		(property "Reference" "R_LP2"
+			(at 66.04 62.23 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "10k"
+			(at 66.04 69.85 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 66.04 66.04 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 66.04 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 66.04 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "4c2833c6-7b14-4d43-8ce4-7c0d4161195c")
+		)
+		(pin "2"
+			(uuid "e95d8f3c-c3ea-497e-8d30-e1a80d77c40e")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_LP2")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 102.87 135.89 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "589709a8-458b-4a9c-b00d-51f855bc0259")
+		(property "Reference" "#PWR088"
+			(at 102.87 140.97 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 102.87 138.43 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 102.87 135.89 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 102.87 135.89 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 102.87 135.89 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "0c88b7ea-5f88-4220-bae6-56ae289471a7")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR088")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 72.39 127 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "5ad7c508-11f9-4220-b59d-617120903189")
+		(property "Reference" "#PWR087"
+			(at 72.39 132.08 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 72.39 129.54 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 72.39 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 72.39 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 72.39 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "f2bac9dc-25df-49a2-82a6-83e75a7a6ea5")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR087")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:+12V")
+		(at 38.1 71.12 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "5d2ec615-f6d3-45c3-a94e-27294f398f6b")
+		(property "Reference" "#PWR076"
+			(at 38.1 76.2 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "+12V"
+			(at 38.1 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 38.1 71.12 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 38.1 71.12 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 38.1 71.12 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "6b68a359-2ad0-49c4-8275-6a91df5715ef")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR076")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 100.33 68.58 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "5f6755c1-6436-4e6a-82d0-c922cbdc4fa0")
+		(property "Reference" "R_FB"
+			(at 102.87 67.31 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "15k"
+			(at 102.87 69.85 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 100.33 68.58 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 100.33 68.58 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 100.33 68.58 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "956fefdf-aae7-4b06-b235-baac3a50937f")
+		)
+		(pin "2"
+			(uuid "14ad6058-9abd-4799-8910-01ab3fe06417")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_FB")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:LED")
+		(at 39.37 128.27 270)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "68068128-03d5-49f6-b04b-9f936ccb0802")
+		(property "Reference" "D_PL"
+			(at 39.37 124.46 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "PWR"
+			(at 39.37 132.08 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "LED_THT:LED_D5.0mm"
+			(at 39.37 128.27 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 39.37 128.27 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 39.37 128.27 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "c263dc1e-6f1b-4d3d-a444-226a41fa73e1")
+		)
+		(pin "2"
+			(uuid "c9e481b1-8175-414b-b823-e366fc96cead")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "D_PL")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 110.49 127 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "68180122-0c29-42a5-a332-779c4c520950")
+		(property "Reference" "#PWR089"
+			(at 110.49 132.08 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 110.49 129.54 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 110.49 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 110.49 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 110.49 127 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "442509ba-fdbf-4525-8cd8-1cb4de219020")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR089")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 39.37 119.38 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "69511441-20c3-4e95-b997-1d0b58a3cd51")
+		(property "Reference" "R_PL"
+			(at 41.91 118.11 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "4k7"
+			(at 41.91 120.65 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 39.37 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 39.37 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 39.37 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "a9cb2a45-d4e9-45f6-9692-7d05c7ec5aed")
+		)
+		(pin "2"
+			(uuid "6a063eec-e9d6-48f2-8bb1-b14f379752e5")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_PL")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 134.62 102.87 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "6efb7333-543c-4f14-92a0-9798d7b7d608")
+		(property "Reference" "#PWR092"
+			(at 134.62 107.95 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 134.62 105.41 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 134.62 102.87 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 134.62 102.87 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 134.62 102.87 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "e5da8026-7c38-4a9c-8840-d9f41edb7595")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR092")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:Q_NMOS")
+		(at 69.85 119.38 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "7ad8de1a-5f48-40bd-b2ba-aa1bf1524157")
+		(property "Reference" "Q_EN"
+			(at 72.39 118.11 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "2N7000"
+			(at 72.39 120.65 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Package_TO_SOT_THT:TO-92_Inline"
+			(at 69.85 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 69.85 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 69.85 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "D"
+			(uuid "927b033c-d6db-408c-8a2a-0da08aeb4a4c")
+		)
+		(pin "G"
+			(uuid "8bb60c1a-f687-4d98-bb07-763461f9ca9e")
+		)
+		(pin "S"
+			(uuid "fbc687dd-61ea-4bf4-884c-763898e52eaa")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "Q_EN")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 100.33 91.44 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "83bb8684-c8c7-46b2-9365-cc55fad51bec")
+		(property "Reference" "R_G"
+			(at 102.87 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "10k"
+			(at 102.87 92.71 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 100.33 91.44 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 100.33 91.44 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 100.33 91.44 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "fdf82bd2-7ff7-4af0-b8a6-bd5afe4eaa57")
+		)
+		(pin "2"
+			(uuid "6b3d33e9-1b3a-4d10-91ee-cacc85e88e00")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_G")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R_Potentiometer")
+		(at 100.33 80.01 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "87ad0280-4c31-4608-b429-ae23558acbc1")
+		(property "Reference" "RV_CAL"
+			(at 102.87 78.74 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "10k"
+			(at 102.87 81.28 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Potentiometer_THT:Potentiometer_Bourns_3296W_Vertical"
+			(at 100.33 80.01 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 100.33 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 100.33 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "51b07d54-1b74-4164-a4e2-3b974e1285c8")
+		)
+		(pin "2"
+			(uuid "b33c5598-23bf-47f3-8187-96c875455594")
+		)
+		(pin "3"
+			(uuid "7f666713-72bd-4536-aa22-0608abe3b131")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "RV_CAL")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:C")
+		(at 55.88 73.66 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "87f8948d-5ecb-4d3f-a7c9-f214e9ded84c")
+		(property "Reference" "C_LP1"
+			(at 58.42 72.39 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "1u"
+			(at 58.42 74.93 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm"
+			(at 55.88 73.66 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 55.88 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 55.88 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "23dae48f-79e2-4b42-b74e-d9d05b4dff32")
+		)
+		(pin "2"
+			(uuid "288ba935-2319-48bf-a7ef-8cd2810e66c3")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "C_LP1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 39.37 134.62 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "8e917974-1e5a-4105-b2b8-0522fae010f2")
+		(property "Reference" "#PWR094"
+			(at 39.37 139.7 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 39.37 137.16 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 39.37 134.62 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 39.37 134.62 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 39.37 134.62 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "61206803-4bb2-4af8-87c0-1ccc70c01a6f")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR094")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 38.1 66.04 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "90f176d4-3fb8-49ee-9708-5010dff492e6")
+		(property "Reference" "#PWR078"
+			(at 38.1 71.12 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 38.1 68.58 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 38.1 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 38.1 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 38.1 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "3d29fb46-b14a-4ec0-8fa9-9a15941f75bd")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR078")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 64.77 129.54 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "9433418e-82ad-4207-b395-5f8f2c3273b9")
+		(property "Reference" "R_PDE"
+			(at 67.31 128.27 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100k"
+			(at 67.31 130.81 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 64.77 129.54 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 64.77 129.54 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 64.77 129.54 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "9a55c80c-496f-4e7e-9f1e-4e0ea5e6f030")
+		)
+		(pin "2"
+			(uuid "6a2c90b6-dd8e-4531-bc4f-a843f774a9d0")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_PDE")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 106.68 83.82 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "95f04868-5386-48aa-a5cf-4132c63fc5a9")
+		(property "Reference" "#PWR082"
+			(at 106.68 88.9 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 106.68 86.36 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 106.68 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 106.68 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 106.68 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "3def29e9-4616-4981-bd58-bfa15e386b9f")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR082")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:C")
+		(at 153.67 83.82 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "a2ac3503-f349-40ae-8c51-c32c53a16825")
+		(property "Reference" "C_OS"
+			(at 156.21 82.55 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100n"
+			(at 156.21 85.09 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm"
+			(at 153.67 83.82 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 153.67 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 153.67 83.82 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "0ccf3ab3-5c18-4bf3-b152-0bf9039b31b7")
+		)
+		(pin "2"
+			(uuid "69781a00-f709-4cc0-b735-f3b6ca12d1ee")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "C_OS")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector_Generic:Conn_01x06")
+		(at 30.48 73.66 180)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "b7bf25da-6b21-4879-b40e-357258f684ac")
+		(property "Reference" "J_CIN"
+			(at 33.02 72.39 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "FROM_CARRIER"
+			(at 33.02 74.93 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Connector_JST:JST_XH_B6B-XH-A_1x06_P2.50mm_Vertical"
+			(at 30.48 73.66 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 30.48 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 30.48 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "847c7f34-393d-458c-a124-8a4e5ded50cb")
+		)
+		(pin "2"
+			(uuid "bab5e59b-8307-4d85-b54a-0f88c858224f")
+		)
+		(pin "3"
+			(uuid "0a163be1-5805-4cd2-85bf-9e9973b28dc4")
+		)
+		(pin "4"
+			(uuid "80172281-167c-48d0-9b5e-5dd780fe2ed6")
+		)
+		(pin "5"
+			(uuid "e95457fc-15be-4596-a20a-cea7966c9a47")
+		)
+		(pin "6"
+			(uuid "6cd5d512-745a-4af1-94af-ed6675985b80")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "J_CIN")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 102.87 129.54 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "ba25312c-bc8c-4271-873a-3fed1ddb16fa")
+		(property "Reference" "R_PDD"
+			(at 105.41 128.27 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100k"
+			(at 105.41 130.81 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 102.87 129.54 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 102.87 129.54 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 102.87 129.54 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "e799c067-a1d5-48f2-b46f-9829d9892d89")
+		)
+		(pin "2"
+			(uuid "d47efac3-dfba-4db9-9391-0d25fed4b12e")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_PDD")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Galdr:OpAmp_Dual_DIP8")
+		(at 119.38 80.01 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "bb2cfd0e-2409-4a4e-becb-1ed091b146dd")
+		(property "Reference" "U_OA"
+			(at 114.3 71.12 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "LMC6482IN"
+			(at 114.3 73.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Package_DIP:DIP-8_W7.62mm"
+			(at 119.38 80.01 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 119.38 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 119.38 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "c587f9e3-b0aa-4918-b658-20d3faa82238")
+		)
+		(pin "2"
+			(uuid "ee1a80d3-77e5-47d7-8225-7c508c81a827")
+		)
+		(pin "3"
+			(uuid "2678e271-f0fe-46c7-b908-18be2e70d55e")
+		)
+		(pin "4"
+			(uuid "4c83190e-0011-4594-a5f7-de76167c583e")
+		)
+		(pin "5"
+			(uuid "38c84979-995b-4554-a1ad-4c9216f7cd64")
+		)
+		(pin "6"
+			(uuid "0dd7b597-f989-4072-b37e-e39e596d8a0b")
+		)
+		(pin "7"
+			(uuid "967c445a-96e5-48e6-9a53-841a9c936503")
+		)
+		(pin "8"
+			(uuid "8e6151dd-1833-4d08-aff9-f8174761a57e")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "U_OA")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 55.88 80.01 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "be813416-046e-4c73-967e-fff661a0b63f")
+		(property "Reference" "#PWR079"
+			(at 55.88 85.09 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 55.88 82.55 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 55.88 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 55.88 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 55.88 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "be3eeb95-3269-4a08-8fc1-6674aeb0f6a6")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR079")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:+12V")
+		(at 132.08 76.2 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "bf9f6ac4-951d-4908-b630-116845d5f157")
+		(property "Reference" "#PWR081"
+			(at 132.08 81.28 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "+12V"
+			(at 132.08 78.74 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 132.08 76.2 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 132.08 76.2 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 132.08 76.2 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "8584b93b-1698-4745-8bad-9054a2e293da")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR081")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 52.07 66.04 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "c92bae72-349a-4c92-b7d7-9d995956fca8")
+		(property "Reference" "R_LP1"
+			(at 52.07 62.23 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "10k"
+			(at 52.07 69.85 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 52.07 66.04 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 52.07 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 52.07 66.04 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "80ebba8b-e73c-4d5f-bade-672f5600a59a")
+		)
+		(pin "2"
+			(uuid "6fda5a37-1219-436b-946c-77677ed51ebd")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_LP1")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 153.67 90.17 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "cb0a45e5-98dd-4fb2-9db6-3ac93bf1efc1")
+		(property "Reference" "#PWR085"
+			(at 153.67 95.25 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 153.67 92.71 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 153.67 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 153.67 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 153.67 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "c572073c-b67e-4eba-a351-2c617015aa54")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR085")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 96.52 119.38 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "d7a40f90-3ca3-4748-b559-1b4e2feb38a7")
+		(property "Reference" "R_GD"
+			(at 96.52 115.57 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100"
+			(at 96.52 123.19 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 96.52 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 96.52 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 96.52 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "9d6d2ec9-0161-43e0-b1ba-593ae74233a4")
+		)
+		(pin "2"
+			(uuid "6b7cd974-9445-4bf0-acd3-3c91e9278c3b")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_GD")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 38.1 68.58 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "de1ca37e-6a51-4e65-b22e-ba9fef9a3007")
+		(property "Reference" "#PWR077"
+			(at 38.1 73.66 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 38.1 71.12 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 38.1 68.58 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 38.1 68.58 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 38.1 68.58 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "9563a6f9-e976-40cf-90fa-d9ae3a6dbec1")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR077")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:+12V")
+		(at 39.37 113.03 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "e4383b95-73e0-408d-b87f-885e7e0b71c2")
+		(property "Reference" "#PWR093"
+			(at 39.37 118.11 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "+12V"
+			(at 39.37 115.57 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 39.37 113.03 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 39.37 113.03 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 39.37 113.03 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "5de8e739-3163-4abd-8653-34a4174de7f8")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR093")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 100.33 97.79 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "e5ef9c00-93df-496a-83a3-721aff228d37")
+		(property "Reference" "#PWR084"
+			(at 100.33 102.87 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 100.33 100.33 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 100.33 97.79 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 100.33 97.79 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 100.33 97.79 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "3131bd4a-7236-4749-98e9-7d276d3f07d4")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR084")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 58.42 119.38 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "e6058326-c6eb-4e67-89dc-ad23df6bceca")
+		(property "Reference" "R_GE"
+			(at 58.42 115.57 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100"
+			(at 58.42 123.19 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 58.42 119.38 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 58.42 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 58.42 119.38 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "7a56c4cf-2b91-47e1-ad09-79491d197ad0")
+		)
+		(pin "2"
+			(uuid "c118a0bc-bd85-444c-8694-00f89d424daa")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_GE")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:+12V")
+		(at 134.62 90.17 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "ec75a7f6-4433-4663-bfff-d071c488cdae")
+		(property "Reference" "#PWR091"
+			(at 134.62 95.25 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "+12V"
+			(at 134.62 92.71 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 134.62 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 134.62 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 134.62 90.17 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "3936097a-c540-484b-9ad5-a50388a0f500")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR091")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 69.85 80.01 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "eda2fe28-6e37-4b75-8dc8-de4e3bfc8778")
+		(property "Reference" "#PWR080"
+			(at 69.85 85.09 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 69.85 82.55 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Footprint" ""
+			(at 69.85 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 69.85 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 69.85 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "4a4c09df-4ef5-4a46-8079-04ea717041ce")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "#PWR080")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 149.86 76.2 90)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(uuid "f40af64e-6de7-4b0c-8e94-cf0687807467")
+		(property "Reference" "R_OS"
+			(at 149.86 72.39 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "100"
+			(at 149.86 80.01 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal"
+			(at 149.86 76.2 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.016 1.016)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 149.86 76.2 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" ""
+			(at 149.86 76.2 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "55494132-8c01-4e60-bc73-c988a2cfd7dd")
+		)
+		(pin "2"
+			(uuid "19449528-d6fb-4f44-bab5-0bda5ea76a55")
+		)
+		(instances
+			(project "galdr-carrier"
+				(path "/3a592650-9ba4-4c65-921b-e5561c5de18f/da920581-48fb-46e6-bcb2-7d797dd21ccc"
+					(reference "R_OS")
+					(unit 1)
+				)
+			)
+		)
+	)
 )

@@ -191,7 +191,7 @@ Wiring:
 - `$G` (`protocol.rs:1359`): replace the hardcoded `G94` token with the live mode (`G93`/`G94`) from the
   snapshot. `MachineSnapshot`/`GcodeStateSnapshot` gains a `feed_mode` field.
 
-**G93 invariant:** every G93 **feed** motion line (G1/G2/G3 and a G38.x probe) MUST carry an `F` word (grbl
+**G93 invariant:** every G93 **feed** motion line (G1/G2/G3) MUST carry an `F` word (grbl
 error: feed-rate undefined, `Status_GcodeUndefinedFeedRate`). **G0 rapids are exempt** — grblHAL requires the
 inverse-time F only for motion that consumes a feed, not for rapids, so a `G93`-active `G0` line needs no F. In
 G93 the F is not modal in the usual sense — it describes *this* move's duration and does not carry forward: the
@@ -199,6 +199,17 @@ parser keeps the existing `FeedRateUndefined` path (`gcode.rs:731`, code 22) but
 feed move with no `F` **on its own line** is rejected even if a prior modal F exists. (G94 keeps the current
 modal-F fallback.) Implementation note: this needs a per-line "saw an F word this line" flag in the line
 accumulator, distinct from the modal `feed` value.
+
+**G93 + G38.x probe — REJECTED (decision, 2026-06-20).** A `G38.x` probe issued while `G93` inverse-time is
+modally active is rejected (`GcodeError::ProbeInverseTimeUnsupported`, wire code 22). A probe needs a well-defined
+units/min **contact** speed, but inverse-time defines speed as distance ÷ duration, and a probe's distance is the
+arbitrary no-contact overshoot — so an inverse-time probe seek speed is meaningless. (And since `G38.x` is
+linear-only — the A axis is held, per the 4th-axis probing architecture — inverse-time's rotary-coordination
+purpose does not apply.) The operator must switch to `G94` to probe, then restore `G93`. The check sits ahead of
+the feed-undefined test, so a `G93` probe reports the probe-specific error regardless of whether an `F` is present
+(the rejection is about the feed *mode*, not a missing feed). The distinct `GcodeError` variant shares wire code
+22 with `FeedRateUndefined` because grblHAL has no canonical code for this case — the `$EE`/host text reads
+"feed rate undefined", a known cosmetic imprecision accepted for the reuse.
 
 ### G94 units/min — grbl's inverse-time conversion for mixed moves (modifies `planner.rs:670`)
 

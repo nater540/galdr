@@ -1428,7 +1428,17 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
         apply_soft_reset(parser, state).await;
         return;
       }
-      match plan_command(&command).await {
+      // G28/G30 (DOC-05 group-0 motion) is intercepted here, ahead of the generic `plan_command`: it must read the
+      // stored predefined position from the consumer-owned coordinate model, so it cannot be planned by the planner
+      // alone. `handle_go_to_predefined` runs the same lock + back-pressure + soft-limit flow and returns a
+      // `PlanResult` the shared match below acts on (a single `ok`, or the soft-reset/soft-limit paths).
+      let result = match &command {
+        firmware_core::gcode::PlannerCommand::GoToPredefined { is_g28, intermediate, units, distance } => {
+          handle_go_to_predefined(*is_g28, intermediate, *units, *distance).await
+        }
+        _ => plan_command(&command).await,
+      };
+      match result {
         // The command was accepted into the planner (a move enqueued, or a non-motion outcome passed
         // through); emit the single `ok`.
         PlanResult::Accepted => ack().await,
@@ -1607,9 +1617,10 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // `M30` program end: the planner flushed look-ahead; the consumer drains motion, stops the spindle, and
       // resets modal state. Surfaced so those side effects run in the consumer task.
       Ok(PlannerOutcome::ProgramEnd) => return PlanResult::ProgramEnd,
-      // TODO(DOC-06): act on the predefined/homing move (G28/G30) — it is real system motion (a rapid to a stored
-      // position), a separate feature from the non-motion outcomes above, so it passes through for now. A
-      // zero-block `Queued` (no-op move) needs no executor wake, so it falls here as well.
+      // G28/G30 is NOT planned through this generic path — the consumer intercepts it before `plan_command`
+      // (see `handle_go_to_predefined`) because it must read the stored predefined position from the coordinate
+      // model, which lives in the consumer, not the planner. The pass-through `GoToPredefined` outcome is therefore
+      // unreachable here; a zero-block `Queued { blocks: 0 }` no-op move still falls here and needs no executor wake.
       Ok(_outcome) => return PlanResult::Accepted,
       // Back-pressure: the planner buffer is full. Do NOT ack and do NOT drop — yield to the motion
       // executor, then retry the same command. Blocking here backs `LINE_QUEUE` up and throttles the host (correct
@@ -1627,6 +1638,58 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // it as a distinct result the caller routes to the alarm path.
       Err(PlannerError::MoveExceedsTravel) => return PlanResult::SoftLimitAlarm,
       // A genuine geometry error (bad arc): surface the grblHAL code to the caller.
+      Err(other) => return PlanResult::Error(other.code()),
+    }
+  }
+}
+
+/// Plan a `G28`/`G30` predefined-position recall (DOC-05 group-0 motion) into the planner. Unlike the generic
+/// [`plan_command`] path this reads the stored predefined position from the consumer-owned coordinate model (index
+/// 0 = G28, 1 = G30; a never-stored slot defaults to the machine origin, grbl's default) and hands it to the
+/// host-tested [`Planner::plan_go_to_predefined`], which sequences the optional work-coordinate intermediate rapid
+/// and the absolute machine-coordinate recall rapid. It mirrors `plan_command`'s flow exactly: the planner mutex is
+/// scoped so it is dropped before any await, the `$20` soft-limit envelope is supplied (so an out-of-envelope
+/// intermediate alarms like any rapid), `QueueFull` back-pressure yields to the executor and retries the WHOLE
+/// call, and a `0x18` soft reset mid-retry aborts the line. Retrying the whole call is safe because
+/// `plan_go_to_predefined` is ATOMIC: it enqueues NEITHER sub-move unless BOTH fit, so a retry always re-resolves
+/// from the original, un-advanced position — critical in INCREMENTAL (G91) mode, where a partial enqueue would
+/// otherwise re-apply the intermediate's increment a second time (double motion).
+async fn handle_go_to_predefined(is_g28: bool, intermediate: &firmware_core::gcode::AxisWords, units: GcodeUnits,
+  distance: GcodeDistance) -> PlanResult {
+  // Index 0 is the G28 home, 1 is the G30 secondary; a never-stored slot reads as the machine origin (grbl default).
+  let predefined = coordinates().predefined(if is_g28 { 0 } else { 1 }).unwrap_or([0.0; AXES]);
+  loop {
+    let limits = current_soft_limits().await;
+    let result = {
+      let mut guard = PLANNER.lock().await;
+      match guard.as_mut() {
+        Some(planner) => planner.plan_go_to_predefined(intermediate, units, distance, predefined, limits),
+        None => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
+      }
+    };
+    match result {
+      // At least one rapid enqueued: wake the core-1 executor to drain it. A zero-block no-op (already at the
+      // stored position with no intermediate words) needs no wake — fall through to `Accepted` either way.
+      Ok(blocks) => {
+        if blocks > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+        return PlanResult::Accepted;
+      }
+      // Back-pressure: yield to the executor and retry the whole call. The call is atomic (enqueues nothing unless
+      // both sub-moves fit), so the retry re-resolves from the un-advanced position — see the doc comment. Race the
+      // retry against a soft reset so `0x18` aborts a stuck recall at once.
+      Err(PlannerError::QueueFull) => {
+        match select(Timer::after(QUEUE_FULL_RETRY), SOFT_RESET.wait()).await {
+          Either::First(()) => {}
+          Either::Second(()) => return PlanResult::Aborted,
+        }
+      }
+      // The intermediate left the `$20` envelope: a SYSTEM ALARM (`ALARM:2`), not an `error:N` line — no motion
+      // started (the planner rejected before any enqueue). The recall point is within-envelope by construction.
+      Err(PlannerError::MoveExceedsTravel) => return PlanResult::SoftLimitAlarm,
+      // No other error is reachable from `plan_go_to_predefined` (it plans only rapids, no arc geometry); surface
+      // any future one as its grblHAL code rather than fabricating an `ok`.
       Err(other) => return PlanResult::Error(other.code()),
     }
   }
@@ -2255,6 +2318,9 @@ async fn apply_coordinate_op(op: CoordinateOp) {
     let guard = PLANNER.lock().await;
     guard.as_ref().map(Planner::position_mm).unwrap_or([0.0; AXES])
   };
+  // The live `$376` rotary mask, so a rotary-A coordinate word is stored as degrees (never inch-scaled) — matching
+  // the planner's per-axis scale fork. Read once here for every `axis_values_mm` call in the match below.
+  let rotary_mask = settings_snapshot().await.rotary_mask;
   let mut coords = coordinates();
   // Whether this op changes the PERSISTENT subset (G54-G59 / G28 / G30 / active WCS) and so must be flushed.
   // G92 and the dynamic TLO are session-only and never marked dirty.
@@ -2265,17 +2331,17 @@ async fn apply_coordinate_op(op: CoordinateOp) {
       persistent = true;
     }
     CoordinateOp::SetWcsOffset { index, axes, units } => {
-      let (values, present) = axis_values_mm(&axes, units);
+      let (values, present) = axis_values_mm(&axes, units, rotary_mask);
       coords.set_wcs_offset(index, values, present);
       persistent = true;
     }
     CoordinateOp::SetWcsOffsetToPosition { index, axes, units } => {
-      let (values, present) = axis_values_mm(&axes, units);
+      let (values, present) = axis_values_mm(&axes, units, rotary_mask);
       coords.set_wcs_offset_to_position(index, machine, values, present);
       persistent = true;
     }
     CoordinateOp::SetG92ToPosition { axes, units } => {
-      let (values, present) = axis_values_mm(&axes, units);
+      let (values, present) = axis_values_mm(&axes, units, rotary_mask);
       coords.set_g92_to_position(machine, values, present);
     }
     CoordinateOp::ClearG92 => coords.clear_g92(),
@@ -2311,15 +2377,22 @@ async fn sync_active_wcs(parser_wcs: usize) {
   mark_coordinates_dirty();
 }
 
-/// Resolve a line's [`AxisWords`] into an mm value array plus a per-axis "present" mask, scaling inch words to
-/// mm. Absent axes carry `0.0` with `present = false` so a mutator writes only the mentioned axes.
-fn axis_values_mm(axes: &firmware_core::gcode::AxisWords, units: GcodeUnits) -> ([f32; AXES], [bool; AXES]) {
-  let scale = units_scale(units);
-  let words = [axes.x, axes.y, axes.z];
+/// Resolve a line's [`AxisWords`] into an mm value array plus a per-axis "present" mask, scaling inch words to mm.
+/// Absent axes carry `0.0` with `present = false` so a mutator writes only the mentioned axes. The full [`AXES`]
+/// word set is read (X/Y/Z AND the rotary A) — omitting A previously indexed a 3-element array at axis 3 and
+/// PANICKED on a G92/G10 L2/L20 line carrying an A word (`AXES == 4`). Per the DOC-10.1 rotary convention a word on
+/// a ROTARY axis (per the live `$376` `rotary_mask`) is in DEGREES and is NEVER inch-scaled — a `G20 ... A90` is 90
+/// degrees, not 90 × 25.4 — matching [`Planner::resolve_target`]'s per-axis scale fork, so a WCS/G92 offset on a
+/// rotary A stores degrees. `rotary_mask` is the live `$376` value; bit N set marks axis N angular.
+fn axis_values_mm(axes: &firmware_core::gcode::AxisWords, units: GcodeUnits, rotary_mask: u8) -> ([f32; AXES], [bool; AXES]) {
+  let linear_scale = units_scale(units);
+  let words = [axes.x, axes.y, axes.z, axes.a];
   let mut values = [0.0f32; AXES];
   let mut present = [false; AXES];
   for axis in 0..AXES {
     if let Some(value) = words[axis] {
+      // A rotary axis word is degrees — never inch-scaled (its scale is 1.0); a linear word scales mm/inch.
+      let scale = if rotary_mask & (1 << axis) != 0 { 1.0 } else { linear_scale };
       values[axis] = value * scale;
       present[axis] = true;
     }

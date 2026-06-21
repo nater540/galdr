@@ -50,6 +50,12 @@ pub enum GcodeError {
   /// [`ProbeNoAxis`](GcodeError::ProbeNoAxis) ("No axis words in block"); kept a distinct variant so a jog
   /// rejection reads clearly at the call site, while sharing the wire code 26.
   JogNoAxis,
+  /// `error:22` — a `G38.x` probe was issued while `G93` inverse-time feed mode is active. A probe needs a
+  /// well-defined units/min CONTACT speed, but inverse-time defines speed as distance ÷ duration — and a probe's
+  /// distance is the arbitrary no-contact overshoot, so the seek speed would be meaningless. The probe is therefore
+  /// rejected; the operator must switch to `G94` to probe. Distinct from [`FeedRateUndefined`](GcodeError::FeedRateUndefined)
+  /// at the call site (so the rejection reads clearly) while sharing the feed-family wire code 22.
+  ProbeInverseTimeUnsupported,
 }
 
 impl GcodeError {
@@ -63,6 +69,7 @@ impl GcodeError {
       GcodeError::ProbeNoAxis => 26,
       GcodeError::FeedRateUndefined => 22,
       GcodeError::JogNoAxis => 26,
+      GcodeError::ProbeInverseTimeUnsupported => 22,
     }
   }
 }
@@ -1085,10 +1092,19 @@ impl Parser {
     // its own toward/away + alarm semantics). `parse_line` already guaranteed at least one axis word is present.
     // A probe MUST have a defined feed (the seek speed); with feed 0 it would crawl, so grbl rejects it (error:22).
     if let Some(kind) = acc.pending_probe {
-      // A probe always consumes a feed (the seek speed); under G93 it must carry an `F` on this line.
+      // A probe is rejected under G93 inverse-time feed mode (DOC-10.2 decision): a probe needs a well-defined
+      // units/min CONTACT speed, but inverse-time ties speed to the move's distance, which for a probe is the
+      // arbitrary no-contact overshoot — so the seek speed would be meaningless. The operator must be in G94 to
+      // probe. Checked before the feed-undefined test so a `G93` probe reads as the probe-specific error, not 22.
+      if state.feed_mode == FeedMode::InverseTime {
+        return Err(GcodeError::ProbeInverseTimeUnsupported);
+      }
+      // A probe always consumes a feed (the seek speed); a feed-undefined probe (no modal F yet) is rejected.
       if feed_is_undefined(state, acc.saw_feed, true) {
         return Err(GcodeError::FeedRateUndefined);
       }
+      // With G93 rejected above, `feed_mode` is always G94 here, so `feed` is provably a units/min contact speed
+      // (no `feed_mode` field is carried — the probe is never inverse-time).
       return Ok(Some(PlannerCommand::Probe {
         kind,
         axes: acc.axes,
@@ -1802,6 +1818,33 @@ mod tests {
   }
 
   #[test]
+  fn parse_probe_under_g93_inverse_time_is_rejected() {
+    let mut parser = Parser::new();
+    // Enter inverse-time feed mode (a bare G93 line carries no motion — Ok(None)).
+    assert_eq!(parser.parse_line(b"G93"), Ok(None));
+    // A probe while G93 is active is rejected (DOC-10.2 decision): inverse-time has no well-defined contact speed.
+    // The fresh F on the line does NOT rescue it — the rejection is about the feed MODE, not a missing feed.
+    assert_eq!(parser.parse_line(b"G38.2 Z-10 F50"), Err(GcodeError::ProbeInverseTimeUnsupported));
+    // It maps to the feed-family wire code 22.
+    assert_eq!(GcodeError::ProbeInverseTimeUnsupported.code(), 22);
+    // The rejected line left the modal state intact: still G93, so re-issuing the probe still rejects (no silent
+    // fallback to G94), proving the parser did not commit a partial state on the error.
+    assert_eq!(parser.parse_line(b"G38.2 Z-10 F50"), Err(GcodeError::ProbeInverseTimeUnsupported));
+  }
+
+  #[test]
+  fn parse_probe_under_g94_after_g93_is_ok() {
+    let mut parser = Parser::new();
+    // G93 then back to G94: the probe is accepted again, and its feed is a units/min contact speed.
+    assert_eq!(parser.parse_line(b"G93"), Ok(None));
+    assert_eq!(parser.parse_line(b"G94"), Ok(None));
+    assert!(matches!(
+      parser.parse_line(b"G38.2 Z-10 F50"),
+      Ok(Some(PlannerCommand::Probe { feed, .. })) if feed == 50.0
+    ));
+  }
+
+  #[test]
   fn parse_g1_feed_move_with_no_feed_is_error_22() {
     let mut parser = Parser::new();
     // A G1 feed move with no prior modal F has feed 0 — undefined; grbl rejects it as error:22.
@@ -2138,11 +2181,16 @@ mod tests {
   }
 
   #[test]
-  fn g93_probe_requires_f_on_its_own_line() {
-    // A G38.x probe always consumes a feed (its seek speed); under G93 it must carry an F on its own line.
+  fn g93_rejects_a_probe_regardless_of_feed() {
+    // DOC-10.2 decision: a G38.x probe is rejected outright under G93 inverse-time — a probe needs a well-defined
+    // units/min contact speed, which inverse-time cannot express. The rejection is the SAME with or without an F
+    // (it is about the feed MODE, not a missing feed), so neither line below reaches the feed-undefined check.
     let mut parser = Parser::new();
     parser.parse_line(b"G93").expect("valid");
-    assert_eq!(parser.parse_line(b"G38.2 Z-5"), Err(GcodeError::FeedRateUndefined));
+    assert_eq!(parser.parse_line(b"G38.2 Z-5"), Err(GcodeError::ProbeInverseTimeUnsupported));
+    assert_eq!(parser.parse_line(b"G38.2 Z-5 F50"), Err(GcodeError::ProbeInverseTimeUnsupported));
+    // Switching back to G94 makes the probe valid again.
+    parser.parse_line(b"G94").expect("valid");
     assert!(matches!(parser.parse_line(b"G38.2 Z-5 F50"), Ok(Some(PlannerCommand::Probe { .. }))));
   }
 

@@ -576,6 +576,92 @@ impl Planner {
     }
   }
 
+  /// Plan a `G28`/`G30` predefined-position recall (DOC-05 group-0 motion) into up to two RAPID blocks, returning
+  /// the number of blocks actually enqueued. The stored `predefined` position is supplied by the consumer (it owns
+  /// the coordinate model — the planner does not) and is ALWAYS an absolute MACHINE position in mm, on every axis
+  /// including the rotary A. The grbl-faithful sequence is:
+  ///
+  /// 1. If ANY `intermediate` axis word is present, FIRST a rapid to that intermediate point — the words resolved in
+  ///    the ACTIVE work coordinate system honoring `units` (G20/G21) and `distance` (G90/G91), with unspecified
+  ///    axes holding their current position (exactly the [`resolve_target`](Self::resolve_target) work-move path,
+  ///    `machine_coords = false`). With no axis words this first move is skipped entirely (one block at most).
+  /// 2. THEN a rapid to the stored predefined MACHINE position — absolute, in mm, bypassing the WCO (like a `G53`
+  ///    move). All axes recall, so a rotary A returns to its stored angle too.
+  ///
+  /// Each sub-move's resolved MACHINE endpoint is soft-limit checked (when `limits` is `Some`) BEFORE anything is
+  /// enqueued, identical to any rapid: a violation returns [`PlannerError::MoveExceedsTravel`] and enqueues
+  /// nothing. The predefined position is within-envelope by construction; only the intermediate can violate. A
+  /// zero-length sub-move (target equals the current position) enqueues no block — so `G28`/`G30` already at the
+  /// stored position with no intermediate words returns `Ok(0)` and the consumer simply `ok`s with no motion.
+  ///
+  /// Back-pressure is ALL-OR-NOTHING (like the arc path): both targets are resolved up front (pure, no mutation),
+  /// the exact number of blocks needed is computed (0 or 1 per move — a no-op move where target == the projected
+  /// position needs none; each rapid is a single block, no subdivision), and if the free queue capacity cannot
+  /// hold that count the call returns [`PlannerError::QueueFull`] BEFORE enqueuing anything. This is essential for
+  /// the consumer's retry to be safe in INCREMENTAL (G91) mode: were the intermediate enqueued and only the recall
+  /// to fail, the planner position would have advanced and a retry's `resolve_target` would add the G91 increment
+  /// to the ALREADY-advanced position — double motion. Pre-checking capacity means a `QueueFull` retry always
+  /// re-resolves from the original, un-advanced position, so the intermediate is applied exactly once.
+  pub fn plan_go_to_predefined(
+    &mut self,
+    intermediate: &AxisWords,
+    units: Units,
+    distance: DistanceMode,
+    predefined: [f32; AXES],
+    limits: Option<SoftLimits>,
+  ) -> Result<usize, PlannerError> {
+    let from = self.position_steps;
+    // Resolve the optional intermediate target (work coords, honoring units + distance) WITHOUT mutating. Only
+    // present when at least one axis word is given — a bare `G28`/`G30` recalls directly with no intermediate.
+    let has_words =
+      intermediate.x.is_some() || intermediate.y.is_some() || intermediate.z.is_some() || intermediate.a.is_some();
+    let inter_target = has_words.then(|| self.resolve_target(intermediate, units, distance, false));
+    // Resolve the recall target (pure): the stored position is already an absolute MACHINE position in mm on every
+    // axis, so it converts straight to steps — no WCO, no unit scaling, no rotary fork (degrees and mm alike are
+    // stored as the model's native value). It is planned FROM the intermediate point when one exists, else `from`.
+    let mut recall = [0i32; AXES];
+    for axis in 0..AXES {
+      recall[axis] = mm_to_steps(predefined[axis], self.config.steps_per_mm[axis]);
+    }
+    // Soft-limit check BEFORE any enqueue (a violation moves nothing). The intermediate is a work move that can
+    // leave the envelope; the recall point is within-envelope by construction but is checked symmetrically.
+    if let Some(limits) = limits {
+      if let Some(target) = inter_target
+        && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm, self.config.rotary_mask)
+      {
+        return Err(PlannerError::MoveExceedsTravel);
+      }
+      if soft_limit_violation(&recall, &self.config.steps_per_mm, &limits.max_travel_mm, self.config.rotary_mask) {
+        return Err(PlannerError::MoveExceedsTravel);
+      }
+    }
+    // Count the blocks actually needed, chaining the projected position so a no-op move (target == projected) costs
+    // nothing — exactly mirroring `build_block`'s zero-length skip (`step_event_count == 0` ⇔ target == from for
+    // integer step targets). All-or-nothing capacity pre-check: if both blocks won't fit, enqueue NEITHER so a
+    // retry restarts from the un-advanced position (the G91 idempotency guarantee above).
+    let mut projected = from;
+    let mut needed = 0usize;
+    if let Some(target) = inter_target {
+      if target != projected {
+        needed += 1;
+        projected = target;
+      }
+    }
+    if recall != projected {
+      needed += 1;
+    }
+    if self.queued_len() + needed > BLOCK_QUEUE_LEN {
+      return Err(PlannerError::QueueFull);
+    }
+    // Capacity is reserved; the enqueues below cannot hit `QueueFull`. Built as rapids (`feed` is ignored for G0).
+    let mut blocks = 0;
+    if let Some(target) = inter_target {
+      blocks += self.plan_line(target, 0.0, units, FeedMode::UnitsPerMin, true)?;
+    }
+    blocks += self.plan_line(recall, 0.0, units, FeedMode::UnitsPerMin, true)?;
+    Ok(blocks)
+  }
+
   /// Plan a `$J=` jog (DOC-08 Phase D) into one cancelable [`jog`](Block::jog)-tagged block. The jog target is
   /// resolved through the SAME work→machine path as a move (honoring units, distance mode, and — for `G53` — the
   /// machine-coordinate bypass of the WCO), so a jog blends with the program's coordinate frame. When `limits`
@@ -1999,6 +2085,149 @@ mod tests {
     };
     let outcome = planner.plan_command(&cmd).expect("g28");
     assert_eq!(outcome, PlannerOutcome::GoToPredefined { is_g28: true });
+  }
+
+  // ---- G28/G30 predefined-position MOVE planning (DOC-05 group-0 motion) -------------------------
+
+  // No axis words: a bare `G28`/`G30` recalls the stored MACHINE position in a single rapid, all axes.
+  #[test]
+  fn predefined_no_words_is_a_single_rapid_to_the_stored_machine_position() {
+    let mut planner = Planner::new(test_config());
+    // Move somewhere first so the recall is a real (non-zero) move from the current position.
+    planner.plan_command(&mm_move(Some(10.0), Some(10.0), None, 600.0, true)).expect("queued");
+    let no_words = AxisWords { x: None, y: None, z: None, a: None };
+    let predefined = [5.0, 0.0, 2.0, 0.0];
+    let blocks = planner
+      .plan_go_to_predefined(&no_words, Units::Millimeter, DistanceMode::Absolute, predefined, None)
+      .expect("recall");
+    assert_eq!(blocks, 1, "no intermediate words => one recall rapid");
+    let block = *planner.peek_block().expect("the recall block");
+    assert!(block.rapid, "the recall is a rapid (G0)");
+    assert_eq!(planner.position_steps(), [500, 0, 200, 0], "ends at the stored MACHINE position (mm * steps/mm)");
+  }
+
+  // The recall is in MACHINE coordinates: it must IGNORE the active work offset (like a G53 move).
+  #[test]
+  fn predefined_recall_ignores_the_work_offset() {
+    let mut planner = Planner::new(test_config());
+    planner.set_work_offset([10.0, 20.0, 0.0, 0.0]);
+    let no_words = AxisWords { x: None, y: None, z: None, a: None };
+    let predefined = [1.0, 1.0, 0.0, 0.0];
+    let blocks = planner
+      .plan_go_to_predefined(&no_words, Units::Millimeter, DistanceMode::Absolute, predefined, None)
+      .expect("recall");
+    assert_eq!(blocks, 1);
+    // Machine X1 Y1 = 100,100 steps — the WCO of (10, 20) is NOT applied (recall is a G53-style machine move).
+    assert_eq!(planner.position_steps(), [100, 100, 0, 0]);
+  }
+
+  // With axis words: FIRST a rapid to the work-coordinate intermediate point, THEN the recall — two blocks.
+  #[test]
+  fn predefined_with_words_does_intermediate_then_recall() {
+    let mut planner = Planner::new(test_config());
+    let inter = AxisWords { x: None, y: None, z: Some(5.0), a: None };
+    let predefined = [0.0, 0.0, 0.0, 0.0];
+    let blocks = planner
+      .plan_go_to_predefined(&inter, Units::Millimeter, DistanceMode::Absolute, predefined, None)
+      .expect("recall");
+    assert_eq!(blocks, 2, "intermediate rapid + recall rapid");
+    // The final committed position is the stored predefined (machine origin here).
+    assert_eq!(planner.position_steps(), [0, 0, 0, 0]);
+  }
+
+  // The intermediate honors units (G20) and distance mode (G91); unspecified axes hold their current position.
+  #[test]
+  fn predefined_intermediate_honors_units_distance_and_holds_unspecified_axes() {
+    let mut planner = Planner::new(test_config());
+    // Start at machine X10 Y10 Z10 so an incremental intermediate and the "hold unspecified" rule are observable.
+    planner.plan_command(&mm_move(Some(10.0), Some(10.0), Some(10.0), 600.0, true)).expect("queued");
+    // The intermediate alone, checked by inspecting the planner state mid-sequence is awkward, so verify via a
+    // predefined that equals the intermediate point: G91 inch Z1 => +25.4 mm on Z, X/Y hold at 10 mm.
+    let inter = AxisWords { x: None, y: None, z: Some(1.0), a: None };
+    // Predefined = the intermediate point in machine mm, so the recall is a zero-length no-op and only the
+    // intermediate rapid enqueues — letting us assert the resolved intermediate directly via the final position.
+    let predefined = [10.0, 10.0, 10.0 + 25.4, 0.0];
+    let blocks = planner
+      .plan_go_to_predefined(&inter, Units::Inch, DistanceMode::Incremental, predefined, None)
+      .expect("recall");
+    assert_eq!(blocks, 1, "intermediate moved; recall is zero-length and enqueues nothing");
+    // X/Y held at 10 mm (1000 steps); Z advanced by 1 inch = 25.4 mm to 35.4 mm = 3540 steps.
+    assert_eq!(planner.position_steps(), [1000, 1000, 3540, 0]);
+  }
+
+  // The rotary A axis recalls too, and a rotary A word in the intermediate is treated as degrees (never inch-scaled).
+  #[test]
+  fn predefined_recalls_rotary_a_and_intermediate_a_is_degrees() {
+    let mut planner = Planner::new(test_config());
+    // G20 inch with a rotary A word: A90 is 90 degrees, NOT 90 * 25.4 (DOC-10.1 rotary unit-scale suppression).
+    let inter = AxisWords { x: None, y: None, z: None, a: Some(90.0) };
+    // Predefined A = 90 deg in machine "mm" (degrees stored natively), so the recall is zero-length on A and only
+    // the intermediate enqueues — isolating the intermediate's A scaling for the assertion.
+    let predefined = [0.0, 0.0, 0.0, 90.0];
+    let blocks = planner
+      .plan_go_to_predefined(&inter, Units::Inch, DistanceMode::Absolute, predefined, None)
+      .expect("recall");
+    assert_eq!(blocks, 1, "A intermediate moved; recall is zero-length on A");
+    // A90 degrees = 90 * 100 steps/mm = 9000 steps (NOT inch-scaled); a recall to the same value is a no-op.
+    assert_eq!(planner.position_steps(), [0, 0, 0, 9000]);
+  }
+
+  // Bare recall already AT the stored position with no intermediate words is a zero-block no-op (no spurious motion).
+  #[test]
+  fn predefined_already_at_target_with_no_words_enqueues_nothing() {
+    let mut planner = Planner::new(test_config());
+    let no_words = AxisWords { x: None, y: None, z: None, a: None };
+    let blocks = planner
+      .plan_go_to_predefined(&no_words, Units::Millimeter, DistanceMode::Absolute, [0.0; AXES], None)
+      .expect("recall");
+    assert_eq!(blocks, 0, "already at machine origin (the never-stored default) => no motion");
+  }
+
+  // Regression: a G91 (incremental) recall must be ATOMIC under back-pressure. If only one queue slot is free but
+  // the call needs two blocks (intermediate + recall), it must enqueue NEITHER and leave the committed position
+  // un-advanced — otherwise a retry re-applies the incremental intermediate a SECOND time (double motion). This
+  // guards the all-or-nothing capacity pre-check.
+  #[test]
+  fn predefined_incremental_back_pressure_is_atomic_no_double_count() {
+    let mut planner = Planner::new(test_config());
+    // Fill the queue to leave EXACTLY one free slot. Each move advances X by 1 mm so every block is distinct.
+    for n in 1..BLOCK_QUEUE_LEN {
+      planner.plan_command(&mm_move(Some(n as f32), None, None, 600.0, false)).expect("queued");
+    }
+    assert_eq!(planner.queued_len(), BLOCK_QUEUE_LEN - 1, "one free slot remains");
+    let committed = planner.position_steps();
+    // A G91 intermediate of +5 mm on Y, plus a recall to a DISTINCT machine point (X0 Y0 — non-zero from here),
+    // so the call genuinely needs two blocks but only one slot is free.
+    let inter = AxisWords { x: None, y: Some(5.0), z: None, a: None };
+    let predefined = [0.0, 0.0, 0.0, 0.0];
+    let result = planner.plan_go_to_predefined(&inter, Units::Millimeter, DistanceMode::Incremental, predefined, None);
+    assert_eq!(result, Err(PlannerError::QueueFull), "two blocks needed, one slot free => QueueFull");
+    assert_eq!(planner.queued_len(), BLOCK_QUEUE_LEN - 1, "NOTHING enqueued — queue length unchanged");
+    assert_eq!(planner.position_steps(), committed, "committed position NOT advanced by the intermediate");
+    // Drain one slot so two are free, then retry. The incremental intermediate must be applied EXACTLY once: Y
+    // ends at the committed Y + 5 mm (500 steps), proving the retry did not double-count it.
+    planner.pop_block().expect("drain one");
+    let blocks = planner
+      .plan_go_to_predefined(&inter, Units::Millimeter, DistanceMode::Incremental, predefined, None)
+      .expect("recall fits now");
+    assert_eq!(blocks, 2, "intermediate + recall both enqueue on the retry");
+    // The FINAL committed position is the recall point (machine origin); the intermediate was a transient waypoint.
+    // To prove the intermediate was applied exactly once we inspect the FIRST of the two new blocks: its Y delta is
+    // +5 mm (500 steps) from the committed position, not +10 mm (which a double-count would have produced).
+    let first_new = planner.queue.iter().nth(BLOCK_QUEUE_LEN - 2).expect("the intermediate block");
+    assert_eq!(first_new.steps[1], 500, "intermediate Y delta is +5 mm exactly once, never +10");
+  }
+
+  // A soft-limited intermediate that leaves the envelope is rejected BEFORE any block is enqueued.
+  #[test]
+  fn predefined_intermediate_outside_envelope_is_rejected() {
+    let mut planner = Planner::new(test_config());
+    let inter = AxisWords { x: Some(10.0), y: None, z: None, a: None };
+    let limits = SoftLimits { max_travel_mm: [5.0; AXES] };
+    // Intermediate X10 is past +0 / -max_travel; the envelope is `[-5, 0]`, so X10 violates.
+    let result = planner.plan_go_to_predefined(&inter, Units::Millimeter, DistanceMode::Absolute, [0.0; AXES], Some(limits));
+    assert_eq!(result, Err(PlannerError::MoveExceedsTravel));
+    assert_eq!(planner.position_steps(), [0, 0, 0, 0], "no block enqueued, position intact");
   }
 
   #[test]
