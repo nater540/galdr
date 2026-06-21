@@ -194,7 +194,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
   ErrorCode {
     id: 33,
     name: "Invalid target",
-    description: "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled).",
+    description: "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled, or a rotary axis word in a G38.x probe, which is linear-only).",
   },
 ];
 
@@ -1211,22 +1211,20 @@ impl ResponseWriter {
     write!(out, "ALARM:{}\r\n", code.code()).map_err(|_| FmtError)
   }
 
-  /// The `[PRB:x,y,z:success]` probe-result push line (DOC-09, `docs/gcode-streaming.md` §9). Emitted
+  /// The `[PRB:x,y,z,a:success]` probe-result push line (DOC-09, `docs/gcode-streaming.md` §9). Emitted
   /// immediately after a `G38.x` cycle completes so a height-mapping / touch-off sender reads the probed point
   /// without polling `$#`. `position` is the MACHINE position at the trigger instant in mm; `success` is the
   /// contact flag (`1` = the expected edge was seen, `0` = it was not). The same value is retained for `$#`'s
-  /// `[PRB:]` line. The form matches grbl's example exactly (`[PRB:-1.015,0.000,0.000:1]`).
+  /// `[PRB:]` line. All [`AXIS_COUNT`] axes are reported (the rotary A value-at-trigger included), matching the
+  /// four-field live `MPos:`/`WPos:` status — grbl's `[PRB:]` is N_AXIS-wide (`[PRB:-1.015,0.000,0.000,0.000:1]`).
   pub fn probe_report<const N: usize>(
     out: &mut String<N>,
     position: &[f32; AXIS_COUNT],
     success: bool,
   ) -> Result<(), FmtError> {
-    write!(
-      out,
-      "[PRB:{:.3},{:.3},{:.3}:{}]\r\n",
-      position[0], position[1], position[2], success as u8,
-    )
-    .map_err(|_| FmtError)
+    write!(out, "[PRB:").map_err(|_| FmtError)?;
+    write_axes_csv(out, position).map_err(|_| FmtError)?;
+    write!(out, ":{}]\r\n", success as u8).map_err(|_| FmtError)
   }
 
   /// One `[ERRORCODE:<id>|<name>|<description>]` line for the `$EE` enumeration, rendered from an
@@ -1420,7 +1418,7 @@ pub struct CoordinateReport {
   pub g92: [f32; AXIS_COUNT],
   /// The dynamic tool-length offset scalar in mm (the Z axis), reported as `[TLO:z]`.
   pub tlo: f32,
-  /// The last probe result in machine mm (`[PRB:x,y,z:flag]`). Filled by Phase C probing; zeros until then.
+  /// The last probe result in machine mm (`[PRB:x,y,z,a:flag]`). Filled by Phase C probing; zeros until then.
   pub probe: [f32; AXIS_COUNT],
   /// The last probe success flag (`1` = contact made, `0` = no contact / never probed).
   pub probe_success: bool,
@@ -1508,30 +1506,31 @@ impl ResponseWriter {
   /// Render ONE line of the `$#` NGC-parameters block (`index` in `0..`[`NGC_PARAMETER_LINES`]) into `out`,
   /// CRLF-terminated, from a [`CoordinateReport`]. Lines 0-5 are `[G54:..]`..`[G59:..]`, 6 is `[G28:..]`, 7 is
   /// `[G30:..]`, 8 is `[G92:..]`, 9 is `[TLO:z]` (a single Z scalar, grbl's legacy form), 10 is
-  /// `[PRB:x,y,z:flag]`. Returns `true` on success, `false` for an out-of-range `index` or (never, with a
+  /// `[PRB:x,y,z,a:flag]`. Every coordinate line reports all [`AXIS_COUNT`] axes (the rotary A included), matching
+  /// the four-field live status. Returns `true` on success, `false` for an out-of-range `index` or (never, with a
   /// correctly sized buffer) a capacity failure. Emitting per-line lets the bin reuse one small [`Response`]
   /// buffer and stream the block through the single USB writer, exactly as `$$` does.
   pub fn ngc_parameter_line<const N: usize>(out: &mut String<N>, report: &CoordinateReport, index: usize) -> bool {
-    let coord3 = |out: &mut String<N>, tag: &str, v: &[f32; AXIS_COUNT]| -> Result<(), core::fmt::Error> {
-      write!(out, "[{}:{:.3},{:.3},{:.3}]\r\n", tag, v[0], v[1], v[2])
+    let coord_line = |out: &mut String<N>, tag: &str, v: &[f32; AXIS_COUNT]| -> Result<(), core::fmt::Error> {
+      write!(out, "[{tag}:")?;
+      write_axes_csv(out, v)?;
+      write!(out, "]\r\n")
     };
     let result = match index {
       0..=5 => {
         // The G54-G59 tag for the offset index: 0 → "G54" … 5 → "G59".
         let tag = WCS_TAGS[index];
-        coord3(out, tag, &report.wcs[index])
+        coord_line(out, tag, &report.wcs[index])
       }
-      6 => coord3(out, "G28", &report.predefined[0]),
-      7 => coord3(out, "G30", &report.predefined[1]),
-      8 => coord3(out, "G92", &report.g92),
+      6 => coord_line(out, "G28", &report.predefined[0]),
+      7 => coord_line(out, "G30", &report.predefined[1]),
+      8 => coord_line(out, "G92", &report.g92),
       // grbl's legacy single-axis TLO form `[TLO:z]`; senders parse 1..N values, so one Z value is compatible.
       9 => write!(out, "[TLO:{:.3}]\r\n", report.tlo),
-      // The probe result: machine X,Y,Z at the trigger instant with a trailing `:1` (success) or `:0`.
-      10 => write!(
-        out,
-        "[PRB:{:.3},{:.3},{:.3}:{}]\r\n",
-        report.probe[0], report.probe[1], report.probe[2], report.probe_success as u8,
-      ),
+      // The probe result: machine position (all axes) at the trigger instant with a trailing `:1`/`:0` flag.
+      10 => write!(out, "[PRB:")
+        .and_then(|()| write_axes_csv(out, &report.probe))
+        .and_then(|()| write!(out, ":{}]\r\n", report.probe_success as u8)),
       _ => return false,
     };
     result.is_ok()
@@ -1540,6 +1539,22 @@ impl ResponseWriter {
 
 /// The `$#` bracket tags for the six work coordinate systems, indexed 0 = G54 … 5 = G59.
 const WCS_TAGS: [&str; 6] = ["G54", "G55", "G56", "G57", "G58", "G59"];
+
+/// Write a coordinate tuple as grbl's comma-separated `{:.3}` axis list (`x,y,z,a`), one field per motion axis
+/// ([`AXIS_COUNT`]). Shared by the `$#` coordinate/PRB lines and the `[PRB:]` push so every report carries all
+/// four axes — the rotary A included — matching the four-field live `MPos:`/`WPos:` status (grbl reports N_AXIS
+/// values). Centralizing the loop keeps a fourth axis from being silently dropped, as the hardcoded three-field
+/// forms did before DOC-10.
+fn write_axes_csv<const N: usize>(out: &mut String<N>, values: &[f32; AXIS_COUNT]) -> core::fmt::Result {
+  for (axis, value) in values.iter().enumerate() {
+    if axis == 0 {
+      write!(out, "{value:.3}")?;
+    } else {
+      write!(out, ",{value:.3}")?;
+    }
+  }
+  Ok(())
+}
 
 /// Write an `f32` with the minimal decimal representation grbl uses for `$G` feed words: an integral value
 /// renders with no fractional part (`1500` not `1500.0`), while a value with a fraction keeps only its
@@ -2339,7 +2354,8 @@ mod tests {
     // A representative coordinate state: G54 offset, G28 stored, a G92, a Z TLO, and a successful probe.
     let report = CoordinateReport {
       wcs: [
-        [10.0, 20.0, 5.0, 0.0],
+        // G54 carries a rotary A offset (45°) so the test proves the fourth (A) field is actually rendered.
+        [10.0, 20.0, 5.0, 45.0],
         [0.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, 0.0, 0.0],
@@ -2349,7 +2365,8 @@ mod tests {
       predefined: [[100.0, 0.0, 50.0, 0.0], [0.0, 100.0, 50.0, 0.0]],
       g92: [1.0, 2.0, 3.0, 0.0],
       tlo: -14.442,
-      probe: [-293.004, -16.995, -78.005, 0.0],
+      // The probe carries an A value-at-trigger (90°) — the angle the touch happened at.
+      probe: [-293.004, -16.995, -78.005, 90.0],
       probe_success: true,
     };
     let mut lines = StdVec::new();
@@ -2361,17 +2378,17 @@ mod tests {
     assert_eq!(
       lines,
       std::vec![
-        "[G54:10.000,20.000,5.000]\r\n".to_string(),
-        "[G55:0.000,0.000,0.000]\r\n".to_string(),
-        "[G56:0.000,0.000,0.000]\r\n".to_string(),
-        "[G57:0.000,0.000,0.000]\r\n".to_string(),
-        "[G58:0.000,0.000,0.000]\r\n".to_string(),
-        "[G59:-1.500,2.500,0.000]\r\n".to_string(),
-        "[G28:100.000,0.000,50.000]\r\n".to_string(),
-        "[G30:0.000,100.000,50.000]\r\n".to_string(),
-        "[G92:1.000,2.000,3.000]\r\n".to_string(),
+        "[G54:10.000,20.000,5.000,45.000]\r\n".to_string(),
+        "[G55:0.000,0.000,0.000,0.000]\r\n".to_string(),
+        "[G56:0.000,0.000,0.000,0.000]\r\n".to_string(),
+        "[G57:0.000,0.000,0.000,0.000]\r\n".to_string(),
+        "[G58:0.000,0.000,0.000,0.000]\r\n".to_string(),
+        "[G59:-1.500,2.500,0.000,0.000]\r\n".to_string(),
+        "[G28:100.000,0.000,50.000,0.000]\r\n".to_string(),
+        "[G30:0.000,100.000,50.000,0.000]\r\n".to_string(),
+        "[G92:1.000,2.000,3.000,0.000]\r\n".to_string(),
         "[TLO:-14.442]\r\n".to_string(),
-        "[PRB:-293.004,-16.995,-78.005:1]\r\n".to_string(),
+        "[PRB:-293.004,-16.995,-78.005,90.000:1]\r\n".to_string(),
       ],
     );
   }
@@ -2388,7 +2405,7 @@ mod tests {
     let report = CoordinateReport::default();
     let mut line = String::<RESPONSE_CAPACITY>::new();
     ResponseWriter::ngc_parameter_line(&mut line, &report, 10);
-    assert_eq!(line.as_str(), "[PRB:0.000,0.000,0.000:0]\r\n");
+    assert_eq!(line.as_str(), "[PRB:0.000,0.000,0.000,0.000:0]\r\n");
   }
 
   #[test]
@@ -2855,13 +2872,14 @@ mod tests {
   #[test]
   fn probe_report_push_line_wire_format() {
     // The immediate `[PRB:...]` push after a successful probe: machine position at the trigger instant, flag 1.
+    // A non-zero A (90°) proves the rotary value-at-trigger field is rendered, not dropped.
     let mut s = String::<RESPONSE_CAPACITY>::new();
-    ResponseWriter::probe_report(&mut s, &[-1.015, 0.0, -2.5, 0.0], true).unwrap();
-    assert_eq!(s.as_str(), "[PRB:-1.015,0.000,-2.500:1]\r\n");
+    ResponseWriter::probe_report(&mut s, &[-1.015, 0.0, -2.5, 90.0], true).unwrap();
+    assert_eq!(s.as_str(), "[PRB:-1.015,0.000,-2.500,90.000:1]\r\n");
     // A failed probe (no contact) reports the end-of-travel position with flag 0.
     let mut f = String::<RESPONSE_CAPACITY>::new();
     ResponseWriter::probe_report(&mut f, &[0.0, 0.0, -5.0, 0.0], false).unwrap();
-    assert_eq!(f.as_str(), "[PRB:0.000,0.000,-5.000:0]\r\n");
+    assert_eq!(f.as_str(), "[PRB:0.000,0.000,-5.000,0.000:0]\r\n");
   }
 
   #[test]
@@ -2892,11 +2910,11 @@ mod tests {
     // The `$#` `[PRB:]` line (line index 10) is driven by the stored last-probe result: feeding a real probe
     // position + success flag into the coordinate report makes `$#` show the triggered point and flag 1 (this
     // replaces the Phase-B zeros/flag-0 stub once the firmware bin fills `probe`/`probe_success` from LastProbe).
-    let last = LastProbe { position_mm: [-1.015, 0.0, -2.5, 0.0], success: true };
+    let last = LastProbe { position_mm: [-1.015, 0.0, -2.5, 90.0], success: true };
     let report = CoordinateReport { probe: last.position_mm, probe_success: last.success, ..CoordinateReport::default() };
     let mut line = String::<RESPONSE_CAPACITY>::new();
     assert!(ResponseWriter::ngc_parameter_line(&mut line, &report, 10));
-    assert_eq!(line.as_str(), "[PRB:-1.015,0.000,-2.500:1]\r\n");
+    assert_eq!(line.as_str(), "[PRB:-1.015,0.000,-2.500,90.000:1]\r\n");
   }
 
   #[test]

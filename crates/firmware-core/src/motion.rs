@@ -1484,7 +1484,7 @@ mod tests {
       ResponseWriter::probe_report(&mut s, &probe_mm, outcome.triggered).expect("prb");
       prb.push_str(s.as_str());
     }
-    assert_eq!(prb, "[PRB:0.000,0.000,-4.200:1]\r\n");
+    assert_eq!(prb, "[PRB:0.000,0.000,-4.200,0.000:1]\r\n");
 
     // Z-zero: the plate is 1.0 mm thick, so `G10 L20 P1 Z1.0` makes the probed point read work Z = 1.0, putting
     // the copper top (1 mm below the plate top the probe touched) at WPos Z = 0.

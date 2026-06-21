@@ -56,6 +56,12 @@ pub enum GcodeError {
   /// rejected; the operator must switch to `G94` to probe. Distinct from [`FeedRateUndefined`](GcodeError::FeedRateUndefined)
   /// at the call site (so the rejection reads clearly) while sharing the feed-family wire code 22.
   ProbeInverseTimeUnsupported,
+  /// `error:33` — a `G38.x` probe carried a rotary `A` axis word. Probing is LINEAR-ONLY: probing while a rotary
+  /// axis moves is metrologically unsound (the surface normal rotates under a fixed probe vector → cosine error,
+  /// invalid tip-radius compensation), so no mainstream controller probes through a rotary axis. Any `A` word in a
+  /// probe is rejected — even a redundant `A` equal to the current position — so the contract is unambiguous. Maps
+  /// to grbl's "Invalid target" code 33 (the probe-target-invalid family), distinct at the call site.
+  ProbeRotaryAxisWord,
 }
 
 impl GcodeError {
@@ -70,6 +76,7 @@ impl GcodeError {
       GcodeError::FeedRateUndefined => 22,
       GcodeError::JogNoAxis => 26,
       GcodeError::ProbeInverseTimeUnsupported => 22,
+      GcodeError::ProbeRotaryAxisWord => 33,
     }
   }
 }
@@ -1092,6 +1099,13 @@ impl Parser {
     // its own toward/away + alarm semantics). `parse_line` already guaranteed at least one axis word is present.
     // A probe MUST have a defined feed (the seek speed); with feed 0 it would crawl, so grbl rejects it (error:22).
     if let Some(kind) = acc.pending_probe {
+      // A probe is LINEAR-ONLY: a rotary `A` word is rejected (decision, 2026-06-21). Probing while a rotary axis
+      // moves is metrologically unsound, so the A axis is never part of a probe target — even a redundant `A`
+      // equal to the current position is rejected, keeping the contract unambiguous. Checked first so a probe that
+      // names A reads as the rotary-axis error regardless of any feed-mode / feed problem on the same line.
+      if acc.axes.a.is_some() {
+        return Err(GcodeError::ProbeRotaryAxisWord);
+      }
       // A probe is rejected under G93 inverse-time feed mode (DOC-10.2 decision): a probe needs a well-defined
       // units/min CONTACT speed, but inverse-time ties speed to the move's distance, which for a probe is the
       // arbitrary no-contact overshoot — so the seek speed would be meaningless. The operator must be in G94 to
@@ -1830,6 +1844,22 @@ mod tests {
     // The rejected line left the modal state intact: still G93, so re-issuing the probe still rejects (no silent
     // fallback to G94), proving the parser did not commit a partial state on the error.
     assert_eq!(parser.parse_line(b"G38.2 Z-10 F50"), Err(GcodeError::ProbeInverseTimeUnsupported));
+  }
+
+  #[test]
+  fn parse_probe_with_rotary_a_word_is_rejected() {
+    let mut parser = Parser::new();
+    // A probe naming the rotary A axis is rejected (linear-only): probing through a rotary axis is unsound.
+    assert_eq!(parser.parse_line(b"G38.2 A90 F50"), Err(GcodeError::ProbeRotaryAxisWord));
+    assert_eq!(GcodeError::ProbeRotaryAxisWord.code(), 33);
+    // Even a redundant A alongside a linear word is rejected — the contract is "no A in a probe, period".
+    assert_eq!(parser.parse_line(b"G38.2 Z-10 A0 F50"), Err(GcodeError::ProbeRotaryAxisWord));
+    // The A-word rejection takes precedence over a same-line feed-mode problem (it is checked first).
+    parser.parse_line(b"G93").expect("valid");
+    assert_eq!(parser.parse_line(b"G38.2 A90 F50"), Err(GcodeError::ProbeRotaryAxisWord));
+    // A purely linear probe (no A) is still accepted.
+    parser.parse_line(b"G94").expect("valid");
+    assert!(matches!(parser.parse_line(b"G38.2 Z-10 F50"), Ok(Some(PlannerCommand::Probe { .. }))));
   }
 
   #[test]
