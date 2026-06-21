@@ -63,6 +63,7 @@ use firmware_core::motion::MotionConfig;
 
 mod comms;
 mod motion;
+mod spindle;
 mod storage;
 mod tmc;
 
@@ -221,6 +222,19 @@ static LIMIT_INPUTS: StaticCell<[motion::RmtLimitInput; firmware_core::planner::
 /// (dropping the `Output` would release the pin and let the drivers float). Driven enabled (low) at init.
 static STEP_ENABLE: StaticCell<esp_hal::gpio::Output<'static>> = StaticCell::new();
 
+/// The LEDC controller, its low-speed timer0, and channel0 backing the spindle PWM (DOC-07). They form a
+/// self-referential `'static` chain (channel borrows timer borrows controller), so each is parked in its own
+/// `StaticCell`; `spindle::init` fills them and hands back sinks holding only `'static` references.
+static SPINDLE_LEDC: StaticCell<esp_hal::ledc::Ledc<'static>> = StaticCell::new();
+static SPINDLE_TIMER: StaticCell<esp_hal::ledc::timer::Timer<'static, esp_hal::ledc::LowSpeed>> = StaticCell::new();
+static SPINDLE_CHANNEL: StaticCell<esp_hal::ledc::channel::Channel<'static, esp_hal::ledc::LowSpeed>> =
+  StaticCell::new();
+
+/// The spindle controller (LEDC PWM + SPIN_EN/SPIN_DIR GPIO), parked for the program's lifetime so its
+/// peripherals stay configured. Borrowed mutably by the long-running `spindle` task (DOC-07), which owns it as
+/// the single driver of the spindle outputs.
+static SPINDLE: StaticCell<spindle::Spindle> = StaticCell::new();
+
 /// The single flash instance plus its persistent pointer cache ([`storage::FlashState`]) behind its
 /// cross-core mutex, parked in a `StaticCell` so it lives for the program and can be shared as `&'static` with
 /// the settings store at boot and the coalesced persist path. `esp_storage::FlashStorage::new` panics if
@@ -307,8 +321,6 @@ async fn main(spawner: Spawner) {
   // periodic status reports at the configured interval (a no-op when `$481=0`, the default).
   comms::init_auto_report(auto_report_interval);
 
-  // TODO(DOC-07): configure LEDC ch0 on GPIO13 for spindle PWM + SPIN_EN/SPIN_DIR GPIO (act on the
-  //   planner's Spindle outcome, currently passed through).
   // TODO(DOC-06): the X/Y/Z limit inputs, `$H` homing, and hard/soft limits are wired below (step 4d); what
   //   remains is the optional feed-hold / cycle-start control-input GPIO (GPIO16/17) and acting on the planner's
   //   GoToPredefined (G28/G30) outcome, currently passed through.
@@ -318,8 +330,9 @@ async fn main(spawner: Spawner) {
   //    their RMT channels / pins live for the program's lifetime (the motion task borrows the sink `'static`).
   let (sink, step_enable) = motion::init(
     peripherals.RMT,
-    (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4),
-    (peripherals.GPIO5, peripherals.GPIO6, peripherals.GPIO7),
+    // A-STEP on the spare RMT ch3/GPIO18; A-DIR on GPIO38. PROVISIONAL (DOC-10 Phase 5, bench-unverified).
+    (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4, peripherals.GPIO18),
+    (peripherals.GPIO5, peripherals.GPIO6, peripherals.GPIO7, peripherals.GPIO38),
     peripherals.GPIO8,
     &motion_config,
   );
@@ -339,13 +352,30 @@ async fn main(spawner: Spawner) {
   //     Parked in a `StaticCell` so the pins stay configured and the `motion_executor` task borrows them
   //     `'static` (it owns the RMT channels, so the homing cycle — which emits steps — runs there, dispatched
   //     by `$H` via the `HOME_REQUEST` signal, exactly as a `G38.x` probe is dispatched).
-  let limits = motion::init_limits(peripherals.GPIO10, peripherals.GPIO11, peripherals.GPIO12);
+  // A-LIMIT placeholder on GPIO39 — A has no physical switch (DOC-10.6); PROVISIONAL (DOC-10 Phase 5).
+  let limits = motion::init_limits(peripherals.GPIO10, peripherals.GPIO11, peripherals.GPIO12, peripherals.GPIO39);
   let limits: &'static mut [motion::RmtLimitInput; firmware_core::planner::AXES] = LIMIT_INPUTS.init(limits);
 
   // 4b. Bring up UART1 as the single-wire TMC2209 bus on GPIO9 (DOC-03). The bus is owned by the
   //     `tmc_manager` task (spawned below), which runs the per-driver init sequence and then polls
   //     `DRV_STATUS`. Built here so its peripherals (UART1 + GPIO9) are claimed alongside the others.
   let tmc_bus = tmc::init(peripherals.UART1, peripherals.GPIO9);
+
+  // 4e. Bring up the SPINDLE (DOC-07): LEDC ch0/timer0 on GPIO13 (PWM → external RC + op-amp → 0–10 V), plus
+  //     SPIN_EN (GPIO14, active-low) and SPIN_DIR (GPIO15). The controller starts SAFE (EN de-asserted, duty 0).
+  //     Parked in a `StaticCell` so the `spindle` task borrows it `'static` and is the sole driver of the spindle
+  //     outputs — it consumes the planner's `Spindle` outcome and the override-scaled RPM, and runs `$393`
+  //     reverse-dwell timing. The LEDC controller/timer/channel cells back the self-referential `'static` chain.
+  let spindle = spindle::init(
+    peripherals.LEDC,
+    peripherals.GPIO13,
+    peripherals.GPIO14,
+    peripherals.GPIO15,
+    &SPINDLE_LEDC,
+    &SPINDLE_TIMER,
+    &SPINDLE_CHANNEL,
+  );
+  let spindle: &'static mut spindle::Spindle = SPINDLE.init(spindle);
 
   // 5. Install the motion planner (built from the loaded settings) before spawning the tasks that share it
   //    (the consumer enqueues, the core-1 executor pops). `Planner::new` is not `const`, so the static holds
@@ -440,6 +470,10 @@ async fn main(spawner: Spawner) {
   // DRV_STATUS for faults. It owns the UART1 bus by value (a `'static` peripheral handle), so no `StaticCell`
   // is needed (DOC-03).
   spawner.must_spawn(tmc::tmc_manager(tmc_bus, tmc_config));
+  // The spindle task (DOC-07, core 0 / PRO_CPU, priority 0) is the sole driver of the spindle outputs. It awaits
+  // the consumer's spindle-update wake (an M3/M4/M5 or a spindle override/stop change) and the emergency-stop
+  // signal (ALARM / soft-reset / sleep), drives the `SpindleController`, and runs the `$393` reverse dwell.
+  spawner.must_spawn(comms::spindle(spindle));
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's

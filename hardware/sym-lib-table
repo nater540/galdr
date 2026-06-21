@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "Galdr")(type "KiCad")(uri "${KIPRJMOD}/galdr.kicad_sym")(options "")(descr "Galdr custom symbols"))
+)

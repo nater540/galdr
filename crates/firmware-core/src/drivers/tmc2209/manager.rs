@@ -25,9 +25,9 @@ use crate::drivers::tmc2209::registers::{
 use crate::drivers::tmc2209::TmcError;
 use crate::hal_traits::TmcBus;
 
-/// Number of stepper drivers the manager configures (X, Y, Z), matching `planner::AXES`. The spare 4th node
-/// (address 3) is out of scope until a 4th axis is wired.
-pub const AXIS_COUNT: usize = 3;
+/// Number of stepper drivers the manager configures (X, Y, Z, A), aliasing `planner::AXES`. Node 3 is the
+/// rotary A driver (DOC-10); its MS1/MS2 address strap and bus wiring are firmware-side and bench-deferred.
+pub const AXIS_COUNT: usize = crate::planner::AXES;
 
 /// Per-axis driver configuration: the bus node address and the motor current / microstepping to program.
 /// These derive from the grblHAL `$`-settings the firmware loads (DOC-00); the manager holds a plain copy.
@@ -68,7 +68,7 @@ impl Default for TmcConfig {
   fn default() -> Self {
     let axis = |node| AxisConfig { node, run_current_ma: 800, hold_current_ma: 400, microsteps: 16 };
     TmcConfig {
-      axes: [axis(0), axis(1), axis(2)],
+      axes: [axis(0), axis(1), axis(2), axis(3)],
       r_sense_ohms: R_SENSE_ADAFRUIT_6121_OHMS,
       ihold_delay: 7,
       tpowerdown: 20,

@@ -233,6 +233,23 @@ pub enum Units {
   Millimeter,
 }
 
+/// Feed-rate mode (RS274/NGC modal group 5, DOC-10.2). G94 is the power-on/reset default.
+///
+/// Under **G94** the `F` word is units-per-minute (mm/min for linear travel, deg/min for a pure-rotary move);
+/// it is modal and carries forward across lines. Under **G93** the `F` word is *inverse time* — it specifies
+/// `1/(move duration in minutes)`, so the move takes `1/F` minutes regardless of its length. Inverse-time `F`
+/// is **not** usefully modal: grblHAL requires a fresh `F` on every feed-motion line (G1/G2/G3 and `G38.x`),
+/// rejecting one without it as `error:22` (`FeedRateUndefined`). G0 rapids never need an `F` in either mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum FeedMode {
+  /// G94 — feed is units per minute. The grbl power-on / reset default.
+  #[default]
+  UnitsPerMin,
+  /// G93 — inverse time: `F` is `1/(move duration in minutes)`; the move takes `1/F` minutes regardless of length.
+  InverseTime,
+}
+
 /// The four `G38.x` probe modes (DOC-09, `docs/tlo-offsets.md` §8, `docs/gcode-streaming.md` §9). Each pairs a
 /// direction sense with whether a failed probe ALARMS:
 /// - **G38.2** — probe TOWARD the workpiece, stop on contact; **error/ALARM if no contact** within the travel.
@@ -270,14 +287,15 @@ impl ProbeKind {
 
 /// Spindle state requested by a line (grbl modal group 7): M3/M4 start the spindle in a direction,
 /// M5 stops it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SpindleState {
   /// M3 — spindle on, clockwise.
   Clockwise,
   /// M4 — spindle on, counter-clockwise.
   CounterClockwise,
-  /// M5 — spindle stop.
+  /// M5 — spindle stop. The power-on / default modal state (the spindle is off until an M3/M4).
+  #[default]
   Stop,
 }
 
@@ -292,6 +310,8 @@ pub struct ModalState {
   pub distance: DistanceMode,
   /// Active units (modal group 6).
   pub units: Units,
+  /// Active feed-rate mode (modal group 5): G94 units/min (default) or G93 inverse-time. Sticky across lines.
+  pub feed_mode: FeedMode,
   /// Active work coordinate system (modal group 12): 0 = G54 … 5 = G59. Sticky across lines and reported in
   /// `$G` as `G54`…`G59`. The actual offset for the active WCS lives in [`crate::coords::CoordinateSystems`].
   pub wcs: usize,
@@ -302,6 +322,10 @@ pub struct ModalState {
   pub feed: f32,
   /// Last commanded spindle speed (S word), in RPM; sticky across lines.
   pub spindle_speed: f32,
+  /// Active spindle direction (modal group 7): `Clockwise`/`CounterClockwise` after M3/M4, `Stop` after M5.
+  /// Sticky across lines so the commanded direction survives even when the M-word shares a line with a move
+  /// (the per-line emit can carry only one command, so the firmware drives the spindle from this modal value).
+  pub spindle: SpindleState,
 }
 
 impl Default for ModalState {
@@ -310,10 +334,12 @@ impl Default for ModalState {
       motion: MotionMode::Rapid,
       distance: DistanceMode::Absolute,
       units: Units::Millimeter,
+      feed_mode: FeedMode::UnitsPerMin,
       wcs: 0,
       tlo_active: false,
       feed: 0.0,
       spindle_speed: 0.0,
+      spindle: SpindleState::Stop,
     }
   }
 }
@@ -330,6 +356,10 @@ pub struct AxisWords {
   pub y: Option<f32>,
   /// Z target word, if present on the line.
   pub z: Option<f32>,
+  /// A target word (rotation about X), if present on the line. In degrees for a rotary A (the active linear
+  /// units' G20/G21 inch scaling is suppressed for an axis marked rotary in `$376`; the planner applies that
+  /// per-axis fork). For a non-rotary A it is a 4th linear word like X/Y/Z (DOC-10.1).
+  pub a: Option<f32>,
 }
 
 /// A coordinate-system / offset operation the parser emits for the Phase B words (G10, G54-G59, G92,
@@ -433,8 +463,12 @@ pub enum PlannerCommand {
     units: Units,
     /// Active distance mode for the axis words.
     distance: DistanceMode,
-    /// Active feed rate (modal F), in `units` per minute.
+    /// Active feed rate (modal F). Its meaning depends on `feed_mode`: under G94 it is `units` per minute;
+    /// under G93 it is inverse time (`1/(move duration in minutes)`). The planner resolves it accordingly.
     feed: f32,
+    /// Active feed-rate mode (modal group 5): G94 units/min or G93 inverse-time. Governs how the planner
+    /// interprets `feed` when deriving the block's nominal speed (DOC-10.2).
+    feed_mode: FeedMode,
     /// True when this is a `G53` one-shot machine-coordinate move: the axis words are MACHINE positions,
     /// so the planner must NOT apply the active work offset. False for an ordinary work-coordinate move.
     machine_coords: bool,
@@ -454,8 +488,11 @@ pub enum PlannerCommand {
     units: Units,
     /// Active distance mode for the axis words.
     distance: DistanceMode,
-    /// Active feed rate (modal F), in `units` per minute.
+    /// Active feed rate (modal F). Under G94 it is `units` per minute; under G93 it is inverse time for the
+    /// whole arc (`1/(arc duration in minutes)`), which the planner distributes across the arc's segments.
     feed: f32,
+    /// Active feed-rate mode (modal group 5): G94 units/min or G93 inverse-time (DOC-10.2).
+    feed_mode: FeedMode,
     /// True when this is a `G53` one-shot machine-coordinate arc: the endpoint words are MACHINE positions
     /// (the planner must not apply the work offset). False for an ordinary work-coordinate arc.
     machine_coords: bool,
@@ -523,6 +560,8 @@ enum Group {
   Plane,
   Spindle,
   Stop,
+  /// Feed-rate mode (RS274/NGC modal group 5): G93 / G94. Two on one line is a modal conflict.
+  FeedMode,
   /// Work-coordinate-system select (grbl modal group 12): G54-G59.
   Coordinate,
   /// Tool-length-offset mode (grbl modal group 8): G43.1 / G49.
@@ -541,6 +580,7 @@ struct GroupGuard {
   plane: bool,
   spindle: bool,
   stop: bool,
+  feed_mode: bool,
   coordinate: bool,
   tool_offset: bool,
   non_modal: bool,
@@ -557,6 +597,7 @@ impl GroupGuard {
       Group::Plane => &mut self.plane,
       Group::Spindle => &mut self.spindle,
       Group::Stop => &mut self.stop,
+      Group::FeedMode => &mut self.feed_mode,
       Group::Coordinate => &mut self.coordinate,
       Group::ToolOffset => &mut self.tool_offset,
       Group::NonModal => &mut self.non_modal,
@@ -594,6 +635,9 @@ struct LineAccumulator {
   selected_wcs: bool,
   /// `L` word value (the G10 sub-mode selector: `L2` literal offset, `L20` set-to-position).
   l: Option<f32>,
+  /// Whether an `F` word appeared on THIS line. Under G93 inverse-time, a feed move requires a fresh `F` per
+  /// line (a prior modal `F` does not satisfy it), so the emit check consults this rather than the modal value.
+  saw_feed: bool,
   axes: AxisWords,
   i: Option<f32>,
   j: Option<f32>,
@@ -604,7 +648,7 @@ impl LineAccumulator {
   /// Whether this line carried any axis word (X/Y/Z). Used to reject a directionless `G38.x` probe and to decide
   /// whether a line realizes the active motion mode.
   fn has_axes(&self) -> bool {
-    self.axes.x.is_some() || self.axes.y.is_some() || self.axes.z.is_some()
+    self.axes.x.is_some() || self.axes.y.is_some() || self.axes.z.is_some() || self.axes.a.is_some()
   }
 }
 
@@ -703,6 +747,7 @@ impl Parser {
         b'X' => axes.x = Some(word.value),
         b'Y' => axes.y = Some(word.value),
         b'Z' => axes.z = Some(word.value),
+        b'A' => axes.a = Some(word.value),
         b'F' => {
           ctx.feed = word.value;
           seen_feed = true;
@@ -724,7 +769,7 @@ impl Parser {
     if !seen_feed {
       return Err(GcodeError::FeedRateUndefined);
     }
-    if axes.x.is_none() && axes.y.is_none() && axes.z.is_none() {
+    if axes.x.is_none() && axes.y.is_none() && axes.z.is_none() && axes.a.is_none() {
       return Err(GcodeError::JogNoAxis);
     }
     Ok(JogCommand { axes, distance_mode: ctx.distance, units: ctx.units, feed: ctx.feed, machine_coords })
@@ -741,7 +786,7 @@ impl Parser {
   ) -> Result<(), GcodeError> {
     match word.letter {
       b'G' => self.apply_g_word(word.value, guard, acc, next_state),
-      b'M' => self.apply_m_word(word.value, guard, acc),
+      b'M' => self.apply_m_word(word.value, guard, acc, next_state),
       b'X' => {
         acc.axes.x = Some(word.value);
         Ok(())
@@ -752,6 +797,10 @@ impl Parser {
       }
       b'Z' => {
         acc.axes.z = Some(word.value);
+        Ok(())
+      }
+      b'A' => {
+        acc.axes.a = Some(word.value);
         Ok(())
       }
       b'I' => {
@@ -772,6 +821,7 @@ impl Parser {
       }
       b'F' => {
         next_state.feed = word.value;
+        acc.saw_feed = true;
         Ok(())
       }
       b'S' => {
@@ -842,6 +892,17 @@ impl Parser {
       21 => {
         guard.claim(Group::Units)?;
         next_state.units = Units::Millimeter;
+        Ok(())
+      }
+      // G93 inverse-time / G94 units-per-minute feed mode (modal group 5). Two on one line is a conflict.
+      93 => {
+        guard.claim(Group::FeedMode)?;
+        next_state.feed_mode = FeedMode::InverseTime;
+        Ok(())
+      }
+      94 => {
+        guard.claim(Group::FeedMode)?;
+        next_state.feed_mode = FeedMode::UnitsPerMin;
         Ok(())
       }
       28 => {
@@ -943,22 +1004,33 @@ impl Parser {
     })
   }
 
-  /// Apply an `M` word from the supported subset (M3/M4/M5 spindle, M30 program end).
-  fn apply_m_word(&self, value: f32, guard: &mut GroupGuard, acc: &mut LineAccumulator) -> Result<(), GcodeError> {
+  /// Apply an `M` word from the supported subset (M3/M4/M5 spindle, M30 program end). M3/M4/M5 update BOTH the
+  /// per-line `pending_spindle` (for a spindle-only line's single emit) and the sticky modal `next_state.spindle`
+  /// (modal group 7) so the commanded direction survives a line that also carries a move.
+  fn apply_m_word(
+    &self,
+    value: f32,
+    guard: &mut GroupGuard,
+    acc: &mut LineAccumulator,
+    next_state: &mut ModalState,
+  ) -> Result<(), GcodeError> {
     match g_code(value)? {
       3 => {
         guard.claim(Group::Spindle)?;
         acc.pending_spindle = Some(SpindleState::Clockwise);
+        next_state.spindle = SpindleState::Clockwise;
         Ok(())
       }
       4 => {
         guard.claim(Group::Spindle)?;
         acc.pending_spindle = Some(SpindleState::CounterClockwise);
+        next_state.spindle = SpindleState::CounterClockwise;
         Ok(())
       }
       5 => {
         guard.claim(Group::Spindle)?;
         acc.pending_spindle = Some(SpindleState::Stop);
+        next_state.spindle = SpindleState::Stop;
         Ok(())
       }
       30 => {
@@ -1013,7 +1085,8 @@ impl Parser {
     // its own toward/away + alarm semantics). `parse_line` already guaranteed at least one axis word is present.
     // A probe MUST have a defined feed (the seek speed); with feed 0 it would crawl, so grbl rejects it (error:22).
     if let Some(kind) = acc.pending_probe {
-      if state.feed <= 0.0 {
+      // A probe always consumes a feed (the seek speed); under G93 it must carry an `F` on this line.
+      if feed_is_undefined(state, acc.saw_feed, true) {
         return Err(GcodeError::FeedRateUndefined);
       }
       return Ok(Some(PlannerCommand::Probe {
@@ -1026,9 +1099,9 @@ impl Parser {
     }
     if acc.has_axes() {
       // G1/G2/G3 feed moves require a defined feed; G0 rapids run at rapid rate and do not. Reject a feed move
-      // with no defined feed (error:22) rather than crawling at feed 0; the modal feed (set on an earlier line)
-      // satisfies the check, so only a genuinely undefined feed is rejected.
-      if state.motion != MotionMode::Rapid && state.feed <= 0.0 {
+      // with no defined feed (error:22) rather than crawling at feed 0. Under G94 a modal feed (set on an earlier
+      // line) satisfies the check; under G93 the inverse-time `F` must appear on THIS line (`feed_is_undefined`).
+      if feed_is_undefined(state, acc.saw_feed, state.motion != MotionMode::Rapid) {
         return Err(GcodeError::FeedRateUndefined);
       }
       return Ok(Some(self.motion_command(acc, state)));
@@ -1055,6 +1128,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        feed_mode: state.feed_mode,
         machine_coords: acc.machine_coords,
       },
       MotionMode::Linear => PlannerCommand::Move {
@@ -1063,6 +1137,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        feed_mode: state.feed_mode,
         machine_coords: acc.machine_coords,
       },
       MotionMode::ArcCw => PlannerCommand::Arc {
@@ -1073,6 +1148,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        feed_mode: state.feed_mode,
         machine_coords: acc.machine_coords,
       },
       MotionMode::ArcCcw => PlannerCommand::Arc {
@@ -1083,6 +1159,7 @@ impl Parser {
         units: state.units,
         distance: state.distance,
         feed: state.feed,
+        feed_mode: state.feed_mode,
         machine_coords: acc.machine_coords,
       },
     }
@@ -1136,6 +1213,22 @@ fn wcs_index_from_p(p: Option<f32>, fallback: usize) -> usize {
     }
     None => fallback,
   }
+}
+
+/// Whether a motion line that *would consume* a feed must be rejected with [`GcodeError::FeedRateUndefined`].
+///
+/// `needs_feed` is false for a G0 rapid (which runs at the rapid rate and never needs an `F`), true for a G1/G2/G3
+/// feed move or a `G38.x` probe. A feed-consuming line is undefined when there is no positive modal feed, OR —
+/// under **G93 inverse-time** — when no `F` appeared on THIS line (`saw_feed`), since an inverse-time `F`
+/// describes the single move's duration and a prior modal `F` does not carry it (grblHAL's per-line rule).
+fn feed_is_undefined(state: &ModalState, saw_feed: bool, needs_feed: bool) -> bool {
+  if !needs_feed {
+    return false;
+  }
+  if state.feed <= 0.0 {
+    return true;
+  }
+  state.feed_mode == FeedMode::InverseTime && !saw_feed
 }
 
 /// Convert a G/M word value to its integer code, rejecting non-integer codes (e.g. `G1.5`). grbl
@@ -1288,10 +1381,11 @@ mod tests {
       cmd,
       Some(PlannerCommand::Move {
         rapid: true,
-        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None },
+        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None, a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 0.0,
+        feed_mode: FeedMode::UnitsPerMin,
         machine_coords: false,
       })
     );
@@ -1305,10 +1399,11 @@ mod tests {
       cmd,
       Some(PlannerCommand::Move {
         rapid: false,
-        axes: AxisWords { x: Some(10.0), y: None, z: None },
+        axes: AxisWords { x: Some(10.0), y: None, z: None, a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 250.0,
+        feed_mode: FeedMode::UnitsPerMin,
         machine_coords: false,
       })
     );
@@ -1353,10 +1448,11 @@ mod tests {
       cmd,
       Some(PlannerCommand::Move {
         rapid: false,
-        axes: AxisWords { x: Some(1.0), y: None, z: None },
+        axes: AxisWords { x: Some(1.0), y: None, z: None, a: None },
         units: Units::Inch,
         distance: DistanceMode::Incremental,
         feed: 10.0,
+        feed_mode: FeedMode::UnitsPerMin,
         machine_coords: false,
       })
     );
@@ -1371,12 +1467,13 @@ mod tests {
       cmd,
       Some(PlannerCommand::Arc {
         cw: true,
-        axes: AxisWords { x: Some(10.0), y: Some(0.0), z: None },
+        axes: AxisWords { x: Some(10.0), y: Some(0.0), z: None, a: None },
         i: Some(5.0),
         j: Some(0.0),
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 100.0,
+        feed_mode: FeedMode::UnitsPerMin,
         machine_coords: false,
       })
     );
@@ -1397,7 +1494,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::GoToPredefined {
         is_g28: true,
-        intermediate: AxisWords { x: None, y: None, z: Some(5.0) },
+        intermediate: AxisWords { x: None, y: None, z: Some(5.0), a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
       })
@@ -1413,7 +1510,7 @@ mod tests {
     assert_eq!(
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetG92ToPosition {
-        axes: AxisWords { x: Some(0.0), y: Some(0.0), z: None },
+        axes: AxisWords { x: Some(0.0), y: Some(0.0), z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1463,7 +1560,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
         index: 0,
-        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None },
+        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1478,7 +1575,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffsetToPosition {
         index: 1,
-        axes: AxisWords { x: Some(0.0), y: None, z: None },
+        axes: AxisWords { x: Some(0.0), y: None, z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1494,7 +1591,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
         index: 2,
-        axes: AxisWords { x: Some(5.0), y: None, z: None },
+        axes: AxisWords { x: Some(5.0), y: None, z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1510,7 +1607,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
         index: 0,
-        axes: AxisWords { x: Some(5.0), y: None, z: None },
+        axes: AxisWords { x: Some(5.0), y: None, z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1527,7 +1624,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffsetToPosition {
         index: 0,
-        axes: AxisWords { x: Some(0.0), y: None, z: None },
+        axes: AxisWords { x: Some(0.0), y: None, z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1543,7 +1640,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Coordinate(CoordinateOp::SetWcsOffset {
         index: 2,
-        axes: AxisWords { x: Some(5.0), y: None, z: None },
+        axes: AxisWords { x: Some(5.0), y: None, z: None, a: None },
         units: Units::Millimeter,
       }))
     );
@@ -1597,10 +1694,11 @@ mod tests {
       cmd,
       Some(PlannerCommand::Move {
         rapid: true,
-        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None },
+        axes: AxisWords { x: Some(10.0), y: Some(20.0), z: None, a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 0.0,
+        feed_mode: FeedMode::UnitsPerMin,
         machine_coords: true,
       })
     );
@@ -1621,7 +1719,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Probe {
         kind: ProbeKind::G38_2,
-        axes: AxisWords { x: None, y: None, z: Some(-5.0) },
+        axes: AxisWords { x: None, y: None, z: Some(-5.0), a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 50.0,
@@ -1663,7 +1761,7 @@ mod tests {
       cmd,
       Some(PlannerCommand::Probe {
         kind: ProbeKind::G38_2,
-        axes: AxisWords { x: None, y: None, z: Some(-0.2) },
+        axes: AxisWords { x: None, y: None, z: Some(-0.2), a: None },
         units: Units::Inch,
         distance: DistanceMode::Incremental,
         feed: 2.0,
@@ -1775,6 +1873,28 @@ mod tests {
   }
 
   #[test]
+  fn spindle_direction_is_modal_and_survives_a_combined_move_line() {
+    // M3/M4/M5 commit the direction to modal state (group 7), not just the per-line accumulator, so a spindle
+    // word that SHARES a line with a move still records the commanded direction — the move wins the single emit
+    // (the firmware drives the spindle from this modal value, see DOC-07). Regression guard for the combined-line
+    // case where the standalone spindle emit is suppressed by `has_axes()`.
+    let mut parser = Parser::new();
+    assert_eq!(parser.state().spindle, SpindleState::Stop, "spindle starts stopped");
+    // A combined `M3 S1000 G1 X10`: the emit is the Move, but the modal spindle still latches Clockwise + S1000.
+    let cmd = parser.parse_line(b"M3 S1000 G1 X10 F100").expect("valid");
+    assert!(matches!(cmd, Some(PlannerCommand::Move { .. })), "the move wins the single per-line emit");
+    assert_eq!(parser.state().spindle, SpindleState::Clockwise);
+    assert_eq!(parser.state().spindle_speed, 1000.0);
+    // A bare following `M4` reverses the modal direction; speed is sticky.
+    parser.parse_line(b"M4").expect("valid");
+    assert_eq!(parser.state().spindle, SpindleState::CounterClockwise);
+    assert_eq!(parser.state().spindle_speed, 1000.0);
+    // M5 returns the modal direction to Stop.
+    parser.parse_line(b"M5").expect("valid");
+    assert_eq!(parser.state().spindle, SpindleState::Stop);
+  }
+
+  #[test]
   fn parse_program_end_m30() {
     let mut parser = Parser::new();
     let cmd = parser.parse_line(b"M30").expect("valid");
@@ -1871,7 +1991,7 @@ mod tests {
     assert_eq!(
       jog,
       JogCommand {
-        axes: AxisWords { x: Some(10.0), y: Some(5.0), z: None },
+        axes: AxisWords { x: Some(10.0), y: Some(5.0), z: None, a: None },
         distance_mode: DistanceMode::Absolute,
         units: Units::Millimeter,
         feed: 600.0,
@@ -1888,7 +2008,7 @@ mod tests {
     assert_eq!(jog.distance_mode, DistanceMode::Incremental);
     assert_eq!(jog.units, Units::Inch);
     assert_eq!(jog.feed, 30.0);
-    assert_eq!(jog.axes, AxisWords { x: Some(1.0), y: None, z: None });
+    assert_eq!(jog.axes, AxisWords { x: Some(1.0), y: None, z: None, a: None });
   }
 
   #[test]
@@ -1896,7 +2016,7 @@ mod tests {
     let parser = Parser::new();
     let jog = parser.parse_jog(b"G53 Z-1 F100").expect("valid jog");
     assert!(jog.machine_coords);
-    assert_eq!(jog.axes, AxisWords { x: None, y: None, z: Some(-1.0) });
+    assert_eq!(jog.axes, AxisWords { x: None, y: None, z: Some(-1.0), a: None });
   }
 
   #[test]
@@ -1960,7 +2080,77 @@ mod tests {
     let parser = Parser::new();
     let jog = parser.parse_jog(b"  g91 x10  f600 ").expect("valid jog");
     assert_eq!(jog.distance_mode, DistanceMode::Incremental);
-    assert_eq!(jog.axes, AxisWords { x: Some(10.0), y: None, z: None });
+    assert_eq!(jog.axes, AxisWords { x: Some(10.0), y: None, z: None, a: None });
     assert_eq!(jog.feed, 600.0);
+  }
+
+  // ---- Feed mode G93/G94 (DOC-10.2, modal group 5) ----------------------------------------------
+
+  #[test]
+  fn feed_mode_defaults_to_g94_units_per_min() {
+    // grbl power-on default is G94. A fresh parser is in units-per-minute until a G93 appears (DOC-10.2 test 9).
+    let parser = Parser::new();
+    assert_eq!(parser.state().feed_mode, FeedMode::UnitsPerMin);
+  }
+
+  #[test]
+  fn g93_sets_inverse_time_and_g94_restores_units_per_min() {
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse_line(b"G93"), Ok(None));
+    assert_eq!(parser.state().feed_mode, FeedMode::InverseTime);
+    assert_eq!(parser.parse_line(b"G94"), Ok(None));
+    assert_eq!(parser.state().feed_mode, FeedMode::UnitsPerMin);
+  }
+
+  #[test]
+  fn feed_mode_is_sticky_across_lines() {
+    // The feed mode is modal: it survives lines that do not mention it until the opposite word appears.
+    let mut parser = Parser::new();
+    parser.parse_line(b"G93").expect("valid");
+    parser.parse_line(b"G21 G90").expect("valid");
+    assert_eq!(parser.state().feed_mode, FeedMode::InverseTime);
+  }
+
+  #[test]
+  fn g93_g94_modal_conflict_on_one_line() {
+    // Two modal-group-5 words on one line is a conflict (DOC-10.2 test 8); the rejected line leaves state intact.
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse_line(b"G93 G94"), Err(GcodeError::ModalGroupViolation));
+    assert_eq!(parser.state().feed_mode, FeedMode::UnitsPerMin);
+  }
+
+  #[test]
+  fn g93_feed_move_requires_f_on_its_own_line() {
+    // Under G93 the inverse-time F is per-move: a feed move with an F passes, but a later feed move with no F on
+    // its own line is rejected (error:22) even though a prior modal F exists (DOC-10.2 test 6).
+    let mut parser = Parser::new();
+    parser.parse_line(b"G93").expect("valid");
+    assert!(matches!(parser.parse_line(b"G1 X10 F2"), Ok(Some(PlannerCommand::Move { rapid: false, .. }))));
+    assert_eq!(parser.parse_line(b"X20"), Err(GcodeError::FeedRateUndefined));
+  }
+
+  #[test]
+  fn g93_rapid_does_not_require_f() {
+    // G0 rapids never consume a feed, so a G93-active rapid needs no F in either mode (grbl behavior).
+    let mut parser = Parser::new();
+    parser.parse_line(b"G93").expect("valid");
+    assert!(matches!(parser.parse_line(b"G0 X10"), Ok(Some(PlannerCommand::Move { rapid: true, .. }))));
+  }
+
+  #[test]
+  fn g93_probe_requires_f_on_its_own_line() {
+    // A G38.x probe always consumes a feed (its seek speed); under G93 it must carry an F on its own line.
+    let mut parser = Parser::new();
+    parser.parse_line(b"G93").expect("valid");
+    assert_eq!(parser.parse_line(b"G38.2 Z-5"), Err(GcodeError::FeedRateUndefined));
+    assert!(matches!(parser.parse_line(b"G38.2 Z-5 F50"), Ok(Some(PlannerCommand::Probe { .. }))));
+  }
+
+  #[test]
+  fn g94_feed_move_still_uses_modal_feed_fallback() {
+    // Regression: G94 (the default) keeps the modal-F fallback — a bare move after an F-bearing line is fine.
+    let mut parser = Parser::new();
+    parser.parse_line(b"G1 X0 F100").expect("valid");
+    assert!(matches!(parser.parse_line(b"X10"), Ok(Some(PlannerCommand::Move { feed, .. })) if feed == 100.0));
   }
 }

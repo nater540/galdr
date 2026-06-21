@@ -156,7 +156,11 @@ impl SegmentGenerator {
 
     // Latch direction from the per-axis step signs. A zero delta keeps the axis "positive"; it never
     // steps, so the latched value is immaterial for that axis.
-    let dir = DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0] };
+    let mut dir_flags = [false; AXES];
+    for axis in 0..AXES {
+      dir_flags[axis] = block.steps[axis] >= 0;
+    }
+    let dir = DirState { dir: dir_flags };
     sink.set_direction(dir)?;
 
     // Apply the override to the squared speeds: a speed scales by `override_scale²` (since the stored quantity is
@@ -184,11 +188,7 @@ impl SegmentGenerator {
     // Bresenham error accumulators per subordinate axis (the classic 2·|d| integer DDA, run in f32 only
     // for the velocity; the step decision itself is exact integer comparison so no step is ever lost).
     let mut error = [0i64; AXES];
-    let abs_steps = [
-      (block.steps[0].unsigned_abs()) as i64,
-      (block.steps[1].unsigned_abs()) as i64,
-      (block.steps[2].unsigned_abs()) as i64,
-    ];
+    let abs_steps: [i64; AXES] = core::array::from_fn(|i| block.steps[i].unsigned_abs() as i64);
     let dom_count = abs_steps[dominant];
 
     // Hoist every per-block, loop-invariant timing quantity out of the hot loop: the dominant-axis travel
@@ -382,7 +382,11 @@ impl ProbeStepper {
       return Ok(ProbeOutcome { triggered: is_at_stop_edge(), steps_emitted: 0 });
     }
 
-    let dir = DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0] };
+    let mut dir_flags = [false; AXES];
+    for axis in 0..AXES {
+      dir_flags[axis] = block.steps[axis] >= 0;
+    }
+    let dir = DirState { dir: dir_flags };
     sink.set_direction(dir)?;
 
     // Clamp the probe period into the representable interval, mirroring `StepTiming` (probes are slow, so the
@@ -391,11 +395,7 @@ impl ProbeStepper {
     let period = step_period_ticks.clamp(self.config.min_period_ticks(), max_period);
 
     let dominant = dominant_axis(&block.steps);
-    let abs_steps = [
-      block.steps[0].unsigned_abs() as i64,
-      block.steps[1].unsigned_abs() as i64,
-      block.steps[2].unsigned_abs() as i64,
-    ];
+    let abs_steps: [i64; AXES] = core::array::from_fn(|i| block.steps[i].unsigned_abs() as i64);
     let dom_count = abs_steps[dominant];
     let mut error = [0i64; AXES];
     let mut emitted = 0u32;
@@ -802,7 +802,7 @@ mod tests {
     Block {
       steps,
       step_event_count: sec,
-      unit_vec: [steps[0] as f32 / norm, steps[1] as f32 / norm, steps[2] as f32 / norm],
+      unit_vec: [steps[0] as f32 / norm, steps[1] as f32 / norm, steps[2] as f32 / norm, steps[3] as f32 / norm],
       millimeters: length_mm,
       acceleration: accel,
       nominal_speed_sq: nominal_sq,
@@ -820,11 +820,11 @@ mod tests {
     // A 3-axis block with distinct counts. Bresenham must emit exactly |steps[axis]| per axis and one
     // tick per dominant-axis step — never dropping or adding a step. This is the load-bearing invariant.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([400, 300, 100], 5.0, 100.0, 0.0, 400.0);
+    let block = make_block([400, 300, 100, 0], 5.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     let emitted = generator.run_block(&block, 0.0, &mut sink).expect("runs");
     assert_eq!(emitted, 400, "one tick per dominant-axis (X) step");
-    assert_eq!(sink.step_totals(), [400, 300, 100], "each axis steps exactly its delta");
+    assert_eq!(sink.step_totals(), [400, 300, 100, 0], "each axis steps exactly its delta");
   }
 
   #[test]
@@ -834,47 +834,47 @@ mod tests {
     // run_block_scaled with override 1.0 and an INFINITY ceiling (a rapid). Must TERMINATE and emit 1250 steps.
     let generator = SegmentGenerator::new(test_config());
     let nominal = 500.0f32 / 60.0; // mm/s
-    let mut block = make_block([1250, 0, 0], 5.0, 10.0, 0.0, nominal * nominal);
+    let mut block = make_block([1250, 0, 0, 0], 5.0, 10.0, 0.0, nominal * nominal);
     block.rapid = true;
     let mut sink = RecordingSink::new();
     let emitted = generator
       .run_block_scaled(&block, 0.0, 1.0, f32::INFINITY, &mut sink)
       .expect("runs");
     assert_eq!(emitted, 1250, "must emit exactly 1250 X steps");
-    assert_eq!(sink.step_totals(), [1250, 0, 0]);
+    assert_eq!(sink.step_totals(), [1250, 0, 0, 0]);
   }
 
   #[test]
   fn dominant_axis_steps_on_every_tick() {
     // Y dominates here (600 > 250 > 0). Every emitted tick must carry a Y step; X steps on a subset.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([250, 600, 0], 6.0, 100.0, 0.0, 400.0);
+    let block = make_block([250, 600, 0, 0], 6.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut sink).expect("runs");
     let ticks = sink.all_ticks();
     assert_eq!(ticks.len(), 600);
     assert!(ticks.iter().all(|ev| ev.step[1]), "dominant axis Y steps every tick");
     assert!(!ticks.iter().all(|ev| ev.step[0]), "subordinate X does not step every tick");
-    assert_eq!(sink.step_totals(), [250, 600, 0]);
+    assert_eq!(sink.step_totals(), [250, 600, 0, 0]);
   }
 
   #[test]
   fn negative_deltas_latch_negative_direction_and_conserve_steps() {
     // Negative step deltas must latch a negative DIR for those axes and still step |delta| times.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([-300, 200, -50], 4.0, 100.0, 0.0, 400.0);
+    let block = make_block([-300, 200, -50, 0], 4.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut sink).expect("runs");
     assert_eq!(sink.directions.len(), 1, "direction latched once per block");
-    assert_eq!(sink.directions[0].dir, [false, true, false], "signs map to DIR per axis");
-    assert_eq!(sink.step_totals(), [300, 200, 50], "magnitudes conserved regardless of sign");
+    assert_eq!(sink.directions[0].dir, [false, true, false, true], "signs map to DIR per axis (A's 0 delta ≥ 0 ⇒ true)");
+    assert_eq!(sink.step_totals(), [300, 200, 50, 0], "magnitudes conserved regardless of sign");
   }
 
   #[test]
   fn pure_diagonal_steps_both_axes_every_tick() {
     // Equal X and Y counts: a 45° line. Bresenham must step both axes on every tick (1:1 ratio).
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([100, 100, 0], 1.414, 100.0, 0.0, 400.0);
+    let block = make_block([100, 100, 0, 0], 1.414, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut sink).expect("runs");
     let ticks = sink.all_ticks();
@@ -889,7 +889,7 @@ mod tests {
     // 500 dominant steps must fan out into ceil(500/48) = 11 bursts, none exceeding the 48-symbol cap, and
     // the tick total must still equal the step count exactly.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([500, 0, 0], 5.0, 100.0, 0.0, 400.0);
+    let block = make_block([500, 0, 0, 0], 5.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     let emitted = generator.run_block(&block, 0.0, &mut sink).expect("runs");
     assert_eq!(emitted, 500);
@@ -903,7 +903,7 @@ mod tests {
   fn exactly_one_full_burst_emits_single_burst() {
     // Precisely 48 steps must produce one full burst, no empty trailing burst.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([MAX_SYMBOLS_PER_BURST as i32, 0, 0], 1.0, 100.0, 200.0, 200.0);
+    let block = make_block([MAX_SYMBOLS_PER_BURST as i32, 0, 0, 0], 1.0, 100.0, 200.0, 200.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 200.0, &mut sink).expect("runs");
     assert_eq!(sink.bursts.len(), 1);
@@ -932,7 +932,7 @@ mod tests {
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
     // Long enough to reach nominal: nominal v = 20 mm/s → v²=400; accel 100; accel_dist = 400/200 = 2 mm.
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 0.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 400.0, &mut sink).expect("runs");
     let v = velocities_from_periods(&sink, &block, &cfg);
@@ -948,7 +948,7 @@ mod tests {
     // Entry == nominal, exit 0: the block only decelerates. Velocity must be non-increasing.
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 400.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut sink).expect("runs");
     let v = velocities_from_periods(&sink, &block, &cfg);
@@ -966,7 +966,7 @@ mod tests {
     let generator = SegmentGenerator::new(cfg);
     // nominal v = 20 mm/s (v²=400), accel 100, accel/decel dist = 2 mm each; 10 mm block leaves a 6 mm
     // cruise plateau, so nominal is genuinely reached and held.
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 0.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut sink).expect("runs");
     let v = velocities_from_periods(&sink, &block, &cfg);
@@ -982,7 +982,7 @@ mod tests {
     // tick should carry essentially the same period (constant velocity), so periods are near-uniform.
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 400.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 400.0, &mut sink).expect("runs");
     let periods: Vec<u32> = sink.all_ticks().iter().map(|e| e.period_ticks).collect();
@@ -997,7 +997,7 @@ mod tests {
     // reachable peak² = a·L = 100·1 = 100 → v_peak = 10 mm/s, far under nominal.
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
-    let block = make_block([100, 0, 0], 1.0, 100.0, 0.0, 10_000.0);
+    let block = make_block([100, 0, 0, 0], 1.0, 100.0, 0.0, 10_000.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut sink).expect("runs");
     let v = velocities_from_periods(&sink, &block, &cfg);
@@ -1014,7 +1014,7 @@ mod tests {
     // tick moving faster than a zero exit — the ramp is shaped by the supplied exit speed.
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 400.0, 400.0);
 
     let mut stop = RecordingSink::new();
     generator.run_block(&block, 0.0, &mut stop).expect("runs");
@@ -1041,7 +1041,7 @@ mod tests {
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
     // v=10 mm/s → v²=100; entry==nominal==exit keeps it constant so the midpoint sample is exactly 100.
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 100.0, 100.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 100.0, 100.0);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 100.0, &mut sink).expect("runs");
     let p = sink.all_ticks()[0].period_ticks;
@@ -1056,7 +1056,7 @@ mod tests {
     let generator = SegmentGenerator::new(cfg);
     // 10000 steps over 1 mm = 10000 steps/mm; nominal v=1000 mm/s would be 10 MHz steps, far over the
     // 83.3 kHz ceiling, so every cruise tick clamps to the 12-tick minimum period.
-    let block = make_block([10_000, 0, 0], 1.0, 1.0e9, 1.0e6, 1.0e6);
+    let block = make_block([10_000, 0, 0, 0], 1.0, 1.0e9, 1.0e6, 1.0e6);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 1.0e6, &mut sink).expect("runs");
     let min = cfg.min_period_ticks();
@@ -1074,7 +1074,7 @@ mod tests {
     let generator = SegmentGenerator::new(cfg);
     // 100 steps over a very long 1000 mm block at a crawling nominal speed (v = 0.01 mm/s, v² = 1e-4). The
     // dominant-axis step rate is far below `tick_hz / max_period_ticks`, so every period saturates the cap.
-    let block = make_block([100, 0, 0], 1000.0, 1.0, 1.0e-4, 1.0e-4);
+    let block = make_block([100, 0, 0, 0], 1000.0, 1.0, 1.0e-4, 1.0e-4);
     let mut sink = RecordingSink::new();
     generator.run_block(&block, 1.0e-4, &mut sink).expect("runs");
     let max_period = RMT_MAX_FIELD_LEN + cfg.step_pulse_ticks;
@@ -1097,7 +1097,7 @@ mod tests {
   fn zero_length_block_emits_nothing() {
     // A block with no dominant steps is a no-op: no direction latch, no bursts, zero ticks.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([0, 0, 0], 0.0, 100.0, 0.0, 0.0);
+    let block = make_block([0, 0, 0, 0], 0.0, 100.0, 0.0, 0.0);
     let mut sink = RecordingSink::new();
     let emitted = generator.run_block(&block, 0.0, &mut sink).expect("runs");
     assert_eq!(emitted, 0);
@@ -1109,13 +1109,13 @@ mod tests {
   fn single_step_block_emits_exactly_one_tick() {
     // The smallest moving block: one step on one axis. Exactly one tick, one burst, that axis steps once.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([1, 0, 0], 0.01, 100.0, 0.0, 400.0);
+    let block = make_block([1, 0, 0, 0], 0.01, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     let emitted = generator.run_block(&block, 0.0, &mut sink).expect("runs");
     assert_eq!(emitted, 1);
     assert_eq!(sink.bursts.len(), 1);
     assert_eq!(sink.bursts[0].len(), 1);
-    assert_eq!(sink.step_totals(), [1, 0, 0]);
+    assert_eq!(sink.step_totals(), [1, 0, 0, 0]);
   }
 
   // ---- Config validation & error propagation ----------------------------------------------------
@@ -1124,7 +1124,7 @@ mod tests {
   fn invalid_config_is_rejected() {
     // A non-positive tick rate cannot produce valid timing; the generator reports it rather than panic.
     let generator = SegmentGenerator::new(MotionConfig { tick_hz: 0.0, step_pulse_ticks: 10, min_low_ticks: 2 });
-    let block = make_block([100, 0, 0], 1.0, 100.0, 0.0, 400.0);
+    let block = make_block([100, 0, 0, 0], 1.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     assert_eq!(generator.run_block(&block, 0.0, &mut sink), Err(MotionError::InvalidConfig));
   }
@@ -1133,7 +1133,7 @@ mod tests {
   fn sink_error_propagates_as_motion_error() {
     // A failing sink surfaces as MotionError::Sink, never a panic — firmware-core's no-unwrap contract.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([100, 0, 0], 1.0, 100.0, 0.0, 400.0);
+    let block = make_block([100, 0, 0, 0], 1.0, 100.0, 0.0, 400.0);
     let mut sink = FailingSink;
     assert_eq!(generator.run_block(&block, 0.0, &mut sink), Err(MotionError::Sink(StepError::Transport)));
   }
@@ -1144,7 +1144,7 @@ mod tests {
   fn planner_block_realizes_through_the_generator() {
     // Drive a real planner-produced block through the generator to confirm the pipeline composes: the
     // planner solves a lone block (entry 0, exit 0), and the generator conserves its steps exactly.
-    use crate::gcode::{AxisWords, DistanceMode, PlannerCommand, Units};
+    use crate::gcode::{AxisWords, DistanceMode, FeedMode, PlannerCommand, Units};
     use crate::planner::{Planner, PlannerConfig};
     let mut planner = Planner::new(PlannerConfig {
       steps_per_mm: [100.0; AXES],
@@ -1152,14 +1152,16 @@ mod tests {
       accel_mm_s2: [1000.0; AXES],
       junction_deviation_mm: 0.01,
       arc_tolerance_mm: 0.002,
+      rotary_mask: crate::planner::DEFAULT_ROTARY_MASK,
     });
     planner
       .plan_command(&PlannerCommand::Move {
         rapid: false,
-        axes: AxisWords { x: Some(3.0), y: Some(4.0), z: None },
+        axes: AxisWords { x: Some(3.0), y: Some(4.0), z: None, a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 600.0,
+        feed_mode: FeedMode::UnitsPerMin,
         machine_coords: false,
       })
       .expect("queued");
@@ -1170,7 +1172,7 @@ mod tests {
     let emitted = generator.run_block(&block, 0.0, &mut sink).expect("runs");
     // X3 Y4 at 100 steps/mm: 300 X steps, 400 Y steps; Y dominates so 400 ticks, steps conserved.
     assert_eq!(emitted, 400);
-    assert_eq!(sink.step_totals(), [300, 400, 0]);
+    assert_eq!(sink.step_totals(), [300, 400, 0, 0]);
   }
 
   // ---- Phase E: feed/rapid override scaling -----------------------------------------------------
@@ -1179,7 +1181,7 @@ mod tests {
   fn override_scale_one_matches_unscaled() {
     // `run_block_scaled` with scale 1.0 and an infinite ceiling must be byte-for-byte identical to `run_block`.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 400.0, 400.0);
     let mut plain = RecordingSink::new();
     generator.run_block(&block, 400.0, &mut plain).expect("runs");
     let mut scaled = RecordingSink::new();
@@ -1193,7 +1195,7 @@ mod tests {
     // the max-rate ceiling allows it (period shrinks), but a ceiling at 20 mm/s (v²=400) must hold it at 20.
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 400.0, 400.0);
 
     // 150% with a generous ceiling (v=40 mm/s, v²=1600): cruise should rise toward 30 mm/s.
     let mut up = RecordingSink::new();
@@ -1215,7 +1217,7 @@ mod tests {
     // A 50% feed override on a v=20 mm/s cruise block must halve the cruise to ~10 mm/s (period doubles).
     let cfg = test_config();
     let generator = SegmentGenerator::new(cfg);
-    let block = make_block([1000, 0, 0], 10.0, 100.0, 400.0, 400.0);
+    let block = make_block([1000, 0, 0, 0], 10.0, 100.0, 400.0, 400.0);
     let mut sink = RecordingSink::new();
     generator.run_block_scaled(&block, 400.0, 0.5, f32::INFINITY, &mut sink).expect("runs");
     let v = velocities_from_periods(&sink, &block, &cfg);
@@ -1227,18 +1229,18 @@ mod tests {
   fn override_scaling_conserves_steps() {
     // Scaling the feed must never drop or invent a step — only the periods change, not the step counts.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([400, 300, 100], 5.0, 100.0, 0.0, 400.0);
+    let block = make_block([400, 300, 100, 0], 5.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
     let emitted = generator.run_block_scaled(&block, 0.0, 1.75, f32::INFINITY, &mut sink).expect("runs");
     assert_eq!(emitted, 400, "one tick per dominant-axis step regardless of the override");
-    assert_eq!(sink.step_totals(), [400, 300, 100], "each axis steps exactly its delta under scaling");
+    assert_eq!(sink.step_totals(), [400, 300, 100, 0], "each axis steps exactly its delta under scaling");
   }
 
   #[test]
   fn degenerate_override_scale_falls_back_to_unscaled() {
     // A non-positive / non-finite override scale must not freeze or runaway motion: it is treated as 1.0.
     let generator = SegmentGenerator::new(test_config());
-    let block = make_block([500, 0, 0], 5.0, 100.0, 400.0, 400.0);
+    let block = make_block([500, 0, 0, 0], 5.0, 100.0, 400.0, 400.0);
     let mut plain = RecordingSink::new();
     generator.run_block(&block, 400.0, &mut plain).expect("runs");
     for bad in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
@@ -1254,18 +1256,18 @@ mod tests {
   #[test]
   fn step_counter_advances_positive_axes() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [true, true, true] });
-    counter.advance(&StepEvent { step: [true, false, true], period_ticks: 12 });
-    assert_eq!(counter.position_steps(), [1, 0, 1]);
+    counter.set_direction(DirState { dir: [true, true, true, false] });
+    counter.advance(&StepEvent { step: [true, false, true, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [1, 0, 1, 0]);
   }
 
   /// A negative latched direction makes a stepping axis advance `−1`; mixed signs are honored per axis.
   #[test]
   fn step_counter_honors_latched_direction_sign() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [false, true, false] });
-    counter.advance(&StepEvent { step: [true, true, true], period_ticks: 12 });
-    assert_eq!(counter.position_steps(), [-1, 1, -1]);
+    counter.set_direction(DirState { dir: [false, true, false, false] });
+    counter.advance(&StepEvent { step: [true, true, true, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-1, 1, -1, 0]);
   }
 
   /// Re-latching direction mid-stream (as the executor does once per block) changes the sign of
@@ -1273,17 +1275,17 @@ mod tests {
   #[test]
   fn step_counter_relatches_direction_per_block() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [true, true, true] });
+    counter.set_direction(DirState { dir: [true, true, true, false] });
     for _ in 0..5 {
-      counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+      counter.advance(&StepEvent { step: [true, false, false, false], period_ticks: 12 });
     }
-    assert_eq!(counter.position_steps(), [5, 0, 0]);
+    assert_eq!(counter.position_steps(), [5, 0, 0, 0]);
     // Next block reverses X: three steps back toward the origin.
-    counter.set_direction(DirState { dir: [false, true, true] });
+    counter.set_direction(DirState { dir: [false, true, true, false] });
     for _ in 0..3 {
-      counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+      counter.advance(&StepEvent { step: [true, false, false, false], period_ticks: 12 });
     }
-    assert_eq!(counter.position_steps(), [2, 0, 0]);
+    assert_eq!(counter.position_steps(), [2, 0, 0, 0]);
   }
 
   /// `position_mm` divides the live step count by `steps_per_mm` per axis (the same resolution the
@@ -1291,12 +1293,12 @@ mod tests {
   #[test]
   fn step_counter_converts_steps_to_mm() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [true, false, true] });
+    counter.set_direction(DirState { dir: [true, false, true, false] });
     for _ in 0..250 {
-      counter.advance(&StepEvent { step: [true, true, false], period_ticks: 12 });
+      counter.advance(&StepEvent { step: [true, true, false, false], period_ticks: 12 });
     }
     // X +250 steps at 250 steps/mm = +1.0 mm; Y −250 steps at 100 steps/mm = −2.5 mm; Z untouched.
-    let mm = counter.position_mm(&[250.0, 100.0, 0.0]);
+    let mm = counter.position_mm(&[250.0, 100.0, 0.0, 0.0]);
     assert!((mm[0] - 1.0).abs() < 1e-6);
     assert!((mm[1] + 2.5).abs() < 1e-6);
     // A zero steps/mm axis is reported as 0.0, not a division blow-up.
@@ -1308,14 +1310,14 @@ mod tests {
   #[test]
   fn step_counter_reset_returns_to_origin() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [false, false, false] });
-    counter.advance(&StepEvent { step: [true, true, true], period_ticks: 12 });
-    assert_eq!(counter.position_steps(), [-1, -1, -1]);
+    counter.set_direction(DirState { dir: [false, false, false, false] });
+    counter.advance(&StepEvent { step: [true, true, true, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-1, -1, -1, 0]);
     counter.reset();
-    assert_eq!(counter.position_steps(), [0, 0, 0]);
+    assert_eq!(counter.position_steps(), [0, 0, 0, 0]);
     // Direction is retained: a subsequent step still goes negative until a block re-latches it.
-    counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
-    assert_eq!(counter.position_steps(), [-1, 0, 0]);
+    counter.advance(&StepEvent { step: [true, false, false, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-1, 0, 0, 0]);
   }
 
   /// `sync_to` snaps the live position to an arbitrary value (the homing machine-zero) without disturbing the
@@ -1323,22 +1325,22 @@ mod tests {
   #[test]
   fn step_counter_sync_to_sets_arbitrary_position() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [true, true, true] });
-    counter.advance(&StepEvent { step: [true, true, true], period_ticks: 12 });
-    assert_eq!(counter.position_steps(), [1, 1, 1]);
+    counter.set_direction(DirState { dir: [true, true, true, false] });
+    counter.advance(&StepEvent { step: [true, true, true, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [1, 1, 1, 0]);
     // Snap to the homing machine-zero (e.g. -100 steps on every axis from a positive-home pull-off).
-    counter.sync_to([-100, -100, -100]);
-    assert_eq!(counter.position_steps(), [-100, -100, -100]);
+    counter.sync_to([-100, -100, -100, 0]);
+    assert_eq!(counter.position_steps(), [-100, -100, -100, 0]);
     // Direction retained: a further positive step advances from the synced position.
-    counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
-    assert_eq!(counter.position_steps(), [-99, -100, -100]);
+    counter.advance(&StepEvent { step: [true, false, false, false], period_ticks: 12 });
+    assert_eq!(counter.position_steps(), [-99, -100, -100, 0]);
   }
 
   /// `steps_to_mm` (the standalone conversion the bin's status reporter uses against the live atomics)
   /// divides each axis by its `$100..102` resolution, and a non-positive resolution yields a finite `0.0`.
   #[test]
   fn steps_to_mm_converts_with_degenerate_axis_safe() {
-    let mm = steps_to_mm(&[250, -250, 7], &[250.0, 100.0, 0.0]);
+    let mm = steps_to_mm(&[250, -250, 7, 0], &[250.0, 100.0, 0.0, 0.0]);
     assert!((mm[0] - 1.0).abs() < 1e-6);
     assert!((mm[1] + 2.5).abs() < 1e-6);
     // A zero steps/mm axis is reported as 0.0, never a division blow-up.
@@ -1349,7 +1351,7 @@ mod tests {
 
   /// A probe block straight down Z by 5 mm at 100 steps/mm → 500 Z steps. Constant feed, no trapezoid.
   fn probe_block() -> Block {
-    make_block([0, 0, -500], 5.0, 100.0, 0.0, 100.0)
+    make_block([0, 0, -500, 0], 5.0, 100.0, 0.0, 100.0)
   }
 
   #[test]
@@ -1381,7 +1383,7 @@ mod tests {
     let outcome = stepper.run_probe(&block, 1000, || false, &mut sink).expect("probe runs");
     assert!(!outcome.triggered, "no contact within travel");
     assert_eq!(outcome.steps_emitted, 500, "ran the full block to the no-contact end of travel");
-    assert_eq!(sink.step_totals(), [0, 0, 500]);
+    assert_eq!(sink.step_totals(), [0, 0, 500, 0]);
   }
 
   #[test]
@@ -1425,7 +1427,7 @@ mod tests {
     // touch plate (with `$6=1`, NO-plate) trips after 4.2 mm of travel → 420 Z steps, i.e. machine Z = -4.2 mm.
     let cfg = test_config();
     let prober = ProbeStepper::new(cfg);
-    let block = make_block([0, 0, -500], 5.0, 100.0, 0.0, 100.0);
+    let block = make_block([0, 0, -500, 0], 5.0, 100.0, 0.0, 100.0);
 
     // A scripted mock probe: idles high (untouched), goes low after 420 steps of travel. Under the base sense
     // (`$6=0`) a high pin reads not-triggered and a low pin (grounded by contact) reads triggered — the right
@@ -1446,7 +1448,7 @@ mod tests {
     // Advance a live step counter through the same ticks the prober emits, exactly as the firmware's CountingSink
     // does, so the latched position is derived from the emitted steps.
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0] });
+    counter.set_direction(DirState { dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0, block.steps[3] >= 0] });
 
     struct CountingRecorder<'a> {
       counter: &'a mut StepCounter,
@@ -1470,8 +1472,8 @@ mod tests {
     assert!(outcome.triggered, "the NO plate tripped within travel");
     // The latched machine position: 420 Z steps in the negative direction → Z = -4.2 mm at 100 steps/mm.
     let stop_steps = counter.position_steps();
-    assert_eq!(stop_steps, [0, 0, -420], "latched at the trigger step");
-    let steps_per_mm = [100.0, 100.0, 100.0];
+    assert_eq!(stop_steps, [0, 0, -420, 0], "latched at the trigger step");
+    let steps_per_mm = [100.0, 100.0, 100.0, 0.0];
     let probe_mm = steps_to_mm(&stop_steps, &steps_per_mm);
     assert!((probe_mm[2] + 4.2).abs() < 1e-4, "probe machine Z is -4.2 mm, got {}", probe_mm[2]);
 
@@ -1487,8 +1489,8 @@ mod tests {
     // Z-zero: the plate is 1.0 mm thick, so `G10 L20 P1 Z1.0` makes the probed point read work Z = 1.0, putting
     // the copper top (1 mm below the plate top the probe touched) at WPos Z = 0.
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset_to_position(0, probe_mm, [0.0, 0.0, 1.0], [false, false, true]);
-    let copper_top = [probe_mm[0], probe_mm[1], probe_mm[2] - 1.0];
+    cs.set_wcs_offset_to_position(0, probe_mm, [0.0, 0.0, 1.0, 0.0], [false, false, true, false]);
+    let copper_top = [probe_mm[0], probe_mm[1], probe_mm[2] - 1.0, 0.0];
     let wpos = cs.machine_to_work(copper_top);
     assert!(wpos[2].abs() < 1e-4, "copper top reads WPos Z = 0, got {}", wpos[2]);
   }
@@ -1536,17 +1538,17 @@ mod tests {
   #[test]
   fn step_counter_saturates_at_i32_bounds() {
     let mut counter = StepCounter::new();
-    counter.set_direction(DirState { dir: [true, true, true] });
+    counter.set_direction(DirState { dir: [true, true, true, false] });
     // Seed near the ceiling, then step past it; the axis must clamp, not wrap.
     for _ in 0..3 {
-      counter.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+      counter.advance(&StepEvent { step: [true, false, false, false], period_ticks: 12 });
     }
     // Manually drive X to the ceiling via a direct check: advance cannot reach i32::MAX in a test loop,
     // so assert the saturating contract at the boundary by constructing the edge case in steps.
     let mut edge = StepCounter::new();
-    edge.set_direction(DirState { dir: [true, true, true] });
-    edge.position = [i32::MAX, 0, 0];
-    edge.advance(&StepEvent { step: [true, false, false], period_ticks: 12 });
+    edge.set_direction(DirState { dir: [true, true, true, false] });
+    edge.position = [i32::MAX, 0, 0, 0];
+    edge.advance(&StepEvent { step: [true, false, false, false], period_ticks: 12 });
     assert_eq!(edge.position_steps()[0], i32::MAX);
   }
 }

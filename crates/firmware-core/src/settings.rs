@@ -19,11 +19,11 @@
 use crate::drivers::tmc2209::manager::{AxisConfig, TmcConfig};
 use crate::hal_traits::{RecordStore, StoreError};
 use crate::motion::MotionConfig;
-use crate::planner::{PlannerConfig, AXES};
+use crate::planner::{PlannerConfig, AXES, DEFAULT_ROTARY_MASK};
 
-/// The UART node addresses strapped on the three TMC2209 drivers (X=0, Y=1, Z=2 per DOC-03). These are a
+/// The UART node addresses strapped on the four TMC2209 drivers (X=0, Y=1, Z=2, A=3 per DOC-03). These are a
 /// hardware property, not a user setting, so the `Settings → TmcConfig` conversion supplies them directly.
-const TMC_NODES: [u8; AXES] = [0, 1, 2];
+const TMC_NODES: [u8; AXES] = [0, 1, 2, 3];
 
 /// `$1` stepper idle lock delay default, milliseconds. grbl convention; 255 means "always energized".
 const DEFAULT_STEP_IDLE_DELAY_MS: u32 = 25;
@@ -52,6 +52,14 @@ const HARD_LIMIT_FLAG_ENABLE: u8 = 1 << 0;
 const HARD_LIMIT_FLAG_STRICT: u8 = 1 << 1;
 /// `$30` maximum spindle RPM default (WS55-220 nominal).
 const DEFAULT_SPINDLE_RPM_MAX: f32 = 12_000.0;
+/// `$392` spindle on (spin-up) delay default, seconds. grbl's `DEFAULT_SPINDLE_ON_DELAY` is 0 (no delay), so the
+/// firmware comes up inserting no spin-up dwell until a host configures one (DOC-07).
+const DEFAULT_SPINDLE_ON_DELAY_S: f32 = 0.0;
+/// `$393` spindle reverse dwell default, seconds (Galdr-specific). The M3↔M4 direction-reversal spin-down dwell:
+/// a running spindle is forced to a stop and parked for this long before the opposite direction is brought up,
+/// so the mechanical spindle is at rest before reversing (DOC-07 safety interlock). 1.5 s is a conservative
+/// default for the WS55-220; a host tunes it to the real spin-down time.
+const DEFAULT_SPINDLE_REVERSE_DWELL_S: f32 = 1.5;
 /// `$481` auto-report interval default, milliseconds. grblHAL ships `DEFAULT_AUTOREPORT_INTERVAL 0`
 /// (disabled), so the firmware comes up with periodic auto-reporting OFF until a host enables it.
 const DEFAULT_AUTO_REPORT_INTERVAL_MS: u32 = 0;
@@ -191,6 +199,12 @@ pub struct Settings {
   pub spindle_rpm_max: f32,
   /// `$31` minimum spindle speed, RPM.
   pub spindle_rpm_min: f32,
+  /// `$392` spindle on (spin-up) delay, seconds. After an M3/M4 the planner inserts a synchronized dwell of this
+  /// length before the first cutting move so the spindle reaches speed before it cuts (DOC-07). 0 = no delay.
+  pub spindle_on_delay_s: f32,
+  /// `$393` spindle reverse dwell, seconds (Galdr-specific). The M3↔M4 reversal spin-down dwell: a running
+  /// spindle is stopped and parked this long before the opposite direction is energized (DOC-07 interlock).
+  pub spindle_reverse_dwell_s: f32,
   /// `$481` auto-status-report interval, milliseconds (0 = disabled, else `[100, 1000]`). When non-zero the
   /// firmware pushes a `<...>` status report every interval-ms without the host polling `?` (DOC-08 §5).
   pub auto_report_interval_ms: u32,
@@ -218,6 +232,11 @@ pub struct Settings {
   pub tmc_send_delay: u8,
   /// TMC sense-resistor value, ohms (host-sync channel / default only).
   pub tmc_r_sense_ohms: f32,
+  /// `$376` rotary-axes bitmask (DOC-10.7): bit N set ⇒ axis N is angular (degrees), continuous/rollover, and
+  /// exempt from G20/G21 inch scaling. Plumbed into [`PlannerConfig::rotary_mask`]. Default
+  /// [`DEFAULT_ROTARY_MASK`] (= 8, A rotary) on a fresh record; `sanitize` masks it to valid bits but never
+  /// forces it non-zero, so a deliberate `$376=0` (A as a 4th linear axis) round-trips.
+  pub rotary_mask: u8,
 }
 
 impl Default for Settings {
@@ -249,19 +268,22 @@ impl Default for Settings {
       homing_pulloff_mm: DEFAULT_HOMING_PULLOFF_MM,
       spindle_rpm_max: DEFAULT_SPINDLE_RPM_MAX,
       spindle_rpm_min: 0.0,
+      spindle_on_delay_s: DEFAULT_SPINDLE_ON_DELAY_S,
+      spindle_reverse_dwell_s: DEFAULT_SPINDLE_REVERSE_DWELL_S,
       auto_report_interval_ms: DEFAULT_AUTO_REPORT_INTERVAL_MS,
       steps_per_mm: planner.steps_per_mm,
       max_rate_mm_min: planner.max_rate_mm_min,
       accel_mm_s2: planner.accel_mm_s2,
       max_travel_mm: [DEFAULT_MAX_TRAVEL_MM; AXES],
-      run_current_ma: [tmc.axes[0].run_current_ma, tmc.axes[1].run_current_ma, tmc.axes[2].run_current_ma],
-      microsteps: [tmc.axes[0].microsteps, tmc.axes[1].microsteps, tmc.axes[2].microsteps],
-      hold_current_ma: [tmc.axes[0].hold_current_ma, tmc.axes[1].hold_current_ma, tmc.axes[2].hold_current_ma],
+      run_current_ma: core::array::from_fn(|axis| tmc.axes[axis].run_current_ma),
+      microsteps: core::array::from_fn(|axis| tmc.axes[axis].microsteps),
+      hold_current_ma: core::array::from_fn(|axis| tmc.axes[axis].hold_current_ma),
       tmc_ihold_delay: tmc.ihold_delay,
       tmc_tpowerdown: tmc.tpowerdown,
       tmc_tpwmthrs: tmc.tpwmthrs,
       tmc_send_delay: tmc.send_delay,
       tmc_r_sense_ohms: tmc.r_sense_ohms,
+      rotary_mask: planner.rotary_mask,
     }
   }
 }
@@ -275,6 +297,7 @@ impl Settings {
       accel_mm_s2: self.accel_mm_s2,
       junction_deviation_mm: self.junction_deviation_mm,
       arc_tolerance_mm: self.arc_tolerance_mm,
+      rotary_mask: self.rotary_mask,
     }
   }
 
@@ -309,7 +332,7 @@ impl Settings {
       seek_mm_min: self.homing_seek_mm_min,
       feed_mm_min: self.homing_feed_mm_min,
       pulloff_mm: self.homing_pulloff_mm,
-      direction: [direction(0), direction(1), direction(2)],
+      direction: core::array::from_fn(direction),
       force_set_origin: self.homing_force_set_origin(),
       motion: self.motion_config(tick_hz),
       limit: self.limit_config(),
@@ -325,7 +348,7 @@ impl Settings {
       microsteps: self.microsteps[i],
     };
     TmcConfig {
-      axes: [axis(0), axis(1), axis(2)],
+      axes: core::array::from_fn(axis),
       r_sense_ohms: self.tmc_r_sense_ohms,
       ihold_delay: self.tmc_ihold_delay,
       tpowerdown: self.tmc_tpowerdown,
@@ -479,6 +502,10 @@ impl Settings {
     self.homing_pulloff_mm = self.homing_pulloff_mm.max(0.0);
     self.spindle_rpm_max = positive_or(self.spindle_rpm_max, defaults.spindle_rpm_max);
     self.spindle_rpm_min = self.spindle_rpm_min.max(0.0);
+    // The spindle delays ($392/$393) legitimately allow 0 (no delay); clamp only the sub-zero / NaN case so a
+    // corrupt record can never park a negative dwell. `non_negative_or` repairs a NaN to the default.
+    self.spindle_on_delay_s = non_negative_or(self.spindle_on_delay_s, defaults.spindle_on_delay_s);
+    self.spindle_reverse_dwell_s = non_negative_or(self.spindle_reverse_dwell_s, defaults.spindle_reverse_dwell_s);
     // `$481` auto-report: keep `0` (disabled) as-is, but pull any non-zero value into the documented range so a
     // corrupt/legacy record can never ask the report task for a starving cadence or an out-of-range one.
     self.auto_report_interval_ms = clamp_auto_report_interval(self.auto_report_interval_ms);
@@ -506,6 +533,10 @@ impl Settings {
     self.tmc_send_delay = self.tmc_send_delay.min(15);
     self.tmc_ihold_delay = self.tmc_ihold_delay.min(15);
     self.tmc_r_sense_ohms = positive_or(self.tmc_r_sense_ohms, defaults.tmc_r_sense_ohms);
+    // `$376` rotary mask: only bit 3 (A) is meaningful on this machine — X/Y/Z are never rotary — so mask to the
+    // single legal bit. A present 0 (A treated as a 4th linear axis) is HONORED; the fresh default of 8 lives in
+    // `Settings::default()`, not a zero-fill here, so an old 3-axis record loads A linear until `$376=8` (DOC-10.7).
+    self.rotary_mask &= DEFAULT_ROTARY_MASK;
     self
   }
 }
@@ -660,6 +691,8 @@ enum Field {
   HomingPulloffMm,
   SpindleRpmMax,
   SpindleRpmMin,
+  SpindleOnDelayS,
+  SpindleReverseDwellS,
   AutoReportIntervalMs,
   StepsPerMm,
   MaxRateMmMin,
@@ -667,10 +700,12 @@ enum Field {
   MaxTravelMm,
   RunCurrentMa,
   Microsteps,
+  /// `$376` rotary-axes bitmask (DOC-10.7). A single scalar value (`axis_span == 1`), not a per-axis field.
+  RotaryMask,
 }
 
 impl Field {
-  /// How many consecutive `$n` numbers this field owns: 3 for a per-axis triple, 1 for a scalar. Drives the
+  /// How many consecutive `$n` numbers this field owns: `AXES` for a per-axis field, 1 for a scalar. Drives the
   /// [`SETTING_NUMBERS`] expansion in a `const fn`, so it must itself be `const`.
   const fn axis_span(self) -> usize {
     match self {
@@ -705,6 +740,8 @@ impl Field {
       Field::HomingPulloffMm => settings.homing_pulloff_mm = parse_f32_non_negative(value)?,
       Field::SpindleRpmMax => settings.spindle_rpm_max = parse_f32_positive(value)?,
       Field::SpindleRpmMin => settings.spindle_rpm_min = parse_f32_non_negative(value)?,
+      Field::SpindleOnDelayS => settings.spindle_on_delay_s = parse_f32_non_negative(value)?,
+      Field::SpindleReverseDwellS => settings.spindle_reverse_dwell_s = parse_f32_non_negative(value)?,
       Field::AutoReportIntervalMs => settings.auto_report_interval_ms = parse_auto_report_interval(value)?,
       Field::StepsPerMm => settings.steps_per_mm[axis] = parse_f32_positive(value)?,
       Field::MaxRateMmMin => settings.max_rate_mm_min[axis] = parse_f32_positive(value)?,
@@ -712,6 +749,8 @@ impl Field {
       Field::MaxTravelMm => settings.max_travel_mm[axis] = parse_f32_positive(value)?,
       Field::RunCurrentMa => settings.run_current_ma[axis] = parse_current_ma(value)?,
       Field::Microsteps => settings.microsteps[axis] = parse_microsteps(value)?,
+      // `$376` rotary mask: parse as a u8 bitmask; `sanitized` masks it to the single legal bit (A).
+      Field::RotaryMask => settings.rotary_mask = parse_u8(value)?,
     }
     Ok(())
   }
@@ -742,6 +781,8 @@ impl Field {
       Field::HomingPulloffMm => write!(out, "${}={:.3}", n, settings.homing_pulloff_mm),
       Field::SpindleRpmMax => write!(out, "${}={:.3}", n, settings.spindle_rpm_max),
       Field::SpindleRpmMin => write!(out, "${}={:.3}", n, settings.spindle_rpm_min),
+      Field::SpindleOnDelayS => write!(out, "${}={:.3}", n, settings.spindle_on_delay_s),
+      Field::SpindleReverseDwellS => write!(out, "${}={:.3}", n, settings.spindle_reverse_dwell_s),
       Field::AutoReportIntervalMs => write!(out, "${}={}", n, settings.auto_report_interval_ms),
       Field::StepsPerMm => write!(out, "${}={:.3}", n, settings.steps_per_mm[axis]),
       Field::MaxRateMmMin => write!(out, "${}={:.3}", n, settings.max_rate_mm_min[axis]),
@@ -749,6 +790,7 @@ impl Field {
       Field::MaxTravelMm => write!(out, "${}={:.3}", n, settings.max_travel_mm[axis]),
       Field::RunCurrentMa => write!(out, "${}={}", n, settings.run_current_ma[axis]),
       Field::Microsteps => write!(out, "${}={}", n, settings.microsteps[axis]),
+      Field::RotaryMask => write!(out, "${}={}", n, settings.rotary_mask),
     };
     result.is_ok()
   }
@@ -1129,6 +1171,32 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
     },
   },
   SettingDescriptor {
+    number: 392,
+    field: Field::SpindleOnDelayS,
+    meta: SettingMeta {
+      group: GROUP_SPINDLE,
+      name: "Spindle on delay",
+      unit: "seconds",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
+    number: 393,
+    field: Field::SpindleReverseDwellS,
+    meta: SettingMeta {
+      group: GROUP_SPINDLE,
+      name: "Spindle reverse dwell",
+      unit: "seconds",
+      datatype: SettingDatatype::Float,
+      format: "#0.000",
+      min: "0",
+      max: "",
+    },
+  },
+  SettingDescriptor {
     number: 481,
     field: Field::AutoReportIntervalMs,
     meta: SettingMeta {
@@ -1217,6 +1285,21 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
       format: "",
       min: "1",
       max: "256",
+    },
+  },
+  SettingDescriptor {
+    number: 376,
+    field: Field::RotaryMask,
+    meta: SettingMeta {
+      group: GROUP_STEPPER,
+      name: "Rotary axes",
+      unit: "",
+      datatype: SettingDatatype::AxisMask,
+      // A single scalar bitmask (axis_span == 1). Only bit 3 (A) is meaningful on this machine, so max is 8;
+      // `sanitized` masks any write down to that bit (DOC-10.7).
+      format: "",
+      min: "0",
+      max: "8",
     },
   },
 ];
@@ -1425,7 +1508,7 @@ impl PbReceiver {
 /// cleanly (and the loader falls back to defaults) rather than feeding garbage into the planner.
 pub mod wire {
   use super::Settings;
-  use crate::planner::AXES;
+  use crate::planner::{A_AXIS, AXES};
   use crate::storage_frame::{self, FRAME_OVERHEAD};
 
   // The shared framing primitives are re-exported so the public `settings::wire` surface (the `CodecError` /
@@ -1498,6 +1581,8 @@ pub mod wire {
       proto.homing_pulloff_mm = self.homing_pulloff_mm;
       proto.spindle_rpm_max = self.spindle_rpm_max;
       proto.spindle_rpm_min = self.spindle_rpm_min;
+      proto.spindle_on_delay_s = self.spindle_on_delay_s;
+      proto.spindle_reverse_dwell_s = self.spindle_reverse_dwell_s;
       proto.auto_report_interval_ms = self.auto_report_interval_ms;
       proto.steps_per_mm_x = self.steps_per_mm[0];
       proto.steps_per_mm_y = self.steps_per_mm[1];
@@ -1520,6 +1605,15 @@ pub mod wire {
       proto.microsteps_x = self.microsteps[0] as u32;
       proto.microsteps_y = self.microsteps[1] as u32;
       proto.microsteps_z = self.microsteps[2] as u32;
+      // 4th axis A (index 3) + the $376 rotary mask (DOC-10.7).
+      proto.steps_per_mm_a = self.steps_per_mm[A_AXIS];
+      proto.max_rate_mm_min_a = self.max_rate_mm_min[A_AXIS];
+      proto.accel_mm_s2_a = self.accel_mm_s2[A_AXIS];
+      proto.max_travel_mm_a = self.max_travel_mm[A_AXIS];
+      proto.run_current_ma_a = self.run_current_ma[A_AXIS] as u32;
+      proto.hold_current_ma_a = self.hold_current_ma[A_AXIS] as u32;
+      proto.microsteps_a = self.microsteps[A_AXIS] as u32;
+      proto.rotary_mask = self.rotary_mask as u32;
       proto.tmc_ihold_delay = self.tmc_ihold_delay as u32;
       proto.tmc_tpowerdown = self.tmc_tpowerdown as u32;
       proto.tmc_tpwmthrs = self.tmc_tpwmthrs;
@@ -1537,7 +1631,7 @@ pub mod wire {
     /// value) — it saturates to `u16::MAX`, then the [`sanitized`](Settings::sanitized) pass maps the
     /// out-of-range microstep count to the default and clamps the over-range currents/masks uniformly.
     pub(crate) fn from_proto(proto: &galdr_proto::Settings) -> Settings {
-      let _ = AXES; // The X/Y/Z triples below assume AXES == 3, asserted once at compile time below.
+      let _ = AXES; // The X/Y/Z/A quads below assume AXES == 4, asserted once at compile time below.
       Settings {
         step_pulse_us: proto.step_pulse_us,
         step_idle_delay_ms: proto.step_idle_delay_ms,
@@ -1559,31 +1653,44 @@ pub mod wire {
         homing_pulloff_mm: proto.homing_pulloff_mm,
         spindle_rpm_max: proto.spindle_rpm_max,
         spindle_rpm_min: proto.spindle_rpm_min,
+        spindle_on_delay_s: proto.spindle_on_delay_s,
+        spindle_reverse_dwell_s: proto.spindle_reverse_dwell_s,
         auto_report_interval_ms: proto.auto_report_interval_ms,
-        steps_per_mm: [proto.steps_per_mm_x, proto.steps_per_mm_y, proto.steps_per_mm_z],
-        max_rate_mm_min: [proto.max_rate_mm_min_x, proto.max_rate_mm_min_y, proto.max_rate_mm_min_z],
-        accel_mm_s2: [proto.accel_mm_s2_x, proto.accel_mm_s2_y, proto.accel_mm_s2_z],
-        max_travel_mm: [proto.max_travel_mm_x, proto.max_travel_mm_y, proto.max_travel_mm_z],
+        steps_per_mm: [proto.steps_per_mm_x, proto.steps_per_mm_y, proto.steps_per_mm_z, proto.steps_per_mm_a],
+        max_rate_mm_min: [
+          proto.max_rate_mm_min_x,
+          proto.max_rate_mm_min_y,
+          proto.max_rate_mm_min_z,
+          proto.max_rate_mm_min_a,
+        ],
+        accel_mm_s2: [proto.accel_mm_s2_x, proto.accel_mm_s2_y, proto.accel_mm_s2_z, proto.accel_mm_s2_a],
+        max_travel_mm: [proto.max_travel_mm_x, proto.max_travel_mm_y, proto.max_travel_mm_z, proto.max_travel_mm_a],
         run_current_ma: [
           saturating_u16(proto.run_current_ma_x),
           saturating_u16(proto.run_current_ma_y),
           saturating_u16(proto.run_current_ma_z),
+          saturating_u16(proto.run_current_ma_a),
         ],
         microsteps: [
           saturating_u16(proto.microsteps_x),
           saturating_u16(proto.microsteps_y),
           saturating_u16(proto.microsteps_z),
+          saturating_u16(proto.microsteps_a),
         ],
         hold_current_ma: [
           saturating_u16(proto.hold_current_ma_x),
           saturating_u16(proto.hold_current_ma_y),
           saturating_u16(proto.hold_current_ma_z),
+          saturating_u16(proto.hold_current_ma_a),
         ],
         tmc_ihold_delay: saturating_u8(proto.tmc_ihold_delay),
         tmc_tpowerdown: saturating_u8(proto.tmc_tpowerdown),
         tmc_tpwmthrs: proto.tmc_tpwmthrs,
         tmc_send_delay: saturating_u8(proto.tmc_send_delay),
         tmc_r_sense_ohms: proto.tmc_r_sense_ohms,
+        // `$376` rotary mask: read verbatim (a present 0 is honored), then `sanitize` masks to valid bits and
+        // fills the fresh default only when the whole record is default — NOT a zero-fill (DOC-10.7).
+        rotary_mask: saturating_u8(proto.rotary_mask),
       }
     }
   }
@@ -1601,8 +1708,8 @@ pub mod wire {
     value.min(u8::MAX as u32) as u8
   }
 
-  // The X/Y/Z triple conversions assume exactly three axes; fail the build loudly if that ever changes.
-  const _: () = assert!(AXES == 3, "settings wire conversions assume AXES == 3");
+  // The X/Y/Z/A quad conversions assume exactly four axes; fail the build loudly if that ever changes.
+  const _: () = assert!(AXES == 4, "settings wire conversions assume AXES == 4");
 }
 
 #[cfg(test)]
@@ -1765,7 +1872,7 @@ mod tests {
     settings.homing_dir_invert_mask = 0b010;
     settings.homing_flags = HOMING_FLAG_ENABLE | HOMING_FLAG_FORCE_SET_ORIGIN;
     let cfg = settings.homing_config(1_000_000.0);
-    assert_eq!(cfg.direction, [HomeDirection::Positive, HomeDirection::Negative, HomeDirection::Positive]);
+    assert_eq!(cfg.direction, [HomeDirection::Positive, HomeDirection::Negative, HomeDirection::Positive, HomeDirection::Positive]);
     assert!(cfg.force_set_origin);
   }
 
@@ -1836,6 +1943,31 @@ mod tests {
     settings.set_command(110, "1.0").expect("set $110");
     settings.set_command(130, "0.5").expect("set $130");
     assert_eq!(settings, settings.sanitized());
+  }
+
+  #[test]
+  fn rotary_mask_376_default_and_sanitize_to_bit3() {
+    // A fresh record defaults to $376 = 8 (A rotary, DOC-10.7) — NOT a zero-fill.
+    assert_eq!(Settings::default().rotary_mask, DEFAULT_ROTARY_MASK);
+    // sanitize keeps only the single legal bit (A); X/Y/Z can never be rotary on this machine.
+    let mut spurious = Settings::default();
+    spurious.rotary_mask = 0b1011; // X + Y + A bits set
+    assert_eq!(spurious.sanitized().rotary_mask, 0b1000, "only bit 3 (A) survives");
+    // A deliberate $376 = 0 (A treated as a 4th linear axis) is HONORED, not forced back to 8.
+    let mut linear_a = Settings::default();
+    linear_a.rotary_mask = 0;
+    assert_eq!(linear_a.sanitized().rotary_mask, 0, "$376=0 round-trips (not zero-filled)");
+  }
+
+  #[test]
+  fn rotary_mask_376_round_trips_through_proto() {
+    // The $376 mask and the A-axis per-axis quads survive a to_proto/from_proto round-trip (DOC-10.7).
+    let mut settings = Settings::default();
+    settings.rotary_mask = DEFAULT_ROTARY_MASK;
+    settings.steps_per_mm[crate::planner::A_AXIS] = 8.889;
+    let restored = Settings::from_proto(&settings.to_proto());
+    assert_eq!(restored.rotary_mask, DEFAULT_ROTARY_MASK);
+    assert!((restored.steps_per_mm[crate::planner::A_AXIS] - 8.889).abs() < 1e-4, "A steps/deg round-trips");
   }
 
   #[test]
@@ -1920,8 +2052,8 @@ mod tests {
     // The three derived operations must agree: every SETTING_NUMBERS entry has exactly one descriptor, dumps a
     // line, and accepts that rendered value back — proving the single descriptor authority cannot drift.
     let mut settings = Settings::default();
-    settings.steps_per_mm = [320.5, 321.5, 800.0];
-    settings.max_rate_mm_min = [1_000.0, 1_001.0, 500.0];
+    settings.steps_per_mm = [320.5, 321.5, 800.0, 8.889];
+    settings.max_rate_mm_min = [1_000.0, 1_001.0, 500.0, 3600.0];
     for &n in SETTING_NUMBERS {
       assert!(lookup_descriptor(n).is_some(), "$n={n} has no descriptor");
       let mut line: heapless::String<32> = heapless::String::new();
@@ -1938,10 +2070,10 @@ mod tests {
   #[test]
   fn wire_frame_round_trips() {
     let mut settings = Settings::default();
-    settings.steps_per_mm = [250.0, 251.0, 800.0];
+    settings.steps_per_mm = [250.0, 251.0, 800.0, 8.889];
     settings.homing_flags = 1;
-    settings.run_current_ma = [900, 900, 1100];
-    settings.microsteps = [16, 16, 32];
+    settings.run_current_ma = [900, 900, 1100, 800];
+    settings.microsteps = [16, 16, 32, 16];
     let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
     wire::encode(&settings, &mut frame).expect("encode");
     let decoded = wire::decode(&frame).expect("decode");
@@ -2079,8 +2211,8 @@ mod tests {
   fn pb_receiver_reassembles_chunked_frame() {
     // Encode a settings frame, hex it, then feed it to the receiver in small chunks; the last chunk completes.
     let mut settings = Settings::default();
-    settings.steps_per_mm = [400.0, 400.0, 1000.0];
-    settings.run_current_ma = [1100, 1100, 1300];
+    settings.steps_per_mm = [400.0, 400.0, 1000.0, 8.889];
+    settings.run_current_ma = [1100, 1100, 1300, 800];
     let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
     wire::encode(&settings, &mut frame).expect("encode");
     let mut hex: heapless::String<{ wire::FRAME_MAX_LEN * 2 }> = heapless::String::new();
@@ -2118,6 +2250,48 @@ mod tests {
     let mut hex: heapless::String<{ wire::FRAME_MAX_LEN * 2 }> = heapless::String::new();
     assert!(write_hex(&frame, &mut hex));
     assert_eq!(receiver.accept_hex(&hex), PbChunkResult::Error);
+  }
+
+  // --- DOC-07: $392 spindle on delay + $393 spindle reverse dwell ----------------------------------
+
+  #[test]
+  fn spindle_delay_settings_default_apply_and_round_trip() {
+    let settings = Settings::default();
+    // grbl-aligned defaults: no spin-up delay, a conservative 1.5 s reverse spin-down dwell.
+    assert_eq!(settings.spindle_on_delay_s, 0.0);
+    assert_eq!(settings.spindle_reverse_dwell_s, 1.5);
+
+    let mut settings = settings;
+    settings.set_command(392, "0.25").expect("set $392=0.25");
+    settings.set_command(393, "2.000").expect("set $393=2.0");
+    assert_eq!(settings.spindle_on_delay_s, 0.25);
+    assert_eq!(settings.spindle_reverse_dwell_s, 2.0);
+    // Zero is a legitimate value for both (no delay), so it must be accepted, not rejected as out-of-range.
+    settings.set_command(392, "0").expect("$392=0 accepted (no spin-up delay)");
+    assert_eq!(settings.spindle_on_delay_s, 0.0);
+    // A negative value is out of range and must be rejected, leaving the prior value untouched.
+    assert_eq!(settings.set_command(393, "-1"), Err(SettingError::OutOfRange));
+    assert_eq!(settings.spindle_reverse_dwell_s, 2.0);
+
+    // The pair survives the protobuf/flash wire frame round-trip unchanged.
+    let mut frame: heapless::Vec<u8, { wire::FRAME_MAX_LEN }> = heapless::Vec::new();
+    wire::encode(&settings, &mut frame).expect("encode");
+    let decoded = wire::decode(&frame).expect("decode");
+    assert_eq!(decoded.spindle_on_delay_s, settings.spindle_on_delay_s);
+    assert_eq!(decoded.spindle_reverse_dwell_s, settings.spindle_reverse_dwell_s);
+  }
+
+  #[test]
+  fn spindle_delay_dump_lines_render_with_three_decimals() {
+    let mut settings = Settings::default();
+    settings.spindle_on_delay_s = 0.5;
+    settings.spindle_reverse_dwell_s = 1.5;
+    let mut on: heapless::String<32> = heapless::String::new();
+    assert!(settings.write_setting_line(392, &mut on));
+    assert_eq!(on.as_str(), "$392=0.500");
+    let mut rev: heapless::String<32> = heapless::String::new();
+    assert!(settings.write_setting_line(393, &mut rev));
+    assert_eq!(rev.as_str(), "$393=1.500");
   }
 
   // --- Phase F: $481 auto-report setting + $ES/$EG/$SED enumeration ---------------------------------

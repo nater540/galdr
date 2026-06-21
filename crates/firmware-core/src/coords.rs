@@ -340,6 +340,7 @@ pub async fn store_coordinates<S: RecordStore>(
 /// the planner.
 pub mod wire {
   use super::{CoordinatePersistent, AXES, PREDEFINED_COUNT, WCS_COUNT};
+  use crate::planner::A_AXIS;
   use crate::storage_frame::{self, FRAME_OVERHEAD};
 
   // Re-export the shared codec error so the public `coords::wire::CodecError` surface (named by `PbReceiver`'s
@@ -384,15 +385,15 @@ pub mod wire {
     let mut proto = galdr_proto::Coordinates::default();
     proto.active_wcs = persistent.active as u32;
     let o = &persistent.offsets;
-    proto.g54_x = o[0][0]; proto.g54_y = o[0][1]; proto.g54_z = o[0][2];
-    proto.g55_x = o[1][0]; proto.g55_y = o[1][1]; proto.g55_z = o[1][2];
-    proto.g56_x = o[2][0]; proto.g56_y = o[2][1]; proto.g56_z = o[2][2];
-    proto.g57_x = o[3][0]; proto.g57_y = o[3][1]; proto.g57_z = o[3][2];
-    proto.g58_x = o[4][0]; proto.g58_y = o[4][1]; proto.g58_z = o[4][2];
-    proto.g59_x = o[5][0]; proto.g59_y = o[5][1]; proto.g59_z = o[5][2];
+    proto.g54_x = o[0][0]; proto.g54_y = o[0][1]; proto.g54_z = o[0][2]; proto.g54_a = o[0][A_AXIS];
+    proto.g55_x = o[1][0]; proto.g55_y = o[1][1]; proto.g55_z = o[1][2]; proto.g55_a = o[1][A_AXIS];
+    proto.g56_x = o[2][0]; proto.g56_y = o[2][1]; proto.g56_z = o[2][2]; proto.g56_a = o[2][A_AXIS];
+    proto.g57_x = o[3][0]; proto.g57_y = o[3][1]; proto.g57_z = o[3][2]; proto.g57_a = o[3][A_AXIS];
+    proto.g58_x = o[4][0]; proto.g58_y = o[4][1]; proto.g58_z = o[4][2]; proto.g58_a = o[4][A_AXIS];
+    proto.g59_x = o[5][0]; proto.g59_y = o[5][1]; proto.g59_z = o[5][2]; proto.g59_a = o[5][A_AXIS];
     let p = &persistent.predefined;
-    proto.g28_x = p[0][0]; proto.g28_y = p[0][1]; proto.g28_z = p[0][2];
-    proto.g30_x = p[1][0]; proto.g30_y = p[1][1]; proto.g30_z = p[1][2];
+    proto.g28_x = p[0][0]; proto.g28_y = p[0][1]; proto.g28_z = p[0][2]; proto.g28_a = p[0][A_AXIS];
+    proto.g30_x = p[1][0]; proto.g30_y = p[1][1]; proto.g30_z = p[1][2]; proto.g30_a = p[1][A_AXIS];
     proto
   }
 
@@ -402,23 +403,23 @@ pub mod wire {
     let active = if (proto.active_wcs as usize) < WCS_COUNT { proto.active_wcs as usize } else { 0 };
     CoordinatePersistent {
       offsets: [
-        [proto.g54_x, proto.g54_y, proto.g54_z],
-        [proto.g55_x, proto.g55_y, proto.g55_z],
-        [proto.g56_x, proto.g56_y, proto.g56_z],
-        [proto.g57_x, proto.g57_y, proto.g57_z],
-        [proto.g58_x, proto.g58_y, proto.g58_z],
-        [proto.g59_x, proto.g59_y, proto.g59_z],
+        [proto.g54_x, proto.g54_y, proto.g54_z, proto.g54_a],
+        [proto.g55_x, proto.g55_y, proto.g55_z, proto.g55_a],
+        [proto.g56_x, proto.g56_y, proto.g56_z, proto.g56_a],
+        [proto.g57_x, proto.g57_y, proto.g57_z, proto.g57_a],
+        [proto.g58_x, proto.g58_y, proto.g58_z, proto.g58_a],
+        [proto.g59_x, proto.g59_y, proto.g59_z, proto.g59_a],
       ],
       active,
       predefined: [
-        [proto.g28_x, proto.g28_y, proto.g28_z],
-        [proto.g30_x, proto.g30_y, proto.g30_z],
+        [proto.g28_x, proto.g28_y, proto.g28_z, proto.g28_a],
+        [proto.g30_x, proto.g30_y, proto.g30_z, proto.g30_a],
       ],
     }
   }
 
-  // The X/Y/Z triple conversions assume exactly three axes; fail the build loudly if that ever changes.
-  const _: () = assert!(AXES == 3, "coordinate wire conversions assume AXES == 3");
+  // The X/Y/Z/A quad conversions assume exactly four axes; fail the build loudly if that ever changes.
+  const _: () = assert!(AXES == 4, "coordinate wire conversions assume AXES == 4");
   // The G54-G59 / G28-G30 field maps above assume the canonical counts; fail loudly if they change.
   const _: () = assert!(WCS_COUNT == 6, "coordinate wire conversions assume 6 work coordinate systems");
   const _: () = assert!(PREDEFINED_COUNT == 2, "coordinate wire conversions assume 2 predefined positions");
@@ -442,28 +443,28 @@ mod tests {
   fn default_wco_is_zero_and_g54_active() {
     let cs = CoordinateSystems::new();
     assert_eq!(cs.active_wcs(), 0);
-    approx(cs.wco(), [0.0, 0.0, 0.0]);
+    approx(cs.wco(), [0.0, 0.0, 0.0, 0.0]);
   }
 
   #[test]
   fn wco_sums_active_wcs_g92_and_tlo() {
     let mut cs = CoordinateSystems::new();
     // G54 = (10, 20, 5); G92 = (1, 2, 3); TLO = 0.5 (Z only).
-    cs.set_wcs_offset(0, [10.0, 20.0, 5.0], ALL);
-    cs.g92 = [1.0, 2.0, 3.0];
+    cs.set_wcs_offset(0, [10.0, 20.0, 5.0, 0.0], ALL);
+    cs.g92 = [1.0, 2.0, 3.0, 0.0];
     cs.tlo = 0.5;
     // X = 10 + 1 = 11; Y = 20 + 2 = 22; Z = 5 + 3 + 0.5 = 8.5 (TLO folds into Z only).
-    approx(cs.wco(), [11.0, 22.0, 8.5]);
+    approx(cs.wco(), [11.0, 22.0, 8.5, 0.0]);
   }
 
   #[test]
   fn active_wcs_selects_which_offset_contributes() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [1.0, 0.0, 0.0], ALL); // G54
-    cs.set_wcs_offset(2, [9.0, 0.0, 0.0], ALL); // G56
+    cs.set_wcs_offset(0, [1.0, 0.0, 0.0, 0.0], ALL); // G54
+    cs.set_wcs_offset(2, [9.0, 0.0, 0.0, 0.0], ALL); // G56
     cs.select_wcs(2);
     assert_eq!(cs.active_wcs(), 2);
-    approx(cs.wco(), [9.0, 0.0, 0.0]);
+    approx(cs.wco(), [9.0, 0.0, 0.0, 0.0]);
   }
 
   #[test]
@@ -478,18 +479,18 @@ mod tests {
   #[test]
   fn work_to_machine_adds_wco() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [10.0, 20.0, 5.0], ALL);
-    approx(cs.work_to_machine([0.0, 0.0, 0.0]), [10.0, 20.0, 5.0]);
-    approx(cs.work_to_machine([1.0, 1.0, 1.0]), [11.0, 21.0, 6.0]);
+    cs.set_wcs_offset(0, [10.0, 20.0, 5.0, 0.0], ALL);
+    approx(cs.work_to_machine([0.0, 0.0, 0.0, 0.0]), [10.0, 20.0, 5.0, 0.0]);
+    approx(cs.work_to_machine([1.0, 1.0, 1.0, 0.0]), [11.0, 21.0, 6.0, 0.0]);
   }
 
   #[test]
   fn machine_to_work_subtracts_wco_and_round_trips() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [10.0, 20.0, 5.0], ALL);
-    cs.g92 = [1.0, 2.0, 3.0];
+    cs.set_wcs_offset(0, [10.0, 20.0, 5.0, 0.0], ALL);
+    cs.g92 = [1.0, 2.0, 3.0, 0.0];
     cs.tlo = 0.25;
-    let work = [3.0, -4.0, 7.0];
+    let work = [3.0, -4.0, 7.0, 0.0];
     let machine = cs.work_to_machine(work);
     approx(cs.machine_to_work(machine), work);
   }
@@ -499,29 +500,29 @@ mod tests {
   #[test]
   fn g10_l2_sets_offset_literally_per_present_axis() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [5.0, 5.0, 5.0], ALL);
+    cs.set_wcs_offset(0, [5.0, 5.0, 5.0, 0.0], ALL);
     // Only X present: X overwritten to 12, Y/Z keep 5.
-    cs.set_wcs_offset(0, [12.0, 0.0, 0.0], [true, false, false]);
-    approx(cs.wcs_offset(0).unwrap(), [12.0, 5.0, 5.0]);
+    cs.set_wcs_offset(0, [12.0, 0.0, 0.0, 0.0], [true, false, false, false]);
+    approx(cs.wcs_offset(0).unwrap(), [12.0, 5.0, 5.0, 0.0]);
   }
 
   #[test]
   fn g10_l20_sets_offset_so_position_reads_work_value() {
     let mut cs = CoordinateSystems::new();
     // Machine is at (100, 50, 10); declare the work position there to be (0, 0, 0).
-    cs.set_wcs_offset_to_position(0, [100.0, 50.0, 10.0], [0.0, 0.0, 0.0], ALL);
-    approx(cs.wcs_offset(0).unwrap(), [100.0, 50.0, 10.0]);
+    cs.set_wcs_offset_to_position(0, [100.0, 50.0, 10.0, 0.0], [0.0, 0.0, 0.0, 0.0], ALL);
+    approx(cs.wcs_offset(0).unwrap(), [100.0, 50.0, 10.0, 0.0]);
     // Now machine (100,50,10) must map to work (0,0,0).
-    approx(cs.machine_to_work([100.0, 50.0, 10.0]), [0.0, 0.0, 0.0]);
+    approx(cs.machine_to_work([100.0, 50.0, 10.0, 0.0]), [0.0, 0.0, 0.0, 0.0]);
   }
 
   #[test]
   fn g10_l20_with_nonzero_work_target() {
     let mut cs = CoordinateSystems::new();
     // At machine X=100 declare work X=10 → offset = 100 − 10 = 90.
-    cs.set_wcs_offset_to_position(0, [100.0, 0.0, 0.0], [10.0, 0.0, 0.0], [true, false, false]);
+    cs.set_wcs_offset_to_position(0, [100.0, 0.0, 0.0, 0.0], [10.0, 0.0, 0.0, 0.0], [true, false, false, false]);
     assert!((cs.wcs_offset(0).unwrap()[0] - 90.0).abs() < 1e-4);
-    approx(cs.machine_to_work([100.0, 0.0, 0.0]), [10.0, 0.0, 0.0]);
+    approx(cs.machine_to_work([100.0, 0.0, 0.0, 0.0]), [10.0, 0.0, 0.0, 0.0]);
   }
 
   #[test]
@@ -530,9 +531,9 @@ mod tests {
     // With a live G92 (here g92_x = 15), `G10 L20` must still make the current machine position read the work
     // target: the WCS offset has to be machine − work − g92 so `machine_to_work` (which re-adds G92 via the WCO)
     // lands exactly on the target. The naive `machine − work` would yield −15 here (G92 double-counted).
-    cs.g92 = [15.0, 0.0, 0.0];
-    cs.set_wcs_offset_to_position(0, [100.0, 0.0, 0.0], [0.0, 0.0, 0.0], [true, false, false]);
-    approx(cs.machine_to_work([100.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
+    cs.g92 = [15.0, 0.0, 0.0, 0.0];
+    cs.set_wcs_offset_to_position(0, [100.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [true, false, false, false]);
+    approx(cs.machine_to_work([100.0, 0.0, 0.0, 0.0]), [0.0, 0.0, 0.0, 0.0]);
   }
 
   #[test]
@@ -541,17 +542,17 @@ mod tests {
     // A live dynamic TLO folds into the Z component of the WCO, so `G10 L20 Z<target>` must subtract it too on the
     // TLO axis (Z) — otherwise `machine_to_work` double-counts the TLO and the probed point misses its target.
     cs.tlo = -3.0;
-    cs.set_wcs_offset_to_position(0, [0.0, 0.0, 10.0], [0.0, 0.0, 2.0], [false, false, true]);
-    approx(cs.machine_to_work([0.0, 0.0, 10.0]), [0.0, 0.0, 2.0]);
+    cs.set_wcs_offset_to_position(0, [0.0, 0.0, 10.0, 0.0], [0.0, 0.0, 2.0, 0.0], [false, false, true, false]);
+    approx(cs.machine_to_work([0.0, 0.0, 10.0, 0.0]), [0.0, 0.0, 2.0, 0.0]);
   }
 
   #[test]
   fn g10_l20_with_no_g92_or_tlo_is_plain_difference() {
     let mut cs = CoordinateSystems::new();
     // With neither G92 nor TLO active the corrected formula reduces to the original `machine − work`.
-    cs.set_wcs_offset_to_position(0, [100.0, 50.0, 10.0], [0.0, 0.0, 0.0], ALL);
-    approx(cs.wcs_offset(0).unwrap(), [100.0, 50.0, 10.0]);
-    approx(cs.machine_to_work([100.0, 50.0, 10.0]), [0.0, 0.0, 0.0]);
+    cs.set_wcs_offset_to_position(0, [100.0, 50.0, 10.0, 0.0], [0.0, 0.0, 0.0, 0.0], ALL);
+    approx(cs.wcs_offset(0).unwrap(), [100.0, 50.0, 10.0, 0.0]);
+    approx(cs.machine_to_work([100.0, 50.0, 10.0, 0.0]), [0.0, 0.0, 0.0, 0.0]);
   }
 
   // ---- G92 set / clear --------------------------------------------------------------------------
@@ -559,10 +560,10 @@ mod tests {
   #[test]
   fn g92_makes_current_machine_read_commanded_work() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [10.0, 0.0, 0.0], ALL); // G54 X = 10.
+    cs.set_wcs_offset(0, [10.0, 0.0, 0.0, 0.0], ALL); // G54 X = 10.
     // At machine X = 25 declare work X = 0. The WCO must then map machine 25 → work 0.
-    cs.set_g92_to_position([25.0, 0.0, 0.0], [0.0, 0.0, 0.0], [true, false, false]);
-    approx(cs.machine_to_work([25.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
+    cs.set_g92_to_position([25.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [true, false, false, false]);
+    approx(cs.machine_to_work([25.0, 0.0, 0.0, 0.0]), [0.0, 0.0, 0.0, 0.0]);
     // G92 is the extra offset on top of G54: g92_x = 25 − 10 − 0 = 15.
     assert!((cs.g92_offset()[0] - 15.0).abs() < 1e-4);
   }
@@ -570,10 +571,10 @@ mod tests {
   #[test]
   fn g92_is_independent_of_active_wcs() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [10.0, 0.0, 0.0], ALL);
-    cs.set_wcs_offset(1, [40.0, 0.0, 0.0], ALL);
+    cs.set_wcs_offset(0, [10.0, 0.0, 0.0, 0.0], ALL);
+    cs.set_wcs_offset(1, [40.0, 0.0, 0.0, 0.0], ALL);
     // Set G92 while G54 active so machine 25 reads work 0.
-    cs.set_g92_to_position([25.0, 0.0, 0.0], [0.0, 0.0, 0.0], [true, false, false]);
+    cs.set_g92_to_position([25.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [true, false, false, false]);
     let g92 = cs.g92_offset();
     // Switching to G55 keeps the same G92 value (it is not folded into the WCS).
     cs.select_wcs(1);
@@ -583,9 +584,9 @@ mod tests {
   #[test]
   fn clear_g92_resets_to_identity() {
     let mut cs = CoordinateSystems::new();
-    cs.g92 = [1.0, 2.0, 3.0];
+    cs.g92 = [1.0, 2.0, 3.0, 0.0];
     cs.clear_g92();
-    approx(cs.g92_offset(), [0.0, 0.0, 0.0]);
+    approx(cs.g92_offset(), [0.0, 0.0, 0.0, 0.0]);
   }
 
   // ---- G28.1 store + recall, G30 -----------------------------------------------------------------
@@ -593,23 +594,23 @@ mod tests {
   #[test]
   fn store_and_recall_g28_in_machine_coords() {
     let mut cs = CoordinateSystems::new();
-    cs.store_predefined(0, [12.0, 34.0, 56.0]);
-    approx(cs.predefined(0).unwrap(), [12.0, 34.0, 56.0]);
+    cs.store_predefined(0, [12.0, 34.0, 56.0, 0.0]);
+    approx(cs.predefined(0).unwrap(), [12.0, 34.0, 56.0, 0.0]);
   }
 
   #[test]
   fn store_g30_independent_of_g28() {
     let mut cs = CoordinateSystems::new();
-    cs.store_predefined(0, [1.0, 1.0, 1.0]);
-    cs.store_predefined(1, [9.0, 9.0, 9.0]);
-    approx(cs.predefined(0).unwrap(), [1.0, 1.0, 1.0]);
-    approx(cs.predefined(1).unwrap(), [9.0, 9.0, 9.0]);
+    cs.store_predefined(0, [1.0, 1.0, 1.0, 0.0]);
+    cs.store_predefined(1, [9.0, 9.0, 9.0, 0.0]);
+    approx(cs.predefined(0).unwrap(), [1.0, 1.0, 1.0, 0.0]);
+    approx(cs.predefined(1).unwrap(), [9.0, 9.0, 9.0, 0.0]);
   }
 
   #[test]
   fn store_predefined_out_of_range_is_ignored() {
     let mut cs = CoordinateSystems::new();
-    cs.store_predefined(9, [1.0, 2.0, 3.0]);
+    cs.store_predefined(9, [1.0, 2.0, 3.0, 0.0]);
     assert_eq!(cs.predefined(9), None);
   }
 
@@ -621,7 +622,7 @@ mod tests {
     cs.apply_tlo(-14.442);
     assert!((cs.tlo() + 14.442).abs() < 1e-4);
     // TLO contributes only to Z.
-    approx(cs.wco(), [0.0, 0.0, -14.442]);
+    approx(cs.wco(), [0.0, 0.0, -14.442, 0.0]);
   }
 
   #[test]
@@ -630,7 +631,7 @@ mod tests {
     cs.apply_tlo(-3.0);
     cs.cancel_tlo();
     assert!(cs.tlo().abs() < 1e-6);
-    approx(cs.wco(), [0.0, 0.0, 0.0]);
+    approx(cs.wco(), [0.0, 0.0, 0.0, 0.0]);
   }
 
   // ---- finite-guards: a NaN/inf word never poisons the offset set -------------------------------
@@ -638,10 +639,10 @@ mod tests {
   #[test]
   fn non_finite_words_are_rejected_per_axis() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [5.0, 5.0, 5.0], ALL);
-    cs.set_wcs_offset(0, [f32::NAN, 7.0, f32::INFINITY], ALL);
+    cs.set_wcs_offset(0, [5.0, 5.0, 5.0, 0.0], ALL);
+    cs.set_wcs_offset(0, [f32::NAN, 7.0, f32::INFINITY, 0.0], ALL);
     // X (NaN) and Z (inf) rejected, only the finite Y written.
-    approx(cs.wcs_offset(0).unwrap(), [5.0, 7.0, 5.0]);
+    approx(cs.wcs_offset(0).unwrap(), [5.0, 7.0, 5.0, 0.0]);
     cs.apply_tlo(f32::NAN);
     assert!(cs.tlo().abs() < 1e-6);
   }
@@ -651,38 +652,38 @@ mod tests {
   #[test]
   fn clear_volatile_drops_g92_and_tlo_but_keeps_persistent() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [10.0, 0.0, 0.0], ALL);
-    cs.store_predefined(0, [1.0, 2.0, 3.0]);
-    cs.g92 = [7.0, 7.0, 7.0];
+    cs.set_wcs_offset(0, [10.0, 0.0, 0.0, 0.0], ALL);
+    cs.store_predefined(0, [1.0, 2.0, 3.0, 0.0]);
+    cs.g92 = [7.0, 7.0, 7.0, 0.0];
     cs.tlo = 4.0;
     cs.clear_volatile();
-    approx(cs.g92_offset(), [0.0, 0.0, 0.0]);
+    approx(cs.g92_offset(), [0.0, 0.0, 0.0, 0.0]);
     assert!(cs.tlo().abs() < 1e-6);
     // Persistent G54 + G28 survive.
-    approx(cs.wcs_offset(0).unwrap(), [10.0, 0.0, 0.0]);
-    approx(cs.predefined(0).unwrap(), [1.0, 2.0, 3.0]);
+    approx(cs.wcs_offset(0).unwrap(), [10.0, 0.0, 0.0, 0.0]);
+    approx(cs.predefined(0).unwrap(), [1.0, 2.0, 3.0, 0.0]);
   }
 
   #[test]
   fn persistent_round_trips_through_load() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(3, [1.0, 2.0, 3.0], ALL); // G57
-    cs.store_predefined(1, [4.0, 5.0, 6.0]); // G30
+    cs.set_wcs_offset(3, [1.0, 2.0, 3.0, 0.0], ALL); // G57
+    cs.store_predefined(1, [4.0, 5.0, 6.0, 0.0]); // G30
     cs.select_wcs(3);
     let persistent = cs.persistent();
     let mut restored = CoordinateSystems::new();
     restored.load_persistent(&persistent);
     assert_eq!(restored.active_wcs(), 3);
-    approx(restored.wcs_offset(3).unwrap(), [1.0, 2.0, 3.0]);
-    approx(restored.predefined(1).unwrap(), [4.0, 5.0, 6.0]);
+    approx(restored.wcs_offset(3).unwrap(), [1.0, 2.0, 3.0, 0.0]);
+    approx(restored.predefined(1).unwrap(), [4.0, 5.0, 6.0, 0.0]);
   }
 
   #[test]
   fn clear_all_resets_everything_to_default() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(2, [1.0, 1.0, 1.0], ALL);
-    cs.store_predefined(0, [2.0, 2.0, 2.0]);
-    cs.g92 = [3.0, 3.0, 3.0];
+    cs.set_wcs_offset(2, [1.0, 1.0, 1.0, 0.0], ALL);
+    cs.store_predefined(0, [2.0, 2.0, 2.0, 0.0]);
+    cs.g92 = [3.0, 3.0, 3.0, 0.0];
     cs.tlo = 4.0;
     cs.select_wcs(2);
     cs.clear_all();
@@ -736,13 +737,13 @@ mod tests {
   fn coordinate_data_persists_and_reloads_round_trip() {
     let mut store = MemStore::default();
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [10.0, 20.0, 5.0], ALL); // G54
-    cs.set_wcs_offset(5, [-1.5, 2.5, 3.0], ALL); // G59
-    cs.store_predefined(0, [100.0, 0.0, 50.0]); // G28
-    cs.store_predefined(1, [0.0, 100.0, 50.0]); // G30
+    cs.set_wcs_offset(0, [10.0, 20.0, 5.0, 0.0], ALL); // G54
+    cs.set_wcs_offset(5, [-1.5, 2.5, 3.0, 0.0], ALL); // G59
+    cs.store_predefined(0, [100.0, 0.0, 50.0, 0.0]); // G28
+    cs.store_predefined(1, [0.0, 100.0, 50.0, 0.0]); // G30
     cs.select_wcs(5);
     // Set volatile state that must NOT persist.
-    cs.g92 = [9.0, 9.0, 9.0];
+    cs.g92 = [9.0, 9.0, 9.0, 0.0];
     cs.tlo = 4.0;
 
     block_on(store_coordinates(&mut store, &cs.persistent())).expect("save");
@@ -752,12 +753,12 @@ mod tests {
     restored.load_persistent(&loaded);
     // Persistent data survives.
     assert_eq!(restored.active_wcs(), 5);
-    approx(restored.wcs_offset(0).unwrap(), [10.0, 20.0, 5.0]);
-    approx(restored.wcs_offset(5).unwrap(), [-1.5, 2.5, 3.0]);
-    approx(restored.predefined(0).unwrap(), [100.0, 0.0, 50.0]);
-    approx(restored.predefined(1).unwrap(), [0.0, 100.0, 50.0]);
+    approx(restored.wcs_offset(0).unwrap(), [10.0, 20.0, 5.0, 0.0]);
+    approx(restored.wcs_offset(5).unwrap(), [-1.5, 2.5, 3.0, 0.0]);
+    approx(restored.predefined(0).unwrap(), [100.0, 0.0, 50.0, 0.0]);
+    approx(restored.predefined(1).unwrap(), [0.0, 100.0, 50.0, 0.0]);
     // Volatile data did NOT persist (a fresh model has zero G92/TLO).
-    approx(restored.g92_offset(), [0.0, 0.0, 0.0]);
+    approx(restored.g92_offset(), [0.0, 0.0, 0.0, 0.0]);
     assert!(restored.tlo().abs() < 1e-6);
   }
 
@@ -793,15 +794,15 @@ mod tests {
     // `G10 L20 P1 Z<plate>` sets G54 so that the current machine position (the probe stop) reads work Z = plate.
     cs.set_wcs_offset_to_position(
       0,
-      [0.0, 0.0, probe_machine_z],
-      [0.0, 0.0, plate_thickness],
-      [false, false, true],
+      [0.0, 0.0, probe_machine_z, 0.0],
+      [0.0, 0.0, plate_thickness, 0.0],
+      [false, false, true, false],
     );
     // The probed point (plate top) now reads work Z = plate thickness (1.0).
-    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z]), [0.0, 0.0, plate_thickness]);
+    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z, 0.0]), [0.0, 0.0, plate_thickness, 0.0]);
     // The copper TOP is plate_thickness BELOW the probed point in machine Z → its work Z is 0.
     let copper_top_machine_z = probe_machine_z - plate_thickness;
-    approx(cs.machine_to_work([0.0, 0.0, copper_top_machine_z]), [0.0, 0.0, 0.0]);
+    approx(cs.machine_to_work([0.0, 0.0, copper_top_machine_z, 0.0]), [0.0, 0.0, 0.0, 0.0]);
   }
 
   /// The same Z-zero outcome via the `G92` path (ioSender's `G92` coordinate mode): `G92 Z<plate>` makes the
@@ -810,16 +811,16 @@ mod tests {
   #[test]
   fn z_zero_via_g92_puts_copper_top_at_wpos_zero() {
     let mut cs = CoordinateSystems::new();
-    cs.set_wcs_offset(0, [0.0, 0.0, 5.0], ALL); // a non-zero G54 Z, to prove G92 is independent of it.
+    cs.set_wcs_offset(0, [0.0, 0.0, 5.0, 0.0], ALL); // a non-zero G54 Z, to prove G92 is independent of it.
     let probe_machine_z = -42.0f32;
     let plate_thickness = 1.0f32;
     cs.set_g92_to_position(
-      [0.0, 0.0, probe_machine_z],
-      [0.0, 0.0, plate_thickness],
-      [false, false, true],
+      [0.0, 0.0, probe_machine_z, 0.0],
+      [0.0, 0.0, plate_thickness, 0.0],
+      [false, false, true, false],
     );
-    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z]), [0.0, 0.0, plate_thickness]);
-    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z - plate_thickness]), [0.0, 0.0, 0.0]);
+    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z, 0.0]), [0.0, 0.0, plate_thickness, 0.0]);
+    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z - plate_thickness, 0.0]), [0.0, 0.0, 0.0, 0.0]);
   }
 
   /// The single-tool PCB Z-zero path uses `G10 L2`/`G92`, NEVER `G43.1` (`docs/tlo-offsets.md` Decision #1 /
@@ -834,13 +835,13 @@ mod tests {
     let plate_thickness = 1.0f32;
     cs.set_wcs_offset_to_position(
       0,
-      [0.0, 0.0, probe_machine_z],
-      [0.0, 0.0, plate_thickness],
-      [false, false, true],
+      [0.0, 0.0, probe_machine_z, 0.0],
+      [0.0, 0.0, plate_thickness, 0.0],
+      [false, false, true, false],
     );
     // No TLO is set during the single-tool probe-zero, so `[TLO:]` is 0 and the WCO is just the WCS offset.
     assert_eq!(cs.tlo(), 0.0);
-    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z]), [0.0, 0.0, plate_thickness]);
-    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z - plate_thickness]), [0.0, 0.0, 0.0]);
+    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z, 0.0]), [0.0, 0.0, plate_thickness, 0.0]);
+    approx(cs.machine_to_work([0.0, 0.0, probe_machine_z - plate_thickness, 0.0]), [0.0, 0.0, 0.0, 0.0]);
   }
 }

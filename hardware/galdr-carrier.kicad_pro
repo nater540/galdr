@@ -1,0 +1,15 @@
+{
+  "board": {"3dviewports": [], "design_settings": {}, "layer_presets": [], "viewports": []},
+  "boards": [],
+  "cvpcb": {"equivalence_files": []},
+  "libraries": {"pinned_footprint_libs": [], "pinned_symbol_libs": []},
+  "meta": {"filename": "galdr-carrier.kicad_pro", "version": 1},
+  "net_settings": {"classes": []},
+  "pcbnew": {"page_layout_descr_file": ""},
+  "schematic": {"legacy_lib_list": [], "meta": {"version": 1}},
+  "sheets": [
+    ["3415d5ba-5b0d-4f54-8957-3faaa96eaddc", "1"],
+    ["da920581-48fb-46e6-bcb2-7d797dd21ccc", "2"]
+  ],
+  "text_variables": {}
+}

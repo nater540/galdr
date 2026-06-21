@@ -108,6 +108,9 @@ mod tests {
     msg.run_current_ma_x = 800;
     msg.microsteps_z = 16;
     msg.tmc_r_sense_ohms = 0.05;
+    // DOC-07 spindle delays ($392/$393): non-default values must survive the encode/decode round-trip.
+    msg.spindle_on_delay_s = 0.5;
+    msg.spindle_reverse_dwell_s = 1.5;
 
     let mut buf: heapless::Vec<u8, SETTINGS_MAX_LEN> = heapless::Vec::new();
     encode_settings_into(&msg, &mut buf).expect("encode fits");
@@ -123,6 +126,8 @@ mod tests {
     assert_eq!(decoded.run_current_ma_x, 800);
     assert_eq!(decoded.microsteps_z, 16);
     assert_eq!(decoded.tmc_r_sense_ohms, 0.05);
+    assert_eq!(decoded.spindle_on_delay_s, 0.5);
+    assert_eq!(decoded.spindle_reverse_dwell_s, 1.5);
   }
 
   #[test]
@@ -172,6 +177,8 @@ mod tests {
     msg.tmc_tpwmthrs = u32::MAX;
     msg.tmc_send_delay = u32::MAX;
     msg.tmc_r_sense_ohms = 1.0;
+    msg.spindle_on_delay_s = 1.0;
+    msg.spindle_reverse_dwell_s = 1.0;
     assert!(settings_size(&msg) <= SETTINGS_MAX_LEN, "encoded size {} exceeds SETTINGS_MAX_LEN", settings_size(&msg));
   }
 }

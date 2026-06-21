@@ -36,7 +36,7 @@
 //! an `ok`, exactly matching the firmware-core contract.
 
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex as BlockingMutex;
@@ -53,19 +53,23 @@ use esp_hal::Async;
 use firmware_core::coords::{self, CoordinatePersistent, CoordinateSystems};
 use firmware_core::homing::{HomingConfig, HomingError};
 use firmware_core::gcode::{
-  CoordinateOp, DistanceMode as GcodeDistance, ModalState, MotionMode, Parser, Units as GcodeUnits,
+  CoordinateOp, DistanceMode as GcodeDistance, FeedMode as GcodeFeedMode, ModalState, MotionMode, Parser,
+  SpindleState, Units as GcodeUnits,
 };
 use firmware_core::motion::steps_to_mm;
-use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcome, SoftLimits, AXES};
+use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcome, SoftLimits, SpinUpGate, AXES};
+use firmware_core::spindle::SpindleAction;
 use firmware_core::protocol::{
   classify_realtime, probe_response, AlarmCode, CheckToggle, ControlState, CoordinateReport, EngineEvent,
-  LastProbe, MachineSnapshot, MachineState, Overrides, ParserDistance, ParserMotion, ParserSnapshot, ParserUnits,
+  LastProbe, MachineSnapshot, MachineState, Overrides, ParserDistance, ParserFeedMode, ParserMotion, ParserSnapshot,
+  ParserSpindle, ParserUnits,
   PinReport, PositionReport, ProbeResponse, RealtimeCommand, RefreshReporter, ResponseWriter, StreamEngine,
   SystemCommand, UnlockOutcome, ERROR_CODES, ERROR_HOMING_DISABLED, ERROR_UNSUPPORTED_COMMAND, MAX_LINE_LEN,
   NGC_PARAMETER_LINES, RX_BUFFER_SIZE, RESPONSE_CAPACITY,
 };
 use firmware_core::settings::{self, PbChunkResult, PbReceiver, SettingError, Settings};
 
+use crate::spindle;
 use crate::storage::{FlashRecordStore, SharedFlash};
 
 /// A single assembled input line handed from `usb_rx` to the parser stub, capped to the protocol line
@@ -175,7 +179,8 @@ pub static MOTION_RESET_PENDING: core::sync::atomic::AtomicBool = core::sync::at
 /// position: the executor zeroes it on a soft reset, and nothing else writes it — so there is no stale
 /// overwrite race with the consumer's pipeline reset (which no longer touches MPos). Steps→mm conversion for
 /// the report stays in the host-tested [`steps_to_mm`].
-pub static LIVE_POSITION: [AtomicI32; AXES] = [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
+pub static LIVE_POSITION: [AtomicI32; AXES] =
+  [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)];
 
 /// The live LOGICAL limit-switch state as a per-axis bitmask (`bit0 = X`, `bit1 = Y`, `bit2 = Z`), published by
 /// the core-1 motion executor and read by [`status_responder`] to source the `Pn:` X/Y/Z letters (DOC-06 / DOC-08).
@@ -417,6 +422,30 @@ pub static LIVE_BLOCK_IS_RAPID: AtomicBool = AtomicBool::new(false);
 /// `status_responder` can render the override-scaled realized RPM (Phase E). Updated whenever the consumer plans
 /// a line (the parser's `S` is the commanded speed); `status_responder` applies the spindle override + stop toggle.
 pub static PROGRAMMED_SPINDLE_RPM: AtomicU32 = AtomicU32::new(0);
+
+/// The commanded modal spindle DIRECTION (DOC-07): `0` = M5/Stop, `1` = M3/CW, `2` = M4/CCW. Published by the
+/// consumer from the planner's `Spindle` outcome and read by the [`spindle`] task, which combines it with the
+/// override-scaled RPM (so a spindle-override / spindle-stop change re-drives the same direction at a new speed).
+/// `Release`/`Acquire` orders it ahead of the [`SPINDLE_UPDATE`] wake that always follows a store.
+pub static SPINDLE_DIRECTION: AtomicU8 = AtomicU8::new(SPINDLE_DIR_STOP);
+/// [`SPINDLE_DIRECTION`] value for M5 / spindle stop.
+pub const SPINDLE_DIR_STOP: u8 = 0;
+/// [`SPINDLE_DIRECTION`] value for M3 / clockwise.
+pub const SPINDLE_DIR_CW: u8 = 1;
+/// [`SPINDLE_DIRECTION`] value for M4 / counter-clockwise.
+pub const SPINDLE_DIR_CCW: u8 = 2;
+
+/// Wakes the [`spindle`] task to RE-APPLY the spindle outputs from the current [`SPINDLE_DIRECTION`] + the
+/// override-scaled RPM. Coalesced (a `Signal`): the task always re-reads the live direction/RPM after a wake, so
+/// a missed-and-coalesced wake loses nothing. Set by the consumer on an M3/M4/M5 and by the real-time override
+/// handler when the spindle override or spindle-stop toggle changes (so the realized RPM re-drives the duty).
+pub static SPINDLE_UPDATE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Forces the [`spindle`] task to EMERGENCY-STOP (SPIN_EN off + duty 0) immediately, independent of motion state,
+/// for any ALARM, soft reset (`0x18`), hard-limit trip, or `$SLP` sleep (DOC-07). A feed hold (`!`) deliberately
+/// does NOT set this — a held program keeps the spindle running, matching grblHAL. The task races this against
+/// the update wake AND against the reverse-dwell timer, so an e-stop during a spin-down still parks the spindle.
+pub static SPINDLE_ESTOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// The last-sampled LOGICAL probe-asserted state (after the `$6` invert), published by the core-1 probe cycle and
 /// read by `status_responder` to source the `Pn:P` letter (Phase E / Phase C). `AcqRel`/`Acquire` publishes it
@@ -927,12 +956,18 @@ fn dispatch_realtime(cmd: RealtimeCommand) {
       // already in flight finishes at its current scale (Stage-1 per-block granularity; mid-block re-scaling is
       // the smooth-ramp Stage-2 refinement). No executor wake is needed: the level is re-read at the boundary.
       let mut ov = overrides();
+      let prev_spindle = (ov.spindle, ov.spindle_stop);
       if ov.apply(byte) {
         set_overrides(ov);
-        // TODO(DOC-05): a spindle-override / spindle-stop change must also re-drive the LEDC PWM duty on the
-        // spindle task once the `PwmSink` backend lands; today the realized RPM is computed and reported but the
-        // peripheral output is stubbed (no spindle hardware wired). Coolant (`0xA0`/`0xA1`, DOC-06) is likewise
-        // tracked in the override state and reportable, but the flood/mist GPIO outputs are not wired yet.
+        // DOC-07: ONLY a spindle-override / spindle-stop change re-drives the LEDC duty. Wake the spindle task to
+        // re-apply from the SAME commanded direction at the new override-scaled RPM (its `commanded_spindle`
+        // reads the live `Ov:`), so a `0x9E` spindle-stop zeroes the duty and a `0x9A`/`0x9B`/`0x99` adjusts it.
+        // A feed / rapid / coolant byte never affects the spindle, so it must NOT wake the task (that would
+        // needlessly re-snapshot settings and re-drive the LEDC/GPIO for an unchanged duty). Coolant (`0xA0`/
+        // `0xA1`, DOC-06) is still tracked + reportable, but the flood/mist GPIO are not wired.
+        if (ov.spindle, ov.spindle_stop) != prev_spindle {
+          SPINDLE_UPDATE.signal(());
+        }
       }
     }
     RealtimeCommand::ToggleAutoReport => {
@@ -1147,6 +1182,14 @@ async fn apply_soft_reset(parser: &mut Parser, state: &mut ConsumerState) {
 /// Emit an `ALARM:N` push line plus its `[MSG:..]` unlock/continue prompt, so a host detects the halt and
 /// learns how to clear it (`$H`/`$X` for homing/locked alarms, reset for the recoverable ones).
 async fn emit_alarm(code: AlarmCode) {
+  // DOC-07: any ALARM forces the spindle off IMMEDIATELY, independent of motion state — a hard limit, soft
+  // limit, homing failure, or any other alarm kills the spindle. Issue the e-stop FIRST, before the message
+  // enqueues/awaits below: `force_spindle_off` is synchronous (an atomic store + a coalesced `Signal`), so the
+  // spindle is parked at once even if the RESPONSE channel is back-pressured and the alarm-text awaits stall.
+  // The commanded direction is also cleared so a later `~`/`$X` does not silently restart a spindle that the
+  // program never re-commanded. (A feed hold does NOT route through here, so it leaves the spindle running,
+  // matching grblHAL.) This is the universal alarm-emit chokepoint, so the e-stop lives here once.
+  force_spindle_off();
   let mut a = Response::new();
   if ResponseWriter::alarm(&mut a, code).is_ok() {
     enqueue(a).await;
@@ -1158,6 +1201,14 @@ async fn emit_alarm(code: AlarmCode) {
     enqueue(ctx).await;
   }
   send_message(code.unlock_hint()).await;
+}
+
+/// Force the spindle to a hard stop (DOC-07): clear the commanded direction to Stop and signal the spindle task's
+/// emergency stop. Used by every spindle-killing event — ALARM ([`emit_alarm`]), soft reset ([`reset_pipeline`]),
+/// and sleep ([`handle_sleep`]). Synchronous (an atomic store + a coalesced `Signal`), callable from any context.
+fn force_spindle_off() {
+  SPINDLE_DIRECTION.store(SPINDLE_DIR_STOP, Ordering::Release);
+  SPINDLE_ESTOP.signal(());
 }
 
 /// Reset the parser/planner pipeline state this task owns on a soft reset (`0x18`): restore the parser to
@@ -1177,6 +1228,13 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   state.error_hold = false;
   // Drop any partially accumulated `$PBX=` import so a frame begun before the reset cannot bleed into one after.
   state.pb.reset();
+  // DOC-07: clear the spin-up gate so a `M3` armed before the reset cannot inject a spurious `$392` dwell ahead of
+  // the first post-reset move (the spindle is off after the reset's `force_spindle_off`). Reset the last-dispatched
+  // spindle tracking to match the reconstructed parser's modal `Stop`/`S0`, so the first post-reset M3/M4/`S` is
+  // seen as a fresh change by `sync_spindle_from_modal`.
+  state.spin_up = SpinUpGate::new();
+  state.last_spindle_dir = SpindleState::Stop;
+  state.last_spindle_rpm = 0;
   // Reconstruct the planner to clear the block queue, machine position, work offset, and junction state in
   // one step (it has no public flush), rebuilding it from the LIVE settings so any `$x=val` changes made
   // before the reset take effect now (grbl applies most settings on the next reset). Snapshot the settings
@@ -1206,6 +1264,11 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   LIVE_PROGRAMMED_FEED_MM_MIN.store(0, Ordering::Release);
   LIVE_BLOCK_IS_RAPID.store(false, Ordering::Relaxed);
   PROGRAMMED_SPINDLE_RPM.store(0, Ordering::Release);
+  // DOC-07: a soft reset (`0x18`) forces the spindle off (grbl resets the spindle on reset), independent of
+  // whether the reset lands in an alarm — a reset from Idle goes to Normal and never calls `emit_alarm`, so the
+  // e-stop is issued here unconditionally. The commanded direction is cleared so the spindle stays off until a
+  // fresh M3/M4 after the reset.
+  force_spindle_off();
   reset_ov_reporter();
   // Phase F: a soft reset re-seeds the auto-report cadence from the (post-reset) live `$481` and clears the
   // `0x8C` runtime suspend, so auto-reporting returns to its configured state. Wake the task so it re-arms (or
@@ -1241,6 +1304,20 @@ struct ConsumerState {
   /// They are held in RAM only: persisting them needs either a separate NVS record or a non-scalar proto field
   /// (which would break `Settings: Copy`), both larger than Phase A — flagged as a TODO(DOC-04) in the report.
   startup_lines: [StartupLine; 2],
+  /// The DOC-07 spin-up gate: tracks whether an M3/M4 owes a `$392` spin-up dwell to the next cutting move, so
+  /// the consumer injects a synthetic [`PlannerCommand::Dwell`] ahead of that move (the planner cannot emit two
+  /// outcomes from one command). The when-to-insert decision is host-tested in [`SpinUpGate`]; the consumer
+  /// supplies the dwell seconds from the live `$392`. Reset (cleared) on a soft reset with the rest of the state.
+  spin_up: SpinUpGate,
+  /// The last spindle direction this consumer dispatched to the [`spindle`] task (DOC-07). Compared against the
+  /// parser's modal `spindle` after each clean parse so a direction change — including an M3/M4 that SHARED a line
+  /// with a move (where the per-line emit is the move, not a `Spindle` command) — re-drives the outputs exactly
+  /// once. Reset to `Stop` on a soft reset alongside the parser. See [`sync_spindle_from_modal`].
+  last_spindle_dir: SpindleState,
+  /// The last programmed spindle RPM this consumer dispatched (whole RPM, the modal `S` clamped to `u16`). Lets a
+  /// bare `S` change re-drive the duty of a RUNNING spindle (grbl updates a spinning spindle's speed on a lone
+  /// `S`); compared only while the spindle is running. Reset to `0` on a soft reset.
+  last_spindle_rpm: u16,
 }
 
 /// The maximum stored startup-line length, in bytes. Bounded so the `$N` echo (`$Nn=<gcode>\r\n`) always fits
@@ -1318,12 +1395,22 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
   if matches!(parsed, Ok(Some(_))) {
     sync_active_wcs(parser.state().wcs).await;
   }
-  // Phase E: publish the parser's modal `S` word as the PROGRAMMED spindle RPM so `status_responder` can render
-  // the override-scaled realized RPM in `FS:`. The modal `S` persists across lines (an `S` set once governs until
-  // changed), so we publish it on any clean parse — including a modal-only `Ok(None)` line that only set `S`.
+  // Phase E / DOC-07: on any clean parse, publish the parser's modal `S` as the PROGRAMMED spindle RPM (so
+  // `status_responder` renders the override-scaled `FS:` and the spindle task reads the new speed), THEN drive the
+  // spindle task from the modal spindle direction. Doing it here — keyed off MODAL state, not the per-line emit —
+  // is what makes an M3/M4/M5 take effect on a line that ALSO carries a move (the emit is the move, not a `Spindle`
+  // command) and lets a bare `S` re-drive a running spindle. The modal `S`/direction persist across lines.
   if parsed.is_ok() {
-    let rpm = parser.state().spindle_speed.max(0.0) as u32;
+    let modal = parser.state();
+    let rpm = modal.spindle_speed.max(0.0) as u32;
     PROGRAMMED_SPINDLE_RPM.store(rpm.min(u16::MAX as u32), Ordering::Release);
+    // Drive the spindle from modal state — but NOT in `$C` check mode: a dry run must validate a program without
+    // actuating any output (grbl check mode moves nothing and does not energize the spindle). Publishing the
+    // PROGRAMMED RPM above is report-only and safe; `sync_spindle_from_modal` actuates the LEDC/SPIN_EN hardware,
+    // so it is gated here. The check guard in the `match` below only suppresses planning, which is too late.
+    if control != ControlState::Check {
+      sync_spindle_from_modal(modal, state);
+    }
   }
   match parsed {
     // A blank/comment-only/modal-only line carries no action; acknowledge with a single `ok`.
@@ -1332,37 +1419,69 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
     // grbl `ok`s it so a host can verify a whole file without moving. The modal state still advanced in the
     // parser (correct: check mode tracks modal state), but no block is enqueued.
     Ok(Some(_)) if control == ControlState::Check => ack().await,
-    Ok(Some(command)) => match plan_command(&command).await {
-      // The command was accepted into the planner (a move enqueued, or a non-motion outcome passed
-      // through); emit the single `ok`.
-      PlanResult::Accepted => ack().await,
-      // A coordinate-system / offset op: apply it to the shared coordinate model (against the live machine
-      // position), push the new WCO into the planner, and persist the persistent subset, then `ok`.
-      PlanResult::Coordinate(op) => {
-        apply_coordinate_op(op).await;
-        ack().await;
+    Ok(Some(command)) => {
+      // DOC-07 spin-up dwell: before the FIRST cutting move after an M3/M4, insert a synchronized `$392` dwell so
+      // the spindle reaches speed before it cuts. The host-tested `SpinUpGate` decides WHEN; this injects the
+      // dwell ahead of the move. `inject_spin_up_dwell` is a no-op (and returns Continue) for a rapid / non-move
+      // command or when no spin-up is owed; it returns Aborted only if a soft reset preempted the awaited dwell.
+      if let SpinUpInjection::Aborted = inject_spin_up_dwell(&command, state).await {
+        apply_soft_reset(parser, state).await;
+        return;
       }
-      // The planner reported a non-back-pressure error (bad arc geometry); reject and arm the hold.
-      PlanResult::Error(code) => {
-        error(code).await;
-        state.error_hold = true;
+      match plan_command(&command).await {
+        // The command was accepted into the planner (a move enqueued, or a non-motion outcome passed
+        // through); emit the single `ok`.
+        PlanResult::Accepted => ack().await,
+        // A coordinate-system / offset op: apply it to the shared coordinate model (against the live machine
+        // position), push the new WCO into the planner, and persist the persistent subset, then `ok`.
+        PlanResult::Coordinate(op) => {
+          apply_coordinate_op(op).await;
+          ack().await;
+        }
+        // The planner reported a non-back-pressure error (bad arc geometry); reject and arm the hold.
+        PlanResult::Error(code) => {
+          error(code).await;
+          state.error_hold = true;
+        }
+        // A program move left the `$20` soft-limit envelope: enter the soft-limit alarm and emit `ALARM:2` (no
+        // `ok`). The block was rejected before any motion, so position is intact, but grbl halts the program; a
+        // soft reset / `$X` clears the alarm. The alarm latches so subsequent GCode is gated until cleared.
+        PlanResult::SoftLimitAlarm => {
+          set_control_state(ControlState::Alarm(AlarmCode::SoftLimit));
+          emit_alarm(AlarmCode::SoftLimit).await;
+        }
+        // A soft reset arrived while this command was back-pressured: abort it (the host discards pending
+        // acks on `0x18`), emit no response, and run the soft-reset transition whose signal was consumed here.
+        PlanResult::Aborted => apply_soft_reset(parser, state).await,
+        // An M3/M4/M5 (DOC-07): the spindle outputs were ALREADY driven from the modal spindle state by
+        // `sync_spindle_from_modal` (above, on the clean parse), so a spindle-only line just `ok`s here. Driving
+        // off modal state — not this per-line outcome — is what makes an M3/M4/M5 sharing a line with a move work.
+        PlanResult::Spindle(_spindle_state, _rpm) => ack().await,
+        // A `G4` dwell: run the synchronized dwell (drain motion, then hold), then `ok`. A soft reset mid-dwell
+        // abandons it and runs the reset (the consumed signal must be honored), emitting no `ok`.
+        PlanResult::Dwell(seconds) => {
+          if run_dwell(seconds).await {
+            ack().await;
+          } else {
+            apply_soft_reset(parser, state).await;
+          }
+        }
+        // An `M30` program end: drain motion, stop the spindle, reset modal state, then `ok`. A soft reset while
+        // draining abandons the end and runs the reset instead.
+        PlanResult::ProgramEnd => {
+          if program_end(parser, state).await {
+            ack().await;
+          } else {
+            apply_soft_reset(parser, state).await;
+          }
+        }
+        // A `G38.x` probe: run the probe-watching cycle on the core-1 executor and decide the response from the
+        // outcome and the mode's alarm-on-fail flag.
+        PlanResult::Probe { request, alarm_on_fail } => {
+          handle_probe(request, alarm_on_fail, parser, state).await;
+        }
       }
-      // A program move left the `$20` soft-limit envelope: enter the soft-limit alarm and emit `ALARM:2` (no
-      // `ok`). The block was rejected before any motion, so position is intact, but grbl halts the program; a
-      // soft reset / `$X` clears the alarm. The alarm latches so subsequent GCode is gated until cleared.
-      PlanResult::SoftLimitAlarm => {
-        set_control_state(ControlState::Alarm(AlarmCode::SoftLimit));
-        emit_alarm(AlarmCode::SoftLimit).await;
-      }
-      // A soft reset arrived while this command was back-pressured: abort it (the host discards pending
-      // acks on `0x18`), emit no response, and run the soft-reset transition whose signal was consumed here.
-      PlanResult::Aborted => apply_soft_reset(parser, state).await,
-      // A `G38.x` probe: run the probe-watching cycle on the core-1 executor and decide the response from the
-      // outcome and the mode's alarm-on-fail flag.
-      PlanResult::Probe { request, alarm_on_fail } => {
-        handle_probe(request, alarm_on_fail, parser, state).await;
-      }
-    },
+    }
     Err(e) => {
       // A parse error: emit `error:N` and arm the gcode error-hold so subsequent GCode lines are held.
       error(e.code()).await;
@@ -1389,6 +1508,20 @@ enum PlanResult {
   SoftLimitAlarm,
   /// A soft reset preempted the command while it was back-pressured; the consumed signal must be honored.
   Aborted,
+  /// An M3/M4/M5 spindle command (DOC-07): the planner passed it through with no motion. The consumer publishes
+  /// the commanded direction, wakes the [`spindle`] task to drive the outputs, and notes the spin-up gate so the
+  /// next cutting move gets a `$392` dwell. Carried out of `plan_command` so the side effects run in the
+  /// consumer task (which owns the spin-up gate state and the direction/wake signals).
+  Spindle(SpindleState, f32),
+  /// A `G4` dwell (DOC). The planner has flushed look-ahead (the preceding block stops); the consumer runs the
+  /// synchronized dwell ([`run_dwell`]) — wait for motion to drain, then hold for the dwell seconds — so the dwell
+  /// blocks the stream like grbl's buffer-synchronize. Carried out of `plan_command` so the timed wait runs in the
+  /// consumer task (which owns the stream).
+  Dwell(f32),
+  /// An `M30` program end. The planner has flushed look-ahead; the consumer drains motion, stops the spindle, and
+  /// resets the parser's modal state to power-on defaults (grbl's M30 reset). Carried out of `plan_command` so the
+  /// drain wait + spindle/modal reset run in the consumer task.
+  ProgramEnd,
   /// A `G38.x` probe (Phase C): the planner resolved the machine target and flushed look-ahead. The consumer
   /// runs the probe-watching cycle on the core-1 executor (carrying the resolved request + the alarming sense),
   /// syncs the planner position to the stop point, emits `[PRB:]`, and decides ALARM/ok.
@@ -1421,8 +1554,10 @@ const ERROR_PLANNER_UNINITIALIZED: u8 = 3;
 /// retry the SAME command (the arc planner is all-or-nothing on `QueueFull`, so re-issue is safe). On an
 /// accepted motion outcome it raises [`BLOCK_AVAILABLE`] to wake the executor. The back-pressure wait is
 /// raced against [`SOFT_RESET`] so a `0x18` aborts a stuck line promptly rather than after the executor frees
-/// a slot. Non-motion outcomes (Dwell/Spindle/G28/G92/M30) currently pass through with no side
-/// effect; the real dwell timer, spindle driver (DOC-07), and homing (DOC-06) consume these in later phases.
+/// a slot. Non-motion outcomes are surfaced as distinct [`PlanResult`]s for the consumer to act on: `Spindle`
+/// (DOC-07), `Dwell` (the synchronized `G4`), `ProgramEnd` (`M30`), and `Coordinate` (G10/G54-G59/G92). Still
+/// passing through as `Accepted` (no side effect): the G28/G30 predefined move (real system motion, a DOC-06
+/// follow-up) and a zero-block no-op `Queued`.
 async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanResult {
   loop {
     // Scope the lock so it is released before any await: hold the planner mutex only for the plan call. A
@@ -1462,9 +1597,19 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
           alarm_on_fail: kind.alarm_on_fail,
         };
       }
-      // TODO(DOC-07/DOC-06): act on the remaining non-motion outcomes — start the dwell timer, drive the
-      // spindle, run the predefined/homing move, reset program state on M30. Stage 1 accepts and passes
-      // through. A zero-block `Queued` (no-op move) needs no executor wake, so it falls here too.
+      // An M3/M4/M5 spindle command (DOC-07): the planner passes it through with no motion. Surface it so the
+      // consumer drives the spindle task and notes the spin-up gate (it owns that state); doing the side effects
+      // here in `plan_command` would scatter them away from the gate/error-hold owner.
+      Ok(PlannerOutcome::Spindle(state, rpm)) => return PlanResult::Spindle(state, rpm),
+      // A `G4` dwell: the planner flushed look-ahead (pinning the preceding block to a stop — the synchronized
+      // boundary); the consumer runs the timed [`run_dwell`] wait. Surfaced so the wait runs in the consumer task.
+      Ok(PlannerOutcome::Dwell { seconds }) => return PlanResult::Dwell(seconds),
+      // `M30` program end: the planner flushed look-ahead; the consumer drains motion, stops the spindle, and
+      // resets modal state. Surfaced so those side effects run in the consumer task.
+      Ok(PlannerOutcome::ProgramEnd) => return PlanResult::ProgramEnd,
+      // TODO(DOC-06): act on the predefined/homing move (G28/G30) — it is real system motion (a rapid to a stored
+      // position), a separate feature from the non-motion outcomes above, so it passes through for now. A
+      // zero-block `Queued` (no-op move) needs no executor wake, so it falls here as well.
       Ok(_outcome) => return PlanResult::Accepted,
       // Back-pressure: the planner buffer is full. Do NOT ack and do NOT drop — yield to the motion
       // executor, then retry the same command. Blocking here backs `LINE_QUEUE` up and throttles the host (correct
@@ -1485,6 +1630,273 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       Err(other) => return PlanResult::Error(other.code()),
     }
   }
+}
+
+/// Drive the [`spindle`] task from the parser's MODAL spindle state (DOC-07), called after every clean parse. This
+/// is the single point the firmware acts on M3/M4/M5 + `S`: keying off modal state (not the per-line emit) is what
+/// makes a spindle word that SHARES a line with a move still start/change the spindle (the emit is the move), and
+/// lets a bare `S` re-drive a running spindle. Acts only on a real change vs the last dispatched `(dir, rpm)`:
+/// - a DIRECTION change publishes the new direction, (dis)arms the spin-up gate, and wakes the task;
+/// - a pure RPM change while RUNNING wakes the task to re-drive the duty WITHOUT re-arming the spin-up (a speed
+///   change is not a fresh spindle start, so it owes no spin-up dwell).
+/// Synchronous (atomics + a coalesced `Signal`); `PROGRAMMED_SPINDLE_RPM` must already be stored for this `S`.
+fn sync_spindle_from_modal(modal: &ModalState, state: &mut ConsumerState) {
+  let dir = modal.spindle;
+  let rpm = modal.spindle_speed.max(0.0).min(u16::MAX as f32) as u16;
+  if dir != state.last_spindle_dir {
+    // A direction change (start, reversal, or stop): dispatch arms/disarms the spin-up gate and wakes the task.
+    dispatch_spindle(dir, state);
+  } else if !matches!(dir, SpindleState::Stop) && rpm != state.last_spindle_rpm {
+    // Same direction, new speed on a RUNNING spindle: wake the task to re-drive the duty from the new programmed
+    // RPM (already stored). No gate re-arm — this is a speed change, not a spindle start.
+    SPINDLE_UPDATE.signal(());
+  }
+  state.last_spindle_dir = dir;
+  state.last_spindle_rpm = rpm;
+}
+
+/// Publish an M3/M4/M5 direction to the [`spindle`] task (DOC-07): record it in [`SPINDLE_DIRECTION`], note the
+/// spin-up gate (so the next cutting move gets a `$392` dwell), and wake the task. Synchronous — atomics + a
+/// coalesced `Signal` — so it adds no await to the line handler. The task reads the override-scaled RPM, so a
+/// spindle-override / spindle-stop change later re-drives the duty without re-issuing the M-word. Called by
+/// [`sync_spindle_from_modal`] on a modal direction change (the single dispatch path).
+fn dispatch_spindle(spindle_state: SpindleState, state: &mut ConsumerState) {
+  let dir = match spindle_state {
+    SpindleState::Clockwise => SPINDLE_DIR_CW,
+    SpindleState::CounterClockwise => SPINDLE_DIR_CCW,
+    SpindleState::Stop => SPINDLE_DIR_STOP,
+  };
+  SPINDLE_DIRECTION.store(dir, Ordering::Release);
+  // Arm / disarm the spin-up gate: an M3/M4 owes a dwell to the next cutting move; an M5 clears it.
+  state.spin_up.note_spindle(spindle_state);
+  // Wake the spindle task to drive the outputs from the new direction + the current scaled RPM.
+  SPINDLE_UPDATE.signal(());
+}
+
+/// The outcome of [`inject_spin_up_dwell`]: whether the line handler should keep planning the move or abort it
+/// because a soft reset preempted the awaited spin-up dwell.
+enum SpinUpInjection {
+  /// No dwell was owed (or one was inserted and completed); continue planning the move.
+  Continue,
+  /// A soft reset arrived while awaiting the spin-up dwell; the caller must run the soft-reset transition and
+  /// drop the move (the host discards pending acks on `0x18`).
+  Aborted,
+}
+
+/// DOC-07 spin-up dwell injection. Before the FIRST cutting move (a G1 feed `Move` or any `Arc`) after an M3/M4,
+/// insert a synchronized `$392` dwell so the spindle reaches speed before it cuts. The host-tested [`SpinUpGate`]
+/// (on [`ConsumerState`]) owns the WHEN decision; this supplies the dwell seconds from the live `$392` and runs
+/// the timed wait. It is a no-op (returns [`SpinUpInjection::Continue`]) for a rapid (G0), a non-move command, or
+/// when no spin-up is owed.
+///
+/// The dwell is realized two ways, matching grbl's "a dwell is a synchronized motion boundary": a
+/// [`PlannerCommand::Dwell`] is planned first (flushing look-ahead so any preceding block stops at the boundary),
+/// then the real timed wait is awaited here — raced against [`SOFT_RESET`] so a `0x18` mid-dwell aborts promptly.
+async fn inject_spin_up_dwell(
+  command: &firmware_core::gcode::PlannerCommand,
+  state: &mut ConsumerState,
+) -> SpinUpInjection {
+  use firmware_core::gcode::PlannerCommand;
+  // Only a CUTTING move consumes the spin-up: a G1 feed move or any arc. A G0 rapid is a positioning move, not a
+  // cut, so it does not consume the spin-up (the dwell waits for the first real cut). Any non-move command (dwell,
+  // coordinate op, spindle, probe, …) is not a cut either.
+  let is_cutting_move = matches!(command, PlannerCommand::Move { rapid: false, .. } | PlannerCommand::Arc { .. });
+  if !is_cutting_move {
+    return SpinUpInjection::Continue;
+  }
+  // Cheap guard BEFORE the settings snapshot: only the first cutting move after a spindle start owes a dwell, so a
+  // dense toolpath's every-G1 common case skips the full-`Settings` snapshot entirely (the gate is a single bool).
+  if !state.spin_up.is_pending() {
+    return SpinUpInjection::Continue;
+  }
+  // A spin-up IS owed: read the live `$392` and consume the gate. `take_dwell_before_move` returns the seconds to
+  // dwell, or `None` only when `$392 == 0` (the gate is consumed either way, so the next move gets no dwell).
+  let spin_up_s = settings_snapshot().await.spindle_on_delay_s;
+  let Some(dwell_s) = state.spin_up.take_dwell_before_move(spin_up_s) else {
+    return SpinUpInjection::Continue;
+  };
+  // Flush the planner's look-ahead at the boundary so the cut starts from rest: plan a synchronized G4 dwell (the
+  // planner pins the preceding block to a stop). `plan_command` returns `PlanResult::Dwell` for it, or `Aborted`
+  // if a soft reset preempted a back-pressured enqueue.
+  if let PlanResult::Aborted = plan_command(&PlannerCommand::Dwell { seconds: dwell_s }).await {
+    return SpinUpInjection::Aborted;
+  }
+  // Run the SAME synchronized dwell a real `G4` uses (wait for prior motion to drain, then hold `$392` so the
+  // spindle reaches speed), raced against a soft reset — one dwell mechanism, no ad-hoc timer.
+  if run_dwell(dwell_s).await {
+    SpinUpInjection::Continue
+  } else {
+    SpinUpInjection::Aborted
+  }
+}
+
+/// The absolute ceiling on any dwell, in seconds — a sanity bound shared by a real `G4`, the `$392` spin-up, and
+/// the `$393` reverse delay. A guard against a grossly mis-set / corrupt value: `(secs * 1e6) as u64` SATURATES
+/// for an enormous `secs`, which would park the stream on a multi-century `Timer`. One hour is far longer than any
+/// real PCB-milling dwell yet safely below the `u64`-microsecond saturation point, so a typo can never wedge the
+/// machine while a legitimate seconds-to-minutes `G4` is unaffected.
+const MAX_DWELL_S: f32 = 3_600.0;
+
+/// Convert a dwell in seconds to an [`embassy_time::Duration`], clamped to `[0, MAX_DWELL_S]` so a negative / NaN /
+/// absurdly large value can neither underflow nor saturate the microsecond `Timer`. Shared by the `G4` dwell
+/// ([`run_dwell`]) and the reverse-dwell ([`spindle`]) waits so all dwell paths honor the same bound.
+fn dwell_duration(secs: f32) -> Duration {
+  let clamped = if secs.is_finite() { secs.clamp(0.0, MAX_DWELL_S) } else { 0.0 };
+  Duration::from_micros((clamped * 1_000_000.0) as u64)
+}
+
+/// The poll interval while waiting for the core-1 executor to drain to a synchronized boundary ([`run_dwell`]).
+/// Short relative to a block's execution time so the dwell starts promptly after motion stops, but long enough
+/// that the brief `PLANNER`-lock checks add negligible load while the machine winds down.
+const MOTION_IDLE_POLL: Duration = Duration::from_millis(4);
+
+/// Wait until the core-1 executor has fully drained the planner queue and stopped — grbl's buffer-synchronize, the
+/// rest point a `G4` dwell (and the spin-up dwell) needs before timing begins. The consumer is the sole enqueuer
+/// and is blocked here, so once [`program_running`] reads false no new motion can appear; the wait converges. Polls
+/// on a short [`MOTION_IDLE_POLL`] ticker, racing [`SOFT_RESET`] so a `0x18` abandons the wait. Returns `true` once
+/// idle, or `false` if a soft reset preempted it (the signal is consumed; the caller runs the reset, matching
+/// [`inject_spin_up_dwell`]'s abort contract).
+async fn wait_for_motion_idle() -> bool {
+  while program_running().await {
+    match select(Timer::after(MOTION_IDLE_POLL), SOFT_RESET.wait()).await {
+      Either::First(()) => {}
+      Either::Second(()) => return false,
+    }
+  }
+  true
+}
+
+/// Run a synchronized dwell (DOC, grbl `G4`): wait for all prior motion to drain to a stop, then hold for `seconds`.
+/// This is the ONE timed-dwell mechanism — a real `G4` and the `$392` spin-up both route through it, so the
+/// "dwell = synchronized motion boundary" guarantee is enforced in one place rather than approximated by an
+/// ad-hoc timer. Returns `true` when the dwell completed, or `false` if a soft reset preempted either phase (the
+/// signal is consumed; the caller runs the reset).
+async fn run_dwell(seconds: f32) -> bool {
+  if !wait_for_motion_idle().await {
+    return false;
+  }
+  match select(Timer::after(dwell_duration(seconds)), SOFT_RESET.wait()).await {
+    Either::First(()) => true,
+    Either::Second(()) => false,
+  }
+}
+
+/// Run an `M30` program end (grbl): drain pending motion to a stop, stop the spindle, and reset the parser's modal
+/// state to power-on defaults (G0/G90/G21/G54, F0/S0) so the next program starts clean — WITHOUT flushing the
+/// planner or zeroing machine position (M30 is a program rewind, not a soft reset). Returns `true` on completion,
+/// or `false` if a soft reset preempted the motion drain (the consumed signal is honored by the caller).
+async fn program_end(parser: &mut Parser, state: &mut ConsumerState) -> bool {
+  if !wait_for_motion_idle().await {
+    return false;
+  }
+  // M30 turns the spindle off: park it (SPIN_EN off + duty 0) and clear the commanded direction + programmed RPM.
+  force_spindle_off();
+  PROGRAMMED_SPINDLE_RPM.store(0, Ordering::Release);
+  // Reset modal state to defaults and the spindle tracking to match, so the next line's `sync_spindle_from_modal`
+  // sees a fresh `Stop`/`S0` baseline rather than the just-ended program's direction. `Parser::new()` resets the
+  // modal WCS to G54 (index 0).
+  *parser = Parser::new();
+  state.spin_up = SpinUpGate::new();
+  state.last_spindle_dir = SpindleState::Stop;
+  state.last_spindle_rpm = 0;
+  // grbl M30 also: selects G54, turns coolant OFF, and resets feed/rapid/spindle overrides to 100%. The parser
+  // reset above only restored the parser-MODAL WCS — push that G54 selection into the coordinate model + planner
+  // too (otherwise the planner keeps the ended program's G55-G59 offset and the next move cuts at the wrong WPos),
+  // and reset the live overrides + coolant toggles (which live outside the parser, in `OVERRIDES`), matching the
+  // soft-reset reset of the same cross-task state.
+  sync_active_wcs(0).await;
+  set_overrides(Overrides::new());
+  reset_ov_reporter();
+  true
+}
+
+/// The spindle task (DOC-07, core 0 / PRO_CPU). The SINGLE driver of the spindle outputs: it owns the
+/// [`SpindleController`](firmware_core::spindle::SpindleController) and awaits two signals —
+/// - [`SPINDLE_UPDATE`]: re-apply from the commanded [`SPINDLE_DIRECTION`] + the override-scaled RPM (an M3/M4/M5
+///   or a spindle-override / spindle-stop change). A running-spindle direction REVERSAL returns
+///   [`SpindleAction::SpinDownThenReverse`]: the controller has already stopped the spindle; this task awaits the
+///   `$393` reverse dwell (raced against an e-stop) then completes the reversal.
+/// - [`SPINDLE_ESTOP`]: an immediate emergency stop (ALARM / soft reset / hard limit / sleep), independent of the
+///   commanded state. A feed hold (`!`) deliberately does NOT signal this — the spindle keeps running (grblHAL).
+///
+/// The task NEVER blocks the consumer: the consumer only stores atomics + signals; all timing lives here.
+#[embassy_executor::task]
+pub async fn spindle(controller: &'static mut spindle::Spindle) {
+  loop {
+    // E-stop is polled FIRST so that when BOTH an emergency stop and an update are pending at a wake (e.g. an
+    // ALARM raised on core 1 while a spindle command's update is still queued), `select`'s first-future bias
+    // services the stop — never the update that would briefly re-energize the spindle before the next iteration.
+    match select(SPINDLE_ESTOP.wait(), SPINDLE_UPDATE.wait()).await {
+      // Emergency stop wins unconditionally: de-assert enable + zero duty regardless of the commanded state.
+      Either::First(()) => spindle_emergency_stop(controller),
+      Either::Second(()) => {
+        // Re-read the commanded direction and the realized (override-scaled) RPM, plus the live `$30`/`$31`/`$393`.
+        let action = apply_spindle(controller).await;
+        if let Some(dwell_s) = action {
+          // A reversal of a running spindle: the controller already stopped it. Await the `$393` reverse dwell,
+          // raced against an e-stop so a reset mid-spin-down still parks the spindle, then bring up the new
+          // direction (unless a newer command/e-stop changed the picture, which the re-read in `complete` honors).
+          match select(Timer::after(dwell_duration(dwell_s)), SPINDLE_ESTOP.wait()).await {
+            Either::First(()) => complete_spindle_reverse(controller).await,
+            Either::Second(()) => spindle_emergency_stop(controller),
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Read the commanded spindle direction + override-scaled RPM + the live `$30`/`$31`/`$393`, apply them to the
+/// controller, and return `Some(dwell_s)` when the apply scheduled a direction reversal (the caller must await the
+/// reverse dwell), or `None` when the command was fully applied. A driver error is logged (defmt) and swallowed —
+/// the spindle task must keep running so a later command / e-stop can still reach the hardware.
+async fn apply_spindle(controller: &mut spindle::Spindle) -> Option<f32> {
+  let settings = settings_snapshot().await;
+  let (state, rpm) = commanded_spindle();
+  match controller.apply(state, rpm, settings.spindle_rpm_min, settings.spindle_rpm_max, settings.spindle_reverse_dwell_s) {
+    Ok(SpindleAction::Applied) => None,
+    Ok(SpindleAction::SpinDownThenReverse { dwell_s }) => Some(dwell_s),
+    Err(_e) => {
+      #[cfg(feature = "defmt")]
+      defmt::error!("spindle apply failed: {:?}", _e);
+      None
+    }
+  }
+}
+
+/// Complete a deferred M3↔M4 reversal after the `$393` dwell: bring up the (re-read) commanded direction at the
+/// current scaled RPM. Re-reading honors a command that changed during the dwell (e.g. an M5 mid-spin-down parks
+/// it rather than energizing the stale direction). A driver error is logged and swallowed.
+async fn complete_spindle_reverse(controller: &mut spindle::Spindle) {
+  let settings = settings_snapshot().await;
+  let (state, rpm) = commanded_spindle();
+  if let Err(_e) = controller.complete_reverse(state, rpm, settings.spindle_rpm_min, settings.spindle_rpm_max) {
+    #[cfg(feature = "defmt")]
+    defmt::error!("spindle reverse-complete failed: {:?}", _e);
+  }
+}
+
+/// Emergency-stop the spindle (de-assert enable + zero duty), logging and swallowing any driver error so the task
+/// keeps running. Idempotent at the controller level.
+fn spindle_emergency_stop(controller: &mut spindle::Spindle) {
+  if let Err(_e) = controller.emergency_stop() {
+    #[cfg(feature = "defmt")]
+    defmt::error!("spindle emergency-stop failed: {:?}", _e);
+  }
+}
+
+/// The currently commanded spindle `(state, rpm)`: the modal direction from [`SPINDLE_DIRECTION`] and the
+/// realized RPM = the programmed `S` scaled by the live spindle override + spindle-stop toggle. So an
+/// override/stop change re-drives the controller at the new speed (or to a stop) on the next [`SPINDLE_UPDATE`].
+fn commanded_spindle() -> (SpindleState, f32) {
+  let state = match SPINDLE_DIRECTION.load(Ordering::Acquire) {
+    SPINDLE_DIR_CW => SpindleState::Clockwise,
+    SPINDLE_DIR_CCW => SpindleState::CounterClockwise,
+    _ => SpindleState::Stop,
+  };
+  let programmed = PROGRAMMED_SPINDLE_RPM.load(Ordering::Acquire).min(u16::MAX as u32) as u16;
+  let scaled = overrides().scaled_rpm(programmed);
+  (state, scaled as f32)
 }
 
 /// Derive the fixed per-tick step period (in motion timer ticks) for a probe seeking `target` (machine steps) at
@@ -2062,7 +2474,9 @@ async fn handle_sleep() {
     // uses keeps one parking mechanism for both.
     HOLD_REQUESTED.store(true, Ordering::Release);
     HOLD_WAKE.signal(());
-    // TODO(DOC-07/DOC-03): stop the spindle (LEDC PWM → 0) and de-energize the drivers (STEP_EN high) here.
+    // DOC-07: `$SLP` stops the spindle (LEDC duty → 0, SPIN_EN de-asserted), independent of motion state. The
+    // TMC driver de-energize (STEP_EN high) remains a DOC-03 follow-up, flagged in the report.
+    force_spindle_off();
     ack().await;
   } else {
     // Sleep is rejected from any non-Normal state (alarm/check/already asleep), matching grbl.
@@ -2655,9 +3069,18 @@ fn parser_snapshot(state: &ModalState) -> ParserSnapshot {
       GcodeDistance::Absolute => ParserDistance::Absolute,
       GcodeDistance::Incremental => ParserDistance::Incremental,
     },
+    feed_mode: match state.feed_mode {
+      GcodeFeedMode::InverseTime => ParserFeedMode::InverseTime,
+      GcodeFeedMode::UnitsPerMin => ParserFeedMode::UnitsPerMin,
+    },
     wcs: state.wcs,
     tlo_active: state.tlo_active,
     feed: state.feed,
+    spindle: match state.spindle {
+      SpindleState::Clockwise => ParserSpindle::Clockwise,
+      SpindleState::CounterClockwise => ParserSpindle::CounterClockwise,
+      SpindleState::Stop => ParserSpindle::Stop,
+    },
     // The parser tracks spindle speed as f32 RPM; the snapshot reports whole RPM (grbl's `$G` S word).
     spindle_rpm: state.spindle_speed.max(0.0) as u16,
   }

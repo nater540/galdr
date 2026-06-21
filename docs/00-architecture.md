@@ -215,7 +215,10 @@ tasks directly; it communicates only through the `BlockQueue` Mutex and feed-hol
   `Mutex<CriticalSectionRawMutex, _>` plus a `Signal` `BLOCK_AVAILABLE`
 - `motion_executor` → `status_reporter`: shared `MachineState` in a `Mutex` (live MPos in steps)
 - Any task → `usb_tx`: `Channel<_, Response, 8>`
-- `gcode_parser`/`planner` → `spindle`: `Signal<SpindleCommand>`
+- `comms` consumer → `spindle`: the commanded direction in a `SPINDLE_DIRECTION` atomic + a `SPINDLE_UPDATE`
+  `Signal` (re-drive from the override-scaled RPM) and a `SPINDLE_ESTOP` `Signal` (immediate stop). (The DOC-00
+  sketch's single `Signal<SpindleCommand>` was the plan; the implementation splits it so the realized RPM and the
+  e-stop are decoupled from the direction.)
 - Limit-switch ISR → `motion_executor`: `Signal` `LIMIT_TRIGGERED`
 
 ### Inter-task message data structures (sketch)
@@ -470,6 +473,23 @@ is:
 | F         | Feed rate word                                       |
 | S         | Spindle speed word                                   |
 
+### Synchronized motion boundaries (G4 dwell, M30)
+Non-motion outcomes that grbl treats as *synchronized* — the stream blocks until prior motion has fully drained —
+are realized in the consumer task, not as silent pass-throughs:
+
+- **G4 P\<seconds\> (dwell).** The planner flushes look-ahead (the preceding block stops); the consumer then runs
+  one shared `run_dwell`: `wait_for_motion_idle` (poll `program_running` — the executor running OR the planner
+  queue non-empty — until the queue has fully drained to a stop, racing a soft reset), then a `Timer` hold for the
+  dwell. A `0x18` mid-dwell aborts the line and runs the soft-reset transition. Dwells are clamped to
+  `MAX_DWELL_S` (1 h) so a grossly mis-set value cannot saturate the microsecond `Timer`.
+- **The `$392` spin-up dwell** uses the *same* `run_dwell` mechanism (one dwell path, not an ad-hoc timer): before
+  the first cutting move after an M3/M4 the consumer flushes look-ahead and runs the synchronized dwell so the
+  spindle reaches speed before the cut. The `SpinUpGate` (host-tested) owns the once-per-start when-decision.
+- **M30 (program end).** Drain motion, stop the spindle (`force_spindle_off`), reset the parser modal state to
+  power-on defaults, re-select G54 into the coordinate model + planner, and reset the live feed/rapid/spindle
+  overrides + flood/mist coolant — matching grbl's M30 rewind. It does **not** flush the planner or zero machine
+  position (M30 is a rewind, not a soft reset).
+
 ### Command queue between parser and planner
 `Channel<CriticalSectionRawMutex, PlannerCommand, 8>`. The parser enqueues only on successful
 validation; errors produce an `error:N` response and the line is discarded. Backpressure: when the
@@ -494,7 +514,8 @@ equivalent to grbl's character-counting protocol.
   (soft/hard limits), `$22` (homing enable), `$23` (homing dir invert mask), `$24/$25` (homing
   feed/seek rates), `$26` (homing debounce ms), `$27` (homing pull-off mm), `$30/$31` (max/min
   spindle RPM), `$100–$102` (steps/mm per axis), `$110–$112` (max rate mm/min), `$120–$122`
-  (acceleration mm/s²), `$130–$132` (max travel mm).
+  (acceleration mm/s²), `$130–$132` (max travel mm), `$392` (spindle-on / spin-up delay s, grbl-aligned),
+  `$393` (spindle reverse spin-down dwell s, Galdr-specific).
 
 ---
 
@@ -636,14 +657,56 @@ Clamp to [0, full_scale]. S = 0 implies M5 (spindle off) regardless.
 - **M4 (CCW):** set SPIN_DIR for CCW, set duty, assert SPIN_EN.
 - **M5 (stop):** de-assert SPIN_EN and set duty to 0.
 
+### Settings
+- `$392` (spindle on delay, seconds) — grbl-aligned spin-up delay; the planner inserts a synchronized dwell of
+  this length before the first cutting move after an M3/M4. Default `0` (no delay).
+- `$393` (spindle reverse dwell, seconds) — Galdr-specific M3↔M4 reversal spin-down dwell; a running spindle is
+  forced to a stop and parked this long before the opposite direction is energized. Default `1.5`.
+
 ### Safety interlock
-- Direction changes (M3 ↔ M4) force M5, a configurable spin-down dwell, then restart. Never
-  reverse a running spindle.
+- Direction changes (M3 ↔ M4) force M5, the `$393` spin-down dwell, then restart. Never reverse a running
+  spindle. The host-tested `SpindleController` forces the stop and signals the dwell; the spindle task awaits it.
 - On any ALARM, soft reset (0x18), or hard limit trigger, the spindle task immediately de-asserts
   SPIN_EN and zeros LEDC duty, independent of motion state.
 - A feed hold (`!`) halts motion but does **not** stop the spindle (matching grblHAL semantics);
   only ALARM/soft-reset forces spindle off.
-- After M3/M4, the planner inserts a spin-up dwell before the first cutting move begins.
+- After M3/M4, the planner inserts a spin-up dwell of `$392` before the first cutting move begins.
+
+### Implementation (host-tested controller + firmware wiring)
+The DOC-07 logic is split so all sequencing is unit-tested off-target and only the peripheral output lives in
+the `firmware` binary:
+
+- **`firmware_core::spindle::SpindleController<P: PwmSink, En: DigitalOut, Dir: DigitalOut>`** — the pure,
+  synchronous, host-tested state machine. It maps RPM → duty (`rpm_to_duty`, clamped, `$30 ≤ $31` ⇒ duty 0,
+  `S0 ⇒ stop`), sequences M3/M4/M5 (set DIRECTION → set duty → assert ENABLE on start; ENABLE off → duty 0 on
+  stop), and handles the M3↔M4 reversal interlock: a reversal of a *running* spindle forces a stop **now** and
+  returns `SpindleAction::SpinDownThenReverse { dwell_s }` for the caller to await before `complete_reverse`. The
+  scheduled dwell is floored to `MIN_REVERSE_DWELL_S` (0.5 s) so a `0` / legacy `$393` can never produce an
+  instant reversal. `emergency_stop()` is the idempotent ALARM/reset path. The controller owns no `Settings` — the
+  caller passes `$30`/`$31`/`$393` in.
+- **HAL traits (`hal_traits.rs`)** — `PwmSink { set_duty(frac) }` (normalized `0.0..=1.0`) and
+  `DigitalOut { set(level) }` (logical level; board polarity lives in the impl).
+- **Firmware wiring (`firmware/src/spindle.rs`)** — `LedcPwmSink` over LEDC timer0/channel0 on GPIO13 (5 kHz,
+  13-bit), and a single polarity-parameterized `GpioOut { pin, active_high }`: SPIN_EN on GPIO14 (`active_high =
+  false`, active-low → logical RUN drives the pin LOW), SPIN_DIR on GPIO15 (`active_high = true`). Spindle starts
+  SAFE (EN de-asserted, duty 0).
+- **`spindle` task (core 0)** — the sole driver of the outputs. It awaits `SPINDLE_ESTOP` (polled first, so an
+  e-stop is never deferred behind a queued update) and `SPINDLE_UPDATE`; on `SpinDownThenReverse` it awaits the
+  `$393` dwell (raced against an e-stop) then `complete_reverse`. Inter-task state: `SPINDLE_DIRECTION` (atomic,
+  the commanded M3/M4/M5), `PROGRAMMED_SPINDLE_RPM` (atomic, the modal `S`), and the two `Signal`s. The realized
+  RPM the task drives is the programmed RPM scaled by the live spindle override / spindle-stop toggle, so a
+  `0x99`/`0x9A`/`0x9B`/`0x9E` override change re-drives the duty without re-issuing the M-word (only spindle-
+  relevant override bytes wake the task).
+- **Modal-driven dispatch (`sync_spindle_from_modal`)** — the spindle is driven from the parser's **modal** spindle
+  state (group 7), not the per-line `Spindle` outcome, on every clean parse. This is what makes an M3/M4/M5 take
+  effect even when it shares a line with a move (`M3 S1000 G1 X10` — the line emits the *move*, and the modal
+  direction still drives the spindle) and lets a bare `S` re-drive a running spindle's speed. It is suppressed in
+  `$C` check mode (a dry run must not actuate outputs) and reset on soft reset / M30.
+
+### Status
+Implemented and host-tested (controller + sequencing + reversal interlock + the two settings). The hardware
+boundary — the LEDC duty → conditioned 0–10 V curve and real reversal timing — is compile-verified only and
+awaits bench measurement (DOC-09 step 6). Coolant (flood/mist) output remains a GPIO stub.
 
 ---
 
