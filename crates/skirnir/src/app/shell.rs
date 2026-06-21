@@ -129,6 +129,36 @@ pub struct SkirnirApp {
   /// its probes: [`Self::pump_wizard`] folds each resolved Phase 0 latch result into the state machine. Held in
   /// app state (not persisted) — DOC-11 §1.3 flags cross-session persistence as a follow-up.
   wizard: Option<RotaryCenterRun>,
+  /// The active Phase 2 angle-sweep run (180°-flip verify OR runout report), or `None`. Both wizards share one
+  /// [`super::angle_sweep::AngleSweep`] engine and one kind-dispatched pump ([`Self::pump_sweep`]) rather than
+  /// each owning a bespoke pump — they are the same "probe at a list of A angles, collect readings" shape.
+  sweep: Option<SweepRun>,
+}
+
+/// Which probe-flow "slot" owns the shared latch, for the mutual-cancel guard. Exactly one may be armed at a
+/// time; starting any flow cancels the others' pending follow-up so a stale one cannot act on a new `[PRB:]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOpSlot {
+  /// The hardened Z touch-off (`pending_zero_z`).
+  ZeroZ,
+  /// The rotary center-finder (`wizard`).
+  Wizard,
+  /// The Phase 2 angle-sweep (`sweep`) — flip-verify or runout.
+  Sweep,
+}
+
+/// The shell-side bookkeeping for a Phase 2 angle-sweep run: the shared pure sweep engine, the bench probe
+/// params, which probe kind owns the latch (so the pump stays kind-routed), and the current touch's lost-push
+/// fallback. The verified `wcs` is carried for the flip-verify's `G10` offer; runout writes nothing.
+struct SweepRun {
+  /// Which Phase 2 wizard this run is — selects the latch `ProbeKind` and the completion compute (flip vs runout).
+  kind: super::view_state::ProbeKind,
+  /// The shared multi-touch sweep engine (angles, axis/dir, collected readings, step).
+  sweep: super::angle_sweep::AngleSweep,
+  /// The bench-tuned clearance/settle/feed/depth shared across the run's touches.
+  params: super::rotary_probe::RotaryProbeParams,
+  /// The current touch's lost-push fallback (shared with the ZeroZ / center-finder flows via `await_action`).
+  touch_fallback: Option<TouchFallback>,
 }
 
 /// The shell-side bookkeeping for a rotary center-finder run: the pure wizard state machine plus the bench-tuned
@@ -200,6 +230,7 @@ impl SkirnirApp {
       pending_probe: None,
       pending_zero_z: None,
       wizard: None,
+      sweep: None,
     };
     app.refresh_ports();
     app
@@ -416,6 +447,11 @@ impl SkirnirApp {
         }
       }
       Intent::RotaryCenterCancel => self.wizard = None,
+      Intent::FlipVerifyStart { angle_deg, axis, dir } => self.flip_verify_start(angle_deg, axis, dir),
+      Intent::RunoutStart { n, start_deg, axis, dir } => self.runout_start(n, start_deg, axis, dir),
+      Intent::SweepProbe => self.sweep_probe(),
+      Intent::FlipVerifyWriteCorrection => self.flip_verify_write_correction(),
+      Intent::SweepCancel => self.sweep_cancel(),
     }
   }
 
@@ -766,8 +802,8 @@ impl SkirnirApp {
   /// the lost-push window cannot corrupt it. A probe issued while one is pending replaces it (latest wins); a
   /// wizard run in progress is cancelled so the two cannot share the latch.
   fn probe_z(&mut self, depth: f64, feed: f64, plate_thickness: f64) {
-    // Starting a ZeroZ probe cancels any rotary wizard run so the shared latch cannot be claimed by both flows.
-    self.wizard = None;
+    // Starting a ZeroZ probe cancels every other probe flow so the shared latch cannot be claimed by two at once.
+    self.cancel_probe_ops_except(ProbeOpSlot::ZeroZ);
     // Arm the latch BEFORE the probe is sent so the result (which can arrive within a frame) always finds an op
     // awaiting it. `begin_probe` supersedes any prior op, matching the "latest request wins" rule.
     self.view.begin_probe(super::view_state::ProbeKind::ZeroZ);
@@ -914,9 +950,9 @@ impl SkirnirApp {
     };
     let params = run.params;
     let lines = super::rotary_probe::rotary_safe_probe_lines(touch, params);
-    // Starting a rotary touch cancels any pending ZeroZ follow-up so the shared latch cannot be claimed by both
-    // flows (the ZeroZ pump also kind-gates, but clearing here is the belt to that suspenders).
-    self.pending_zero_z = None;
+    // Starting a rotary touch cancels every other probe flow so the shared latch cannot be claimed by two at once
+    // (the pumps also kind-gate, but clearing here is the belt to that suspenders).
+    self.cancel_probe_ops_except(ProbeOpSlot::Wizard);
     // Arm the latch BEFORE sending so the result always finds an op awaiting it; the wizard owns the follow-up.
     self.view.begin_probe(super::view_state::ProbeKind::RotaryCenter);
     // Stamp the touch's lost-push fallback so a dropped `[PRB:]` push does not leave the wizard awaiting forever.
@@ -1052,6 +1088,206 @@ impl SkirnirApp {
       AwaitAction::GiveUp(reason) => {
         if let Some(run) = self.wizard.as_mut() {
           run.state.abort(reason.clone());
+          run.touch_fallback = None;
+        }
+        self.view.fail_probe(reason);
+        true
+      }
+    }
+  }
+
+  /// Cancel every OTHER in-flight probe op so only one is ever armed at a time (the cross-contamination guard).
+  /// Called when any probe flow starts. The shared latch is kind-routed, but clearing the others' pending state
+  /// here means a stale follow-up can never act on a new flow's `[PRB:]`.
+  fn cancel_probe_ops_except(&mut self, keep: ProbeOpSlot) {
+    if keep != ProbeOpSlot::ZeroZ {
+      self.pending_zero_z = None;
+    }
+    if keep != ProbeOpSlot::Wizard {
+      self.wizard = None;
+    }
+    if keep != ProbeOpSlot::Sweep {
+      self.sweep = None;
+    }
+  }
+
+  /// Start a Phase 2 180°-flip center-verify (DOC-11 §2.1): a two-angle sweep at θ and θ+180 along `axis`/`dir`.
+  /// The operator jogs the approach and triggers each touch; on completion [`super::flip_verify`] computes the
+  /// residual and offers a position-independent `G10 L2` correction. Cancels any other in-flight probe op.
+  fn flip_verify_start(&mut self, angle_deg: f64, axis: super::intent::Axis, dir: super::intent::Dir) {
+    self.cancel_probe_ops_except(ProbeOpSlot::Sweep);
+    let angles = vec![angle_deg, angle_deg + 180.0];
+    self.sweep = Some(SweepRun {
+      kind: super::view_state::ProbeKind::FlipVerify,
+      sweep: super::angle_sweep::AngleSweep::new(angles, axis, dir),
+      params: super::rotary_probe::RotaryProbeParams::default(),
+      touch_fallback: None,
+    });
+    self.notice(format!("180°-flip verify: probe {} at A{angle_deg:.1}° then A{:.1}°", axis.letter(),
+      angle_deg + 180.0));
+  }
+
+  /// Start a Phase 2 runout report (DOC-11 §2.2): an N-angle sweep (evenly spaced from `start_deg`) along
+  /// `axis`/`dir`. READ-ONLY — on completion [`super::runout`] reports TIR / eccentricity; nothing is written.
+  /// Cancels any other in-flight probe op. `n < 2` is rejected (TIR needs at least two readings).
+  fn runout_start(&mut self, n: usize, start_deg: f64, axis: super::intent::Axis, dir: super::intent::Dir) {
+    if n < 2 {
+      self.notice("runout needs at least 2 angles".to_string());
+      return;
+    }
+    self.cancel_probe_ops_except(ProbeOpSlot::Sweep);
+    let angles = super::angle_sweep::evenly_spaced_angles(n, start_deg);
+    self.sweep = Some(SweepRun {
+      kind: super::view_state::ProbeKind::Runout,
+      sweep: super::angle_sweep::AngleSweep::new(angles, axis, dir),
+      params: super::rotary_probe::RotaryProbeParams::default(),
+      touch_fallback: None,
+    });
+    self.notice(format!("runout report: {n} angles along {}", axis.letter()));
+  }
+
+  /// Trigger the sweep's next touch: ask the engine for the touch due at the current angle, emit its rotary-safe
+  /// probe lines, and arm the latch (with the run's [`ProbeKind`]) so [`Self::pump_sweep`] folds the result back.
+  /// Inert if no sweep is running, one is already probing, or no angle remains.
+  fn sweep_probe(&mut self) {
+    let Some(run) = self.sweep.as_mut() else {
+      self.notice("no verify/runout sweep running".to_string());
+      return;
+    };
+    if run.sweep.is_probing() {
+      self.notice("sweep probe already in progress".to_string());
+      return;
+    }
+    let Some(touch) = run.sweep.begin_next_touch() else {
+      self.notice("no sweep touch is due".to_string());
+      return;
+    };
+    let (kind, params) = (run.kind, run.params);
+    let lines = super::rotary_probe::rotary_safe_probe_lines(touch, params);
+    // Only this sweep may own the latch now (cross-contamination guard), and arm it BEFORE sending so the result
+    // always finds an op awaiting it.
+    self.cancel_probe_ops_except(ProbeOpSlot::Sweep);
+    self.view.begin_probe(kind);
+    if let Some(run) = self.sweep.as_mut() {
+      run.touch_fallback =
+        Some(TouchFallback { issued_at: Instant::now(), polled: false, polled_at: None, seen_cycle: false });
+    }
+    let mut all_sent = true;
+    for line in lines {
+      self.view.note_sent(line.clone());
+      if !self.send_command(Command::SendLine(line)) {
+        all_sent = false;
+        break;
+      }
+    }
+    if !all_sent {
+      self.view.fail_probe("sweep probe not sent (not connected)");
+      if let Some(run) = self.sweep.as_mut() {
+        run.sweep.abort("probe not sent (not connected)");
+      }
+    }
+  }
+
+  /// Write the flip-verify's offered `G10 L2` correction (the verified axis only, never A). Inert unless a
+  /// completed flip-verify sweep is present with a computable two-reading result.
+  fn flip_verify_write_correction(&mut self) {
+    use super::flip_verify::FlipResult;
+    use super::rotary_center::Wcs;
+    let Some(run) = self.sweep.as_ref() else {
+      return;
+    };
+    if run.kind != super::view_state::ProbeKind::FlipVerify || !run.sweep.is_done() {
+      self.notice("no flip-verify correction to write yet".to_string());
+      return;
+    }
+    // The probed axis is the sweep's axis; the readings are complete (is_done). Recover the axis from the first
+    // touch description is unnecessary — the run carries it via the sweep's touches, so probe along the same axis.
+    let axis = run.sweep.probe_axis();
+    let Some(result) = FlipResult::from_readings(axis, run.sweep.readings()) else {
+      self.notice("flip-verify needs exactly two readings".to_string());
+      return;
+    };
+    // The correction is a RELATIVE shift of the current work origin by the measured residual, so it needs the
+    // current WCO on the verified axis (the machine coordinate of work-0). Without a status report carrying `WCO:`
+    // we cannot compute it safely — surface that rather than guess.
+    let Some(&current_origin) = self.view.last_wco.get(axis.index()) else {
+      self.notice("no WCO yet — request a status report before applying the correction".to_string());
+      return;
+    };
+    let line = result.offer_g10(Wcs::Active, current_origin);
+    self.send_line(line);
+    self.notice("shifted the active WCS origin by the flip-verify residual".to_string());
+  }
+
+  /// Cancel any running Phase 2 sweep, discarding its state.
+  fn sweep_cancel(&mut self) {
+    self.sweep = None;
+  }
+
+  /// Drive a running Phase 2 sweep one frame: fold a resolved latch result into the shared engine, or run the
+  /// SAME completion-gated lost-push fallback the other flows use. Kind-routed: acts only when the latch belongs
+  /// to THIS sweep's kind (FlipVerify/Runout). Returns whether anything changed. The single pump for both Phase 2
+  /// wizards — they differ only in the post-completion compute, which the view/`flip_verify_write_correction` do.
+  fn pump_sweep(&mut self) -> bool {
+    use super::probe_flow::{AwaitAction, await_action};
+    // Only act while a touch is in flight; copy the fallback stamps up front to release the borrow before mutating.
+    let (kind, issued_at, polled_at) = match self.sweep.as_ref() {
+      Some(run) if run.sweep.is_probing() => {
+        let (issued, polled) = match &run.touch_fallback {
+          Some(f) => (f.issued_at, f.polled_at),
+          None => (Instant::now(), None),
+        };
+        (run.kind, issued, polled)
+      }
+      _ => return false,
+    };
+    // The latch must belong to THIS sweep's kind. Gone or another kind ⇒ abort the sweep rather than act on
+    // someone else's `[PRB:]`.
+    match self.view.probe_op.as_ref() {
+      Some(op) if op.kind == kind => {}
+      _ => {
+        if let Some(run) = self.sweep.as_mut() {
+          run.sweep.abort("probe latch lost");
+        }
+        return true;
+      }
+    }
+    // Resolved ⇒ fold the outcome into the engine and finish the touch.
+    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
+    if let Some(outcome) = resolved {
+      if let Some(run) = self.sweep.as_mut() {
+        run.sweep.on_probe_result(&outcome);
+        run.touch_fallback = None;
+      }
+      self.view.clear_probe_op();
+      return true;
+    }
+    // Still awaiting ⇒ shared lost-push fallback, gated on the touch having demonstrably finished.
+    let now = Instant::now();
+    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
+    if busy_now && let Some(run) = self.sweep.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+      f.seen_cycle = true;
+    }
+    let (polled, seen_cycle) = match self.sweep.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
+      Some(f) => (f.polled, f.seen_cycle),
+      None => return false,
+    };
+    let probe_finished = seen_cycle && !busy_now;
+    let since_issue = now.duration_since(issued_at);
+    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
+    match await_action(polled, probe_finished, since_issue, since_poll) {
+      AwaitAction::Wait => false,
+      AwaitAction::Poll => {
+        if let Some(run) = self.sweep.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+          f.polled = true;
+          f.polled_at = Some(now);
+        }
+        self.send_line("$#".to_string());
+        true
+      }
+      AwaitAction::GiveUp(reason) => {
+        if let Some(run) = self.sweep.as_mut() {
+          run.sweep.abort(reason.clone());
           run.touch_fallback = None;
         }
         self.view.fail_probe(reason);
@@ -1198,6 +1434,10 @@ impl eframe::App for SkirnirApp {
           // the center lives in skirnir state); pass a borrow so the view stays a pure render of it.
           let wizard = self.wizard.as_ref().map(|run| &run.state);
           views::rotary_center(ui, &self.view, &mut self.ui, wizard, &mut sink);
+          ui.separator();
+          // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
+          let sweep = self.sweep.as_ref().map(|run| (&run.sweep, run.kind));
+          views::verify_measure(ui, &self.view, &mut self.ui, sweep, &mut sink);
         });
       });
 
@@ -1239,6 +1479,9 @@ impl eframe::App for SkirnirApp {
     //     wizard advances (or aborts) the instant a touch resolves.
     let saw_wizard = self.pump_wizard();
 
+    // 3e. Service a running Phase 2 sweep (flip-verify / runout) the same way, via the shared kind-routed pump.
+    let saw_sweep = self.pump_sweep();
+
     // 4. Schedule the next wake. Only spin the steady timer when there is live traffic to expect: while an
     //    engine is attached (the firmware auto-reports and a stream needs prompt progress updates, and the
     //    engine's events are polled from this loop), or for one extra frame after an event arrived. When
@@ -1257,8 +1500,8 @@ impl eframe::App for SkirnirApp {
         (false, false)
       }
     };
-    if saw_event || saw_probe || saw_probe_z || saw_wizard || fired_reconnect || probe_pending || reconnect_pending
-      || self.engine.is_some() || self.jog_stream.is_some() || self.pending_zero_z.is_some()
+    if saw_event || saw_probe || saw_probe_z || saw_wizard || saw_sweep || fired_reconnect || probe_pending
+      || reconnect_pending || self.engine.is_some() || self.jog_stream.is_some() || self.pending_zero_z.is_some()
     {
       ctx.request_repaint_after(REPAINT_INTERVAL);
     }
@@ -1723,18 +1966,172 @@ mod tests {
     assert!(!after.contains("G10"), "an aborted wizard must never write a WCS offset; saw {after:?}");
   }
 
-  /// Pump BOTH probe follow-ups (ZeroZ and wizard) each step, draining events + writes — so a test can prove the
-  /// two never act on each other's `[PRB:]` through the shared latch.
+  /// Pump ALL probe follow-ups (ZeroZ, center-finder, and Phase 2 sweep) each step, draining events + writes — so
+  /// a test can prove no flow acts on another's `[PRB:]` through the shared kind-routed latch.
   fn pump_both_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for _ in 0..steps {
       app.pump_events();
       app.pump_probe_z();
       app.pump_wizard();
+      app.pump_sweep();
       out.extend(controller.drain_written());
       std::thread::sleep(Duration::from_millis(5));
     }
     out
+  }
+
+  /// Drive the sweep pump across a short window, draining events + writes each step.
+  fn pump_sweep_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_events();
+      app.pump_sweep();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// Issue one Phase 2 sweep touch and feed back its `[PRB:]` result, returning the emitted probe lines. Mirrors
+  /// the real flow: trigger `sweep_probe`, the firmware acks each line and pushes a `[PRB:]`, the pump folds it.
+  fn sweep_touch(app: &mut SkirnirApp, controller: &mut LoopbackController, prb: &str) -> String {
+    app.sweep_probe();
+    let issued = String::from_utf8_lossy(&pump_sweep_steps(app, controller, 8)).into_owned();
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line(prb));
+    pump_sweep_steps(app, controller, 12);
+    issued
+  }
+
+  /// The 180°-flip verify (DOC-11 §2.1) must run a two-touch sweep (θ, θ+180), compute `error=(r2−r1)/2`, and
+  /// offer a position-independent `G10 L2` correction on the verified axis only (never A).
+  #[test]
+  fn the_flip_verify_runs_two_touches_and_offers_a_yz_only_correction() {
+    use crate::app::intent::{Axis, Dir};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.flip_verify_start(0.0, Axis::Y, Dir::Neg);
+    controller.drain_written();
+
+    // Touch 1 at A0 → reading r1 = 4.0 (Y component). The probe must be rotary-safe and carry no A in the probe.
+    let t1 = sweep_touch(&mut app, &mut controller, "[PRB:0.000,4.000,0.000:1]");
+    assert!(t1.contains("G90 G0 A0.000"), "the first touch indexes A0 absolutely; saw {t1:?}");
+    let probe = t1.lines().find(|l| l.contains("G38.2")).expect("a probe line");
+    assert!(!probe.contains('A'), "the probe line must never carry an A word; saw {probe:?}");
+
+    // Touch 2 at A180 → reading r2 = -2.0. error = (-2 - 4)/2 = -3.0 (the residual eccentricity; radius-free).
+    let t2 = sweep_touch(&mut app, &mut controller, "[PRB:0.000,-2.000,0.000:1]");
+    assert!(t2.contains("G90 G0 A180.000"), "the second touch indexes A180; saw {t2:?}");
+    assert!(app.sweep.as_ref().unwrap().sweep.is_done(), "both touches done");
+
+    // The correction is a RELATIVE shift of the current work origin by the residual. With the work-Y origin
+    // currently at machine-Y = 10.0 (WCO), the corrected origin is 10 + (-3) = 7.0 — Y-only, never A, and position-
+    // independent (it does NOT write the surface midpoint 1.0, which would be a full radius off the axis).
+    app.view.last_wco = std::vec![0.0, 10.0, 0.0, 0.0];
+    app.flip_verify_write_correction();
+    let wrote = String::from_utf8_lossy(&pump_sweep_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(wrote.contains("G10 L2 P0 Y7.000"), "the correction must shift the origin by the residual; saw {wrote:?}");
+    let g10 = wrote.lines().find(|l| l.contains("G10")).expect("a G10 line");
+    assert!(!g10.contains('A'), "the correction must never carry an A word; saw {g10:?}");
+  }
+
+  /// The runout report (DOC-11 §2.2) must run an N-touch sweep, compute TIR = max−min and eccentricity = TIR/2,
+  /// and write NO `G10` (read-only).
+  #[test]
+  fn the_runout_report_runs_n_touches_and_writes_nothing() {
+    use crate::app::intent::{Axis, Dir};
+    use crate::app::runout::RunoutReport;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.runout_start(4, 0.0, Axis::Y, Dir::Neg);
+    controller.drain_written();
+
+    // Four readings spanning [-0.5, 1.5] → TIR = 2.0, eccentricity = 1.0.
+    for prb in ["[PRB:0.000,0.000,0.000:1]", "[PRB:0.000,1.500,0.000:1]", "[PRB:0.000,-0.500,0.000:1]",
+      "[PRB:0.000,1.000,0.000:1]"]
+    {
+      sweep_touch(&mut app, &mut controller, prb);
+    }
+    let run = app.sweep.as_ref().expect("a sweep");
+    assert!(run.sweep.is_done(), "all four touches done");
+    let report = RunoutReport::from_readings(run.sweep.readings()).expect("a report");
+    assert_eq!(report.tir, 2.0);
+    assert_eq!(report.eccentricity, 1.0);
+
+    // Read-only: the whole run must have emitted NO G10.
+    controller.drain_written();
+    let after = String::from_utf8_lossy(&pump_sweep_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(!after.contains("G10"), "runout is read-only and must never write a G10; saw {after:?}");
+  }
+
+  /// A failed touch mid-sweep aborts the whole run with no partial result (no TIR, no correction).
+  #[test]
+  fn a_failed_sweep_touch_aborts_with_no_partial_result() {
+    use crate::app::angle_sweep::SweepStep;
+    use crate::app::intent::{Axis, Dir};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.runout_start(3, 0.0, Axis::Y, Dir::Neg);
+    controller.drain_written();
+    sweep_touch(&mut app, &mut controller, "[PRB:0.000,1.000,0.000:1]");
+    // The second touch reports no contact (`:0`) → the sweep aborts.
+    sweep_touch(&mut app, &mut controller, "[PRB:0.000,0.000,0.000:0]");
+    assert_eq!(app.sweep.as_ref().unwrap().sweep.step(), SweepStep::Aborted);
+  }
+
+  /// A lost wizard-touch push in a Phase 2 sweep must fall back to `$#` (the SHARED fallback), exactly like the
+  /// ZeroZ and center-finder flows — a dropped `[PRB:]` must not hang the sweep.
+  #[test]
+  fn a_lost_sweep_touch_push_falls_back_to_dollar_hash() {
+    use crate::app::intent::{Axis, Dir};
+    use crate::app::probe_flow::PUSH_TIMEOUT;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.runout_start(2, 0.0, Axis::Y, Dir::Neg);
+    app.sweep_probe();
+    // Backdate the touch past the push timeout; no `[PRB:]` arrives (lost).
+    if let Some(run) = app.sweep.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+      f.issued_at = Instant::now() - (PUSH_TIMEOUT + Duration::from_secs(5));
+    }
+    controller.drain_written();
+
+    // In a cycle → no poll. A clean return to Idle (push genuinely lost) → poll `$#`.
+    assert!(controller.inject_line("<Run|MPos:0.000,-1.000,0.000>"));
+    let during = String::from_utf8_lossy(&pump_sweep_steps(&mut app, &mut controller, 12)).into_owned();
+    assert!(!during.contains("$#"), "an in-flight sweep touch must not poll $# mid-cycle; saw {during:?}");
+    assert!(controller.inject_line("<Idle|MPos:0.000,-3.000,0.000>"));
+    let after = String::from_utf8_lossy(&pump_sweep_steps(&mut app, &mut controller, 12)).into_owned();
+    assert!(after.contains("$#"), "a finished sweep touch with a lost push must poll $#; saw {after:?}");
+  }
+
+  /// Cross-contamination guard (extended to Phase 2): starting a flip-verify cancels a pending ZeroZ, and the
+  /// sweep's `[PRB:]` must be consumed ONLY by the sweep — never firing the ZeroZ `G10`.
+  #[test]
+  fn a_sweep_touch_does_not_fire_a_pending_zeroz_or_wizard() {
+    use crate::app::intent::{Axis, Dir};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Arm a ZeroZ and a center-finder, then start a flip-verify and issue its touch — both others must cancel.
+    app.probe_z(2.5, 50.0, 1.0);
+    app.rotary_center_start(6.0, 0.0);
+    app.flip_verify_start(0.0, Axis::Y, Dir::Neg);
+    app.sweep_probe();
+    assert!(app.pending_zero_z.is_none(), "starting a sweep must cancel a pending ZeroZ");
+    assert!(app.wizard.is_none(), "starting a sweep must cancel a center-finder run");
+    controller.drain_written();
+
+    // The sweep result lands. It must feed the sweep and NOT emit any G10 (no ZeroZ zero, no wizard write).
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line("[PRB:0.000,4.000,0.000:1]"));
+    let after = String::from_utf8_lossy(&pump_both_steps(&mut app, &mut controller, 20)).into_owned();
+    assert!(!after.contains("G10"), "a sweep `[PRB:]` must not fire any other flow's G10; saw {after:?}");
+    assert_eq!(app.sweep.as_ref().unwrap().sweep.readings(), &[4.0], "the sweep consumes its own result");
   }
 
   /// THE CROSS-CONTAMINATION REGRESSION (finding #2): starting a rotary touch while a ZeroZ touch-off is pending

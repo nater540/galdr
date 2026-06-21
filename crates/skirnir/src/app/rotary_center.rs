@@ -50,8 +50,9 @@ pub enum ZDatum {
 }
 
 impl Wcs {
-  /// The `Pn` selector digit for this WCS (`P0` = active).
-  fn selector(self) -> u32 {
+  /// The `Pn` selector digit for this WCS (`P0` = active). Public so the Phase 2 verify wizard reuses the same
+  /// `G10 L2 P<n>` framing.
+  pub fn selector_digit(self) -> u32 {
     match self {
       Wcs::Active => 0,
     }
@@ -295,7 +296,7 @@ impl WizardState {
   pub fn offer_g10(&self, wcs: Wcs) -> Option<String> {
     let yc = self.y_center()?;
     let z = self.z_datum_value()?;
-    Some(format!("G10 L2 P{} Y{:.3} Z{:.3}", wcs.selector(), yc, z))
+    Some(format!("G10 L2 P{} Y{:.3} Z{:.3}", wcs.selector_digit(), yc, z))
   }
 }
 

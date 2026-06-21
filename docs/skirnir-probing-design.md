@@ -124,9 +124,19 @@ sent g-code. Persist it with skirnir's existing project/profile store. (See the 
 ## Phase 2 — Verify / measure
 
 ### 2.1 180°-flip center-verify
-Cancels eccentricity/runout to validate (or refine) the center: probe a feature, zero, `G0 A180`, probe again.
-`error_from_center = (reading_2 − reading_1) / 2`; offer to move/trim half to center. Composes the 1.1 primitive
-twice with an A180 between. TDD: scripted pair of `ProbeResult`s → assert `error = Δ/2` and the correction offered.
+Cancels eccentricity to validate/refine the center: probe a feature at θ (reading `r1`), `G0 A<θ+180>`, probe the
+SAME side again (reading `r2`). Both are `G38.x` SURFACE touches, so each reading carries the probe contact radius
+`R` (`r1 = C + e + R`, `r2 = C − e + R`, with rotation axis `C` and eccentricity `e`):
+- `error = (r2 − r1) / 2 = −e` — the residual eccentricity. The radius **cancels in the difference**, so this is
+  radius-free and is what we SHOW. Zero exactly when the feature is centered.
+- **The absolute axis `C` cannot be recovered from two same-side touches** (it would need `R = D/2`). So the
+  correction is a **RELATIVE shift** of the current work origin by `error`: `new_origin = current_origin + error`
+  (since Phase 1 placed the origin at the dowel center, `error = C − O`). This is radius-free and a **true no-op
+  when centered** — it must NEVER write the surface midpoint `(r1+r2)/2` (= axis + radius), which would move the
+  origin a full radius off the axis. `current_origin` is the tracked `WCO` on the verified axis; if no `WCO` has
+  arrived the correction is withheld. Carries only the verified axis word, never `A`. Composes the 1.1 primitive
+  twice with an `A180` between. TDD: realistic readings WITH the `+R` term → `error = Δ/2`; centered → correction
+  is a no-op; the offered `G10 L2` shifts the current origin by the residual (not the surface midpoint).
 
 ### 2.2 Runout report
 Probe at N angles around the part at fixed X (rotary-safe primitive at each angle), collect the radial readings,

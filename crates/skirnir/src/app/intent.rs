@@ -29,6 +29,16 @@ impl Axis {
       Axis::Z => 'Z',
     }
   }
+
+  /// The index of this axis in a machine-coordinate position vector (X=0, Y=1, Z=2), matching the `[PRB:]` /
+  /// `MPos:` report order. Used to pull the radial reading for the probed axis out of a `ProbeResult` position.
+  pub fn index(self) -> usize {
+    match self {
+      Axis::X => 0,
+      Axis::Y => 1,
+      Axis::Z => 2,
+    }
+  }
 }
 
 /// A direction along an axis: positive or negative.
@@ -130,6 +140,22 @@ pub enum Intent {
   RotaryCenterSetZDatum(crate::app::rotary_center::ZDatum),
   /// Cancel the rotary center-finder run, discarding its state.
   RotaryCenterCancel,
+
+  /// Start a Phase 2 180°-flip center-verify (DOC-11 §2.1): probe a feature along `axis`/`dir` at `angle_deg`,
+  /// then at `angle_deg + 180`, and compute the residual offset from the rotation centerline. Cancels any other
+  /// in-flight probe op.
+  FlipVerifyStart { angle_deg: f64, axis: Axis, dir: Dir },
+  /// Start a Phase 2 runout report (DOC-11 §2.2): probe a feature along `axis`/`dir` at `n` evenly-spaced angles
+  /// from `start_deg`, then report TIR / eccentricity. Read-only. Cancels any other in-flight probe op.
+  RunoutStart { n: usize, start_deg: f64, axis: Axis, dir: Dir },
+  /// Trigger the running sweep's next touch (the operator has jogged the approach). Inert if no sweep is running
+  /// or one is already probing. Shared by both Phase 2 wizards.
+  SweepProbe,
+  /// Write the completed flip-verify's `G10 L2` correction (the verified axis only, never A). Inert unless a
+  /// finished flip-verify sweep is present. (Runout never writes — it has no such intent.)
+  FlipVerifyWriteCorrection,
+  /// Cancel the running Phase 2 sweep, discarding its state.
+  SweepCancel,
 }
 
 /// Build a `G10 L20 P0` line that sets the active work-coordinate system's offset so each listed axis reads

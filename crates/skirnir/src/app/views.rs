@@ -63,6 +63,10 @@ pub struct UiState {
   pub rotary_dowel_diameter: f64,
   /// The rotary center-finder's index-angle input (degrees) every touch holds A at during a run.
   pub rotary_index_angle: f64,
+  /// The Phase 2 verify/measure starting A angle (degrees): θ for the flip-verify pair, and the first runout angle.
+  pub verify_start_angle: f64,
+  /// The Phase 2 runout report's number of evenly-spaced angles (N ≥ 2).
+  pub verify_runout_n: usize,
   /// Whether the settings window is open.
   pub settings_open: bool,
   /// The setting currently being edited in the panel, as `(number, edit_buffer)`, or `None` when no row is in
@@ -116,6 +120,8 @@ impl Default for UiState {
       plate_thickness: 1.0,
       rotary_dowel_diameter: 6.0,
       rotary_index_angle: 0.0,
+      verify_start_angle: 0.0,
+      verify_runout_n: 4,
       settings_open: false,
       editing_setting: None,
       show_machine_pos: false,
@@ -1217,6 +1223,132 @@ fn rotary_z_datum_picker(ui: &mut egui::Ui, w: &super::rotary_center::WizardStat
   ui.label(RichText::new(desc).size(11.0).color(Theme::TEXT_DIM));
   if let Some(z) = z {
     ui.label(RichText::new(format!("G10 will set Z {z:.3}")).size(11.0).color(Theme::TEXT_DIM));
+  }
+}
+
+/// Render the Phase 2 verify/measure panel (DOC-11 §2): the 180°-flip center-verify and the runout report, both
+/// driven by the shared [`super::angle_sweep::AngleSweep`] engine (passed as `(sweep, kind)` when one is running).
+/// When idle it offers both Start actions; while running it guides the per-angle touches and shows the readings;
+/// on completion it computes the flip residual (with a `G10` correction offer) or the runout TIR/eccentricity
+/// (read-only). The probes use the conventional Y radial axis (matching the center-finder), probing toward −Y.
+pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
+  sweep: Option<(&super::angle_sweep::AngleSweep, super::view_state::ProbeKind)>, sink: &mut IntentSink) {
+  use super::angle_sweep::SweepStep;
+  use super::intent::{Axis, Dir};
+  use super::view_state::ProbeKind;
+  section_header(ui, "Verify · measure");
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+    let idle = view.connection == ConnectionState::Idle;
+    let Some((s, kind)) = sweep else {
+      // No run: collect the shared start angle + (for runout) N, and offer both Start actions.
+      ui.label(RichText::new("180°-flip verify or N-angle runout, probing −Y.").size(11.0).color(Theme::TEXT_DIM));
+      ui.add_space(4.0);
+      egui::Grid::new("verify_setup").num_columns(2).show(ui, |ui| {
+        ui.label("Start A");
+        ui.add(egui::DragValue::new(&mut state.verify_start_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
+        ui.end_row();
+        ui.label("Runout N");
+        ui.add(egui::DragValue::new(&mut state.verify_runout_n).range(2..=36));
+        ui.end_row();
+      });
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new("Start 180°-flip verify")).clicked() {
+          sink.push(Intent::FlipVerifyStart { angle_deg: state.verify_start_angle, axis: Axis::Y, dir: Dir::Neg });
+        }
+        if ui.add_sized(full, egui::Button::new("Start runout report")).clicked() {
+          sink.push(Intent::RunoutStart {
+            n: state.verify_runout_n,
+            start_deg: state.verify_start_angle,
+            axis: Axis::Y,
+            dir: Dir::Neg,
+          });
+        }
+      });
+      return;
+    };
+
+    let title = match kind {
+      ProbeKind::FlipVerify => "180°-flip verify",
+      ProbeKind::Runout => "Runout report",
+      _ => "Verify",
+    };
+    ui.label(RichText::new(title).size(11.0).color(Theme::TEXT));
+    verify_readings_table(ui, s);
+    ui.add_space(6.0);
+    match s.step() {
+      SweepStep::Ready => {
+        ui.label(RichText::new(format!("Jog the approach for touch {} of {}, then probe.",
+          s.current_touch_number(), s.total_touches())).size(11.0).color(Theme::TEXT_DIM));
+        ui.add_enabled_ui(idle, |ui| {
+          if ui.add_sized(full, egui::Button::new("Probe this angle")).clicked() {
+            sink.push(Intent::SweepProbe);
+          }
+        });
+      }
+      SweepStep::Probing => {
+        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(Theme::TEXT_DIM));
+      }
+      SweepStep::Done => verify_done(ui, state, s, kind, idle, full, sink),
+      SweepStep::Aborted => {
+        let reason = s.abort_reason().unwrap_or("cancelled");
+        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(Theme::DANGER));
+      }
+    }
+    ui.add_space(4.0);
+    if ui.add_sized(full, egui::Button::new("Cancel")).clicked() {
+      sink.push(Intent::SweepCancel);
+    }
+  });
+}
+
+/// Render the completed-sweep result: the flip-verify residual + `G10` correction offer, or the read-only runout
+/// TIR / eccentricity. Pure render of the computed values over the sweep's readings.
+fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &super::angle_sweep::AngleSweep,
+  kind: super::view_state::ProbeKind, idle: bool, full: Vec2, sink: &mut IntentSink) {
+  use super::flip_verify::FlipResult;
+  use super::runout::RunoutReport;
+  use super::view_state::ProbeKind;
+  match kind {
+    ProbeKind::FlipVerify => {
+      let Some(result) = FlipResult::from_readings(s.probe_axis(), s.readings()) else {
+        ui.label(RichText::new("Flip verify needs two readings.").size(11.0).color(Theme::DANGER));
+        return;
+      };
+      ui.label(RichText::new(format!("Residual eccentricity {:.3} mm.", result.error()))
+        .size(11.0).color(Theme::OK));
+      ui.label(RichText::new("Apply shifts the active WCS origin on this axis by the residual.")
+        .size(11.0).color(Theme::TEXT_DIM));
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new("Apply correction → WCS (G10 L2)")).clicked() {
+          sink.push(Intent::FlipVerifyWriteCorrection);
+        }
+      });
+    }
+    ProbeKind::Runout => match RunoutReport::from_readings(s.readings()) {
+      Some(r) => {
+        ui.label(RichText::new(format!("TIR {:.3} mm · eccentricity {:.3} mm ({} pts)", r.tir, r.eccentricity,
+          r.count)).size(11.0).color(Theme::OK));
+        ui.label(RichText::new("Read-only — no offset written.").size(11.0).color(Theme::TEXT_DIM));
+      }
+      None => {
+        ui.label(RichText::new("Runout needs at least two readings.").size(11.0).color(Theme::DANGER));
+      }
+    },
+    _ => {}
+  }
+}
+
+/// Render the sweep's per-angle readings as a compact dim list (angle → reading once captured). Pure render of
+/// the shared [`super::angle_sweep::AngleSweep`].
+fn verify_readings_table(ui: &mut egui::Ui, s: &super::angle_sweep::AngleSweep) {
+  let readings = s.readings();
+  for (i, &angle) in s.angles().iter().enumerate() {
+    let text = match readings.get(i) {
+      Some(r) => format!("A{angle:.1}°  →  {r:.3}"),
+      None => format!("A{angle:.1}°  →  —"),
+    };
+    ui.label(RichText::new(text).size(11.0).color(Theme::TEXT_DIM));
   }
 }
 

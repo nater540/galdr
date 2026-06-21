@@ -61,6 +61,12 @@ pub enum ProbeKind {
   /// One touch of the rotary center-finder wizard (DOC-11 §1.2). The wizard ([`super::rotary_center`]) owns the
   /// follow-up: it folds the resolved result into its state machine and advances or aborts.
   RotaryCenter,
+  /// One touch of the 180°-flip center-verify wizard (DOC-11 §2.1). The shared angle-sweep engine
+  /// ([`super::angle_sweep`]) collects the reading; the [`super::flip_verify`] computation runs on completion.
+  FlipVerify,
+  /// One touch of the runout report (DOC-11 §2.2). The same angle-sweep engine collects the N radial readings;
+  /// the read-only [`super::runout`] computation (TIR / eccentricity) runs on completion.
+  Runout,
 }
 
 /// The resolved outcome of a probe operation: either a typed `[PRB:]` reading, or a failure with a reason. A
