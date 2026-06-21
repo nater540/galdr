@@ -110,6 +110,26 @@ pub enum Intent {
   /// Set the work-coordinate zero on the given axes to the current position (`G10 L20 P0 …`). An empty set is
   /// treated as "all of X, Y, Z" (the "Zero XYZ" button).
   SetWorkZero { axes: Vec<Axis> },
+
+  /// Start a fresh rotary center-finder run for a dowel of `dowel_diameter` (mm) indexed at `index_angle_deg`
+  /// (DOC-11 §1.2). The shell builds the [`crate::app::rotary_center::WizardState`] and waits for the operator to
+  /// position and trigger each touch. Replaces any wizard already in progress.
+  RotaryCenterStart { dowel_diameter: f64, index_angle_deg: f64 },
+  /// Trigger the wizard's next touch (the operator has jogged to the approach): the shell asks the wizard which
+  /// touch is due, emits the rotary-safe probe lines, and arms the Phase 0 latch. Inert if no wizard is running
+  /// or one is already probing.
+  RotaryCenterProbe,
+  /// Send the wizard's "move to the computed Y center" positioning move, after both Y touches — the mandatory
+  /// step before the top probe so it reads the diameter, not a chord. Inert unless the wizard is at that step.
+  RotaryCenterMoveToYc,
+  /// Write the found center to the active WCS via the wizard's offered `G10 L2` line (Y/Z only, never A). Inert
+  /// until the wizard has a computed center.
+  RotaryCenterWriteWcs,
+  /// Select which feature work-Z0 lands on when the center is written: the rotary axis centerline (default) or
+  /// the probed top surface. Only affects the Z word of the offered `G10 L2`. Inert if no wizard is running.
+  RotaryCenterSetZDatum(crate::app::rotary_center::ZDatum),
+  /// Cancel the rotary center-finder run, discarding its state.
+  RotaryCenterCancel,
 }
 
 /// Build a `G10 L20 P0` line that sets the active work-coordinate system's offset so each listed axis reads

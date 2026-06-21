@@ -61,7 +61,10 @@ pub enum Command {
 
 /// An event surfaced from the engine to the UI. The UI renders these into its state and requests a repaint;
 /// it never blocks on them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: [`Event::Response`] can carry a [`Response::ProbeResult`] whose `Vec<f64>` is not `Eq`.
+/// `PartialEq` is retained for tests and comparisons; nothing keys an `Event` in a hash/tree set.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
   /// The lifecycle moved to a new state.
   StateChanged(ConnectionState),

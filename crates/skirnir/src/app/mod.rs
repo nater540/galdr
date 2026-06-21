@@ -18,7 +18,10 @@
 pub mod badge;
 pub mod intent;
 pub mod overrides;
+pub mod probe_flow;
 pub mod progress;
+pub mod rotary_center;
+pub mod rotary_probe;
 pub mod settings_model;
 pub mod view_state;
 

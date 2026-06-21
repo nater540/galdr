@@ -119,6 +119,57 @@ pub struct SkirnirApp {
   /// 500ms probe never blocks rendering. `None` when no probe is in flight.
   #[cfg(feature = "serial")]
   pending_probe: Option<std::sync::mpsc::Receiver<String>>,
+  /// The in-flight hardened Z touch-off, if one is running, or `None`. Tracks the zero line to send *only* on a
+  /// successful probe plus the wall-clock instants that pace the push-or-poll fallback ([`PendingZeroZProbe`]).
+  /// Held in the shell (not the reducer) because the timeouts are `Instant` work the egui frame owns; the
+  /// success/failure *decision* is the pure [`super::probe_flow::decide`]. `None` once resolved or never started.
+  pending_zero_z: Option<PendingZeroZProbe>,
+  /// The active rotary center-finder run, or `None`. Holds the pure [`super::rotary_center::WizardState`] plus the
+  /// shared bench [`super::rotary_probe::RotaryProbeParams`] for the run. The wizard is the follow-up owner for
+  /// its probes: [`Self::pump_wizard`] folds each resolved Phase 0 latch result into the state machine. Held in
+  /// app state (not persisted) — DOC-11 §1.3 flags cross-session persistence as a follow-up.
+  wizard: Option<RotaryCenterRun>,
+}
+
+/// The shell-side bookkeeping for a rotary center-finder run: the pure wizard state machine plus the bench-tuned
+/// probe parameters shared across its touches. Kept in the shell so the egui frame owns it; all decisions live in
+/// the pure [`super::rotary_center::WizardState`].
+struct RotaryCenterRun {
+  /// The pure wizard state machine (step, readings, computed center).
+  state: super::rotary_center::WizardState,
+  /// The bench-tuned clearance/settle/feed/depth shared across the run's touches and the move-to-Yc.
+  params: super::rotary_probe::RotaryProbeParams,
+  /// The CURRENT touch's lost-push fallback bookkeeping (the same completion-gated push-or-poll-`$#`-or-give-up
+  /// machinery the ZeroZ flow uses, shared via [`super::probe_flow::await_action`]). `None` between touches; set
+  /// when a touch is issued and cleared when it resolves. So a dropped/suppressed `[PRB:]` push cannot leave the
+  /// wizard awaiting forever — it polls `$#` once the touch has finished, then gives up cleanly.
+  touch_fallback: Option<TouchFallback>,
+}
+
+/// One rotary touch's lost-push fallback state: whether `$#` has been polled, whether a probe cycle was observed
+/// (the completion gate, mirroring [`super::probe_flow::PendingZeroZ`]'s `seen_cycle`), and the wall-clock stamps
+/// pacing the timeouts. Reset per touch.
+struct TouchFallback {
+  /// When the touch's probe lines were sent, pacing the push timeout before a `$#` poll.
+  issued_at: Instant,
+  /// Whether the `$#` fallback poll has been sent (so the give-up deadline then runs off `polled_at`).
+  polled: bool,
+  /// When the `$#` poll was sent, or `None` until it is, pacing the give-up deadline after a poll.
+  polled_at: Option<Instant>,
+  /// Whether the machine has been observed in a cycle since the touch was issued (the completion gate).
+  seen_cycle: bool,
+}
+
+/// The shell-side bookkeeping for an in-flight hardened Z touch-off: the pure [`super::probe_flow::PendingZeroZ`]
+/// follow-up plus the wall-clock stamps the egui frame uses to pace the push-or-poll fallback. Kept out of the
+/// pure reducer because `Instant` is frame-owned state.
+struct PendingZeroZProbe {
+  /// The pure follow-up state: the zero line to send on success and whether `$#` was already polled.
+  inner: super::probe_flow::PendingZeroZ,
+  /// When the probe line was sent, pacing the push timeout before a `$#` poll.
+  issued_at: Instant,
+  /// When the `$#` poll was sent, or `None` until it is, pacing the give-up deadline after a poll.
+  polled_at: Option<Instant>,
 }
 
 impl SkirnirApp {
@@ -147,6 +198,8 @@ impl SkirnirApp {
       last_status_at: None,
       #[cfg(feature = "serial")]
       pending_probe: None,
+      pending_zero_z: None,
+      wizard: None,
     };
     app.refresh_ports();
     app
@@ -194,6 +247,9 @@ impl SkirnirApp {
       // held continuous jog belongs to the dead link too — stop streaming increments into a gone engine.
       self.ui.on_disconnected();
       self.clear_jog_stream();
+      // A pending Z touch-off belongs to the dead link: drop it so the follow-up never fires into a gone engine
+      // (the reducer has already cleared the latch on the Disconnected event).
+      self.pending_zero_z = None;
       self.last_status_at = None;
       self.override_tracker = super::overrides::OverrideTracker::default();
       self.on_engine_dropped();
@@ -327,7 +383,9 @@ impl SkirnirApp {
       Intent::IdentifyPort { path } => self.identify_port(&path),
       Intent::OpenProgram(path) => self.open_program(&path),
       Intent::StartStream => self.start_stream(),
-      Intent::SendLine(line) => self.send_line(line),
+      Intent::SendLine(line) => {
+        self.send_line(line);
+      }
       Intent::Realtime(cmd) => {
         self.send_command(Command::Realtime(cmd));
       }
@@ -339,9 +397,25 @@ impl SkirnirApp {
       Intent::ProbeZ { depth, feed, plate_thickness } => self.probe_z(depth, feed, plate_thickness),
       Intent::RequestSettings => self.request_settings(),
       Intent::WriteSetting { number, value } => self.write_setting(number, &value),
-      Intent::Home => self.send_line("$H".to_string()),
+      Intent::Home => {
+        self.send_line("$H".to_string());
+      }
       Intent::RunOrResume => self.run_or_resume(),
-      Intent::SetWorkZero { axes } => self.send_line(super::intent::work_zero_line(&axes)),
+      Intent::SetWorkZero { axes } => {
+        self.send_line(super::intent::work_zero_line(&axes));
+      }
+      Intent::RotaryCenterStart { dowel_diameter, index_angle_deg } => {
+        self.rotary_center_start(dowel_diameter, index_angle_deg)
+      }
+      Intent::RotaryCenterProbe => self.rotary_center_probe(),
+      Intent::RotaryCenterMoveToYc => self.rotary_center_move_to_yc(),
+      Intent::RotaryCenterWriteWcs => self.rotary_center_write_wcs(),
+      Intent::RotaryCenterSetZDatum(datum) => {
+        if let Some(run) = self.wizard.as_mut() {
+          run.state.z_datum = datum;
+        }
+      }
+      Intent::RotaryCenterCancel => self.wizard = None,
     }
   }
 
@@ -586,14 +660,15 @@ impl SkirnirApp {
     self.send_line("$$".to_string());
   }
 
-  /// Send one manual line, echoing it to the console as sent traffic.
-  fn send_line(&mut self, line: String) {
+  /// Send one manual line, echoing it to the console as sent traffic. Returns whether it was actually sent (an
+  /// empty line, or a missing/dead engine, yields `false`) so sequencing callers can stop on a failed send.
+  fn send_line(&mut self, line: String) -> bool {
     let trimmed = line.trim().to_string();
     if trimmed.is_empty() {
-      return;
+      return false;
     }
     self.view.note_sent(trimmed.clone());
-    self.send_command(Command::SendLine(trimmed));
+    self.send_command(Command::SendLine(trimmed))
   }
 
   /// Form and send a step `$J=` jog line via the shared [`super::intent::jog_line`] builder, echoing it.
@@ -678,16 +753,310 @@ impl SkirnirApp {
     }
   }
 
-  /// Sequence a Z probe: `G38.2` toward `-depth` at `feed`, then set work-Z to the plate thickness via
-  /// `G10 L20 P0` (L20, the set-relative-to-current form — so the copper top becomes work-Z `plate_thickness`,
-  /// i.e. Z0 at the copper surface after the plate is removed). Each line is sent and echoed; the engine acks
-  /// them in order. The offset line is built by the shared [`super::intent::work_offset_line`] helper.
+  /// Begin a hardened Z touch-off: send a RELATIVE `G38.2` probe and arm the probe latch, but DEFER the zeroing
+  /// until the probe resolves successfully. [`Self::pump_probe_z`] builds and sends a position-independent
+  /// `G10 L2` zero from the contact machine-Z only on a `success:1` result, and surfaces a notice (zeroing
+  /// nothing) on any failure. This replaces the old fire-and-forget sequence that zeroed unconditionally and
+  /// relied on alarm-ordering — a race — to protect a failed probe.
+  ///
+  /// The probe is wrapped `G91` … `G90` (per `docs/tlo-offsets.md`): under the power-on `G90`, `G38.2 Z-<depth>`
+  /// would resolve as an ABSOLUTE target and travel to the wrong place — the probe must advance `<depth>` mm FROM
+  /// the current position. The zero is computed on resolution as `G10 L2 P0 Z<contact_Z − plate_thickness>` (see
+  /// [`super::probe_flow::zero_z_line`]) so it is independent of where the tool sits when it lands — a jog during
+  /// the lost-push window cannot corrupt it. A probe issued while one is pending replaces it (latest wins); a
+  /// wizard run in progress is cancelled so the two cannot share the latch.
   fn probe_z(&mut self, depth: f64, feed: f64, plate_thickness: f64) {
-    let probe = format!("G38.2 Z-{depth:.3} F{feed:.0}");
-    let zero = super::intent::work_offset_line(&[(Axis::Z, plate_thickness)]);
-    for line in [probe, zero] {
+    // Starting a ZeroZ probe cancels any rotary wizard run so the shared latch cannot be claimed by both flows.
+    self.wizard = None;
+    // Arm the latch BEFORE the probe is sent so the result (which can arrive within a frame) always finds an op
+    // awaiting it. `begin_probe` supersedes any prior op, matching the "latest request wins" rule.
+    self.view.begin_probe(super::view_state::ProbeKind::ZeroZ);
+    let lines = [
+      // Incremental probe wrapper: probe relative, then restore absolute mode.
+      "G91".to_string(),
+      format!("G38.2 Z-{depth:.3} F{feed:.0}"),
+      "G90".to_string(),
+    ];
+    let mut all_sent = true;
+    for line in lines {
       self.view.note_sent(line.clone());
-      self.send_command(Command::SendLine(line));
+      if !self.send_command(Command::SendLine(line)) {
+        all_sent = false;
+        break;
+      }
+    }
+    if all_sent {
+      self.pending_zero_z = Some(PendingZeroZProbe {
+        inner: super::probe_flow::PendingZeroZ::new(plate_thickness),
+        issued_at: Instant::now(),
+        polled_at: None,
+      });
+    } else {
+      // The send failed (no engine): there is nothing to await, so drop the latch we just armed rather than
+      // leaving it awaiting a result that can never come.
+      self.view.fail_probe("probe not sent (not connected)");
+      self.pending_zero_z = None;
+    }
+  }
+
+  /// Drive the hardened Z touch-off one frame: gate the deferred zeroing on the probe latch and run the
+  /// push-or-poll fallback. Pure [`super::probe_flow::decide`] chooses the action from the latch outcome and the
+  /// elapsed wall-clock; the shell only performs the I/O it names (send the zero line, query `$#`, surface a
+  /// notice). Returns whether anything happened, so the caller can request a prompt repaint. No-op when no
+  /// touch-off is pending. A disconnect clears the latch (the reducer) AND the pending here, so this abandons
+  /// cleanly.
+  fn pump_probe_z(&mut self) -> bool {
+    use super::probe_flow::{ZeroZAction, decide};
+    // Copy out the wall-clock stamps up front so the immutable borrow is released before the `observe_busy`
+    // mutation below. No pending touch-off ⇒ nothing to do.
+    let (issued_at, polled_at) = match self.pending_zero_z.as_ref() {
+      Some(p) => (p.issued_at, p.polled_at),
+      None => return false,
+    };
+    // The latch must belong to THIS flow. If it is gone (a disconnect cleared it) or it belongs to another probe
+    // kind (a rotary touch armed it), abandon our follow-up rather than acting on someone else's `[PRB:]` — the
+    // `ProbeKind` field exists precisely to route the shared latch.
+    match self.view.probe_op.as_ref() {
+      Some(op) if op.kind == super::view_state::ProbeKind::ZeroZ => {}
+      _ => {
+        self.pending_zero_z = None;
+        return false;
+      }
+    }
+    let now = Instant::now();
+    let since_issue = now.duration_since(issued_at);
+    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
+    // Whether the machine is in a probe CYCLE this frame, from the live status: Run/Hold/Jog/Home are in-cycle;
+    // Idle (and anything else) is not. A no-status frame counts as not-busy, but the `seen_cycle` latch below
+    // means a not-yet-started probe still cannot be mistaken for "finished".
+    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
+    // Latch that we have seen the machine in a cycle, so a later return to Idle is trusted as completion (the
+    // startup-race guard: the pre-`Run` Idle window must not pass the `$#` fallback gate).
+    if busy_now && let Some(p) = self.pending_zero_z.as_mut() {
+      p.inner.observe_busy();
+    }
+    // Snapshot the refreshed pending + latch outcome for the pure decision. Both borrows are read-only and
+    // released before any action below mutates `self`.
+    let (Some(pending), Some(op)) = (self.pending_zero_z.as_ref(), self.view.probe_op.as_ref()) else {
+      return false;
+    };
+    let probe_finished = pending.inner.probe_finished(busy_now);
+    let action = decide(op.last.as_ref(), &pending.inner, probe_finished, since_issue, since_poll);
+    match action {
+      ZeroZAction::Wait => false,
+      ZeroZAction::Zero(zero_line) => {
+        self.pending_zero_z = None;
+        self.notice("probe contacted — setting work-Z".to_string());
+        self.send_line(zero_line);
+        true
+      }
+      ZeroZAction::Fail(reason) => {
+        self.pending_zero_z = None;
+        self.notice(format!("probe failed: {reason} — work-Z NOT changed"));
+        true
+      }
+      ZeroZAction::Poll => {
+        // The immediate `[PRB:]` push did not arrive: retrieve the last probe result via `$#` (its `[PRB:]` line
+        // parses through the same path and resolves the latch). Send it once and start the give-up clock.
+        if let Some(p) = self.pending_zero_z.as_mut() {
+          p.inner.polled = true;
+          p.polled_at = Some(now);
+        }
+        self.send_line("$#".to_string());
+        true
+      }
+      ZeroZAction::GiveUp(reason) => {
+        self.pending_zero_z = None;
+        self.view.fail_probe(reason.clone());
+        self.notice(format!("probe failed: {reason} — work-Z NOT changed"));
+        true
+      }
+    }
+  }
+
+  /// Start a fresh rotary center-finder run (DOC-11 §1.2): build the pure wizard state for the given dowel
+  /// diameter / index angle with the conservative bench defaults, replacing any run in progress. The operator
+  /// then jogs to each approach and triggers the touches.
+  fn rotary_center_start(&mut self, dowel_diameter: f64, index_angle_deg: f64) {
+    self.wizard = Some(RotaryCenterRun {
+      state: super::rotary_center::WizardState::new(dowel_diameter, index_angle_deg),
+      params: super::rotary_probe::RotaryProbeParams::default(),
+      touch_fallback: None,
+    });
+    self.notice(format!("rotary center-finder: dowel {dowel_diameter:.3} mm @ A{index_angle_deg:.1}°"));
+  }
+
+  /// Trigger the wizard's next touch: ask the state machine which touch is due (left Y, right Y, or Z-top), emit
+  /// its rotary-safe probe lines, and arm the Phase 0 latch so [`Self::pump_wizard`] can fold the result back in.
+  /// Inert if no wizard is running, one is already probing, or the due touch is off-step.
+  fn rotary_center_probe(&mut self) {
+    use super::rotary_center::WizardStep;
+    let Some(run) = self.wizard.as_mut() else {
+      self.notice("no rotary center-finder running".to_string());
+      return;
+    };
+    if run.state.is_probing() {
+      self.notice("rotary probe already in progress".to_string());
+      return;
+    }
+    // Advance the state machine to the next probing step, getting the touch to issue. The step the wizard is in
+    // selects which touch: EnterDowel→left Y, ProbeYLeft(resolved)→right Y, MoveToYc→Z-top.
+    let touch = match run.state.step {
+      WizardStep::EnterDowel => run.state.begin_y_left(),
+      WizardStep::ReadyYRight => run.state.begin_y_right(),
+      // The top probe is allowed only AFTER the move to Y_c has been sent (MovedToYc), never from MoveToYc.
+      WizardStep::MovedToYc => run.state.begin_z_top(),
+      _ => None,
+    };
+    let Some(touch) = touch else {
+      self.notice("no rotary touch is due in this step".to_string());
+      return;
+    };
+    let params = run.params;
+    let lines = super::rotary_probe::rotary_safe_probe_lines(touch, params);
+    // Starting a rotary touch cancels any pending ZeroZ follow-up so the shared latch cannot be claimed by both
+    // flows (the ZeroZ pump also kind-gates, but clearing here is the belt to that suspenders).
+    self.pending_zero_z = None;
+    // Arm the latch BEFORE sending so the result always finds an op awaiting it; the wizard owns the follow-up.
+    self.view.begin_probe(super::view_state::ProbeKind::RotaryCenter);
+    // Stamp the touch's lost-push fallback so a dropped `[PRB:]` push does not leave the wizard awaiting forever.
+    if let Some(run) = self.wizard.as_mut() {
+      run.touch_fallback =
+        Some(TouchFallback { issued_at: Instant::now(), polled: false, polled_at: None, seen_cycle: false });
+    }
+    let mut all_sent = true;
+    for line in lines {
+      self.view.note_sent(line.clone());
+      if !self.send_command(Command::SendLine(line)) {
+        all_sent = false;
+        break;
+      }
+    }
+    if !all_sent {
+      // The send failed mid-sequence (no engine): fail the latch and the wizard rather than awaiting forever.
+      self.view.fail_probe("rotary probe not sent (not connected)");
+      if let Some(run) = self.wizard.as_mut() {
+        run.state.abort("probe not sent (not connected)");
+      }
+    }
+  }
+
+  /// Send the wizard's move-to-Y-center positioning move (the mandatory step before the top probe). Emits the
+  /// retract + absolute Y move to the computed `Y_c`, then ADVANCES the wizard to `MovedToYc` so the top probe is
+  /// unlocked only after the move was actually sent. Inert unless the wizard is at the `MoveToYc` step with a
+  /// known center.
+  fn rotary_center_move_to_yc(&mut self) {
+    use super::rotary_center::WizardStep;
+    let Some(run) = self.wizard.as_ref() else {
+      return;
+    };
+    if run.state.step != WizardStep::MoveToYc {
+      self.notice("move-to-Yc is not due in this step".to_string());
+      return;
+    }
+    let Some(lines) = run.state.move_to_yc_lines(run.params) else {
+      self.notice("Y center not yet known".to_string());
+      return;
+    };
+    let mut all_sent = true;
+    for line in lines {
+      if !self.send_line(line) {
+        all_sent = false;
+        break;
+      }
+    }
+    if all_sent && let Some(run) = self.wizard.as_mut() {
+      // The move was actually sent: advance so `begin_z_top` (gated on `MovedToYc`) becomes reachable.
+      run.state.mark_moved_to_yc();
+      self.notice("moved to Y center — probe the dowel top next".to_string());
+    }
+  }
+
+  /// Write the found center to the active WCS via the wizard's offered `G10 L2` line (Y/Z only, never A). Inert
+  /// until the wizard has a computed center (the `Review` step).
+  fn rotary_center_write_wcs(&mut self) {
+    use super::rotary_center::Wcs;
+    let Some(run) = self.wizard.as_ref() else {
+      return;
+    };
+    let Some(line) = run.state.offer_g10(Wcs::Active) else {
+      self.notice("no rotary center to write yet".to_string());
+      return;
+    };
+    self.send_line(line);
+    self.notice("wrote rotary center to the active WCS (Y/Z only)".to_string());
+  }
+
+  /// Drive a running rotary touch one frame: fold a resolved latch result into the wizard, or run the SHARED
+  /// completion-gated lost-push fallback (`$#` poll, then give up) so a dropped/suppressed `[PRB:]` never leaves
+  /// the wizard awaiting forever. Mirrors [`Self::pump_probe_z`] but folds the result into the state machine
+  /// instead of zeroing. Returns whether anything changed (for a prompt repaint). No-op when no wizard is running
+  /// or it is not awaiting a touch.
+  fn pump_wizard(&mut self) -> bool {
+    use super::probe_flow::{AwaitAction, await_action};
+    // Only act while a touch is in flight (a probing step). Copy the fallback stamps up front so the immutable
+    // borrow is released before the `seen_cycle` mutation below.
+    let (issued_at, polled_at) = match self.wizard.as_ref() {
+      Some(run) if run.state.is_probing() => match &run.touch_fallback {
+        Some(f) => (f.issued_at, f.polled_at),
+        // Probing but no fallback stamp (e.g. a run restored mid-touch): nothing to pace; treat as just-issued.
+        None => (Instant::now(), None),
+      },
+      _ => return false,
+    };
+    // The latch must belong to THIS flow. Gone (disconnect) or another kind (a ZeroZ armed it) ⇒ abort the
+    // wizard rather than wait forever or act on someone else's `[PRB:]`.
+    match self.view.probe_op.as_ref() {
+      Some(op) if op.kind == super::view_state::ProbeKind::RotaryCenter => {}
+      _ => {
+        if let Some(run) = self.wizard.as_mut() {
+          run.state.abort("probe latch lost");
+        }
+        return true;
+      }
+    }
+    // If the latch has resolved, fold the outcome into the wizard and finish the touch.
+    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
+    if let Some(outcome) = resolved {
+      if let Some(run) = self.wizard.as_mut() {
+        run.state.on_probe_result(&outcome);
+        run.touch_fallback = None;
+      }
+      // Consume the latch so the result is fed exactly once (the next touch's `begin_probe` re-arms it).
+      self.view.clear_probe_op();
+      return true;
+    }
+    // Still awaiting: run the shared lost-push fallback, gated on the touch having demonstrably finished.
+    let now = Instant::now();
+    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
+    if busy_now && let Some(run) = self.wizard.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+      f.seen_cycle = true;
+    }
+    let (polled, seen_cycle) = match self.wizard.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
+      Some(f) => (f.polled, f.seen_cycle),
+      None => return false,
+    };
+    let probe_finished = seen_cycle && !busy_now;
+    let since_issue = now.duration_since(issued_at);
+    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
+    match await_action(polled, probe_finished, since_issue, since_poll) {
+      AwaitAction::Wait => false,
+      AwaitAction::Poll => {
+        if let Some(run) = self.wizard.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+          f.polled = true;
+          f.polled_at = Some(now);
+        }
+        self.send_line("$#".to_string());
+        true
+      }
+      AwaitAction::GiveUp(reason) => {
+        if let Some(run) = self.wizard.as_mut() {
+          run.state.abort(reason.clone());
+          run.touch_fallback = None;
+        }
+        self.view.fail_probe(reason);
+        true
+      }
     }
   }
 
@@ -824,6 +1193,11 @@ impl eframe::App for SkirnirApp {
           views::overrides(ui, &self.view, &mut self.ui, &mut sink);
           ui.separator();
           views::probe(ui, &self.view, &mut self.ui, &mut sink);
+          ui.separator();
+          // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
+          // the center lives in skirnir state); pass a borrow so the view stays a pure render of it.
+          let wizard = self.wizard.as_ref().map(|run| &run.state);
+          views::rotary_center(ui, &self.view, &mut self.ui, wizard, &mut sink);
         });
       });
 
@@ -856,6 +1230,15 @@ impl eframe::App for SkirnirApp {
     //     short `$J=` increment when due. Runs after the intents so a fresh JogStart emits immediately.
     self.pump_jog_stream();
 
+    // 3c. Service a pending hardened Z touch-off: gate the deferred zeroing on the probe latch and run the
+    //     push-or-poll fallback. Runs after the intents so a ProbeZ issued this frame is tracked before its
+    //     follow-up is evaluated next frame (the result cannot have landed yet this frame).
+    let saw_probe_z = self.pump_probe_z();
+
+    // 3d. Service a running rotary center-finder: fold a resolved probe latch result into its state machine so the
+    //     wizard advances (or aborts) the instant a touch resolves.
+    let saw_wizard = self.pump_wizard();
+
     // 4. Schedule the next wake. Only spin the steady timer when there is live traffic to expect: while an
     //    engine is attached (the firmware auto-reports and a stream needs prompt progress updates, and the
     //    engine's events are polled from this loop), or for one extra frame after an event arrived. When
@@ -874,12 +1257,28 @@ impl eframe::App for SkirnirApp {
         (false, false)
       }
     };
-    if saw_event || saw_probe || fired_reconnect || probe_pending || reconnect_pending
-      || self.engine.is_some() || self.jog_stream.is_some()
+    if saw_event || saw_probe || saw_probe_z || saw_wizard || fired_reconnect || probe_pending || reconnect_pending
+      || self.engine.is_some() || self.jog_stream.is_some() || self.pending_zero_z.is_some()
     {
       ctx.request_repaint_after(REPAINT_INTERVAL);
     }
   }
+}
+
+/// Whether a machine [`RunState`](crate::protocol::RunState) represents an active probe CYCLE — the machine is
+/// moving or paused mid-program (`Run`/`Hold`/`Jog`/`Home`), as opposed to settled (`Idle`) or faulted
+/// (`Alarm`/...). The hardened touch-off uses this to gate the `$#` lost-push fallback: the fallback runs only
+/// once the machine has been in a cycle and then returned to `Idle`, so a probe still travelling — which can
+/// legitimately exceed the push timeout — is never polled mid-cycle on the previous probe's stale result.
+fn is_probe_cycle_state(state: crate::protocol::RunState) -> bool {
+  use crate::protocol::RunState;
+  // A probe is "finished" ONLY on a clean return to `Idle`. Every other non-idle state is treated as in-cycle so
+  // the lost-push `$#` fallback never arms while the machine is still busy or merely SUSPENDED: `Door` (safety-door
+  // suspend), `Sleep` (`$SLP`), and `Tool` (tool-change wait) can interrupt a probe mid-flight, and reading them as
+  // "finished" would poll `$#` for the previous probe's stale result. A genuine probe FAILURE (alarm/error) already
+  // resolves the latch via the Alarm/Error path, so `probe_finished` is never consulted on that path. `Check` and
+  // `Unknown` are likewise treated as not-finished (conservative). Only `Idle` is a clean completion.
+  !matches!(state, RunState::Idle)
 }
 
 /// Build the tokio runtime and launch the eframe window. This is the binary's GUI entry point; `expect` is
@@ -1085,6 +1484,336 @@ mod tests {
     let after = collect_written(&mut app, &mut controller, 60); // ~300 ms.
     let after_text = String::from_utf8_lossy(&after);
     assert!(!after_text.contains("$J="), "no jog increments may stream after release; saw {after_text:?}");
+  }
+
+  /// Drive the probe-z pump across a short window, draining engine events (so an injected `[PRB:]` reaches the
+  /// latch) and the transport writes each step. Returns everything the engine wrote, so a test can assert whether
+  /// the deferred `G10 L2` zeroing line was emitted.
+  fn pump_probe_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_events();
+      app.pump_probe_z();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// A hardened Z touch-off must DEFER the `G10 L2` zeroing: it sends the relative `G38.2` probe, then emits the
+  /// zeroing line only after a successful `[PRB:]` result lands. Regression: the old `probe_z` fired both lines
+  /// back-to-back with no success check, relying on alarm-ordering — a race — to protect a failed probe.
+  #[test]
+  fn a_successful_probe_emits_the_zeroing_line_only_after_the_result_lands() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Issue the probe. The RELATIVE probe (`G91 G38.2 Z-…` then `G90`) goes out; the zeroing `G10` must NOT yet
+    // (it is deferred until a successful result lands).
+    app.probe_z(2.5, 50.0, 1.0);
+    assert!(app.view.probe_is_awaiting(), "the latch must be awaiting the probe result");
+    let issued = String::from_utf8_lossy(&pump_probe_steps(&mut app, &mut controller, 10)).into_owned();
+    assert!(issued.contains("G38.2 Z-2.500 F50"), "the probe line must be sent immediately; saw {issued:?}");
+    assert!(issued.contains("G91"), "the probe must be wrapped incremental (G91); saw {issued:?}");
+    assert!(!issued.contains("G10"), "the zeroing line must be deferred, not sent up front; saw {issued:?}");
+
+    // The firmware acks the probe lines, then pushes a successful `[PRB:]` with contact machine-Z = -2.500. The
+    // deferred zero is computed from the CONTACT (position-independent): work-Z reads the 1.0 mm plate AT the
+    // contact, so the WCS Z origin is -2.500 − 1.000 = -3.500, emitted as `G10 L2` (not the position-dependent L20).
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line("[PRB:0.000,0.000,-2.500:1]"));
+    let after = String::from_utf8_lossy(&pump_probe_steps(&mut app, &mut controller, 40)).into_owned();
+    assert!(after.contains("G10 L2 P0 Z-3.500"), "a successful probe must emit the contact-based zero; saw {after:?}");
+    assert!(!after.contains("G10 L20"), "the zero must be position-independent L2, not L20; saw {after:?}");
+    assert!(app.pending_zero_z.is_none(), "the pending touch-off resolves once zeroed");
+  }
+
+  /// The `$#` lost-push fallback must be gated on probe COMPLETION, not raw elapsed time. A slow / no-contact
+  /// probe legitimately travels longer than `PUSH_TIMEOUT`; while the machine still reports a cycle (`Run`),
+  /// querying `$#` would return the PREVIOUS probe's stale result, which the latch could then zero off. So even
+  /// past the timeout, an in-flight probe must NOT poll — only once the machine has been in a cycle and returned
+  /// to `Idle` (a genuinely lost push) does the fallback fire. We backdate `issued_at` past the timeout to drive
+  /// this deterministically without a 15 s wait.
+  #[test]
+  fn the_dollar_hash_fallback_is_gated_on_probe_completion_not_elapsed_time() {
+    use crate::app::probe_flow::PUSH_TIMEOUT;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.probe_z(2.5, 50.0, 1.0);
+    // Backdate the issue so the push timeout is already exceeded; no result has arrived (the probe is "slow").
+    if let Some(p) = app.pending_zero_z.as_mut() {
+      p.issued_at = Instant::now() - (PUSH_TIMEOUT + Duration::from_secs(5));
+    }
+    controller.drain_written();
+
+    // The machine reports it is mid-probe (`Run`). Despite the elapsed timeout, NO `$#` may be sent — polling
+    // mid-cycle would read the previous probe's stale result.
+    assert!(controller.inject_line("<Run|MPos:0.000,0.000,-1.000>"));
+    let during = String::from_utf8_lossy(&pump_probe_steps(&mut app, &mut controller, 20)).into_owned();
+    assert!(!during.contains("$#"), "an in-flight (Run) probe past the timeout must NOT poll $#; saw {during:?}");
+    assert!(app.pending_zero_z.is_some(), "the touch-off stays pending while the probe is still travelling");
+
+    // The machine finishes the move and returns to Idle with NO `[PRB:]` push (a genuinely lost push). NOW the
+    // fallback is allowed to fire: `$#` is queried to retrieve the last probe result.
+    assert!(controller.inject_line("<Idle|MPos:0.000,0.000,-2.500>"));
+    let after = String::from_utf8_lossy(&pump_probe_steps(&mut app, &mut controller, 20)).into_owned();
+    assert!(after.contains("$#"), "a finished (Idle, post-cycle) probe with a lost push must poll $#; saw {after:?}");
+  }
+
+  /// A failed probe (a no-contact `:0` flag, here from the silent `G38.3` path) must NOT emit the zeroing line —
+  /// the success flag is the guard, and a non-contact result must leave work-Z untouched.
+  #[test]
+  fn a_failed_probe_never_emits_the_zeroing_line() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.probe_z(2.5, 50.0, 1.0);
+    controller.drain_written();
+
+    // The probe acks, then reports no contact (`:0`). The zeroing line must never be sent.
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line("[PRB:0.000,0.000,0.000:0]"));
+    let after = String::from_utf8_lossy(&pump_probe_steps(&mut app, &mut controller, 40)).into_owned();
+    assert!(!after.contains("G10"), "a failed probe must NOT zero work-Z; saw {after:?}");
+    assert!(app.pending_zero_z.is_none(), "the failed touch-off resolves without zeroing");
+    // The failure outcome is latched for the UI to render.
+    assert!(app.view.probe_op.as_ref().and_then(|op| op.last.as_ref()).is_some_and(|o| !o.is_success()));
+  }
+
+  /// An alarming probe failure (`ALARM:5`, no contact within travel) must fail the op off the alarm and never
+  /// emit the zeroing line — even though no `[PRB:]` push arrives. This is the case the old code only "protected"
+  /// by the `error:9` g-code lock racing the unconditional `G10`.
+  #[test]
+  fn an_alarming_probe_fails_the_op_without_zeroing() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.probe_z(2.5, 50.0, 1.0);
+    controller.drain_written();
+
+    // No `[PRB:]` push — a no-contact `G38.2` raises `ALARM:5` instead. The latch fails off the alarm.
+    assert!(controller.inject_line("ALARM:5"));
+    let after = String::from_utf8_lossy(&pump_probe_steps(&mut app, &mut controller, 40)).into_owned();
+    assert!(!after.contains("G10"), "an alarming probe must NOT zero work-Z; saw {after:?}");
+    assert!(app.pending_zero_z.is_none());
+    assert_eq!(app.view.banner, Some(crate::app::view_state::Banner::Alarm(5)));
+  }
+
+  /// Drive the wizard pump across a short window, draining engine events (so an injected `[PRB:]` reaches the
+  /// latch and is folded into the wizard) and the transport writes each step. Returns everything written.
+  fn pump_wizard_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_events();
+      app.pump_wizard();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// Issue one wizard touch and feed back its `[PRB:]` result, returning the emitted probe lines. Mirrors the
+  /// real flow: the operator triggers a probe (`rotary_center_probe`), the firmware acks each line and pushes a
+  /// `[PRB:]`, and the pump folds the result into the wizard.
+  fn wizard_touch(app: &mut SkirnirApp, controller: &mut LoopbackController, prb: &str) -> String {
+    app.rotary_center_probe();
+    let issued = String::from_utf8_lossy(&pump_wizard_steps(app, controller, 8)).into_owned();
+    // Ack the probe line and push the result; the pump folds it into the wizard.
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line(prb));
+    pump_wizard_steps(app, controller, 12);
+    issued
+  }
+
+  /// The rotary center-finder must drive a full multi-step run over the loopback transport: each touch composes
+  /// the Phase 0 latch, the readings compute `(Y_c, Z_c)` with the symmetric formulas, and the offered WCS write
+  /// carries only Y/Z (never A) as a `G10 L2`. This is the headline Phase 1 integration.
+  #[test]
+  fn the_rotary_center_finder_runs_a_full_three_touch_sequence_and_writes_yz_only() {
+    use crate::app::rotary_center::WizardStep;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Start a run: 6 mm dowel at A0.
+    app.rotary_center_start(6.0, 0.0);
+    controller.drain_written();
+
+    // Touch 1 — left Y face. The emitted sequence must be the rotary-safe primitive (retract, index, settle,
+    // linear probe) and the probe line must carry NO A word.
+    let left = wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
+    assert!(left.contains("G53 G0 Z"), "the touch must retract first; saw {left:?}");
+    assert!(left.contains("G0 A0.000"), "the touch must index the rotary; saw {left:?}");
+    assert!(left.contains("G4 P"), "the touch must settle before probing; saw {left:?}");
+    let probe_line = left.lines().find(|l| l.contains("G38.2")).expect("a probe line");
+    assert!(!probe_line.contains('A'), "the probe line must never carry an A word; saw {probe_line:?}");
+
+    // Touch 2 — right Y face. After it, the wizard is at MoveToYc with Y_c = (-3 + 5)/2 = 1.0.
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,5.000,0.000:1]");
+    assert_eq!(app.wizard.as_ref().unwrap().state.step, WizardStep::MoveToYc);
+    assert_eq!(app.wizard.as_ref().unwrap().state.y_center(), Some(1.0));
+
+    // The mandatory move-to-Yc before the top probe.
+    app.rotary_center_move_to_yc();
+    let moved = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(moved.contains("G53 G0 Y1.000"), "the wizard must move to the computed Y center; saw {moved:?}");
+
+    // Touch 3 — dowel top. Z_c = Z_top - D/2 = -10 - 3 = -13.
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,0.000,-10.000:1]");
+    let state = &app.wizard.as_ref().unwrap().state;
+    assert_eq!(state.step, WizardStep::Review);
+    assert_eq!(state.z_center(), Some(-13.0));
+
+    // Write the center to the active WCS: the line must be G10 L2 carrying only Y and Z. The default datum is the
+    // axis centerline, so Z = Z_top − D/2 = -10 - 3 = -13.
+    app.rotary_center_write_wcs();
+    let wrote = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(wrote.contains("G10 L2 P0 Y1.000 Z-13.000"), "the WCS write must be G10 L2 Y/Z; saw {wrote:?}");
+    let g10 = wrote.lines().find(|l| l.contains("G10")).expect("a G10 line");
+    assert!(!g10.contains('A'), "the WCS write must never carry an A word; saw {g10:?}");
+  }
+
+  /// Selecting the top-surface Z datum must change the emitted `G10` Z word end-to-end: work-Z0 lands on the
+  /// raw probed top (`Z_top`) instead of the axis centerline, while Y stays the axis and no A word appears.
+  #[test]
+  fn selecting_the_top_surface_datum_writes_z_top_to_the_wcs() {
+    use crate::app::rotary_center::{WizardStep, ZDatum};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.rotary_center_start(6.0, 0.0);
+    controller.drain_written();
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,5.000,0.000:1]");
+    app.rotary_center_move_to_yc();
+    pump_wizard_steps(&mut app, &mut controller, 8);
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,0.000,-10.000:1]");
+    assert_eq!(app.wizard.as_ref().unwrap().state.step, WizardStep::Review);
+
+    // Operator switches the Z datum to the probed top surface, then writes.
+    app.handle_intent(Intent::RotaryCenterSetZDatum(ZDatum::TopSurface));
+    controller.drain_written();
+    app.rotary_center_write_wcs();
+    let wrote = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 8)).into_owned();
+    // Y is still the axis center (1.0); Z is now the raw top (-10.0), not the axis (-13.0).
+    assert!(wrote.contains("G10 L2 P0 Y1.000 Z-10.000"), "the top-surface datum must write Z_top; saw {wrote:?}");
+    let g10 = wrote.lines().find(|l| l.contains("G10")).expect("a G10 line");
+    assert!(!g10.contains('A'), "the WCS write must never carry an A word; saw {g10:?}");
+  }
+
+  /// A failed touch mid-run must abort the wizard with no partial compute — and crucially never reach the WCS
+  /// write. Here the second Y touch reports no contact (`:0`).
+  #[test]
+  fn a_failed_touch_aborts_the_rotary_wizard_without_writing() {
+    use crate::app::rotary_center::WizardStep;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.rotary_center_start(6.0, 0.0);
+    controller.drain_written();
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
+    // The right touch fails (no contact, `:0`): the wizard must abort.
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,0.000,0.000:0]");
+    assert_eq!(app.wizard.as_ref().unwrap().state.step, WizardStep::Aborted);
+
+    // A write attempt on an aborted wizard must emit no G10.
+    controller.drain_written();
+    app.rotary_center_write_wcs();
+    let after = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(!after.contains("G10"), "an aborted wizard must never write a WCS offset; saw {after:?}");
+  }
+
+  /// Pump BOTH probe follow-ups (ZeroZ and wizard) each step, draining events + writes — so a test can prove the
+  /// two never act on each other's `[PRB:]` through the shared latch.
+  fn pump_both_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_events();
+      app.pump_probe_z();
+      app.pump_wizard();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// THE CROSS-CONTAMINATION REGRESSION (finding #2): starting a rotary touch while a ZeroZ touch-off is pending
+  /// must cancel the ZeroZ follow-up, and the rotary `[PRB:]` that lands must be consumed ONLY by the wizard — it
+  /// must never fire the deferred ZeroZ `G10` off an unrelated probe.
+  #[test]
+  fn a_rotary_touch_does_not_fire_a_pending_zeroz_zeroing() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Arm a ZeroZ touch-off (deferred). Then, before it resolves, start a rotary run and issue its first touch —
+    // which re-arms the shared latch as a RotaryCenter op and must cancel the ZeroZ pending.
+    app.probe_z(2.5, 50.0, 1.0);
+    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_probe();
+    assert!(app.pending_zero_z.is_none(), "starting a rotary touch must cancel the pending ZeroZ follow-up");
+    controller.drain_written();
+
+    // The rotary touch's result lands. It must advance the WIZARD (ReadyYRight) and NOT emit the ZeroZ `G10`.
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line("[PRB:0.000,-3.000,0.000:1]"));
+    let after = String::from_utf8_lossy(&pump_both_steps(&mut app, &mut controller, 20)).into_owned();
+    assert!(!after.contains("G10"), "a rotary `[PRB:]` must NOT fire the ZeroZ zeroing; saw {after:?}");
+    assert_eq!(app.wizard.as_ref().unwrap().state.y_left, Some(-3.0), "the wizard must consume its own result");
+  }
+
+  /// A safety-door suspend mid-probe must NOT be treated as "finished" — `Door` (like Sleep/Tool) is in-cycle, so
+  /// the lost-push `$#` fallback must not arm while suspended (finding #6). Only a clean return to Idle finishes.
+  #[test]
+  fn a_door_suspend_mid_probe_does_not_arm_the_dollar_hash_fallback() {
+    use crate::app::probe_flow::PUSH_TIMEOUT;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.probe_z(2.5, 50.0, 1.0);
+    if let Some(p) = app.pending_zero_z.as_mut() {
+      p.issued_at = Instant::now() - (PUSH_TIMEOUT + Duration::from_secs(5));
+    }
+    // The machine was in a cycle, then a safety door opened → `Door` suspend. Despite the elapsed timeout, the
+    // probe is NOT finished (Door is in-cycle), so no `$#` may be sent.
+    assert!(controller.inject_line("<Run|MPos:0.000,0.000,-1.000>"));
+    pump_both_steps(&mut app, &mut controller, 4);
+    controller.drain_written();
+    assert!(controller.inject_line("<Door:0|MPos:0.000,0.000,-1.000>"));
+    let during = String::from_utf8_lossy(&pump_both_steps(&mut app, &mut controller, 20)).into_owned();
+    assert!(!during.contains("$#"), "a Door suspend must not arm the lost-push fallback; saw {during:?}");
+    assert!(app.pending_zero_z.is_some(), "the touch-off stays pending through the suspend");
+  }
+
+  /// The rotary wizard must have the SAME lost-push fallback as ZeroZ (finding #7): a dropped/suppressed `[PRB:]`
+  /// push, once the touch has finished, falls back to a `$#` poll rather than leaving the wizard awaiting forever.
+  #[test]
+  fn a_lost_wizard_touch_push_falls_back_to_dollar_hash() {
+    use crate::app::probe_flow::PUSH_TIMEOUT;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_probe();
+    // Backdate the touch's issue past the push timeout; no `[PRB:]` push arrives (it was lost).
+    if let Some(run) = app.wizard.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+      f.issued_at = Instant::now() - (PUSH_TIMEOUT + Duration::from_secs(5));
+    }
+    controller.drain_written();
+
+    // While still in a cycle, no poll (would read the previous probe's stale result).
+    assert!(controller.inject_line("<Run|MPos:0.000,-1.000,0.000>"));
+    let during = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 12)).into_owned();
+    assert!(!during.contains("$#"), "an in-flight wizard touch must not poll $# mid-cycle; saw {during:?}");
+
+    // A clean return to Idle (the push genuinely lost): the wizard polls `$#`, exactly like the ZeroZ flow.
+    assert!(controller.inject_line("<Idle|MPos:0.000,-3.000,0.000>"));
+    let after = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 12)).into_owned();
+    assert!(after.contains("$#"), "a finished wizard touch with a lost push must poll $#; saw {after:?}");
+
+    // The `$#` answer (a `[PRB:]` line) then resolves the touch normally.
+    assert!(controller.inject_line("[PRB:0.000,-3.000,0.000:1]"));
+    pump_wizard_steps(&mut app, &mut controller, 12);
+    assert_eq!(app.wizard.as_ref().unwrap().state.y_left, Some(-3.0), "the $# answer resolves the wizard touch");
   }
 
   /// While the firmware reports its planner queue nearly full (`Bf:` blocks-free below the margin), a held jog
