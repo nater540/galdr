@@ -211,6 +211,21 @@ the feed-undefined test, so a `G93` probe reports the probe-specific error regar
 22 with `FeedRateUndefined` because grblHAL has no canonical code for this case — the `$EE`/host text reads
 "feed rate undefined", a known cosmetic imprecision accepted for the reuse.
 
+**G38.x is LINEAR-ONLY — an A word in a probe is REJECTED (decision, 2026-06-21).** A `G38.x` probe carrying a
+rotary `A` word is rejected (`GcodeError::ProbeRotaryAxisWord`, wire code 33 "Invalid target"). No mainstream
+controller probes through a rotary axis: probing while A moves rotates the surface normal under a fixed probe
+vector (cosine error, invalid tip-radius compensation). The A axis is therefore never part of a probe target —
+**any** `A` word is rejected, even a redundant `A` equal to the current position, so the contract is unambiguous.
+The check is first in the probe-emit path (ahead of the G93 and feed checks). Rotary center-finding etc. is the
+host's job (index A to a fixed angle, hold, then a linear probe) — see the 4th-axis probing architecture.
+
+**`[PRB:...]` reports all four axes (fix, 2026-06-21).** The probe-result push and the `$#` `[PRB:]` line now
+render `[PRB:x,y,z,a:flag]` — the A value-at-trigger (the angle a touch happened at) is reported, matching the
+four-field live `MPos:`/`WPos:` status. This also widened the whole `$#` block (`[G54:]`…`[G59:]`, `[G28:]`,
+`[G30:]`, `[G92:]`) to four axes via a shared `write_axes_csv` helper — previously they silently dropped A. (TLO
+stays grbl's legacy single-Z `[TLO:z]` form.) `skirnir` does not parse these field lists yet, so nothing downstream
+broke.
+
 ### G94 units/min — grbl's inverse-time conversion for mixed moves (modifies `planner.rs:670`)
 
 > **Correction (design review, 2026-06-20).** An earlier draft of this section claimed grbl computes a
