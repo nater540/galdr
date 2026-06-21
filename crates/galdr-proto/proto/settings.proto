@@ -78,6 +78,29 @@ message Settings {
 
   // --- grbl $5 (limit-pin invert, DOC-06). Additive proto3 field, no version bump. ---
   bool   limit_invert          = 57;  // $5  limit-pin invert (0 = NC fail-safe high-triggered, 1 = inverted).
+
+  // --- spindle delays (DOC-07). Additive proto3 fields after the highest prior tag, no version bump. These are
+  // spindle settings but use the high reserved tag range (like the TMC block) so a future low-numbered grbl $n
+  // never collides; the grbl $30..$31 spindle block above stays contiguous. ---
+  float  spindle_on_delay_s      = 58; // $392 spindle on delay, seconds.
+  float  spindle_reverse_dwell_s = 59; // $393 spindle reverse dwell, seconds.
+
+  // --- 4th axis A (rotary about X, DOC-10). Appended after the highest prior tag; additive proto3 fields, no
+  // version bump. An old 3-axis record lacks them and decodes to 0, then `sanitize` fills the A defaults. The
+  // `_a` per-axis values mirror the `_x/_y/_z` flat-triple convention; index 3 of the firmware arrays maps here.
+  // For a rotary A the units are degrees: steps_per_mm_a is steps/deg, max_rate_mm_min_a is deg/min, etc. ---
+  float  steps_per_mm_a        = 60;  // $103 steps per degree, A.
+  float  max_rate_mm_min_a     = 61;  // $113 maximum rate, A (deg/min).
+  float  accel_mm_s2_a         = 62;  // $123 acceleration, A (deg/s^2).
+  float  max_travel_mm_a       = 63;  // $133 maximum travel, A (deg); IGNORED for an axis marked rotary in $376.
+  uint32 run_current_ma_a      = 64;  // RMS run current, A (mA).
+  uint32 hold_current_ma_a     = 65;  // RMS hold current, A (mA).
+  uint32 microsteps_a          = 66;  // microsteps per full step, A.
+
+  // --- grbl $376 rotary-axes bitmask (DOC-10): bit N set => axis N is angular (degrees), continuous/rollover,
+  // and exempt from G20/G21 inch scaling. Default 8 (bit 3 => A) is filled by `sanitize` only on a FRESH record;
+  // a present 0 is honored (lets A be treated as a 4th linear axis), so this is NOT a zero-fill. ---
+  uint32 rotary_mask           = 67;  // $376 rotary-axes bitmask.
 }
 
 // Note: the `$PBX` host-sync channel transfers a FULL `Settings` message in both directions (the host does a
@@ -107,4 +130,11 @@ message Coordinates {
   // --- G28 / G30 predefined positions (machine mm) ---
   float g28_x = 20; float g28_y = 21; float g28_z = 22;
   float g30_x = 23; float g30_y = 24; float g30_z = 25;
+
+  // --- 4th axis A (rotary about X, DOC-10): the A component of each WCS offset and predefined position.
+  // Appended additively; an old record lacks them and decodes to 0 (A offset zero). For a rotary A these are
+  // degrees. ---
+  float g54_a = 26; float g55_a = 27; float g56_a = 28;
+  float g57_a = 29; float g58_a = 30; float g59_a = 31;
+  float g28_a = 32; float g30_a = 33;
 }

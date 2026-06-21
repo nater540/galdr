@@ -1,0 +1,31 @@
+Quantity,DigiKey Part Number,Manufacturer Part Number,Manufacturer,Customer Reference,Description,Notes
+2,S7034-ND,PPTC361LFBN-RC,Sullins,J1;J2,Female socket 1x36 2.54mm,Cut to 1x22 for the two dev-board rows
+2,S7034-ND,PPTC361LFBN-RC,Sullins,U1-U4 (TMC sockets),Female 1x36 2.54mm,OPTIONAL - cut to 2x8 sockets; omit if soldering TMC drivers directly
+5,277-1949-ND,1727036,Phoenix Contact,J_MOT1;J_MOT2;J_MOT3;J_MOT4;J_WS,Terminal block 4-pos 3.81mm THT,
+1,S1011EC-40-ND,PRPC040SAAN-RC,Sullins,J_AUX;J_DIAG;U_BUCK,Pin header 1x40 male 2.54mm,Cut into three 1x4 headers
+4,455-2248-ND,B3B-XH-A(LF)(SN),JST,J_LIM_PROBE;J_LIM_X;J_LIM_Y;J_LIM_Z,Header JST-XH 3-pos vertical THT,
+2,455-B6B-XH-A-ND,B6B-XH-A(LF)(SN),JST,J_CIN;J_SPIN,Header JST-XH 6-pos vertical THT,BACKORDERED at DigiKey
+1,CP-102AH-ND,PJ-102AH,CUI,J_PWR,DC barrel jack 2.5mm PCB,Match center pin to your PSU plug
+3,100QBK-ND,CFR-25JB-52-100R,Yageo,R_GD;R_GE;R_OS,Res 100R 1/4W 5% axial,
+4,680QBK-ND,CFR-25JB-52-680R,Yageo,R_LED_PROBE;R_LED_X;R_LED_Y;R_LED_Z,Res 680R 1/4W 5% axial,
+5,1.0KQBK-ND,CFR-25JB-52-1K,Yageo,R_DEB_PROBE;R_DEB_X;R_DEB_Y;R_DEB_Z;R_UART,Res 1k 1/4W 5% axial,
+2,13-CFR-25JB-52-4K7-ND,CFR-25JB-52-4K7,Yageo,R_PL;R_PLED,Res 4.7k 1/4W 5% axial,
+7,13-CFR-25JB-52-10K-ND,CFR-25JB-52-10K,Yageo,R_G;R_LP1;R_LP2;R_PU_PROBE;R_PU_X;R_PU_Y;R_PU_Z,Res 10k 1/4W 5% axial,
+1,15KQBK-ND,CFR-25JB-52-15K,Yageo,R_FB,Res 15k 1/4W 5% axial,
+1,20KQBK-ND,CFR-25JB-52-20K,Yageo,R_UPU,Res 20k 1/4W 5% axial,
+2,13-CFR-25JB-52-100K-ND,CFR-25JB-52-100K,Yageo,R_PDD;R_PDE,Res 100k 1/4W 5% axial,
+1,3296W-103LF-ND,3296W-1-103LF,Bourns,RV_CAL,Trimmer pot 10k multiturn top adj,
+11,399-4264-ND,C320C104K5R5TA,KEMET,C1;C2;C3;C4;C_BYP;C_DEB_PROBE;C_DEB_X;C_DEB_Y;C_DEB_Z;C_IN2;C_OS,Cap ceramic 0.1uF 50V X7R radial 5.08mm,Corrected (was Vishay - not DK-stocked)
+2,399-4390-ND,C330C105M5U5TA,KEMET,C_LP1;C_LP2,Cap ceramic 1uF 50V Z5U radial 5.08mm,Value non-critical (PWM filter)
+1,P19607CT-ND,EEU-EB1H100SH,Panasonic,C_5V,Cap elec 10uF 50V radial,Lead pitch 2.0mm vs footprint 2.5mm - fits but verify
+1,493-1084-ND,UVR1V471MPD,Nichicon,C_IN1,Cap elec 470uF 35V radial D10 P5,
+4,1N4148TACT-ND,1N4148TA,onsemi,D_LED_PROBE;D_LED_X;D_LED_Y;D_LED_Z,Diode signal 100V DO-35,Corrected (was bare 1N4148)
+1,497-11370-1-ND,1N5822,STMicroelectronics,D_BUCK,Schottky 3A 40V DO-201AD,Diodes Inc 1N5822-T is EOL - use ST (in stock)
+1,,P6KE16A-E3/54,Vishay,D_TVS,TVS 16V unidir 600W DO-15,Mfr-specific MPN (bare P6KE16A was ambiguous)
+2,754-1264-ND,WP7113ID,Kingbright,D_PL;D_PLED,LED red 5mm diffused THT,
+1,FQP27P06-ND,FQP27P06,onsemi,Q1,MOSFET P-ch 60V 27A TO-220,Pick onsemi TO-220 listing if multiple match
+2,2N7000BU-ND,2N7000BU,onsemi,Q_DIR;Q_EN,MOSFET N-ch 60V 0.2A TO-92 (bulk),Corrected (was bare 2N7000)
+1,LMC6482IN/NOPB-ND,LMC6482IN/NOPB,Texas Instruments,U_OA,Op-amp dual RRIO 15.5V DIP-8,SUBSTITUTE for MCP6H02-E/P (PDIP not stocked); pin-compatible
+4,,LTV-817,Lite-On,OK_PROBE;OK_X;OK_Y;OK_Z,Optocoupler transistor-out DIP-4,SUBSTITUTE for Sharp PC817 (EOL at DK) - VERIFY in-stock DIP-4 opto
+1,F4727-ND,0235003.MXP,Littelfuse,F1,Fuse 3A 250V 5x20mm glass,
+2,F4189-ND,01110501Z,Littelfuse,F1 (clips),Fuse clip PCB 5mm for 5x20,2 per fuse

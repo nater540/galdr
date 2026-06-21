@@ -61,7 +61,7 @@ use firmware_core::hal_traits::{
 };
 use firmware_core::homing::{HomingConfig, HomingError, HOMING_GROUPS};
 use firmware_core::motion::{silent_symbol_halves, MotionConfig, ProbeStepper, SegmentGenerator, StepCounter};
-use firmware_core::planner::{Block, Planner, AXES};
+use firmware_core::planner::{Block, Planner, A_AXIS, AXES};
 
 use crate::comms::{
   overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HARD_LIMITS_ENABLED,
@@ -297,7 +297,7 @@ impl StepSink for RmtStepSink {
 
     // Start all three transmits before waiting any, so the three channels fire together. `transmit`
     // consumes the channel; we take it out of its slot and restore it from the transaction's `wait()`.
-    let mut txns: [Option<_>; AXES] = [None, None, None];
+    let mut txns: [Option<_>; AXES] = [None, None, None, None];
     for (axis, slot) in txns.iter_mut().enumerate() {
       // The channel is always `Some` here (only this method takes it, and it restores it before returning).
       // A missing channel would be an internal invariant break; treat it as a transport failure rather than
@@ -644,7 +644,7 @@ fn run_block(
   // Latch the live counter's direction from the same step signs the generator latches onto the sink, so the
   // counter advances each axis the correct way. A zero-length block never steps, so this is harmless then.
   counter.set_direction(DirState {
-    dir: [block.steps[0] >= 0, block.steps[1] >= 0, block.steps[2] >= 0],
+    dir: core::array::from_fn(|axis| block.steps[axis] >= 0),
   });
   let mut tracking = CountingSink::live(sink, counter);
   // The generator returns the tick count or a recoverable error; on error we simply stop emitting this
@@ -827,10 +827,12 @@ fn run_homing(config: &HomingConfig, limits: &mut [RmtLimitInput; AXES], sink: &
 /// applied downstream in [`check_hard_limits`] / [`hard_limit_alarm_armed`], not here.
 async fn wait_for_limit_trip(limits: &mut [RmtLimitInput; AXES]) {
   loop {
-    // Park on a rising edge from ANY limit pin. `select` over the three borrows races them concurrently; the
-    // first edge to fire resolves. The borrows are split per element so all three can be awaited at once.
+    // Park on a rising edge from ANY linear limit pin. `select` over the three borrows races them concurrently;
+    // the first edge to fire resolves. The borrows are split per element so all three can be awaited at once. The
+    // rotary A axis (index 3) has NO physical limit switch (DOC-10.6), so its placeholder input is never waited
+    // on — TODO(DOC-00/Phase-5): finalize A's exclusion from all limit sampling once the carrier wiring is set.
     {
-      let [x, y, z] = limits;
+      let [x, y, z, _a] = limits;
       let edge = select(
         select(x.wait_for_rising_edge(), y.wait_for_rising_edge()),
         z.wait_for_rising_edge(),
@@ -843,7 +845,10 @@ async fn wait_for_limit_trip(limits: &mut [RmtLimitInput; AXES]) {
     let debounce_ms = crate::comms::limit_debounce_ms();
     Timer::after(Duration::from_millis(debounce_ms as u64)).await;
     let config = crate::comms::limit_config();
-    let still_tripped = (0..AXES).any(|i| firmware_core::hal_traits::limit_triggered(limits[i].is_high(), &config));
+    // The rotary A axis has no limit switch (DOC-10.6), so exclude it — its placeholder pin must never count as
+    // a trip regardless of `$5`.
+    let still_tripped = (0..AXES)
+      .any(|i| i != A_AXIS && firmware_core::hal_traits::limit_triggered(limits[i].is_high(), &config));
     if still_tripped {
       // A confirmed trip: publish the documented `LIMIT_TRIGGERED` seam and return so the idle arm samples the
       // switches and raises `ALARM:1` (gated by `$21` + the not-homing shared-pin rule) via `check_hard_limits`.
@@ -882,7 +887,9 @@ fn check_hard_limits(limits: &[RmtLimitInput; AXES], armed: &mut [bool; AXES]) {
   // Sample the raw pin levels ONCE for this call (finding #6): `from_fn` over `AXES` cannot silently desync from
   // the axis count/order the way a hardcoded `[0, 1, 2]` index list could. Both the alarm decision AND the
   // published `Pn:` mask are derived from this single sample, so they are one coherent read of the same instant.
-  let raw_high: [bool; AXES] = core::array::from_fn(|i| limits[i].is_high());
+  // The rotary A axis (index 3) has no physical limit switch (DOC-10.6); its placeholder pin reads as NOT high so
+  // it can never raise a hard-limit alarm or appear in `Pn:`, regardless of `$5`. TODO(Phase-5): finalize wiring.
+  let raw_high: [bool; AXES] = core::array::from_fn(|i| i != A_AXIS && limits[i].is_high());
   // `hard_limit_alarm_armed` applies the `$5` invert internally, returning the post-`$5` logical-triggered array
   // and an EDGE-armed alarm keyed on `*armed` (the previous-sample triggered state). Feed the RAW levels here (NOT
   // pre-inverted); reuse `decision.triggered` for the published mask so the `Pn:` view is the logical (post-`$5`)
@@ -907,7 +914,10 @@ fn check_hard_limits(limits: &[RmtLimitInput; AXES], armed: &mut [bool; AXES]) {
 /// it only computes the triggered array, sharing the `$5`/NC logic with [`check_hard_limits`] and the `Pn:` publish.
 fn sample_limit_triggered(limits: &[RmtLimitInput; AXES]) -> [bool; AXES] {
   let config = crate::comms::limit_config();
-  core::array::from_fn(|axis| firmware_core::hal_traits::limit_triggered(limits[axis].is_high(), &config))
+  // A (index 3) has no limit switch (DOC-10.6) → always not-triggered, so it is never armed against a held level.
+  core::array::from_fn(|axis| {
+    axis != A_AXIS && firmware_core::hal_traits::limit_triggered(limits[axis].is_high(), &config)
+  })
 }
 
 /// Build a probe [`Block`] from the current machine position `start` (steps) to the probe `target` (steps). A
@@ -1060,11 +1070,15 @@ pub fn init(
     esp_hal::peripherals::GPIO1<'static>,
     esp_hal::peripherals::GPIO2<'static>,
     esp_hal::peripherals::GPIO4<'static>,
+    // A-STEP on the documented spare RMT ch3 (GPIO18, DOC-00). PROVISIONAL / bench-unverified (DOC-10 Phase 5).
+    esp_hal::peripherals::GPIO18<'static>,
   ),
   dir_pins: (
     esp_hal::peripherals::GPIO5<'static>,
     esp_hal::peripherals::GPIO6<'static>,
     esp_hal::peripherals::GPIO7<'static>,
+    // A-DIR — PROVISIONAL GPIO38 (a free S3 pin; DOC-00 manifest addition pending bench, DOC-10 Phase 5).
+    esp_hal::peripherals::GPIO38<'static>,
   ),
   step_enable_pin: esp_hal::peripherals::GPIO8<'static>,
   config: &MotionConfig,
@@ -1084,12 +1098,15 @@ pub fn init(
   let ch_x = rmt.channel0.configure_tx(step_pins.0, tx_config).expect("RMT ch0 (X step)");
   let ch_y = rmt.channel1.configure_tx(step_pins.1, tx_config).expect("RMT ch1 (Y step)");
   let ch_z = rmt.channel2.configure_tx(step_pins.2, tx_config).expect("RMT ch2 (Z step)");
+  // A-STEP on the previously-spare ch3 (DOC-10). Compile-verified only; not driven on the bench yet (Phase 5).
+  let ch_a = rmt.channel3.configure_tx(step_pins.3, tx_config).expect("RMT ch3 (A step)");
 
   // DIR outputs start low (positive direction); the first block latches the real direction before stepping.
   let out_cfg = OutputConfig::default();
   let dir_x = Output::new(dir_pins.0, Level::Low, out_cfg);
   let dir_y = Output::new(dir_pins.1, Level::Low, out_cfg);
   let dir_z = Output::new(dir_pins.2, Level::Low, out_cfg);
+  let dir_a = Output::new(dir_pins.3, Level::Low, out_cfg);
 
   // STEP_EN (TMC ENN) is active-low: drive it low to ENABLE the drivers so the steppers hold at boot. The
   // full enable-on-motion / disable-on-idle policy is deferred; for now the drivers stay enabled.
@@ -1097,7 +1114,7 @@ pub fn init(
 
   // `$29` direction-setup delay in ticks (= microseconds at this divider). Placeholder default until
   // esp-storage settings are loaded; DOC-02 cites a 2 µs practical minimum (5–15 µs for opto drivers).
-  let sink = RmtStepSink::new([ch_x, ch_y, ch_z], [dir_x, dir_y, dir_z], config, DIR_SETUP_US);
+  let sink = RmtStepSink::new([ch_x, ch_y, ch_z, ch_a], [dir_x, dir_y, dir_z, dir_a], config, DIR_SETUP_US);
   (sink, step_enable)
 }
 
@@ -1136,13 +1153,20 @@ pub fn init_limits(
   x_lim: esp_hal::peripherals::GPIO10<'static>,
   y_lim: esp_hal::peripherals::GPIO11<'static>,
   z_lim: esp_hal::peripherals::GPIO12<'static>,
+  // A-LIMIT placeholder. The rotary A axis has NO physical limit switch (DOC-10.6) and is never homed; this pin
+  // exists only to fill the `[_; AXES]` array. PROVISIONAL GPIO39 (DOC-00 addition pending bench, DOC-10 Phase 5).
+  a_lim: esp_hal::peripherals::GPIO39<'static>,
 ) -> [RmtLimitInput; AXES] {
-  // The NC fail-safe requires the pull-up on every limit pin regardless of `$5` (which is a logical sense flip,
-  // applied in `limit_triggered`, not a pin-pull setting).
+  // The NC fail-safe requires the pull-up on every REAL limit pin regardless of `$5` (which is a logical sense
+  // flip, applied in `limit_triggered`, not a pin-pull setting).
   let config = InputConfig::default().with_pull(Pull::Up);
+  // The A placeholder is pulled DOWN so it reads LOW (not asserted) by default; combined with the explicit
+  // `A_AXIS` exclusion in the sampling functions, A can never raise a hard-limit alarm or appear in `Pn:`.
+  let a_config = InputConfig::default().with_pull(Pull::Down);
   [
     RmtLimitInput::new(Input::new(x_lim, config)),
     RmtLimitInput::new(Input::new(y_lim, config)),
     RmtLimitInput::new(Input::new(z_lim, config)),
+    RmtLimitInput::new(Input::new(a_lim, a_config)),
   ]
 }

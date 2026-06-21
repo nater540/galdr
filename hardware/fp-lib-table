@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "Galdr")(type "KiCad")(uri "${KIPRJMOD}/galdr.pretty")(options "")(descr "Galdr custom footprints"))
+)

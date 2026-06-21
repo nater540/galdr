@@ -90,8 +90,32 @@ pub trait StepSink {
   fn emit_burst(&mut self, ticks: &[StepEvent]) -> Result<(), StepError>;
 }
 
-// PwmSink: normalized 0.0..=1.0 spindle duty sink (LEDC PWM on target).
-// TODO(DOC-05): pub trait PwmSink { fn set_duty(&mut self, frac: f32) -> Result<(), PwmError>; }
+/// Errors a [`PwmSink`] may return. Like [`StepError`] these are recoverable by the caller (the spindle task):
+/// the [`SpindleController`](crate::spindle::SpindleController) surfaces them rather than panicking, per the
+/// firmware-core no-`unwrap` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PwmError {
+  /// The underlying PWM transport failed (on target: an LEDC duty-set error). Host recorders never return this.
+  Transport,
+}
+
+/// Sink for a normalized analog level driven as a PWM duty cycle (the WS55-220 spindle speed line on target,
+/// DOC-07). Implemented over LEDC timer0/channel0 on GPIO13 on target (the duty conditioned to 0–10 V by an
+/// external RC + op-amp stage) and as a recording buffer in host tests.
+///
+/// ## Contract
+/// - [`set_duty`](PwmSink::set_duty) takes a normalized `frac` in `0.0..=1.0`: `0.0` is full off (0 V, spindle
+///   stopped) and `1.0` is full scale (10 V, max RPM). The caller (the spindle controller) is responsible for
+///   CLAMPING `frac` into range before calling, so an implementation always receives a valid duty and never has
+///   to reject one; a defensive impl may still clamp, but must not error on an out-of-range value.
+/// - The sink is purely a consumer of a decided duty; the RPM→duty mapping and all M3/M4/M5 sequencing live in
+///   the host-tested [`SpindleController`](crate::spindle::SpindleController) so they stay off-target testable.
+pub trait PwmSink {
+  /// Set the PWM duty from a normalized `frac` in `0.0..=1.0`. Returns [`PwmError::Transport`] on a hardware
+  /// failure. The caller guarantees `frac` is already clamped into range.
+  fn set_duty(&mut self, frac: f32) -> Result<(), PwmError>;
+}
 
 /// The runtime configuration of a limit input that the host-tested homing/hard-limit logic needs (DOC-06). It
 /// folds the one grblHAL limit `$`-setting the trigger READ depends on:
@@ -205,8 +229,31 @@ pub trait ProbeInput {
   fn is_high(&self) -> bool;
 }
 
-// DigitalOut: digital output (stepper enable, spindle enable/direction).
-// TODO(DOC-05): pub trait DigitalOut { fn set(&mut self, level: bool) -> Result<(), ()>; }
+/// Errors a [`DigitalOut`] may return. Like [`StepError`]/[`PwmError`] these are recoverable by the caller (the
+/// spindle task), surfaced rather than panicked, per the firmware-core no-`unwrap` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DigitalOutError {
+  /// The underlying output transport failed (on target: a GPIO set error). Host recorders never return this.
+  Transport,
+}
+
+/// A digital output line (the stepper-enable line and the spindle ENABLE / DIRECTION lines, DOC-07). Implemented
+/// over a single `esp_hal::gpio::Output` on target and as a recording mock in host tests.
+///
+/// ## Logical-level contract
+/// The trait deals in the LOGICAL level only: `true` means ASSERTED (the function is active), `false` means
+/// de-asserted. The PHYSICAL polarity is the firmware implementation's job, NOT the controller's — e.g. the
+/// spindle ENABLE line (`SPIN_EN`, GPIO14) is active-LOW (the WS55-220 runs when its EN terminal is pulled to
+/// GND), so the firmware impl drives the pin LOW for a logical `true` (run). For the DIRECTION line a logical
+/// `true` is the controller's chosen CW convention (see [`SpindleController`](crate::spindle::SpindleController));
+/// the firmware impl maps that to whichever pin level the F/R input expects. Keeping the trait invert-agnostic
+/// means the host-tested controller carries zero board-polarity knowledge, exactly as [`DigitalIn`] does for inputs.
+pub trait DigitalOut {
+  /// Drive the output to the given LOGICAL level (`true` = asserted/active). Returns [`DigitalOutError::Transport`]
+  /// on a hardware failure. Physical inversion (e.g. active-low enable) is applied by the implementation.
+  fn set(&mut self, level: bool) -> Result<(), DigitalOutError>;
+}
 
 /// Half-duplex TMC2209 single-wire UART transport (DOC-03). Implemented over UART1 on target (one bus
 /// shared by all three driver nodes) and as a byte-buffer mock in host tests. The byte-level datagram

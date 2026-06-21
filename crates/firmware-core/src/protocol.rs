@@ -74,7 +74,7 @@ pub const MAX_LINE_LEN: usize = 256;
 /// The grblHAL `error:N` code for an over-length input line ("line length exceeded").
 pub const ERROR_LINE_OVERFLOW: u8 = 15;
 
-/// The number of motion axes reported in build info and status (`[AXS:3:XYZ]`, three `MPos` fields).
+/// The number of motion axes reported in build info and status (`[AXS:4:XYZA]`, four `MPos` fields).
 /// References the planner's [`AXES`](crate::planner::AXES) so the protocol layer cannot disagree with the
 /// kinematics about how many axes exist.
 pub const AXIS_COUNT: usize = crate::planner::AXES;
@@ -1038,6 +1038,29 @@ impl ParserMotion {
   }
 }
 
+/// The active spindle state (modal group 7) reported in a `$G` line: M3/M4 when running, M5 when stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ParserSpindle {
+  /// M3 — spindle on, clockwise.
+  Clockwise,
+  /// M4 — spindle on, counter-clockwise.
+  CounterClockwise,
+  /// M5 — spindle stop (the power-on default).
+  Stop,
+}
+
+impl ParserSpindle {
+  /// The `M<n>` word for this spindle state.
+  fn word(self) -> &'static str {
+    match self {
+      ParserSpindle::Clockwise => "M3",
+      ParserSpindle::CounterClockwise => "M4",
+      ParserSpindle::Stop => "M5",
+    }
+  }
+}
+
 /// The active units mode reported in a `$G` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -1078,6 +1101,26 @@ impl ParserDistance {
   }
 }
 
+/// The active feed-rate mode reported in a `$G` line (modal group 5, DOC-10.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ParserFeedMode {
+  /// G93 inverse-time feed.
+  InverseTime,
+  /// G94 units-per-minute feed (the grbl power-on default).
+  UnitsPerMin,
+}
+
+impl ParserFeedMode {
+  /// The `G<n>` word for this feed mode.
+  fn word(self) -> &'static str {
+    match self {
+      ParserFeedMode::InverseTime => "G93",
+      ParserFeedMode::UnitsPerMin => "G94",
+    }
+  }
+}
+
 /// A `Copy` snapshot of the live parser modal state the `$G` formatter renders. The `firmware` bin builds
 /// this from the consumer's persistent `gcode::Parser` (via its `state()`) so the `[GC:...]` line reports
 /// the real motion/units/distance/feed/spindle words rather than a hardcoded constant. Keeping the
@@ -1092,6 +1135,8 @@ pub struct ParserSnapshot {
   pub units: ParserUnits,
   /// Active distance mode (modal group 3).
   pub distance: ParserDistance,
+  /// Active feed-rate mode (modal group 5): reported as `G93`/`G94`.
+  pub feed_mode: ParserFeedMode,
   /// Active work coordinate system (modal group 12): 0 = G54 … 5 = G59. Reported in `$G` as `G54`…`G59`.
   pub wcs: usize,
   /// Whether a dynamic tool-length offset (`G43.1`) is active (modal group 8): reported as `G43.1` when set,
@@ -1099,6 +1144,8 @@ pub struct ParserSnapshot {
   pub tlo_active: bool,
   /// Programmed feed rate (modal F), in the active units per minute.
   pub feed: f32,
+  /// Active spindle state (modal group 7): reported as `M3`/`M4`/`M5`.
+  pub spindle: ParserSpindle,
   /// Programmed spindle speed (modal S), in RPM.
   pub spindle_rpm: u16,
 }
@@ -1111,9 +1158,11 @@ impl ParserSnapshot {
       motion: ParserMotion::Rapid,
       units: ParserUnits::Millimeter,
       distance: ParserDistance::Absolute,
+      feed_mode: ParserFeedMode::UnitsPerMin,
       wcs: 0,
       tlo_active: false,
       feed: 0.0,
+      spindle: ParserSpindle::Stop,
       spindle_rpm: 0,
     }
   }
@@ -1260,17 +1309,20 @@ impl ResponseWriter {
         ("WPos", work)
       }
     };
+    // Emit one comma-separated field per axis (grblHAL reports N axes: `MPos:x,y,z,a`). The A field is the
+    // rotary position in degrees (DOC-10); the loop widens with `AXIS_COUNT`.
+    write!(out, "|{label}:").map_err(|_| FmtError)?;
+    for (axis, value) in position.iter().enumerate() {
+      if axis == 0 {
+        write!(out, "{value:.3}").map_err(|_| FmtError)?;
+      } else {
+        write!(out, ",{value:.3}").map_err(|_| FmtError)?;
+      }
+    }
     write!(
       out,
-      "|{}:{:.3},{:.3},{:.3}|FS:{:.0},{}|Bf:{},{}",
-      label,
-      position[0],
-      position[1],
-      position[2],
-      snap.feed_mm_min,
-      snap.spindle_rpm,
-      snap.planner_blocks_free,
-      snap.rx_bytes_free,
+      "|FS:{:.0},{}|Bf:{},{}",
+      snap.feed_mm_min, snap.spindle_rpm, snap.planner_blocks_free, snap.rx_bytes_free,
     )
     .map_err(|_| FmtError)?;
     // `Pn:` — asserted input pins, in grbl's signal-letter order. Omitted entirely when nothing is asserted
@@ -1280,7 +1332,14 @@ impl ResponseWriter {
       snap.pins.write_letters(out)?;
     }
     if snap.include_wco {
-      write!(out, "|WCO:{:.3},{:.3},{:.3}", snap.wco_mm[0], snap.wco_mm[1], snap.wco_mm[2]).map_err(|_| FmtError)?;
+      out.push_str("|WCO:").map_err(|_| FmtError)?;
+      for (axis, value) in snap.wco_mm.iter().enumerate() {
+        if axis == 0 {
+          write!(out, "{value:.3}").map_err(|_| FmtError)?;
+        } else {
+          write!(out, ",{value:.3}").map_err(|_| FmtError)?;
+        }
+      }
     }
     // `Ov:` — feed,rapid,spindle override percentages, on the change/periodic cadence (mirroring `WCO:`), so it
     // is not emitted in every report. Placed after `WCO:` per the documented grblHAL element order.
@@ -1305,7 +1364,7 @@ impl ResponseWriter {
     )
     .map_err(|_| FmtError)?;
     if extended {
-      write!(out, "[AXS:{AXIS_COUNT}:XYZ]\r\n").map_err(|_| FmtError)?;
+      write!(out, "[AXS:{AXIS_COUNT}:XYZA]\r\n").map_err(|_| FmtError)?;
       // `ENUMS` advertises the runtime enumeration commands (`$ES`/`$EG`/`$EE`/`$EA`) so a sender builds its
       // settings/error/alarm UI from the controller instead of hardcoding; `RT+` advertises the top-bit-set
       // real-time command forms this module classifies; `SED` advertises the `$SED=<n>` per-setting description
@@ -1317,10 +1376,10 @@ impl ResponseWriter {
   }
 
   /// The `$G` parser-state report: `[GC:<modal words>]`, rendered from a live [`ParserSnapshot`]. The
-  /// motion (`G0`–`G3`), units (`G20`/`G21`), distance (`G90`/`G91`), work coordinate (`G54`–`G59`),
-  /// tool-offset mode (`G43.1`/`G49`), feed (`F`), and spindle (`S`) words reflect the snapshot; the remaining
-  /// modal groups (`G17` plane, `G94` feed mode, `M5` spindle stop, `M9` coolant off, `T0` tool) are fixed,
-  /// where they are not yet commandable, but are emitted so the line is a complete, grbl-faithful modal report.
+  /// motion (`G0`–`G3`), units (`G20`/`G21`), distance (`G90`/`G91`), feed mode (`G93`/`G94`), work coordinate
+  /// (`G54`–`G59`), tool-offset mode (`G43.1`/`G49`), spindle state (`M3`/`M4`/`M5`), feed (`F`), and spindle speed
+  /// (`S`) words reflect the snapshot; the remaining modal groups (`G17` plane, `M9` coolant off, `T0` tool) are
+  /// fixed where they are not yet commandable, but are emitted so the line is a complete grbl-faithful report.
   /// Feed is written with a minimal decimal (no trailing `.0` for whole values) to match grbl's compact form.
   pub fn parser_state<const N: usize>(out: &mut String<N>, snap: &ParserSnapshot) -> Result<(), FmtError> {
     // The active work-coordinate word: G54..G59 from the modal WCS index (clamped defensively to G54 for an
@@ -1330,11 +1389,13 @@ impl ResponseWriter {
     let tlo_word = if snap.tlo_active { "G43.1" } else { "G49" };
     write!(
       out,
-      "[GC:{} {} G17 {} {} G94 M5 M9 T0 {} F",
+      "[GC:{} {} G17 {} {} {} {} M9 T0 {} F",
       snap.motion.word(),
       wcs_word,
       snap.units.word(),
       snap.distance.word(),
+      snap.feed_mode.word(),
+      snap.spindle.word(),
       tlo_word,
     )
     .map_err(|_| FmtError)?;
@@ -2126,7 +2187,7 @@ mod tests {
     // rule re-emits both change-only elements), here zeros / 100% since nothing is set.
     assert_eq!(
       s.as_str(),
-      "<Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024|WCO:0.000,0.000,0.000|Ov:100,100,100>\r\n",
+      "<Idle|MPos:0.000,0.000,0.000,0.000|FS:0,0|Bf:32,1024|WCO:0.000,0.000,0.000,0.000|Ov:100,100,100>\r\n",
     );
   }
 
@@ -2135,8 +2196,8 @@ mod tests {
     // Machine-position report with the WCO element suppressed this cycle (the steady-state cadence).
     let snap = MachineSnapshot {
       state: MachineState::Hold(false),
-      mpos_mm: [1.5, -2.25, 0.125],
-      wco_mm: [0.0, 0.0, 0.0],
+      mpos_mm: [1.5, -2.25, 0.125, 0.0],
+      wco_mm: [0.0, 0.0, 0.0, 0.0],
       position_report: PositionReport::Machine,
       include_wco: false,
       feed_mm_min: 250.0,
@@ -2151,7 +2212,7 @@ mod tests {
     ResponseWriter::status_report(&mut s, &snap).unwrap();
     assert_eq!(
       s.as_str(),
-      "<Hold:0|MPos:1.500,-2.250,0.125|FS:250,1000|Bf:12,1000>\r\n",
+      "<Hold:0|MPos:1.500,-2.250,0.125,0.000|FS:250,1000|Bf:12,1000>\r\n",
     );
   }
 
@@ -2160,8 +2221,8 @@ mod tests {
     // `$10` work-position mode: the report carries `WPos: = MPos − WCO`, plus the WCO element this cycle.
     let snap = MachineSnapshot {
       state: MachineState::Idle,
-      mpos_mm: [10.0, 20.0, 5.0],
-      wco_mm: [10.0, 20.0, 5.0],
+      mpos_mm: [10.0, 20.0, 5.0, 0.0],
+      wco_mm: [10.0, 20.0, 5.0, 0.0],
       position_report: PositionReport::Work,
       include_wco: true,
       feed_mm_min: 0.0,
@@ -2176,7 +2237,7 @@ mod tests {
     // WPos = (10,20,5) − (10,20,5) = (0,0,0); WCO element shows the offset.
     assert_eq!(
       s.as_str(),
-      "<Idle|WPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024|WCO:10.000,20.000,5.000>\r\n",
+      "<Idle|WPos:0.000,0.000,0.000,0.000|FS:0,0|Bf:32,1024|WCO:10.000,20.000,5.000,0.000>\r\n",
     );
   }
 
@@ -2185,8 +2246,8 @@ mod tests {
     // Machine-position mode WITH the WCO element: a host can reconstruct WPos from MPos and WCO.
     let snap = MachineSnapshot {
       state: MachineState::Run,
-      mpos_mm: [10.0, 20.0, 5.0],
-      wco_mm: [1.0, 2.0, 3.0],
+      mpos_mm: [10.0, 20.0, 5.0, 0.0],
+      wco_mm: [1.0, 2.0, 3.0, 0.0],
       position_report: PositionReport::Machine,
       include_wco: true,
       feed_mm_min: 100.0,
@@ -2200,7 +2261,7 @@ mod tests {
     ResponseWriter::status_report(&mut s, &snap).unwrap();
     assert_eq!(
       s.as_str(),
-      "<Run|MPos:10.000,20.000,5.000|FS:100,0|Bf:30,1020|WCO:1.000,2.000,3.000>\r\n",
+      "<Run|MPos:10.000,20.000,5.000,0.000|FS:100,0|Bf:30,1020|WCO:1.000,2.000,3.000,0.000>\r\n",
     );
   }
 
@@ -2224,29 +2285,29 @@ mod tests {
   #[test]
   fn wco_reporter_first_report_always_includes_wco() {
     let mut reporter = wco_reporter();
-    assert!(reporter.should_include([0.0, 0.0, 0.0]), "the first report after construction includes WCO");
+    assert!(reporter.should_include([0.0, 0.0, 0.0, 0.0]), "the first report after construction includes WCO");
   }
 
   #[test]
   fn wco_reporter_includes_on_change_then_suppresses() {
     let mut reporter = wco_reporter();
-    reporter.should_include([0.0, 0.0, 0.0]); // consume the forced first report.
+    reporter.should_include([0.0, 0.0, 0.0, 0.0]); // consume the forced first report.
     // No change → suppressed.
-    assert!(!reporter.should_include([0.0, 0.0, 0.0]));
+    assert!(!reporter.should_include([0.0, 0.0, 0.0, 0.0]));
     // A change → included immediately.
-    assert!(reporter.should_include([10.0, 0.0, 0.0]));
+    assert!(reporter.should_include([10.0, 0.0, 0.0, 0.0]));
     // Same value again → suppressed.
-    assert!(!reporter.should_include([10.0, 0.0, 0.0]));
+    assert!(!reporter.should_include([10.0, 0.0, 0.0, 0.0]));
   }
 
   #[test]
   fn wco_reporter_periodic_refresh_every_period() {
     let mut reporter = wco_reporter();
-    reporter.should_include([5.0, 0.0, 0.0]); // forced first (records 5,0,0).
+    reporter.should_include([5.0, 0.0, 0.0, 0.0]); // forced first (records 5,0,0).
     let mut included = 0;
     // Run many steady (unchanged) reports; a refresh must fire on the periodic cadence.
     for _ in 0..(WCO_REFRESH_PERIOD * 3) {
-      if reporter.should_include([5.0, 0.0, 0.0]) {
+      if reporter.should_include([5.0, 0.0, 0.0, 0.0]) {
         included += 1;
       }
     }
@@ -2257,10 +2318,10 @@ mod tests {
   #[test]
   fn wco_reporter_reset_forces_next_include() {
     let mut reporter = wco_reporter();
-    reporter.should_include([0.0, 0.0, 0.0]);
-    assert!(!reporter.should_include([0.0, 0.0, 0.0]));
+    reporter.should_include([0.0, 0.0, 0.0, 0.0]);
+    assert!(!reporter.should_include([0.0, 0.0, 0.0, 0.0]));
     reporter.reset([0.0; AXIS_COUNT]);
-    assert!(reporter.should_include([0.0, 0.0, 0.0]), "the first report after a reset includes WCO");
+    assert!(reporter.should_include([0.0, 0.0, 0.0, 0.0]), "the first report after a reset includes WCO");
   }
 
   #[test]
@@ -2268,9 +2329,9 @@ mod tests {
     // The `[f32; AXIS_COUNT]` change detection is the array's own element-wise `PartialEq`: a change on ANY axis
     // (here only Z) reads as changed, exactly as the prior hand-rolled per-axis loop did.
     let mut reporter = wco_reporter();
-    reporter.should_include([1.0, 2.0, 3.0]); // forced-first, records [1,2,3].
-    assert!(!reporter.should_include([1.0, 2.0, 3.0]), "identical array suppresses");
-    assert!(reporter.should_include([1.0, 2.0, 3.5]), "a single-axis change is detected element-wise");
+    reporter.should_include([1.0, 2.0, 3.0, 0.0]); // forced-first, records [1, 2, 3, 0.0].
+    assert!(!reporter.should_include([1.0, 2.0, 3.0, 0.0]), "identical array suppresses");
+    assert!(reporter.should_include([1.0, 2.0, 3.5, 0.0]), "a single-axis change is detected element-wise");
   }
 
   #[test]
@@ -2278,17 +2339,17 @@ mod tests {
     // A representative coordinate state: G54 offset, G28 stored, a G92, a Z TLO, and a successful probe.
     let report = CoordinateReport {
       wcs: [
-        [10.0, 20.0, 5.0],
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0],
-        [-1.5, 2.5, 0.0],
+        [10.0, 20.0, 5.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [-1.5, 2.5, 0.0, 0.0],
       ],
-      predefined: [[100.0, 0.0, 50.0], [0.0, 100.0, 50.0]],
-      g92: [1.0, 2.0, 3.0],
+      predefined: [[100.0, 0.0, 50.0, 0.0], [0.0, 100.0, 50.0, 0.0]],
+      g92: [1.0, 2.0, 3.0, 0.0],
       tlo: -14.442,
-      probe: [-293.004, -16.995, -78.005],
+      probe: [-293.004, -16.995, -78.005, 0.0],
       probe_success: true,
     };
     let mut lines = StdVec::new();
@@ -2334,8 +2395,8 @@ mod tests {
   fn build_info_base_reports_buffer_sizes_in_documented_order() {
     let mut s = String::<RESPONSE_CAPACITY>::new();
     ResponseWriter::build_info(&mut s, false).unwrap();
-    // OPT order: options, block buffer (32), RX buffer (1024), axes (3), tool entries (0).
-    assert!(s.as_str().contains("[OPT:VNMSL,32,1024,3,0]"));
+    // OPT order: options, block buffer (32), RX buffer (1024), axes (4), tool entries (0).
+    assert!(s.as_str().contains("[OPT:VNMSL,32,1024,4,0]"));
     assert!(s.as_str().contains("[VER:1.1f."));
     // Base report does not include the extended grblHAL lines.
     assert!(!s.as_str().contains("[NEWOPT:"));
@@ -2346,7 +2407,7 @@ mod tests {
   fn build_info_extended_adds_grblhal_lines() {
     let mut s = String::<256>::new();
     ResponseWriter::build_info(&mut s, true).unwrap();
-    assert!(s.as_str().contains("[AXS:3:XYZ]"));
+    assert!(s.as_str().contains("[AXS:4:XYZA]"));
     // Phase F: NEWOPT now advertises the enumeration + per-setting-description capabilities alongside RT+.
     assert!(s.as_str().contains("[NEWOPT:ENUMS,RT+,SED]"));
     assert!(s.as_str().contains("[FIRMWARE:grblHAL]"));
@@ -2369,14 +2430,41 @@ mod tests {
       motion: ParserMotion::Linear,
       units: ParserUnits::Inch,
       distance: ParserDistance::Incremental,
+      feed_mode: ParserFeedMode::UnitsPerMin,
       wcs: 1,
       tlo_active: true,
       feed: 12.5,
+      // S8000 alone (no M3) sets the speed but leaves the spindle stopped — grbl reports M5 with the S word.
+      spindle: ParserSpindle::Stop,
       spindle_rpm: 8000,
     };
     let mut s = String::<RESPONSE_CAPACITY>::new();
     ResponseWriter::parser_state(&mut s, &snap).unwrap();
     assert_eq!(s.as_str(), "[GC:G1 G55 G17 G20 G91 G94 M5 M9 T0 G43.1 F12.5 S8000]\r\n");
+  }
+
+  #[test]
+  fn parser_state_renders_g93_inverse_time_feed_mode() {
+    // G93 inverse-time mode must render as `G93` in the modal-group-5 slot (DOC-10.2), replacing the previously
+    // hardcoded `G94` token. The default (UnitsPerMin) still renders `G94`, covered by the power-on test above.
+    let snap = ParserSnapshot { feed_mode: ParserFeedMode::InverseTime, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &snap).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G93 M5 M9 T0 G49 F0 S0]\r\n");
+  }
+
+  #[test]
+  fn parser_state_renders_spindle_direction_word() {
+    // M3/M4 must report as the modal spindle word (group 7), not the hardcoded M5 — regression guard for the
+    // now-commandable spindle direction.
+    let cw = ParserSnapshot { spindle: ParserSpindle::Clockwise, spindle_rpm: 1000, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &cw).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G94 M3 M9 T0 G49 F0 S1000]\r\n");
+    let ccw = ParserSnapshot { spindle: ParserSpindle::CounterClockwise, ..ParserSnapshot::power_on() };
+    let mut s2 = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s2, &ccw).unwrap();
+    assert!(s2.as_str().contains(" M4 M9 "), "M4 reported: {}", s2.as_str());
   }
 
   #[test]
@@ -2768,11 +2856,11 @@ mod tests {
   fn probe_report_push_line_wire_format() {
     // The immediate `[PRB:...]` push after a successful probe: machine position at the trigger instant, flag 1.
     let mut s = String::<RESPONSE_CAPACITY>::new();
-    ResponseWriter::probe_report(&mut s, &[-1.015, 0.0, -2.5], true).unwrap();
+    ResponseWriter::probe_report(&mut s, &[-1.015, 0.0, -2.5, 0.0], true).unwrap();
     assert_eq!(s.as_str(), "[PRB:-1.015,0.000,-2.500:1]\r\n");
     // A failed probe (no contact) reports the end-of-travel position with flag 0.
     let mut f = String::<RESPONSE_CAPACITY>::new();
-    ResponseWriter::probe_report(&mut f, &[0.0, 0.0, -5.0], false).unwrap();
+    ResponseWriter::probe_report(&mut f, &[0.0, 0.0, -5.0, 0.0], false).unwrap();
     assert_eq!(f.as_str(), "[PRB:0.000,0.000,-5.000:0]\r\n");
   }
 
@@ -2795,7 +2883,7 @@ mod tests {
   fn last_probe_none_is_origin_failed() {
     let none = LastProbe::none();
     assert_eq!(none, LastProbe::default());
-    assert_eq!(none.position_mm, [0.0, 0.0, 0.0]);
+    assert_eq!(none.position_mm, [0.0, 0.0, 0.0, 0.0]);
     assert!(!none.success);
   }
 
@@ -2804,7 +2892,7 @@ mod tests {
     // The `$#` `[PRB:]` line (line index 10) is driven by the stored last-probe result: feeding a real probe
     // position + success flag into the coordinate report makes `$#` show the triggered point and flag 1 (this
     // replaces the Phase-B zeros/flag-0 stub once the firmware bin fills `probe`/`probe_success` from LastProbe).
-    let last = LastProbe { position_mm: [-1.015, 0.0, -2.5], success: true };
+    let last = LastProbe { position_mm: [-1.015, 0.0, -2.5, 0.0], success: true };
     let report = CoordinateReport { probe: last.position_mm, probe_success: last.success, ..CoordinateReport::default() };
     let mut line = String::<RESPONSE_CAPACITY>::new();
     assert!(ResponseWriter::ngc_parameter_line(&mut line, &report, 10));
@@ -3095,7 +3183,7 @@ mod tests {
     // Probe + all three limits + door + hold + reset + cycle-start in the documented order: P X Y Z D H R S.
     let pins = PinReport {
       probe: true,
-      limits: [true, true, true],
+      limits: [true, true, true, false],
       door: true,
       hold: true,
       reset: true,
@@ -3119,7 +3207,7 @@ mod tests {
 
   #[test]
   fn pin_report_partial_limits_only() {
-    let pins = PinReport { limits: [false, true, false], ..PinReport::new_idle() };
+    let pins = PinReport { limits: [false, true, false, false], ..PinReport::new_idle() };
     let mut s = String::<32>::new();
     pins.write_letters(&mut s).unwrap();
     assert_eq!(s.as_str(), "Y");
@@ -3128,7 +3216,7 @@ mod tests {
   #[test]
   fn pin_report_x_limit_only() {
     // The lowest limit bit on its own: the bin's `LIMIT_LEVELS` bit0 (X) asserted maps to a bare `X`.
-    let pins = PinReport { limits: [true, false, false], ..PinReport::new_idle() };
+    let pins = PinReport { limits: [true, false, false, false], ..PinReport::new_idle() };
     let mut s = String::<32>::new();
     pins.write_letters(&mut s).unwrap();
     assert_eq!(s.as_str(), "X");
@@ -3137,7 +3225,7 @@ mod tests {
   #[test]
   fn pin_report_z_limit_only() {
     // The highest limit bit on its own (the common Z-probe / Z-min over-travel case): a bare `Z`.
-    let pins = PinReport { limits: [false, false, true], ..PinReport::new_idle() };
+    let pins = PinReport { limits: [false, false, true, false], ..PinReport::new_idle() };
     let mut s = String::<32>::new();
     pins.write_letters(&mut s).unwrap();
     assert_eq!(s.as_str(), "Z");
@@ -3146,7 +3234,7 @@ mod tests {
   #[test]
   fn pin_report_x_and_z_limits_skip_y() {
     // A non-contiguous limit mask (X+Z, Y released) must emit the letters in axis order with no `Y` between them.
-    let pins = PinReport { limits: [true, false, true], ..PinReport::new_idle() };
+    let pins = PinReport { limits: [true, false, true, false], ..PinReport::new_idle() };
     let mut s = String::<32>::new();
     pins.write_letters(&mut s).unwrap();
     assert_eq!(s.as_str(), "XZ");
@@ -3155,7 +3243,7 @@ mod tests {
   #[test]
   fn pin_report_probe_and_limits_combine_in_order() {
     // The probe plus two limits: the probe `P` precedes the limit letters in grbl's documented order.
-    let pins = PinReport { probe: true, limits: [true, true, false], ..PinReport::new_idle() };
+    let pins = PinReport { probe: true, limits: [true, true, false, false], ..PinReport::new_idle() };
     let mut s = String::<32>::new();
     pins.write_letters(&mut s).unwrap();
     assert_eq!(s.as_str(), "PXY");
@@ -3169,7 +3257,7 @@ mod tests {
       state: MachineState::Run,
       feed_mm_min: 500.0,
       spindle_rpm: 0,
-      pins: PinReport { limits: [true, false, true], ..PinReport::new_idle() },
+      pins: PinReport { limits: [true, false, true, false], ..PinReport::new_idle() },
       include_ov: false,
       ..MachineSnapshot::idle()
     };
@@ -3177,7 +3265,7 @@ mod tests {
     ResponseWriter::status_report(&mut s, &snap).unwrap();
     assert_eq!(
       s.as_str(),
-      "<Run|MPos:0.000,0.000,0.000|FS:500,0|Bf:32,1024|Pn:XZ|WCO:0.000,0.000,0.000>\r\n",
+      "<Run|MPos:0.000,0.000,0.000,0.000|FS:500,0|Bf:32,1024|Pn:XZ|WCO:0.000,0.000,0.000,0.000>\r\n",
     );
   }
 
@@ -3193,8 +3281,8 @@ mod tests {
     assert_eq!(ov.feed, 150);
     let snap = MachineSnapshot {
       state: MachineState::Run,
-      mpos_mm: [1.0, 2.0, 3.0],
-      wco_mm: [0.0, 0.0, 0.0],
+      mpos_mm: [1.0, 2.0, 3.0, 0.0],
+      wco_mm: [0.0, 0.0, 0.0, 0.0],
       position_report: PositionReport::Machine,
       include_wco: false,
       // The bin computes these as the REALIZED feed/spindle (programmed × override); here 1000 mm/min at 150%
@@ -3211,7 +3299,7 @@ mod tests {
     ResponseWriter::status_report(&mut s, &snap).unwrap();
     assert_eq!(
       s.as_str(),
-      "<Run|MPos:1.000,2.000,3.000|FS:1500,12000|Bf:30,1020|Pn:P|Ov:150,100,100>\r\n",
+      "<Run|MPos:1.000,2.000,3.000,0.000|FS:1500,12000|Bf:30,1020|Pn:P|Ov:150,100,100>\r\n",
     );
   }
 
@@ -3223,7 +3311,7 @@ mod tests {
     ResponseWriter::status_report(&mut s, &snap).unwrap();
     assert_eq!(
       s.as_str(),
-      "<Idle|MPos:0.000,0.000,0.000|FS:0,0|Bf:32,1024|WCO:0.000,0.000,0.000>\r\n",
+      "<Idle|MPos:0.000,0.000,0.000,0.000|FS:0,0|Bf:32,1024|WCO:0.000,0.000,0.000,0.000>\r\n",
     );
   }
 

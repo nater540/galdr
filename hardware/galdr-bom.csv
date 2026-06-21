@@ -1,0 +1,34 @@
+Item,Qty,References,Description,Footprint,Manufacturer,MPN,Supplier,Supplier PN,Notes
+1,11,C1;C2;C3;C4;C_BYP;C_DEB_PROBE;C_DEB_X;C_DEB_Y;C_DEB_Z;C_IN2;C_OS,Ceramic cap 0.1uF 50V (104),C_Disc_D5.0mm_W2.5mm_P5.00mm,KEMET/any,C 0.1uF 50V,Adafruit,753 (10pk x2),Decoupling/debounce/filter
+2,7,R_G;R_LP1;R_LP2;R_PU_PROBE;R_PU_X;R_PU_Y;R_PU_Z,Resistor 10k 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-10K,Adafruit,2784 (25pk),Pull-ups/gain leg
+3,5,R_DEB_PROBE;R_DEB_X;R_DEB_Y;R_DEB_Z;R_UART,Resistor 1k 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-1K0,Adafruit,4294 (25pk),UART/debounce series
+4,4,D_LED_PROBE;D_LED_X;D_LED_Y;D_LED_Z,Signal diode 1N4148 DO-35,D_DO-35_SOD27_P7.62mm_Horizontal,onsemi,1N4148,Adafruit,1641 (10pk),Opto anti-parallel
+5,3,R_GD;R_GE;R_OS,Resistor 100R 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-100R,Adafruit,4293 (25pk),Gate/SV series
+6,2,J1;J2,Female socket 1x22 2.54mm,PinSocket_1x22_P2.54mm_Vertical,Sullins,PPTC221LFBN-RC,Adafruit,598 (cut from 36pk),Dev-board socket
+7,2,D_PL;D_PLED,LED 5mm through-hole,LED_D5.0mm,any,5mm THT LED,Adafruit,2975 Parts Pal / LED pack,Power indicators
+8,2,J_AUX;J_DIAG,Pin header 1x4 2.54mm male,PinHeader_1x04_P2.54mm_Vertical,Sullins,PRPC040SAAN-RC,Adafruit,392 (cut from 36pk),Control header
+9,2,R_PDD;R_PDE,Resistor 100k 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-100K,Adafruit,2787 (25pk),Gate pulldown
+10,2,R_PL;R_PLED,Resistor 4.7k 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-4K7,Adafruit,2783 (25pk),Power-LED series
+11,1,C_5V,Electrolytic 10uF >=16V radial,CP_Radial_D5.0mm_P2.50mm,any,10uF/50V,Adafruit,2195 (10pk),5V rail bulk
+12,1,U_BUCK,MP1584 buck module + 1x4 socket,PinHeader_1x04_P2.54mm_Vertical,(module),MP1584EN module,Amazon/generic,- (NOT Adafruit fp),12V->5V standalone
+13,4,U1;U2;U3;U4,Stepper driver BTT TMC2209 V1.3,TMC2209_StepStick_Socket,BigTreeTech,TMC2209 V1.3,BigTreeTech/Amazon,- (NOT Adafruit pinout),X/Y/Z + spare A
+14,5,J_MOT1;J_MOT2;J_MOT3;J_MOT4;J_WS,Terminal block 4-pos 3.81mm,TerminalBlock_Phoenix_MKDS-1-4-3.81_1x04_P3.81mm_Horizontal,On Shore/Phoenix,OSTVN04A150 / MKDS 1/4-3.81,DigiKey,- (3.81mm; not Adafruit),Motor coils / WS55 out
+15,4,J_LIM_PROBE;J_LIM_X;J_LIM_Y;J_LIM_Z,JST-XH 3-pin vertical header,JST_XH_B3B-XH-A_1x03_P2.50mm_Vertical,JST,B3B-XH-A(LF)(SN),DigiKey,- (not at Adafruit),Limit/probe input
+16,4,OK_PROBE;OK_X;OK_Y;OK_Z,Optocoupler PC817 DIP-4,DIP-4_W7.62mm,Sharp,PC817C,DigiKey,- (not at Adafruit),Isolated limit/probe in
+17,4,R_LED_PROBE;R_LED_X;R_LED_Y;R_LED_Z,Resistor 680R 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-680R,DigiKey,- (not at Adafruit),Opto LED limit
+18,2,C_LP1;C_LP2,Ceramic cap 1uF 50V X7R radial,C_Disc_D5.0mm_W2.5mm_P5.00mm,Vishay,K105K15X7RF5TL2,DigiKey,- (verify),PWM low-pass; not at Adafruit
+19,2,J_CIN;J_SPIN,JST-XH 6-pin vertical header,JST_XH_B6B-XH-A_1x06_P2.50mm_Vertical,JST,B6B-XH-A(LF)(SN),DigiKey,- (not at Adafruit),Carrier<->cond cable
+20,2,Q_DIR;Q_EN,N-MOSFET 2N7000 TO-92,TO-92_Inline,onsemi,2N7000,DigiKey,- (not at Adafruit),EN/DIR open-drain
+21,1,J_PWR,DC barrel jack PCB (match PSU plug),BarrelJack_CUI_PJ-102AH_Horizontal,CUI,PJ-102AH,DigiKey,Adafruit 373=2.1mm - verify,12V input
+22,1,C_IN1,Electrolytic 470uF 35V radial D10/P5,CP_Radial_D10.0mm_P5.00mm,Nichicon,UVR1V471MPD,DigiKey,- (verify),12V input bulk
+23,1,F1,Fuse 3A 5x20 + PCB clips,Fuseholder_Clip-5x20mm_Littelfuse_111_Inline_P20.00x5.00mm_D1.05mm_Horizontal,Littelfuse,0217003.HXP + 01110702Z,DigiKey,- (not at Adafruit),Clip=111 series
+24,1,U_OA,Op-amp dual RRIO 16V DIP-8,DIP-8_W7.62mm,Microchip,MCP6H02-E/P,DigiKey,- (not at Adafruit),0-10V amp (ch B parked)
+25,1,Q1,P-MOSFET FQP27P06 TO-220,TO-220-3_Vertical,onsemi,FQP27P06,DigiKey,- (not at Adafruit),Reverse-polarity protect
+26,1,R_FB,Resistor 15k 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-15K,DigiKey,- (not at Adafruit),Op-amp feedback
+27,1,R_UPU,Resistor 20k 1/4W axial,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,Yageo,CFR-25JB-52-20K,DigiKey,- (not at Adafruit),UART idle pull-up
+28,1,D_BUCK,Schottky 1N5822 3A DO-201AD,D_DO-201AD_P15.24mm_Horizontal,onsemi,1N5822,DigiKey,- (Adafruit only 1N5817),5V anti-backfeed
+29,1,D_TVS,TVS P6KE16A DO-15,D_DO-15_P10.16mm_Horizontal,Littelfuse,P6KE16A,DigiKey,- (not at Adafruit),12V input clamp
+30,1,RV_CAL,Trimmer pot 10k Bourns 3296W,Potentiometer_Bourns_3296W_Vertical,Bourns,3296W-1-103LF,DigiKey,Adafruit 356 alt,Gain calibration
+31,1,-,MCU dev board (plugs into J1/J2),-,Espressif/LonelyBinary,ESP32-S3-DevKitC-1-N16R8,Vendor/Amazon,- (not Adafruit form factor),Required to run the board
+32,4,under U1-U4,2x8 female header per driver,-,Sullins/Adafruit,cut from 598,Adafruit,598,Makes StepSticks removable
+33,-,off-board,JST-XH housings+crimps for cables,-,JST,XHP-3/XHP-6 + SXH-001T-P0.6,DigiKey,-,Interboard + limit-switch cables

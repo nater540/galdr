@@ -609,18 +609,18 @@ mod tests {
   fn hard_limit_alarm_respects_enable_and_shared_pin_rule() {
     let cfg = LimitConfig::default(); // NC: HIGH = triggered.
     // Z switch triggered (high), `$21` enabled, NOT homing => alarm, with the Z mask bit set.
-    let d = hard_limit_alarm([false, false, true], &cfg, true, false);
-    assert_eq!(d.triggered, [false, false, true]);
+    let d = hard_limit_alarm([false, false, true, false], &cfg, true, false);
+    assert_eq!(d.triggered, [false, false, true, false]);
     assert!(d.alarm, "an enabled hard limit trips the alarm when not homing");
     // Same trip, but `$21` DISABLED => no alarm (the mask still reports the switch).
-    let d = hard_limit_alarm([false, false, true], &cfg, false, false);
+    let d = hard_limit_alarm([false, false, true, false], &cfg, false, false);
     assert!(!d.alarm, "a disabled hard limit raises no alarm");
-    assert_eq!(d.triggered, [false, false, true], "but the triggered mask still reflects the switch");
+    assert_eq!(d.triggered, [false, false, true, false], "but the triggered mask still reflects the switch");
     // Same trip, `$21` enabled, but HOMING ACTIVE => suppressed (the shared-pin rule, research finding #17).
-    let d = hard_limit_alarm([false, false, true], &cfg, true, true);
+    let d = hard_limit_alarm([false, false, true, false], &cfg, true, true);
     assert!(!d.alarm, "a limit trip during homing must NOT raise the hard-limit alarm");
     // No switch triggered => no alarm.
-    let d = hard_limit_alarm([false, false, false], &cfg, true, false);
+    let d = hard_limit_alarm([false, false, false, false], &cfg, true, false);
     assert!(!d.alarm);
   }
 
@@ -631,10 +631,10 @@ mod tests {
     // level STILL `true`, no axis makes a not-triggered -> triggered transition, so `alarm` is false — while the
     // published `triggered` mask STILL reports the held switch so the host's `Pn:` endstop view stays correct.
     let cfg = LimitConfig::default(); // NC: HIGH = triggered.
-    let d = hard_limit_alarm_armed([false, false, true], &cfg, true, false, [false, false, true]);
+    let d = hard_limit_alarm_armed([false, false, true, false], &cfg, true, false, [false, false, true, false]);
     assert!(!d.alarm, "a switch already triggered at the previous sample must not re-fire the hard-limit alarm");
-    assert_eq!(d.triggered, [false, false, true], "the level mask still reports the held switch for Pn:");
-    assert_eq!(d.next_armed, [false, false, true], "the carried arming state tracks the current level");
+    assert_eq!(d.triggered, [false, false, true, false], "the level mask still reports the held switch for Pn:");
+    assert_eq!(d.next_armed, [false, false, true, false], "the carried arming state tracks the current level");
   }
 
   #[test]
@@ -643,10 +643,10 @@ mod tests {
     // That not-triggered -> triggered transition MUST raise the alarm — the fix only suppresses a persistently-held
     // level, never a real new trip.
     let cfg = LimitConfig::default();
-    let d = hard_limit_alarm_armed([false, false, true], &cfg, true, false, [false, false, false]);
+    let d = hard_limit_alarm_armed([false, false, true, false], &cfg, true, false, [false, false, false, false]);
     assert!(d.alarm, "a fresh not-triggered -> triggered transition raises the hard-limit alarm");
-    assert_eq!(d.triggered, [false, false, true]);
-    assert_eq!(d.next_armed, [false, false, true]);
+    assert_eq!(d.triggered, [false, false, true, false]);
+    assert_eq!(d.next_armed, [false, false, true, false]);
   }
 
   #[test]
@@ -654,10 +654,10 @@ mod tests {
     // A held axis must not mask a NEW trip on a different axis: X held (prev=true) while Y freshly trips. Only Y's
     // transition counts, so the alarm fires — but the held X is not what triggered it.
     let cfg = LimitConfig::default();
-    let d = hard_limit_alarm_armed([true, true, false], &cfg, true, false, [true, false, false]);
+    let d = hard_limit_alarm_armed([true, true, false, false], &cfg, true, false, [true, false, false, false]);
     assert!(d.alarm, "a fresh trip on Y still alarms even though X is held from before");
-    assert_eq!(d.triggered, [true, true, false]);
-    assert_eq!(d.next_armed, [true, true, false]);
+    assert_eq!(d.triggered, [true, true, false, false]);
+    assert_eq!(d.next_armed, [true, true, false, false]);
   }
 
   #[test]
@@ -665,12 +665,12 @@ mod tests {
     // The gating rules survive the edge-arming: `$21` off and homing-active both suppress even a FRESH assertion
     // (prev all-false). A disabled limit or an expected in-cycle trip is never an over-travel alarm.
     let cfg = LimitConfig::default();
-    let d = hard_limit_alarm_armed([false, false, true], &cfg, false, false, [false, false, false]);
+    let d = hard_limit_alarm_armed([false, false, true, false], &cfg, false, false, [false, false, false, false]);
     assert!(!d.alarm, "a disabled `$21` raises no alarm even on a fresh trip");
-    assert_eq!(d.triggered, [false, false, true], "but the mask still reports the switch");
-    let d = hard_limit_alarm_armed([false, false, true], &cfg, true, true, [false, false, false]);
+    assert_eq!(d.triggered, [false, false, true, false], "but the mask still reports the switch");
+    let d = hard_limit_alarm_armed([false, false, true, false], &cfg, true, true, [false, false, false, false]);
     assert!(!d.alarm, "a fresh trip DURING homing is suppressed by the shared-pin rule");
-    assert_eq!(d.triggered, [false, false, true]);
+    assert_eq!(d.triggered, [false, false, true, false]);
   }
 
   #[test]
@@ -678,10 +678,10 @@ mod tests {
     // The published `triggered` mask is purely level-based (post-`$5`), independent of the arming state: under
     // `$5=1` an all-low read is all-triggered regardless of `prev`, so the host `Pn:` view never depends on edges.
     let inverted = LimitConfig { invert: true };
-    let d = hard_limit_alarm_armed([false, false, false], &inverted, true, false, [true, true, true]);
-    assert_eq!(d.triggered, [true, true, true], "$5=1 makes all-low read as all-triggered regardless of arming");
+    let d = hard_limit_alarm_armed([false, false, false, false], &inverted, true, false, [true, true, true, true]);
+    assert_eq!(d.triggered, [true, true, true, true], "$5=1 makes all-low read as all-triggered regardless of arming");
     assert!(!d.alarm, "all axes were already armed, so the held (inverted) level raises no fresh alarm");
-    assert_eq!(d.next_armed, [true, true, true]);
+    assert_eq!(d.next_armed, [true, true, true, true]);
   }
 
   #[test]
@@ -690,10 +690,10 @@ mod tests {
     // edge that alarms. This proves the arming state is not a one-way latch: prev=true, now=false yields no alarm
     // and clears the bit; feeding that back with a new press alarms again.
     let cfg = LimitConfig::default();
-    let released = hard_limit_alarm_armed([false, false, false], &cfg, true, false, [false, false, true]);
+    let released = hard_limit_alarm_armed([false, false, false, false], &cfg, true, false, [false, false, true, false]);
     assert!(!released.alarm, "a release is not a trip");
-    assert_eq!(released.next_armed, [false, false, false], "the released axis disarms");
-    let repressed = hard_limit_alarm_armed([false, false, true], &cfg, true, false, released.next_armed);
+    assert_eq!(released.next_armed, [false, false, false, false], "the released axis disarms");
+    let repressed = hard_limit_alarm_armed([false, false, true, false], &cfg, true, false, released.next_armed);
     assert!(repressed.alarm, "a fresh press after a release alarms again");
   }
 
@@ -701,19 +701,19 @@ mod tests {
   fn hard_limit_alarm_honors_the_dollar5_invert() {
     // With `$5=1` the sense flips: a LOW pin is now triggered. The mask + alarm must follow the inverted sense.
     let inverted = LimitConfig { invert: true };
-    let d = hard_limit_alarm([false, false, false], &inverted, true, false);
-    assert_eq!(d.triggered, [true, true, true], "$5=1 makes a low pin read triggered");
+    let d = hard_limit_alarm([false, false, false, false], &inverted, true, false);
+    assert_eq!(d.triggered, [true, true, true, true], "$5=1 makes a low pin read triggered");
     assert!(d.alarm);
   }
 
   #[test]
   fn pack_limit_mask_uses_bit0_x_bit1_y_bit2_z() {
     // The published `Pn:` layout is bit0 = X, bit1 = Y, bit2 = Z; assert each axis maps to its own bit.
-    assert_eq!(pack_limit_mask([false, false, false]), 0b000, "nothing triggered = 0");
-    assert_eq!(pack_limit_mask([true, false, false]), 0b001, "X => bit0");
-    assert_eq!(pack_limit_mask([false, true, false]), 0b010, "Y => bit1");
-    assert_eq!(pack_limit_mask([false, false, true]), 0b100, "Z => bit2");
-    assert_eq!(pack_limit_mask([true, true, true]), 0b111, "all three set");
+    assert_eq!(pack_limit_mask([false, false, false, false]), 0b000, "nothing triggered = 0");
+    assert_eq!(pack_limit_mask([true, false, false, false]), 0b001, "X => bit0");
+    assert_eq!(pack_limit_mask([false, true, false, false]), 0b010, "Y => bit1");
+    assert_eq!(pack_limit_mask([false, false, true, false]), 0b100, "Z => bit2");
+    assert_eq!(pack_limit_mask([true, true, true, false]), 0b111, "all three set");
   }
 
   #[test]
@@ -721,12 +721,12 @@ mod tests {
     // The single-sample coherence guarantee: the same `raw_high` that drives the alarm also drives the published
     // mask, by packing `HardLimitDecision::triggered` (the post-`$5` logical state) straight into the bitmask.
     let cfg = LimitConfig::default(); // NC: HIGH = triggered.
-    let d = hard_limit_alarm([false, true, false], &cfg, true, false);
+    let d = hard_limit_alarm([false, true, false, false], &cfg, true, false);
     assert_eq!(pack_limit_mask(d.triggered), 0b010, "Y trip packs to bit1");
     // Under `$5=1` the logical sense flips, and the packed mask must follow that inverted (logical) state.
     let inverted = LimitConfig { invert: true };
-    let d = hard_limit_alarm([false, false, false], &inverted, true, false);
-    assert_eq!(pack_limit_mask(d.triggered), 0b111, "$5=1 makes all-low read as all-triggered");
+    let d = hard_limit_alarm([false, false, false, false], &inverted, true, false);
+    assert_eq!(pack_limit_mask(d.triggered), 0b1111, "$5=1 makes all-low read as all-triggered");
   }
 
   #[test]

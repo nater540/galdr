@@ -31,12 +31,20 @@
 //! [`BLOCK_QUEUE_LEN`]; an over-full queue is a recoverable [`PlannerError::QueueFull`], never a
 //! panic. All arithmetic is `f32`; `libm` supplies `sqrtf`, `acosf`, `sinf`, `cosf`.
 
-use crate::gcode::{AxisWords, CoordinateOp, DistanceMode, JogCommand, PlannerCommand, ProbeKind, Units};
+use crate::gcode::{AxisWords, CoordinateOp, DistanceMode, FeedMode, JogCommand, PlannerCommand, ProbeKind, Units};
 use heapless::Deque;
 
-/// Number of axes the planner coordinates (X, Y, Z) per DOC-02. The spare RMT channel's 4th axis is
-/// out of scope until a 4th axis is wired, so the planner is fixed at three.
-pub const AXES: usize = 3;
+/// Number of axes the planner coordinates: X, Y, Z (linear, mm) and A (rotary about X, degrees) per DOC-10.
+/// Hardcoded at 4 — the firmware is not generalized to arbitrary axis counts; index 3 is always the A axis.
+pub const AXES: usize = 4;
+
+/// Axis index of the rotary A axis (rotation about machine X). The linear axes are indices 0..3 (X, Y, Z).
+pub const A_AXIS: usize = 3;
+
+/// DEFAULT `$376` rotary-axes bitmask — the fresh power-on value before flash loads (DOC-10.7). Bit N set ⇒
+/// axis N is angular (degrees). The authoritative value is the runtime `$376` setting in
+/// [`PlannerConfig::rotary_mask`]; this const is only the default. `8` = bit 3 set → A rotary, X/Y/Z linear.
+pub const DEFAULT_ROTARY_MASK: u8 = 0b0000_1000;
 
 /// Block ring-buffer capacity. DOC-05 recommends 16–32 blocks of look-ahead for PCB milling and notes
 /// the ESP32-S3 can comfortably hold 32 (grbl uses ~16 on AVR). 32 maximizes look-ahead headroom.
@@ -121,18 +129,32 @@ pub struct PlannerConfig {
   /// `$12` arc chord tolerance in mm: the maximum chord error when subdividing an arc into linear
   /// segments. grbl default ≈ 0.002 mm.
   pub arc_tolerance_mm: f32,
+  /// `$376` rotary-axes bitmask (DOC-10.7): bit N set ⇒ axis N is angular (degrees). Drives the rotary
+  /// kinematic gating (units inch-scaling suppression, continuous/rollover soft limits) at the rotary-gated
+  /// sites; the unit-agnostic look-ahead/DDA never consults it. Default [`DEFAULT_ROTARY_MASK`] (= 8).
+  pub rotary_mask: u8,
+}
+
+impl PlannerConfig {
+  /// Whether axis `axis` is rotary per the live `$376` mask. The rotary-gated sites call this instead of
+  /// indexing a const, so toggling `$376` re-classifies an axis at runtime (DOC-10.1).
+  pub fn is_rotary(&self, axis: usize) -> bool {
+    self.rotary_mask & (1 << axis) != 0
+  }
 }
 
 impl Default for PlannerConfig {
-  /// grbl-like defaults useful for tests and first boot: 250 steps/mm, 500 mm/min max rate,
-  /// 10 mm/s² acceleration on every axis, `$11` = 0.01 mm, `$12` = 0.002 mm.
+  /// grbl-like defaults useful for tests and first boot. Linear X/Y/Z: 250 steps/mm, 500 mm/min, 10 mm/s².
+  /// Rotary A (index 3, degrees): 8.889 steps/deg (200 × 16 microsteps / 360), 3600 deg/min (10 rev/min),
+  /// 360 deg/s². `$11` = 0.01 mm, `$12` = 0.002 mm, `$376` = [`DEFAULT_ROTARY_MASK`] (A rotary).
   fn default() -> Self {
     PlannerConfig {
-      steps_per_mm: [250.0; AXES],
-      max_rate_mm_min: [500.0; AXES],
-      accel_mm_s2: [10.0; AXES],
+      steps_per_mm: [250.0, 250.0, 250.0, 8.889],
+      max_rate_mm_min: [500.0, 500.0, 500.0, 3600.0],
+      accel_mm_s2: [10.0, 10.0, 10.0, 360.0],
       junction_deviation_mm: 0.01,
       arc_tolerance_mm: 0.002,
+      rotary_mask: DEFAULT_ROTARY_MASK,
     }
   }
 }
@@ -261,6 +283,61 @@ pub enum PlannerOutcome {
   },
 }
 
+/// The spin-up-dwell decision (DOC-07): after an M3/M4 the planner must insert a synchronized dwell of `$392`
+/// (`spindle_on_delay_s`) before the FIRST cutting move that follows, so the spindle reaches speed before it
+/// cuts. This is pure, host-tested decision logic kept SEPARATE from [`Planner::plan_command`] because that call
+/// returns exactly ONE [`PlannerOutcome`] and cannot emit a dwell ahead of a move in a single step; instead the
+/// firmware comms consumer — which already sees both the [`PlannerOutcome::Spindle`] and the live `$392` setting —
+/// drives this gate: it `note_spindle`s every M3/M4/M5 it forwards, and before planning a cutting move it
+/// consults [`take_dwell_before_move`](SpinUpGate::take_dwell_before_move) and, if a dwell is owed, plans a
+/// synthetic [`PlannerCommand::Dwell`] first. The gate keeps the WHEN-to-insert decision unit-tested in
+/// firmware-core; the consumer supplies the dwell SECONDS from settings, so the planner stays settings-free.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SpinUpGate {
+  /// True when an M3/M4 has started the spindle and the spin-up dwell is still OWED to the next cutting move. A
+  /// stop (M5/S0) or the consumption of the dwell clears it, so exactly one dwell is inserted per spindle start.
+  pending: bool,
+}
+
+impl SpinUpGate {
+  /// A fresh gate with no spin-up owed (the spindle is off at program start / after a reset).
+  pub fn new() -> Self {
+    SpinUpGate { pending: false }
+  }
+
+  /// Observe a spindle command. An M3/M4 (`Clockwise`/`CounterClockwise`) arms the spin-up so the next cutting
+  /// move gets a dwell ahead of it; an M5 (`Stop`) disarms it (a stopped spindle owes no spin-up). Re-arming on a
+  /// second M3/M4 before any move is harmless: the gate is a single boolean, so a back-to-back M3 then M4 still
+  /// owes exactly one dwell.
+  pub fn note_spindle(&mut self, state: crate::gcode::SpindleState) {
+    self.pending = !matches!(state, crate::gcode::SpindleState::Stop);
+  }
+
+  /// Called just before a cutting move (G1/G2/G3 — a feed move, not a rapid) is planned. If a spin-up is owed it
+  /// is CONSUMED (so only the first move after the spindle start gets it) and the dwell to insert is returned:
+  /// `Some(spin_up_delay_s)` when `$392 > 0`, or `None` when `$392 == 0` (the spin-up is still consumed, but
+  /// there is nothing to insert). When no spin-up is owed, returns `None` and leaves the gate untouched.
+  ///
+  /// `spin_up_delay_s` is the live `$392` value the caller reads from settings, so the planner owns no settings.
+  pub fn take_dwell_before_move(&mut self, spin_up_delay_s: f32) -> Option<f32> {
+    if !self.pending {
+      return None;
+    }
+    self.pending = false;
+    // A positive, finite delay is inserted as a dwell; `$392 == 0` (or a non-finite value) consumes the spin-up
+    // but inserts nothing. Positive form avoids the `neg_cmp_op_on_partial_ord` lint and treats NaN as "none".
+    if spin_up_delay_s > 0.0 { Some(spin_up_delay_s) } else { None }
+  }
+
+  /// True when a spin-up dwell is currently owed to the next cutting move (the spindle was started and no move has
+  /// consumed the dwell yet). Exposed for the consumer's diagnostics / tests; the decision uses the `take`/`note`
+  /// methods.
+  pub fn is_pending(&self) -> bool {
+    self.pending
+  }
+}
+
 /// The geometry of one G2/G3 arc, bundled so the arc planner takes a single borrowed request rather
 /// than a long positional argument list. The fields mirror [`PlannerCommand::Arc`].
 struct ArcRequest<'a> {
@@ -276,8 +353,11 @@ struct ArcRequest<'a> {
   units: Units,
   /// Active distance mode for the endpoint words.
   distance: DistanceMode,
-  /// Active feed rate (modal F) in `units` per minute, shared by every subdivided segment.
+  /// Active feed rate (modal F). Under G94 it is `units` per minute, shared by every subdivided segment; under
+  /// G93 it is the inverse-time feed for the WHOLE arc, distributed across the equal-length segments in [`plan_arc`].
   feed: f32,
+  /// Active feed-rate mode (modal group 5): G94 units/min or G93 inverse-time (DOC-10.2).
+  feed_mode: FeedMode,
   /// True for a `G53` machine-coordinate arc: the endpoint words are MACHINE positions (no work offset).
   machine_coords: bool,
 }
@@ -429,17 +509,17 @@ impl Planner {
     limits: Option<SoftLimits>,
   ) -> Result<PlannerOutcome, PlannerError> {
     match command {
-      PlannerCommand::Move { rapid, axes, units, distance, feed, machine_coords } => {
+      PlannerCommand::Move { rapid, axes, units, distance, feed, feed_mode, machine_coords } => {
         let target = self.resolve_target(axes, *units, *distance, *machine_coords);
         if let Some(limits) = limits
-          && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm)
+          && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm, self.config.rotary_mask)
         {
           return Err(PlannerError::MoveExceedsTravel);
         }
-        let queued = self.plan_line(target, *feed, *units, *rapid)?;
+        let queued = self.plan_line(target, *feed, *units, *feed_mode, *rapid)?;
         Ok(PlannerOutcome::Queued { blocks: queued })
       }
-      PlannerCommand::Arc { cw, axes, i, j, units, distance, feed, machine_coords } => {
+      PlannerCommand::Arc { cw, axes, i, j, units, distance, feed, feed_mode, machine_coords } => {
         // Check the arc ENDPOINT against the envelope (the start is wherever the machine already is, already
         // inside the envelope by induction). A degenerate arc still surfaces its `InvalidArc` below.
         if let Some(limits) = limits
@@ -447,6 +527,7 @@ impl Planner {
             &self.resolve_target(axes, *units, *distance, *machine_coords),
             &self.config.steps_per_mm,
             &limits.max_travel_mm,
+            self.config.rotary_mask,
           )
         {
           return Err(PlannerError::MoveExceedsTravel);
@@ -459,6 +540,7 @@ impl Planner {
           units: *units,
           distance: *distance,
           feed: *feed,
+          feed_mode: *feed_mode,
           machine_coords: *machine_coords,
         };
         let queued = self.plan_arc(&request)?;
@@ -508,13 +590,14 @@ impl Planner {
   pub fn plan_jog(&mut self, jog: &JogCommand, limits: Option<SoftLimits>) -> Result<PlannerOutcome, PlannerError> {
     let target = self.resolve_target(&jog.axes, jog.units, jog.distance_mode, jog.machine_coords);
     if let Some(limits) = limits
-      && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm)
+      && soft_limit_violation(&target, &self.config.steps_per_mm, &limits.max_travel_mm, self.config.rotary_mask)
     {
       return Err(PlannerError::JogExceedsTravel);
     }
     // A jog is a feed move (its `F` governs speed, not the rapid max-rate path), tagged `jog = true` so a
-    // jog-cancel can flush exactly the jog blocks. Run look-ahead immediately like a single move.
-    let enqueued = self.enqueue_move(target, jog.feed, jog.units, false, true)?;
+    // jog-cancel can flush exactly the jog blocks. A jog feed is always units/min — the jog grammar accepts no
+    // G93/G94 word — so it plans as `FeedMode::UnitsPerMin`. Run look-ahead immediately like a single move.
+    let enqueued = self.enqueue_move(target, jog.feed, jog.units, FeedMode::UnitsPerMin, false, true)?;
     if enqueued == 1 {
       self.recalculate();
     }
@@ -547,11 +630,14 @@ impl Planner {
   /// the words as MACHINE positions and skips the offset; an incremental move adds to the current machine
   /// position (the offset is already baked in). Axes not mentioned on the line keep their current position.
   fn resolve_target(&self, axes: &AxisWords, units: Units, distance: DistanceMode, machine_coords: bool) -> [i32; AXES] {
-    let scale = units_scale(units);
-    let words = [axes.x, axes.y, axes.z];
+    let words = [axes.x, axes.y, axes.z, axes.a];
     let mut target = self.position_steps;
     for axis in 0..AXES {
       if let Some(value) = words[axis] {
+        // G20/G21 inch scaling applies to LINEAR axes only; a rotary axis word (per the live `$376` mask) is
+        // never inch-scaled — a `G20 A90` is 90 degrees, not 90 × 25.4 (DOC-10.1). The same mask that marks an
+        // axis rotary thus suppresses its unit scaling, so the rotary fork lives entirely in this `scale` choice.
+        let scale = if self.config.is_rotary(axis) { 1.0 } else { units_scale(units) };
         let value_mm = value * scale;
         let machine_mm = match distance {
           // Absolute words are MACHINE coordinates under G53 (no offset), else WORK coordinates (add the WCO).
@@ -572,8 +658,15 @@ impl Planner {
   /// Plan a single straight-line move to an absolute step target. Builds the block, enqueues it, runs
   /// look-ahead, and advances the planner position. Returns 1 if a block was enqueued, 0 for a no-op
   /// move (target equals current position).
-  fn plan_line(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool) -> Result<usize, PlannerError> {
-    let enqueued = self.enqueue_move(target, feed, units, rapid, false)?;
+  fn plan_line(
+    &mut self,
+    target: [i32; AXES],
+    feed: f32,
+    units: Units,
+    feed_mode: FeedMode,
+    rapid: bool,
+  ) -> Result<usize, PlannerError> {
+    let enqueued = self.enqueue_move(target, feed, units, feed_mode, rapid, false)?;
     if enqueued == 1 {
       // A single move runs the full look-ahead immediately, so its planned entry speeds are final the
       // moment the command returns (the arc path defers this to one recalculate after the whole sweep).
@@ -587,8 +680,16 @@ impl Planner {
   /// against this one correctly. Returns 1 if a block was enqueued, 0 for a no-op move. Separated from the
   /// `recalculate()` pass so an arc can enqueue all its segments first and recalculate exactly once — the
   /// per-block reverse+forward passes are O(n), so calling them per segment makes arc planning O(n²).
-  fn enqueue_move(&mut self, target: [i32; AXES], feed: f32, units: Units, rapid: bool, jog: bool) -> Result<usize, PlannerError> {
-    let block = match self.build_block(target, feed, units, rapid, jog) {
+  fn enqueue_move(
+    &mut self,
+    target: [i32; AXES],
+    feed: f32,
+    units: Units,
+    feed_mode: FeedMode,
+    rapid: bool,
+    jog: bool,
+  ) -> Result<usize, PlannerError> {
+    let block = match self.build_block(target, feed, units, feed_mode, rapid, jog) {
       Some(block) => block,
       None => return Ok(0),
     };
@@ -602,7 +703,15 @@ impl Planner {
   /// Build a block from the current position to an absolute step `target`. Returns `None` for a
   /// zero-length move. Computes the step delta, dominant-axis count, unit vector and mm travel, the
   /// limiting acceleration and nominal speed, and the junction-deviation entry-speed cap.
-  fn build_block(&self, target: [i32; AXES], feed: f32, units: Units, rapid: bool, jog: bool) -> Option<Block> {
+  fn build_block(
+    &self,
+    target: [i32; AXES],
+    feed: f32,
+    units: Units,
+    feed_mode: FeedMode,
+    rapid: bool,
+    jog: bool,
+  ) -> Option<Block> {
     let mut steps = [0i32; AXES];
     let mut delta_mm = [0.0f32; AXES];
     let mut step_event_count = 0u32;
@@ -612,15 +721,26 @@ impl Planner {
       step_event_count = step_event_count.max(d.unsigned_abs());
       delta_mm[axis] = d as f32 / self.config.steps_per_mm[axis];
     }
-    let millimeters = libm::sqrtf(delta_mm[0] * delta_mm[0] + delta_mm[1] * delta_mm[1] + delta_mm[2] * delta_mm[2]);
+    // The single block length is the FULL all-axis Euclidean norm (degrees treated as mm per the grblHAL
+    // convention), used identically for ramp distance, the direction unit vector, and junction cornering — there
+    // is one length quantity, never a separate linear-only path length (DOC-10.2 review correction / grbl
+    // `ROTARY_FIX`). A pure-rotary move's norm is just |Δa|, which is exactly what the G93 rotary-only feed wants.
+    let mut len_sq = 0.0f32;
+    for axis in 0..AXES {
+      len_sq += delta_mm[axis] * delta_mm[axis];
+    }
+    let millimeters = libm::sqrtf(len_sq);
     if millimeters < LENGTH_EPSILON_MM || step_event_count == 0 {
       return None;
     }
     let inv_mm = 1.0 / millimeters;
-    let unit_vec = [delta_mm[0] * inv_mm, delta_mm[1] * inv_mm, delta_mm[2] * inv_mm];
+    let mut unit_vec = [0.0f32; AXES];
+    for axis in 0..AXES {
+      unit_vec[axis] = delta_mm[axis] * inv_mm;
+    }
 
     let acceleration = limiting_acceleration(&unit_vec, &self.config.accel_mm_s2);
-    let nominal_speed = self.nominal_speed_mm_s(feed, units, rapid, &unit_vec);
+    let nominal_speed = self.nominal_speed_mm_s(feed, units, feed_mode, rapid, millimeters, &unit_vec);
     let nominal_speed_sq = nominal_speed * nominal_speed;
 
     // The junction cornering limit caps the entry speed; it never exceeds this block's own nominal.
@@ -643,18 +763,35 @@ impl Planner {
   }
 
   /// The block's nominal (cruise) speed in mm/s. For a rapid (G0) the speed is governed by the per-axis
-  /// maximum rates; for a feed move it is the requested feed (mm/min → mm/s), each clamped so no
-  /// participating axis exceeds its own maximum rate along the unit vector.
-  fn nominal_speed_mm_s(&self, feed: f32, units: Units, rapid: bool, unit_vec: &[f32; AXES]) -> f32 {
+  /// maximum rates; for a feed move it is derived from the requested feed, clamped so no participating axis
+  /// exceeds its own maximum rate along the unit vector.
+  ///
+  /// The feed interpretation forks on `feed_mode` (DOC-10.2):
+  /// - **G94 units/min:** the feed is `units`-per-minute; convert inch/min → mm/min → mm/s.
+  /// - **G93 inverse-time:** the feed is `1/(duration in minutes)`, so the block (path length `millimeters`)
+  ///   runs in `1/feed` minutes → speed `= millimeters × feed / 60`. The inverse-time feed is NOT unit-scaled
+  ///   (grbl never inch-scales an inverse-time `F`), and `millimeters` is already true mm, so the result is
+  ///   correct under both G20 and G21. An over-fast G93 duration is floored by the axis-rate clamp below, so
+  ///   the move finishes slower than commanded rather than losing steps (DOC-10.2 Q3).
+  fn nominal_speed_mm_s(
+    &self,
+    feed: f32,
+    units: Units,
+    feed_mode: FeedMode,
+    rapid: bool,
+    millimeters: f32,
+    unit_vec: &[f32; AXES],
+  ) -> f32 {
     let axis_rate_limit = self.axis_rate_limit_mm_s(unit_vec);
     if rapid {
       // A rapid has no feed word; it cruises at the most restrictive axis rate limit.
       return axis_rate_limit;
     }
-    // Feed words are in the active units per minute; convert inch/min to mm/min, then to mm/s.
-    let feed_mm_min = feed * units_scale(units);
-    let feed_mm_s = feed_mm_min / 60.0;
-    feed_mm_s.min(axis_rate_limit).max(0.0)
+    let requested_mm_s = match feed_mode {
+      FeedMode::UnitsPerMin => feed * units_scale(units) / 60.0,
+      FeedMode::InverseTime => millimeters * feed / 60.0,
+    };
+    requested_mm_s.min(axis_rate_limit).max(0.0)
   }
 
   /// The speed limit in mm/s imposed by the per-axis maximum rates (`$110–$112`) for a move along
@@ -680,10 +817,16 @@ impl Planner {
     if is_zero_vec(&self.prev_unit_vec) {
       return 0.0;
     }
-    // grbl: junction_cos_theta = -dot(prev, curr). For a straight continuation prev==curr so the dot is
-    // +1 and cos_theta = -1 (no restriction); for a full reversal the dot is -1 and cos_theta = +1.
+    // grbl: junction_cos_theta = -dot(prev, curr) over ALL axes (linear and rotary alike, DOC-10.3) — a change
+    // in rotary direction is a real velocity discontinuity on the A motor and corners the same as a linear one.
+    // For a straight continuation prev==curr so the dot is +1 and cos_theta = -1 (no restriction); for a full
+    // reversal the dot is -1 and cos_theta = +1. The all-axis unit vectors are normalized by the full norm, so
+    // a 1° rotary step and a 1 mm linear step contribute equally — the grblHAL "degrees == mm" convention.
     let prev = &self.prev_unit_vec;
-    let dot = prev[0] * unit_vec[0] + prev[1] * unit_vec[1] + prev[2] * unit_vec[2];
+    let mut dot = 0.0f32;
+    for axis in 0..AXES {
+      dot += prev[axis] * unit_vec[axis];
+    }
     let cos_theta = -dot;
     // A reversal (cos_theta → +1) forces the junction speed to zero: the machine must stop and back up.
     if cos_theta >= 1.0 - JUNCTION_REVERSAL_EPSILON {
@@ -818,22 +961,38 @@ impl Planner {
 
     let z_start = start[2];
     let z_delta = target[2] - z_start;
+    // The rotary A axis is slaved linearly across the arc exactly like the Z helix (DOC-10.5): it advances
+    // `a_delta / segments` per chord, in lockstep with the XY interpolation. A is never circularly interpolated;
+    // a G2/G3 with an `A` word produces an A-slaved helical arc, not a rotary-plane arc (that is out of scope).
+    let a_start = start[A_AXIS];
+    let a_delta = target[A_AXIS] - a_start;
     let theta_start = libm::atan2f(r0[1], r0[0]);
     let theta_step = sweep / segments as f32;
 
+    // The per-segment feed. Under G94 every segment carries the same units/min feed. Under G93 the inverse-time
+    // F describes the WHOLE arc's duration; since a circular arc with a constant angular step subdivides into
+    // EQUAL-length segments (identical chord, identical Z/A step), each segment must take `1/(feed × segments)`
+    // minutes, i.e. its inverse-time feed is `feed × segments`. This keeps the arc's total duration at `1/feed`
+    // minutes while reusing the same per-block inverse-time math (DOC-10.2).
+    let seg_feed = match request.feed_mode {
+      FeedMode::UnitsPerMin => request.feed,
+      FeedMode::InverseTime => request.feed * segments as f32,
+    };
     let mut enqueued = 0usize;
     for seg in 1..=segments {
       let theta = theta_start + theta_step * seg as f32;
       let x = center[0] + radius * libm::cosf(theta);
       let y = center[1] + radius * libm::sinf(theta);
-      let z = z_start + z_delta * (seg as f32 / segments as f32);
-      let seg_target = self.mm_target_to_steps(&[x, y, z]);
+      let frac = seg as f32 / segments as f32;
+      let z = z_start + z_delta * frac;
+      let a = a_start + a_delta * frac;
+      let seg_target = self.mm_target_to_steps(&[x, y, z, a]);
       // Each segment is a linear feed move; the arc feed applies (already in active units). Enqueue without
       // look-ahead — the all-or-nothing pre-check above guaranteed the queue has room for every segment, so
       // this cannot hit `QueueFull` mid-arc, and the per-segment junction state still advances so adjacent
       // segments corner against each other. The single `recalculate()` below then resolves all entry speeds
       // in one O(n) reverse+forward pass instead of one pass per segment (which would be O(n²)).
-      enqueued += self.enqueue_move(seg_target, request.feed, request.units, false, false)?;
+      enqueued += self.enqueue_move(seg_target, seg_feed, request.units, request.feed_mode, false, false)?;
     }
     // Resolve look-ahead once across the whole arc. This is exactly equivalent to recalculating after each
     // segment, because the reverse/forward passes always sweep the entire queue — only the final state of
@@ -853,14 +1012,17 @@ impl Planner {
     machine_coords: bool,
     start: &[f32; AXES],
   ) -> [f32; AXES] {
-    let words = [axes.x, axes.y, axes.z];
+    let words = [axes.x, axes.y, axes.z, axes.a];
     let mut endpoint = *start;
     for axis in 0..AXES {
       if let Some(value) = words[axis] {
+        // A rotary axis word bypasses G20/G21 inch scaling (DOC-10.1), matching `resolve_target`; the I/J center
+        // offsets handled by the caller are always linear (X/Y), so they keep the units scale.
+        let axis_scale = if self.config.is_rotary(axis) { 1.0 } else { scale };
         endpoint[axis] = match distance {
-          DistanceMode::Absolute if machine_coords => value * scale,
-          DistanceMode::Absolute => value * scale + self.work_offset_mm[axis],
-          DistanceMode::Incremental => start[axis] + value * scale,
+          DistanceMode::Absolute if machine_coords => value * axis_scale,
+          DistanceMode::Absolute => value * axis_scale + self.work_offset_mm[axis],
+          DistanceMode::Incremental => start[axis] + value * axis_scale,
         };
       }
     }
@@ -895,8 +1057,19 @@ fn mm_to_steps(pos_mm: f32, steps_per_mm: f32) -> i32 {
 /// interval `[-max_travel, 0]` per axis (machine coordinates are non-positive). A small one-step tolerance
 /// absorbs the `round()` at the mm→step boundary so a jog exactly to `-max_travel` is accepted, not spuriously
 /// rejected by sub-step rounding. Host-tested in isolation so the envelope rule cannot drift from the jog path.
-pub fn soft_limit_violation(target: &[i32; AXES], steps_per_mm: &[f32; AXES], max_travel_mm: &[f32; AXES]) -> bool {
+pub fn soft_limit_violation(
+  target: &[i32; AXES],
+  steps_per_mm: &[f32; AXES],
+  max_travel_mm: &[f32; AXES],
+  rotary_mask: u8,
+) -> bool {
   for axis in 0..AXES {
+    // A rotary axis (per the `$376` mask) is continuous / rollover: soft limits never apply to it, and its
+    // `$133` max-travel is ignored entirely — `$133` keeps a single unambiguous meaning for bounded axes only
+    // (DOC-10.6). Skip it before the envelope check so a huge A target is never a violation.
+    if rotary_mask & (1 << axis) != 0 {
+      continue;
+    }
     // The lower bound in steps, with a one-step rounding tolerance: a target at exactly `-max_travel` (which
     // `round()` may place one step beyond) is still inside the envelope.
     let lower = mm_to_steps(-max_travel_mm[axis], steps_per_mm[axis]) - 1;
@@ -990,16 +1163,18 @@ mod tests {
       accel_mm_s2: [1000.0; AXES],
       junction_deviation_mm: 0.01,
       arc_tolerance_mm: 0.002,
+      rotary_mask: DEFAULT_ROTARY_MASK,
     }
   }
 
   fn mm_move(x: Option<f32>, y: Option<f32>, z: Option<f32>, feed: f32, rapid: bool) -> PlannerCommand {
     PlannerCommand::Move {
       rapid,
-      axes: AxisWords { x, y, z },
+      axes: AxisWords { x, y, z, a: None },
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed,
+      feed_mode: FeedMode::UnitsPerMin,
       machine_coords: false,
     }
   }
@@ -1009,19 +1184,19 @@ mod tests {
   #[test]
   fn resolve_absolute_mm_target_to_steps() {
     let planner = Planner::new(test_config());
-    let axes = AxisWords { x: Some(10.0), y: Some(-5.0), z: None };
+    let axes = AxisWords { x: Some(10.0), y: Some(-5.0), z: None, a: None };
     let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, false);
     // 10 mm × 100 steps/mm = 1000; -5 mm × 100 = -500; Z unmentioned stays at 0.
-    assert_eq!(target, [1000, -500, 0]);
+    assert_eq!(target, [1000, -500, 0, 0]);
   }
 
   #[test]
   fn resolve_inch_target_scales_by_25_4() {
     let planner = Planner::new(test_config());
-    let axes = AxisWords { x: Some(1.0), y: None, z: None };
+    let axes = AxisWords { x: Some(1.0), y: None, z: None, a: None };
     let target = planner.resolve_target(&axes, Units::Inch, DistanceMode::Absolute, false);
     // 1 inch = 25.4 mm × 100 steps/mm = 2540 steps.
-    assert_eq!(target, [2540, 0, 0]);
+    assert_eq!(target, [2540, 0, 0, 0]);
   }
 
   #[test]
@@ -1029,10 +1204,10 @@ mod tests {
     let mut planner = Planner::new(test_config());
     // Move to X10 absolute first so the position advances to 1000 steps.
     planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
-    let axes = AxisWords { x: Some(2.5), y: None, z: None };
+    let axes = AxisWords { x: Some(2.5), y: None, z: None, a: None };
     let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Incremental, false);
     // 1000 steps (10 mm) + 2.5 mm × 100 = 1250 steps.
-    assert_eq!(target, [1250, 0, 0]);
+    assert_eq!(target, [1250, 0, 0, 0]);
   }
 
   #[test]
@@ -1041,11 +1216,11 @@ mod tests {
     // pushes it here. The planner's job is to ADD that WCO to absolute work words. Push a WCO of (10, 20) so an
     // absolute work (0, 0) resolves to machine (10, 20).
     let mut planner = Planner::new(test_config());
-    planner.set_work_offset([10.0, 20.0, 0.0]);
-    assert_eq!(planner.work_offset(), [10.0, 20.0, 0.0]);
-    let axes = AxisWords { x: Some(0.0), y: Some(0.0), z: None };
+    planner.set_work_offset([10.0, 20.0, 0.0, 0.0]);
+    assert_eq!(planner.work_offset(), [10.0, 20.0, 0.0, 0.0]);
+    let axes = AxisWords { x: Some(0.0), y: Some(0.0), z: None, a: None };
     let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, false);
-    assert_eq!(target, [1000, 2000, 0]);
+    assert_eq!(target, [1000, 2000, 0, 0]);
   }
 
   #[test]
@@ -1053,10 +1228,10 @@ mod tests {
     // A G53 one-shot move's words are MACHINE coordinates, so the WCO must NOT be applied: an absolute G53
     // X0 Y0 resolves to machine (0, 0) even with a non-zero work offset set.
     let mut planner = Planner::new(test_config());
-    planner.set_work_offset([10.0, 20.0, 0.0]);
-    let axes = AxisWords { x: Some(0.0), y: Some(0.0), z: None };
+    planner.set_work_offset([10.0, 20.0, 0.0, 0.0]);
+    let axes = AxisWords { x: Some(0.0), y: Some(0.0), z: None, a: None };
     let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, true);
-    assert_eq!(target, [0, 0, 0]);
+    assert_eq!(target, [0, 0, 0, 0]);
   }
 
   #[test]
@@ -1079,12 +1254,12 @@ mod tests {
     use crate::gcode::ProbeKind;
     let mut planner = Planner::new(test_config());
     // A WCO of (0, 0, 50): an absolute work probe to Z-5 resolves to machine Z = -5 + 50 = 45 mm → 4500 steps.
-    planner.set_work_offset([0.0, 0.0, 50.0]);
+    planner.set_work_offset([0.0, 0.0, 50.0, 0.0]);
     // Queue a move first so the flush is observable (the probe must clear trailing junction state).
     planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
     let cmd = PlannerCommand::Probe {
       kind: ProbeKind::G38_2,
-      axes: AxisWords { x: None, y: None, z: Some(-5.0) },
+      axes: AxisWords { x: None, y: None, z: Some(-5.0), a: None },
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 50.0,
@@ -1094,7 +1269,7 @@ mod tests {
       outcome,
       PlannerOutcome::Probe {
         kind: ProbeKind::G38_2,
-        target: [1000, 0, 4500],
+        target: [1000, 0, 4500, 0],
         feed: 50.0,
         units: Units::Millimeter,
       }
@@ -1108,16 +1283,16 @@ mod tests {
     let mut planner = Planner::new(test_config());
     planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
     // The executor latched a stop at machine Z = 4.2 mm → 420 steps; sync the commanded position to it.
-    planner.sync_position([0, 0, 420]);
-    assert_eq!(planner.position_steps(), [0, 0, 420]);
+    planner.sync_position([0, 0, 420, 0]);
+    assert_eq!(planner.position_steps(), [0, 0, 420, 0]);
     // The next absolute move resolves relative to the synced position (Z stays, X moves to 10).
     let target = planner.resolve_target(
-      &AxisWords { x: Some(10.0), y: None, z: None },
+      &AxisWords { x: Some(10.0), y: None, z: None, a: None },
       Units::Millimeter,
       DistanceMode::Absolute,
       false,
     );
-    assert_eq!(target, [1000, 0, 420]);
+    assert_eq!(target, [1000, 0, 420, 0]);
   }
 
   #[test]
@@ -1129,13 +1304,13 @@ mod tests {
     planner
       .plan_command(&PlannerCommand::Probe {
         kind: ProbeKind::G38_2,
-        axes: AxisWords { x: None, y: None, z: Some(-5.0) },
+        axes: AxisWords { x: None, y: None, z: Some(-5.0), a: None },
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 50.0,
       })
       .expect("probe");
-    planner.sync_position([0, 0, 420]);
+    planner.sync_position([0, 0, 420, 0]);
     planner.plan_command(&mm_move(Some(0.0), None, Some(10.0), 600.0, false)).expect("queued");
     let block = planner.peek_block().expect("a block");
     assert!(block.entry_speed_sq < 1e-3, "the post-probe move starts at rest");
@@ -1145,7 +1320,7 @@ mod tests {
 
   fn jog(x: Option<f32>, y: Option<f32>, z: Option<f32>, feed: f32, machine_coords: bool) -> JogCommand {
     JogCommand {
-      axes: AxisWords { x, y, z },
+      axes: AxisWords { x, y, z, a: None },
       distance_mode: DistanceMode::Absolute,
       units: Units::Millimeter,
       feed,
@@ -1157,22 +1332,22 @@ mod tests {
   fn plan_jog_enqueues_a_jog_tagged_block_resolved_through_the_work_offset() {
     let mut planner = Planner::new(test_config());
     // An absolute work jog with a WCO of (10, 0, 0): work X0 resolves to machine X10 → 1000 steps.
-    planner.set_work_offset([10.0, 0.0, 0.0]);
+    planner.set_work_offset([10.0, 0.0, 0.0, 0.0]);
     let outcome = planner.plan_jog(&jog(Some(0.0), None, None, 600.0, false), None).expect("jog");
     assert_eq!(outcome, PlannerOutcome::Queued { blocks: 1 });
     let block = planner.peek_block().expect("a jog block");
     assert!(block.jog, "the block is tagged as a jog so a jog-cancel can flush it");
-    assert_eq!(block.steps, [1000, 0, 0]);
+    assert_eq!(block.steps, [1000, 0, 0, 0]);
   }
 
   #[test]
   fn plan_jog_g53_bypasses_the_work_offset() {
     let mut planner = Planner::new(test_config());
-    planner.set_work_offset([10.0, 20.0, 0.0]);
+    planner.set_work_offset([10.0, 20.0, 0.0, 0.0]);
     // A G53 jog's words are MACHINE coordinates: machine X-5 resolves to -500 steps regardless of the WCO.
     let outcome = planner.plan_jog(&jog(Some(-5.0), None, None, 600.0, true), None).expect("jog");
     assert_eq!(outcome, PlannerOutcome::Queued { blocks: 1 });
-    assert_eq!(planner.peek_block().expect("block").steps, [-500, 0, 0]);
+    assert_eq!(planner.peek_block().expect("block").steps, [-500, 0, 0, 0]);
   }
 
   #[test]
@@ -1231,10 +1406,11 @@ mod tests {
   fn move_to_machine_x(x: f32, feed: f32) -> PlannerCommand {
     PlannerCommand::Move {
       rapid: false,
-      axes: AxisWords { x: Some(x), y: None, z: None },
+      axes: AxisWords { x: Some(x), y: None, z: None, a: None },
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed,
+      feed_mode: FeedMode::UnitsPerMin,
       machine_coords: true,
     }
   }
@@ -1274,14 +1450,28 @@ mod tests {
   fn soft_limit_violation_envelope() {
     let steps_per_mm = [100.0; AXES];
     let max_travel = [50.0; AXES];
+    // Mask 0 => every axis (including A) is treated as a bounded linear axis for this envelope test.
+    let mask = 0;
     // Inside the [-50, 0] mm envelope (machine coordinates ≤ 0): accepted.
-    assert!(!soft_limit_violation(&[0, -2500, -5000], &steps_per_mm, &max_travel));
+    assert!(!soft_limit_violation(&[0, -2500, -5000, 0], &steps_per_mm, &max_travel, mask));
     // A positive target (past the home end) violates.
-    assert!(soft_limit_violation(&[100, 0, 0], &steps_per_mm, &max_travel));
+    assert!(soft_limit_violation(&[100, 0, 0, 0], &steps_per_mm, &max_travel, mask));
     // Past -max_travel violates.
-    assert!(soft_limit_violation(&[0, -5200, 0], &steps_per_mm, &max_travel));
+    assert!(soft_limit_violation(&[0, -5200, 0, 0], &steps_per_mm, &max_travel, mask));
     // Exactly at the -max_travel boundary is accepted (one-step rounding tolerance).
-    assert!(!soft_limit_violation(&[-5000, 0, 0], &steps_per_mm, &max_travel));
+    assert!(!soft_limit_violation(&[-5000, 0, 0, 0], &steps_per_mm, &max_travel, mask));
+  }
+
+  #[test]
+  fn rotary_axis_is_exempt_from_soft_limits() {
+    // DOC-10.6: an axis marked rotary in `$376` is continuous/rollover — its `$133` is ignored and a huge target
+    // is never a violation. With the default mask (bit 3 = A), a massive A target passes; clearing the bit (A as
+    // a bounded 4th linear axis) makes the same target violate, proving `$133` governs only non-rotary axes.
+    let steps_per_mm = [100.0; AXES];
+    let max_travel = [50.0; AXES]; // A's $133 = 50 mm/deg-equivalent, ignored while A is rotary.
+    let huge_a = [0, 0, 0, 1_000_000];
+    assert!(!soft_limit_violation(&huge_a, &steps_per_mm, &max_travel, DEFAULT_ROTARY_MASK), "A rotary => exempt");
+    assert!(soft_limit_violation(&huge_a, &steps_per_mm, &max_travel, 0), "A linear => $133 envelope enforced");
   }
 
   // ---- Block geometry: unit vector, mm travel, dominant axis ------------------------------------
@@ -1291,7 +1481,7 @@ mod tests {
     let mut planner = Planner::new(test_config());
     planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
     let block = planner.peek_block().expect("a block");
-    assert_eq!(block.steps, [1000, 0, 0]);
+    assert_eq!(block.steps, [1000, 0, 0, 0]);
     assert_eq!(block.step_event_count, 1000);
     assert!((block.unit_vec[0] - 1.0).abs() < 1e-6);
     assert!(block.unit_vec[1].abs() < 1e-6 && block.unit_vec[2].abs() < 1e-6);
@@ -1371,8 +1561,8 @@ mod tests {
     planner.plan_command(&mm_move(Some(3.0), None, None, 600.0, false)).expect("queued");
     let first = planner.pop_block().expect("first");
     let second = planner.pop_block().expect("second");
-    assert_eq!(first.steps, [100, 0, 0]); // 0 → 1 mm
-    assert_eq!(second.steps, [200, 0, 0]); // 1 → 3 mm
+    assert_eq!(first.steps, [100, 0, 0, 0]); // 0 → 1 mm
+    assert_eq!(second.steps, [200, 0, 0, 0]); // 1 → 3 mm
     assert!(planner.is_empty());
   }
 
@@ -1570,12 +1760,13 @@ mod tests {
     // side (angle 0°), arriving at (10, 10).
     PlannerCommand::Arc {
       cw: false,
-      axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None },
+      axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None, a: None },
       i: Some(0.0),
       j: Some(10.0),
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
       machine_coords: false,
     }
   }
@@ -1590,7 +1781,7 @@ mod tests {
     };
     assert!(segments > 1);
     // After planning, the planner position is the arc endpoint: X10 Y10 → (1000, 1000) steps.
-    assert_eq!(planner.position_steps(), [1000, 1000, 0]);
+    assert_eq!(planner.position_steps(), [1000, 1000, 0, 0]);
   }
 
   #[test]
@@ -1641,12 +1832,13 @@ mod tests {
     let mut cw = Planner::new(coarse_arc_config());
     cw.plan_command(&PlannerCommand::Arc {
       cw: true,
-      axes: AxisWords { x: Some(-10.0), y: Some(10.0), z: None },
+      axes: AxisWords { x: Some(-10.0), y: Some(10.0), z: None, a: None },
       i: Some(0.0),
       j: Some(10.0),
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
       machine_coords: false,
     })
     .expect("queued");
@@ -1665,19 +1857,20 @@ mod tests {
     // direction changes engage the junction limiter so the entry speeds are non-trivial (not all clamped
     // to nominal), making this a meaningful equivalence check rather than a degenerate one.
     let chain: [[i32; AXES]; 6] = [
-      [200, 0, 0],
-      [400, 50, 0],
-      [600, 0, 0],
-      [800, 80, 0],
-      [1000, 0, 0],
-      [1200, 40, 0],
+      [200, 0, 0, 0],
+      [400, 50, 0, 0],
+      [600, 0, 0, 0],
+      [800, 80, 0, 0],
+      [1000, 0, 0, 0],
+      [1200, 40, 0, 0],
     ];
     let feed = 12000.0;
 
     // Path A: recalculate after every segment (the pre-refactor behavior).
     let mut per_segment = Planner::new(test_config());
     for &target in &chain {
-      let n = per_segment.enqueue_move(target, feed, Units::Millimeter, false, false).expect("enqueued");
+      let n =
+        per_segment.enqueue_move(target, feed, Units::Millimeter, FeedMode::UnitsPerMin, false, false).expect("enqueued");
       assert_eq!(n, 1, "each chain step is a real move");
       per_segment.recalculate();
     }
@@ -1685,7 +1878,7 @@ mod tests {
     // Path B: enqueue every segment, then recalculate exactly once (the refactored arc behavior).
     let mut once = Planner::new(test_config());
     for &target in &chain {
-      once.enqueue_move(target, feed, Units::Millimeter, false, false).expect("enqueued");
+      once.enqueue_move(target, feed, Units::Millimeter, FeedMode::UnitsPerMin, false, false).expect("enqueued");
     }
     once.recalculate();
 
@@ -1708,12 +1901,13 @@ mod tests {
     let mut planner = Planner::new(test_config());
     let arc = PlannerCommand::Arc {
       cw: true,
-      axes: AxisWords { x: Some(10.0), y: Some(0.0), z: None },
+      axes: AxisWords { x: Some(10.0), y: Some(0.0), z: None, a: None },
       i: None,
       j: None,
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
       machine_coords: false,
     };
     assert_eq!(planner.plan_command(&arc), Err(PlannerError::InvalidArc));
@@ -1744,6 +1938,48 @@ mod tests {
     assert!(planner.is_empty());
   }
 
+  // --- DOC-07 spin-up gate: a dwell of `$392` is inserted before the first cutting move after M3/M4 ----------
+
+  #[test]
+  fn spin_up_gate_inserts_dwell_before_first_move_after_m3() {
+    // M3 S1000 arms the spin-up; the next cutting move owes a dwell of $392 seconds ahead of it.
+    let mut gate = SpinUpGate::new();
+    assert!(!gate.is_pending());
+    gate.note_spindle(SpindleState::Clockwise);
+    assert!(gate.is_pending());
+    // $392 = 0.5 s: the first move consumes the spin-up and asks for a 0.5 s dwell to be inserted ahead of it.
+    assert_eq!(gate.take_dwell_before_move(0.5), Some(0.5));
+    assert!(!gate.is_pending(), "the spin-up is consumed by the first move");
+  }
+
+  #[test]
+  fn spin_up_gate_inserts_nothing_when_delay_is_zero() {
+    // With $392 = 0 (grbl default) the spin-up is still consumed but NO dwell is inserted.
+    let mut gate = SpinUpGate::new();
+    gate.note_spindle(SpindleState::CounterClockwise);
+    assert_eq!(gate.take_dwell_before_move(0.0), None);
+    assert!(!gate.is_pending());
+  }
+
+  #[test]
+  fn spin_up_gate_does_not_reinsert_on_a_second_move() {
+    // The dwell is inserted before the FIRST move only; a second move after the same M3 gets nothing.
+    let mut gate = SpinUpGate::new();
+    gate.note_spindle(SpindleState::Clockwise);
+    assert_eq!(gate.take_dwell_before_move(1.0), Some(1.0));
+    assert_eq!(gate.take_dwell_before_move(1.0), None, "second move owes no spin-up");
+  }
+
+  #[test]
+  fn spin_up_gate_stop_disarms_a_pending_spin_up() {
+    // An M5 (or S0-as-stop) before any move clears the owed spin-up: a stopped spindle owes no spin-up dwell.
+    let mut gate = SpinUpGate::new();
+    gate.note_spindle(SpindleState::Clockwise);
+    gate.note_spindle(SpindleState::Stop);
+    assert!(!gate.is_pending());
+    assert_eq!(gate.take_dwell_before_move(0.5), None);
+  }
+
   #[test]
   fn program_end_flushes_lookahead() {
     let mut planner = Planner::new(test_config());
@@ -1757,7 +1993,7 @@ mod tests {
     let mut planner = Planner::new(test_config());
     let cmd = PlannerCommand::GoToPredefined {
       is_g28: true,
-      intermediate: AxisWords { x: None, y: None, z: Some(5.0) },
+      intermediate: AxisWords { x: None, y: None, z: Some(5.0), a: None },
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
     };
@@ -1769,11 +2005,198 @@ mod tests {
   fn placeholder_block_derives_dominant_count_and_keeps_benign_trapezoid() {
     // A fixed-period block: the dominant `step_event_count` is the max axis magnitude, the signs are preserved,
     // and the trapezoid fields are non-degenerate placeholders the fixed-period stepper ignores.
-    let block = Block::placeholder([-300, 50, 0]);
-    assert_eq!(block.steps, [-300, 50, 0]);
+    let block = Block::placeholder([-300, 50, 0, 0]);
+    assert_eq!(block.steps, [-300, 50, 0, 0]);
     assert_eq!(block.step_event_count, 300, "dominant count = max axis magnitude");
     assert_eq!(block.millimeters, 1.0, "non-degenerate placeholder mm length");
     assert!(block.acceleration > 0.0 && block.nominal_speed_sq > 0.0, "non-degenerate placeholder trapezoid");
     assert!(!block.rapid && !block.jog);
+  }
+
+  // ---- G93 inverse-time feed (DOC-10.2) ---------------------------------------------------------
+
+  /// Build a single-axis X move under a given feed mode for the inverse-time tests.
+  fn x_move(x: f32, feed: f32, feed_mode: FeedMode) -> PlannerCommand {
+    PlannerCommand::Move {
+      rapid: false,
+      axes: AxisWords { x: Some(x), y: None, z: None, a: None },
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed,
+      feed_mode,
+      machine_coords: false,
+    }
+  }
+
+  #[test]
+  fn g93_inverse_time_nominal_speed_is_path_over_duration() {
+    // G93 `F` is 1/(duration in minutes): a 10 mm move with F2 takes 0.5 min, so nominal = 10 mm / 0.5 min
+    // = 20 mm/min = 10 * 2 / 60 mm/s. (test_config: 100 steps/mm, 6000 mm/min max rate → no clamp here.)
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&x_move(10.0, 2.0, FeedMode::InverseTime)).expect("queued");
+    let block = *planner.peek_block().expect("a block");
+    assert!((block.nominal_speed() - (10.0 * 2.0 / 60.0)).abs() < 1e-4, "nominal = mm * F / 60");
+    let duration_min = block.millimeters / (block.nominal_speed() * 60.0);
+    assert!((duration_min - 0.5).abs() < 1e-4, "duration must be 1/F = 0.5 min, got {duration_min}");
+  }
+
+  #[test]
+  fn g93_and_g94_with_same_f_differ() {
+    // The same `F2` means 2 mm/min under G94 but "0.5 min for this move" under G93 — distinct nominal speeds.
+    // Regression guard against the pre-fix bug where G93 F was silently interpreted as units/min.
+    let mut g94 = Planner::new(test_config());
+    g94.plan_command(&x_move(10.0, 2.0, FeedMode::UnitsPerMin)).expect("queued");
+    let mut g93 = Planner::new(test_config());
+    g93.plan_command(&x_move(10.0, 2.0, FeedMode::InverseTime)).expect("queued");
+    let n94 = g94.peek_block().expect("block").nominal_speed();
+    let n93 = g93.peek_block().expect("block").nominal_speed();
+    assert!((n94 - 2.0 / 60.0).abs() < 1e-4, "G94 F2 = 2 mm/min");
+    assert!((n93 - 20.0 / 60.0).abs() < 1e-4, "G93 F2 over 10 mm = 20 mm/min");
+    assert!(n93 > n94 * 9.0, "G93 here is ~10x faster than G94 for the same F");
+  }
+
+  #[test]
+  fn g93_over_fast_duration_is_clamped_to_axis_rate() {
+    // A commanded G93 duration faster than the per-axis max rate is floored to the achievable rate (DOC-10.2 Q3):
+    // 10 mm with F1200 demands 200 mm/s, but the X axis caps at 6000 mm/min = 100 mm/s — the move finishes slower.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&x_move(10.0, 1200.0, FeedMode::InverseTime)).expect("queued");
+    let block = *planner.peek_block().expect("a block");
+    assert!((block.nominal_speed() - 100.0).abs() < 1e-3, "clamped to the 100 mm/s axis rate, not 200 mm/s");
+  }
+
+  #[test]
+  fn g93_arc_total_duration_is_one_over_f() {
+    // A G93 arc's inverse-time F governs the WHOLE arc: a quarter arc with F1 must take exactly 1 min total
+    // across every subdivided segment (the per-segment feed is scaled by the segment count, DOC-10.2). The
+    // coarse arc config keeps the subdivided block count inside the queue, exactly like the other arc tests.
+    let mut planner = Planner::new(coarse_arc_config());
+    planner
+      .plan_command(&PlannerCommand::Arc {
+        cw: false,
+        axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None, a: None },
+        i: Some(0.0),
+        j: Some(10.0),
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 1.0,
+        feed_mode: FeedMode::InverseTime,
+        machine_coords: false,
+      })
+      .expect("queued");
+    // Sum the per-block cruise durations (millimeters / nominal). The chord-vs-arc-length error cancels exactly
+    // because each equal-length segment is planned to take 1/(F * segments) min regardless of its chord.
+    let total_s: f32 = planner.queue.iter().map(|b| b.millimeters / b.nominal_speed()).sum();
+    assert!((total_s - 60.0).abs() < 0.1, "G93 arc should take 1/F = 60 s total, got {total_s}");
+  }
+
+  // ---- $376 rotary axis: detection, units fork, arc A-slaving (DOC-10.1/10.5/10.6) --------------
+
+  /// A rapid move carrying only an A word, for the rotary-axis tests (test_config is 100 steps/unit per axis).
+  fn a_move(a: f32, units: Units, rotary_mask: u8) -> (Planner, i32) {
+    let mut cfg = test_config();
+    cfg.rotary_mask = rotary_mask;
+    let mut planner = Planner::new(cfg);
+    planner
+      .plan_command(&PlannerCommand::Move {
+        rapid: true,
+        axes: AxisWords { x: None, y: None, z: None, a: Some(a) },
+        units,
+        distance: DistanceMode::Absolute,
+        feed: 0.0,
+        feed_mode: FeedMode::UnitsPerMin,
+        machine_coords: false,
+      })
+      .expect("queued");
+    let steps = planner.peek_block().expect("a block").steps[A_AXIS];
+    (planner, steps)
+  }
+
+  #[test]
+  fn default_rotary_mask_marks_only_a_rotary() {
+    let cfg = test_config();
+    assert!(cfg.is_rotary(A_AXIS), "default $376 = 8 marks A rotary");
+    assert!(!cfg.is_rotary(0) && !cfg.is_rotary(1) && !cfg.is_rotary(2), "X/Y/Z stay linear");
+  }
+
+  #[test]
+  fn g20_inch_does_not_scale_a_rotary_word() {
+    // A rotary A word is never inch-scaled (DOC-10.1): G20 A90 is 90 degrees → 90 * 100 steps/deg = 9000 steps,
+    // NOT 90 * 25.4. test_config marks A rotary by default ($376 = 8).
+    let (_, steps) = a_move(90.0, Units::Inch, DEFAULT_ROTARY_MASK);
+    assert_eq!(steps, 9000, "rotary A bypasses inch scaling");
+  }
+
+  #[test]
+  fn clearing_rotary_mask_makes_a_inch_scale_like_a_linear_axis() {
+    // Runtime re-gating: clear A's $376 bit and the SAME G20 A90 now inch-scales (A is a 4th LINEAR axis):
+    // 90 in * 25.4 mm/in * 100 steps/mm = 228600 steps. Proves $376 drives the units fork at runtime (DOC-10.1).
+    let (_, steps) = a_move(90.0, Units::Inch, 0);
+    assert_eq!(steps, 228_600, "non-rotary A inch-scales like X/Y/Z");
+  }
+
+  #[test]
+  fn rotary_a_target_is_never_a_soft_limit_violation() {
+    // End-to-end through plan_command_with_limits: a huge A target with A rotary is accepted despite a tiny $133.
+    let mut planner = Planner::new(test_config());
+    let limits = SoftLimits { max_travel_mm: [50.0; AXES] };
+    let outcome = planner.plan_command_with_limits(
+      &PlannerCommand::Move {
+        rapid: true,
+        axes: AxisWords { x: None, y: None, z: None, a: Some(100_000.0) },
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 0.0,
+        feed_mode: FeedMode::UnitsPerMin,
+        machine_coords: false,
+      },
+      Some(limits),
+    );
+    assert!(matches!(outcome, Ok(PlannerOutcome::Queued { .. })), "rotary A is exempt from soft limits");
+  }
+
+  #[test]
+  fn arc_slaves_a_linearly_like_the_z_helix() {
+    // A G2/G3 with an A word produces an A-slaved helical arc (DOC-10.5): A advances linearly across the segments
+    // to its endpoint, never circularly interpolated. A90 (rotary, no inch scale) = 9000 steps total.
+    let mut planner = Planner::new(coarse_arc_config());
+    planner
+      .plan_command(&PlannerCommand::Arc {
+        cw: false,
+        axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None, a: Some(90.0) },
+        i: Some(0.0),
+        j: Some(10.0),
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 600.0,
+        feed_mode: FeedMode::UnitsPerMin,
+        machine_coords: false,
+      })
+      .expect("queued");
+    let total_a: i32 = planner.queue.iter().map(|b| b.steps[A_AXIS]).sum();
+    assert_eq!(total_a, 9000, "A reaches 90 deg total, slaved linearly across the arc");
+  }
+
+  #[test]
+  fn pure_rotary_reversal_forces_a_junction_stop() {
+    // Two opposite pure-rotary moves (A+10 then A−10) reverse the A direction: the 4-term junction dot is −1, so
+    // the cornering model forces the second block's entry speed to 0 (DOC-10.3). A never moves linearly here.
+    let mut planner = Planner::new(test_config());
+    for target in [10.0f32, -10.0f32] {
+      planner
+        .plan_command(&PlannerCommand::Move {
+          rapid: false,
+          axes: AxisWords { x: None, y: None, z: None, a: Some(target) },
+          units: Units::Millimeter,
+          distance: DistanceMode::Absolute,
+          feed: 600.0,
+          feed_mode: FeedMode::UnitsPerMin,
+          machine_coords: false,
+        })
+        .expect("queued");
+    }
+    // The trailing (reversing) block must start from rest.
+    let reversing = planner.queue.back().expect("second block");
+    assert_eq!(reversing.entry_speed_sq, 0.0, "a rotary reversal corners to a full stop");
   }
 }

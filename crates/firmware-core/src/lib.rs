@@ -21,4 +21,5 @@ pub mod motion;
 pub mod planner;
 pub mod protocol;
 pub mod settings;
+pub mod spindle;
 pub mod storage_frame;
