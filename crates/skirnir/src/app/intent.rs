@@ -29,6 +29,16 @@ impl Axis {
       Axis::Z => 'Z',
     }
   }
+
+  /// The index of this axis in a machine-coordinate position vector (X=0, Y=1, Z=2), matching the `[PRB:]` /
+  /// `MPos:` report order. Used to pull the radial reading for the probed axis out of a `ProbeResult` position.
+  pub fn index(self) -> usize {
+    match self {
+      Axis::X => 0,
+      Axis::Y => 1,
+      Axis::Z => 2,
+    }
+  }
 }
 
 /// A direction along an axis: positive or negative.
@@ -110,6 +120,42 @@ pub enum Intent {
   /// Set the work-coordinate zero on the given axes to the current position (`G10 L20 P0 …`). An empty set is
   /// treated as "all of X, Y, Z" (the "Zero XYZ" button).
   SetWorkZero { axes: Vec<Axis> },
+
+  /// Start a fresh rotary center-finder run for a dowel of `dowel_diameter` (mm) indexed at `index_angle_deg`
+  /// (DOC-11 §1.2). The shell builds the [`crate::app::rotary_center::WizardState`] and waits for the operator to
+  /// position and trigger each touch. Replaces any wizard already in progress.
+  RotaryCenterStart { dowel_diameter: f64, index_angle_deg: f64 },
+  /// Trigger the wizard's next touch (the operator has jogged to the approach): the shell asks the wizard which
+  /// touch is due, emits the rotary-safe probe lines, and arms the Phase 0 latch. Inert if no wizard is running
+  /// or one is already probing.
+  RotaryCenterProbe,
+  /// Send the wizard's "move to the computed Y center" positioning move, after both Y touches — the mandatory
+  /// step before the top probe so it reads the diameter, not a chord. Inert unless the wizard is at that step.
+  RotaryCenterMoveToYc,
+  /// Write the found center to the active WCS via the wizard's offered `G10 L2` line (Y/Z only, never A). Inert
+  /// until the wizard has a computed center.
+  RotaryCenterWriteWcs,
+  /// Select which feature work-Z0 lands on when the center is written: the rotary axis centerline (default) or
+  /// the probed top surface. Only affects the Z word of the offered `G10 L2`. Inert if no wizard is running.
+  RotaryCenterSetZDatum(crate::app::rotary_center::ZDatum),
+  /// Cancel the rotary center-finder run, discarding its state.
+  RotaryCenterCancel,
+
+  /// Start a Phase 2 180°-flip center-verify (DOC-11 §2.1): probe a feature along `axis`/`dir` at `angle_deg`,
+  /// then at `angle_deg + 180`, and compute the residual offset from the rotation centerline. Cancels any other
+  /// in-flight probe op.
+  FlipVerifyStart { angle_deg: f64, axis: Axis, dir: Dir },
+  /// Start a Phase 2 runout report (DOC-11 §2.2): probe a feature along `axis`/`dir` at `n` evenly-spaced angles
+  /// from `start_deg`, then report TIR / eccentricity. Read-only. Cancels any other in-flight probe op.
+  RunoutStart { n: usize, start_deg: f64, axis: Axis, dir: Dir },
+  /// Trigger the running sweep's next touch (the operator has jogged the approach). Inert if no sweep is running
+  /// or one is already probing. Shared by both Phase 2 wizards.
+  SweepProbe,
+  /// Write the completed flip-verify's `G10 L2` correction (the verified axis only, never A). Inert unless a
+  /// finished flip-verify sweep is present. (Runout never writes — it has no such intent.)
+  FlipVerifyWriteCorrection,
+  /// Cancel the running Phase 2 sweep, discarding its state.
+  SweepCancel,
 }
 
 /// Build a `G10 L20 P0` line that sets the active work-coordinate system's offset so each listed axis reads

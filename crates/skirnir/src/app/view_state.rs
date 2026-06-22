@@ -51,6 +51,67 @@ pub enum Banner {
   StreamError(u32),
 }
 
+/// What a tracked probe operation was for, so the UI can label the result and the shell can route the
+/// follow-up action (e.g. zeroing after a Z touch-off). The latch mechanics are kind-agnostic — the kind only
+/// tells the shell which pending follow-up owns the resolved result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+  /// A `G38.x` Z touch-off whose successful result drives a `G10 L20` work-Z zeroing.
+  ZeroZ,
+  /// One touch of the rotary center-finder wizard (DOC-11 §1.2). The wizard ([`super::rotary_center`]) owns the
+  /// follow-up: it folds the resolved result into its state machine and advances or aborts.
+  RotaryCenter,
+  /// One touch of the 180°-flip center-verify wizard (DOC-11 §2.1). The shared angle-sweep engine
+  /// ([`super::angle_sweep`]) collects the reading; the [`super::flip_verify`] computation runs on completion.
+  FlipVerify,
+  /// One touch of the runout report (DOC-11 §2.2). The same angle-sweep engine collects the N radial readings;
+  /// the read-only [`super::runout`] computation (TIR / eccentricity) runs on completion.
+  Runout,
+}
+
+/// The resolved outcome of a probe operation: either a typed `[PRB:]` reading, or a failure with a reason. A
+/// failure carries no position — a non-contact `G38.2` alarms (or, for the silent `G38.3`, reports `:0`), and
+/// in neither case is the reported position a trustworthy trigger point to act on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeOutcome {
+  /// The probe contacted within travel: `success:1`. `position` is the machine-coordinate trigger point.
+  Success { position: Vec<f64> },
+  /// The probe failed — no contact (`success:0`), or an intervening `ALARM`/`error` resolved the op. The reason
+  /// is a short operator-facing string; the destructive follow-up (zeroing) is suppressed on this path.
+  Failure { reason: String },
+}
+
+impl ProbeOutcome {
+  /// Whether the probe contacted successfully — the guard the shell checks before any destructive follow-up.
+  pub fn is_success(&self) -> bool {
+    matches!(self, ProbeOutcome::Success { .. })
+  }
+}
+
+/// The latch that correlates a probe the app issued with the result that comes back asynchronously off the
+/// event stream. grbl streaming has no request→response correlation — `ok` only acks the probe *line*, and the
+/// `[PRB:]` result arrives as a separate push — so the only sound model is to mark an op `awaiting` and capture
+/// the next [`Response::ProbeResult`] (or resolve it failed on an intervening `Alarm`/`Error`). This stays in
+/// the pure reducer so the whole mechanism is unit-testable without a window or real hardware.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeOp {
+  /// What the operation was for, so the UI/shell can label and route it.
+  pub kind: ProbeKind,
+  /// Whether a result is still outstanding. Set when the probe is issued; cleared when a result lands or an
+  /// `Alarm`/`Error` resolves the op as failed.
+  pub awaiting: bool,
+  /// The last resolved outcome, or `None` while still awaiting the first result. The UI renders this; the shell
+  /// reads it to decide the follow-up (zero on success, surface a notice on failure).
+  pub last: Option<ProbeOutcome>,
+}
+
+impl ProbeOp {
+  /// Begin tracking a freshly-issued probe of `kind`: awaiting a result, no outcome yet.
+  pub fn issued(kind: ProbeKind) -> Self {
+    ProbeOp { kind, awaiting: true, last: None }
+  }
+}
+
 /// Streaming progress, mirrored from [`Event::Progress`]. `total == 0` means no program is loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Progress {
@@ -92,6 +153,10 @@ pub struct ViewState {
   pub progress: Progress,
   /// A latched alarm/error banner, if active.
   pub banner: Option<Banner>,
+  /// The current probe operation latch, if one is in flight or its result is still being shown. `None` when no
+  /// probe has been issued this session. Populated by the shell on a probe issue (via [`Self::begin_probe`]) and
+  /// resolved here when a [`Response::ProbeResult`] lands or an intervening `Alarm`/`Error` fails the op.
+  pub probe_op: Option<ProbeOp>,
   /// The code of the most recent `error:N`, stashed so the stream-error banner can carry it when the lifecycle
   /// transition into [`ConnectionState::Error`] arrives (the transition event itself carries only the state).
   /// Not part of the rendered view — purely a one-event bridge from the error response to the halt transition.
@@ -117,6 +182,7 @@ impl Default for ViewState {
       last_wco: Vec::new(),
       progress: Progress::default(),
       banner: None,
+      probe_op: None,
       last_error_code: None,
       console: VecDeque::new(),
       settings: SettingsModel::new(),
@@ -153,6 +219,39 @@ impl ViewState {
   /// Clear a latched banner (operator dismissed it, or issued the clearing command).
   pub fn dismiss_banner(&mut self) {
     self.banner = None;
+  }
+
+  /// Begin tracking a freshly-issued probe of `kind`: arm the latch to await its result. Called by the shell the
+  /// moment it sends the probe line, so the next [`Response::ProbeResult`] (or an intervening `Alarm`/`Error`)
+  /// resolves *this* op. Replaces any prior op — a new probe supersedes a stale, already-resolved one.
+  pub fn begin_probe(&mut self, kind: ProbeKind) {
+    self.probe_op = Some(ProbeOp::issued(kind));
+  }
+
+  /// Whether a probe is currently awaiting its result, so the shell can run its push-or-poll timeout only while
+  /// one is genuinely outstanding.
+  pub fn probe_is_awaiting(&self) -> bool {
+    self.probe_op.as_ref().is_some_and(|op| op.awaiting)
+  }
+
+  /// Resolve the in-flight probe op as failed for an external reason (the shell's push-or-poll timeout giving
+  /// up, or a disconnect). No-op when nothing is awaiting, so a late call cannot clobber a result already
+  /// captured. Kept here (not just in the shell) so the failure path is reduced uniformly with the event-driven
+  /// `Alarm`/`Error` failures.
+  pub fn fail_probe(&mut self, reason: impl Into<String>) {
+    if let Some(op) = self.probe_op.as_mut()
+      && op.awaiting
+    {
+      op.awaiting = false;
+      op.last = Some(ProbeOutcome::Failure { reason: reason.into() });
+    }
+  }
+
+  /// Clear the probe-op latch entirely, so a resolved result is consumed exactly once. The rotary wizard folds
+  /// the result into its own state machine and then calls this, so the same `[PRB:]` is not re-fed on the next
+  /// frame — and the next touch's [`Self::begin_probe`] re-arms a fresh op.
+  pub fn clear_probe_op(&mut self) {
+    self.probe_op = None;
   }
 
   /// The semantic badge state for the toolbar/status badge: the host lifecycle reconciled with the firmware's
@@ -240,11 +339,33 @@ impl ViewState {
         // Status reports are high-frequency telemetry; echoing each to the console would drown it. Skip them.
         return;
       }
-      Response::Alarm(code) => self.banner = Some(Banner::Alarm(*code)),
+      Response::ProbeResult { position, success } => {
+        // Capture the typed result into the latch: a `success:1` is the trustworthy trigger point the shell can
+        // act on; a `success:0` (the silent `G38.3`/`G38.5` non-contact path) resolves the op as a failure so no
+        // destructive follow-up runs. The reading still reaches the console below for the operator's record.
+        self.resolve_probe(if *success {
+          ProbeOutcome::Success { position: position.clone() }
+        } else {
+          ProbeOutcome::Failure { reason: "probe did not contact (flag :0)".to_string() }
+        });
+      }
+      // An alarm latches the banner AND fails any awaiting probe: a no-contact `G38.2`/`G38.4` raises `ALARM:5`,
+      // so a probe op outstanding when the alarm lands resolved as a non-contact failure — the shell must not
+      // then run the zeroing line (which the alarm would `error:9`-lock anyway, but the latch makes it explicit
+      // rather than relying on that race).
+      Response::Alarm(code) => {
+        self.banner = Some(Banner::Alarm(*code));
+        self.fail_probe(format!("ALARM:{code} during probe"));
+      }
       // Stash the code but do not latch the banner here: a `error:N` only halts the stream when it belongs to a
       // program line, which the core signals with a transition to `Error`. `on_state_changed` latches the
       // banner on that transition, so a manual-command rejection (which never enters `Error`) only logs below.
-      Response::Error(code) => self.last_error_code = Some(*code),
+      // An `error:N` arriving while a probe is awaiting also fails the op (e.g. a rejected probe line, or the
+      // `error:9` g-code lock after an alarm) so the shell never zeroes off a probe the firmware refused.
+      Response::Error(code) => {
+        self.last_error_code = Some(*code);
+        self.fail_probe(format!("error:{code} during probe"));
+      }
       Response::Setting { number, value } => {
         // A `$<n>=<value>` line merges into the live settings model. Like status telemetry, a `$$` dump is many
         // lines of structured data the settings panel renders, so it does not flood the console.
@@ -284,11 +405,27 @@ impl ViewState {
     self.log(LogSource::Received, text);
   }
 
+  /// Capture a resolved outcome into the in-flight probe op, clearing `awaiting`. Only resolves an op that is
+  /// still awaiting, so a stray second `[PRB:]` (e.g. a push followed by a redundant `$#` echo) cannot overwrite
+  /// a result the shell may have already acted on. No-op when no probe is outstanding.
+  fn resolve_probe(&mut self, outcome: ProbeOutcome) {
+    if let Some(op) = self.probe_op.as_mut()
+      && op.awaiting
+    {
+      op.awaiting = false;
+      op.last = Some(outcome);
+    }
+  }
+
   /// React to the terminal disconnect event.
   fn on_disconnected(&mut self, reason: Option<TransportError>) {
     self.connection = ConnectionState::Disconnected;
     self.progress = Progress::default();
     self.status = None;
+    // A probe op belongs to the session that just ended: drop it so a reconnect never resumes awaiting a result
+    // from the dead link or shows the previous board's reading. If one was awaiting, the shell's per-frame poll
+    // sees the cleared latch and abandons its follow-up.
+    self.probe_op = None;
     // Drop the cached pin state with the report it came from, so a reconnect does not show the old board's
     // endstops asserted before its first status report arrives.
     self.pins = PinState::default();
@@ -324,6 +461,13 @@ impl ViewState {
       Response::Error(code) => format!("error:{code} — {}", self.codes.error_name(*code)),
       Response::Alarm(code) => format!("ALARM:{code} — {}", self.codes.alarm_name(*code)),
       Response::Message(body) => format!("[{body}]"),
+      // Reconstruct the `[PRB:…]` line for the console so the operator's record is unchanged from the untyped
+      // days, while the latch consumes the typed value separately. Values render at 3 decimals, the firmware's
+      // PRB precision.
+      Response::ProbeResult { position, success } => {
+        let coords = position.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",");
+        format!("[PRB:{coords}:{}]", if *success { 1 } else { 0 })
+      }
       Response::Banner(text) => text.clone(),
       Response::StartupEcho(text) => format!(">{text}"),
       Response::Unknown(text) => text.clone(),
@@ -672,6 +816,93 @@ mod tests {
     view.apply(Event::Disconnected(None));
     // The override is gone; the static fallback name is restored for the next session.
     assert_eq!(view.codes.error(21).name, "Modal group violation");
+  }
+
+  #[test]
+  fn a_probe_op_latches_a_successful_result_and_clears_awaiting() {
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    assert!(view.probe_is_awaiting(), "the op is awaiting once issued");
+    // An intervening status report must not resolve the op — only the `[PRB:]` result does.
+    feed_status(&mut view, "Run|MPos:0,0,-1.0");
+    assert!(view.probe_is_awaiting(), "a status report does not resolve the probe op");
+    // The result lands: the latch captures the typed position, marks success, and clears awaiting.
+    view.apply(Event::Response(Response::ProbeResult { position: vec![-1.015, 0.0, -2.5, 90.0], success: true }));
+    assert!(!view.probe_is_awaiting(), "a result clears awaiting");
+    let op = view.probe_op.as_ref().expect("the op is still present, now resolved");
+    assert_eq!(op.last, Some(ProbeOutcome::Success { position: vec![-1.015, 0.0, -2.5, 90.0] }));
+    // The line still reaches the console for the operator's record.
+    assert_eq!(view.console.back().unwrap().text, "[PRB:-1.015,0.000,-2.500,90.000:1]");
+  }
+
+  #[test]
+  fn a_zero_flag_probe_result_resolves_the_op_as_a_failure() {
+    // The silent `G38.3`/`G38.5` path: no alarm, just a `:0` flag. The flag check is the only guard, so a
+    // non-contact result must resolve the op as a failure (never a Success the shell would zero off).
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    view.apply(Event::Response(Response::ProbeResult { position: vec![0.0, 0.0, 0.0], success: false }));
+    assert!(!view.probe_is_awaiting());
+    let outcome = view.probe_op.as_ref().and_then(|op| op.last.as_ref()).expect("a resolved outcome");
+    assert!(!outcome.is_success(), "a :0 flag is a failure, not a success");
+  }
+
+  #[test]
+  fn an_alarm_before_any_probe_result_resolves_the_op_as_failed() {
+    // A no-contact alarming probe (`G38.2`) raises `ALARM:5` with no `[PRB:]` push: the op must resolve failed
+    // off the alarm so the shell's follow-up is suppressed.
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    view.apply(Event::Response(Response::Alarm(5)));
+    assert!(!view.probe_is_awaiting(), "an alarm resolves the awaiting op");
+    let outcome = view.probe_op.as_ref().and_then(|op| op.last.as_ref()).expect("a resolved outcome");
+    assert!(!outcome.is_success());
+    assert!(matches!(outcome, ProbeOutcome::Failure { reason } if reason.contains("ALARM:5")));
+    // The alarm banner still latches as usual.
+    assert_eq!(view.banner, Some(Banner::Alarm(5)));
+  }
+
+  #[test]
+  fn an_error_while_awaiting_resolves_the_probe_as_failed() {
+    // A rejected probe line (or the `error:9` g-code lock after an alarm) arriving while awaiting fails the op.
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    view.apply(Event::Response(Response::Error(9)));
+    assert!(!view.probe_is_awaiting());
+    assert!(view.probe_op.as_ref().and_then(|op| op.last.as_ref()).is_some_and(|o| !o.is_success()));
+  }
+
+  #[test]
+  fn a_late_probe_result_does_not_clobber_an_already_resolved_op() {
+    // Once an op resolves (here, failed by an alarm), a trailing `[PRB:]` push (e.g. a redundant `$#` echo) must
+    // not overwrite the captured outcome — the shell may already have acted on it.
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    view.apply(Event::Response(Response::Alarm(5)));
+    view.apply(Event::Response(Response::ProbeResult { position: vec![0.0, 0.0, 0.0], success: true }));
+    let outcome = view.probe_op.as_ref().and_then(|op| op.last.as_ref()).expect("the failure outcome stands");
+    assert!(!outcome.is_success(), "a late result must not flip a resolved op to success");
+  }
+
+  #[test]
+  fn fail_probe_is_a_noop_when_nothing_is_awaiting() {
+    // The shell's timeout/disconnect failure path must not fabricate an op when none is in flight.
+    let mut view = ViewState::default();
+    view.fail_probe("timeout");
+    assert!(view.probe_op.is_none());
+    // And it must not flip an already-resolved op.
+    view.begin_probe(ProbeKind::ZeroZ);
+    view.apply(Event::Response(Response::ProbeResult { position: vec![1.0], success: true }));
+    view.fail_probe("timeout");
+    assert!(view.probe_op.as_ref().unwrap().last.as_ref().unwrap().is_success());
+  }
+
+  #[test]
+  fn disconnect_clears_the_probe_op() {
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    view.apply(Event::Disconnected(None));
+    assert!(view.probe_op.is_none(), "a probe op must not survive a disconnect");
   }
 
   #[test]

@@ -30,7 +30,10 @@ use crate::protocol::status::{RunState, parse_status};
 
 /// One side effect the core wants the driver to perform or surface. The driver writes [`Effect::Write`]
 /// bytes to the transport and forwards every other variant to the UI event channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived: [`Effect::Response`] can carry a [`Response::ProbeResult`] whose `Vec<f64>` is not `Eq`.
+/// `PartialEq` is retained for tests; nothing keys an `Effect` in a hash/tree set.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
   /// Raw bytes to write to the transport, in order. Used for both program/manual lines (which were already
   /// counted against the window) and real-time bytes (which were not).
@@ -316,6 +319,9 @@ impl ProtocolCore {
       // A `$<n>=<value>` settings line is push output, not a flow-control response: it is surfaced (above) for
       // the reducer's settings model but does not touch the window, the program, or the lifecycle.
       Response::Setting { .. } => {}
+      // A `[PRB:…]` probe result is push output (the probe's own line was already counted/acked as `ok`): it is
+      // surfaced to the reducer's probe latch above the flow layer, but it never touches the window or lifecycle.
+      Response::ProbeResult { .. } => {}
       Response::Status(_) | Response::StartupEcho(_) | Response::Unknown(_) => {}
     }
     out

@@ -59,6 +59,14 @@ pub struct UiState {
   pub probe_feed: f64,
   /// Measured touch-plate thickness (mm) used to set work-Z after a successful probe.
   pub plate_thickness: f64,
+  /// The rotary center-finder's dowel/gauge diameter input (mm) used to start a run (`Z_c = Z_top − D/2`).
+  pub rotary_dowel_diameter: f64,
+  /// The rotary center-finder's index-angle input (degrees) every touch holds A at during a run.
+  pub rotary_index_angle: f64,
+  /// The Phase 2 verify/measure starting A angle (degrees): θ for the flip-verify pair, and the first runout angle.
+  pub verify_start_angle: f64,
+  /// The Phase 2 runout report's number of evenly-spaced angles (N ≥ 2).
+  pub verify_runout_n: usize,
   /// Whether the settings window is open.
   pub settings_open: bool,
   /// The setting currently being edited in the panel, as `(number, edit_buffer)`, or `None` when no row is in
@@ -110,6 +118,10 @@ impl Default for UiState {
       probe_depth: 10.0,
       probe_feed: 50.0,
       plate_thickness: 1.0,
+      rotary_dowel_diameter: 6.0,
+      rotary_index_angle: 0.0,
+      verify_start_angle: 0.0,
+      verify_runout_n: 4,
       settings_open: false,
       editing_setting: None,
       show_machine_pos: false,
@@ -1010,7 +1022,334 @@ pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mu
         });
       }
     });
+    // Render the latched probe result below the action so the operator sees the probed point + success here
+    // rather than hunting for it in the console. Shows a live "Probing…" while awaiting, the contact point on
+    // success, or the failure reason — driven entirely by the reducer's `probe_op` latch.
+    probe_result(ui, view);
   });
+}
+
+/// Render the probe-operation latch outcome inside the Z touch-off panel: a "Probing…" spinner-line while
+/// awaiting, the contact point on success, or the failure reason. Reads only [`ViewState::probe_op`] — a thin
+/// render of the pure latch. Draws nothing when no probe has been issued, OR when the latched op belongs to a
+/// DIFFERENT flow (a rotary wizard touch): this panel speaks only for the ZeroZ touch-off, so it must not claim
+/// "Work-Z set." for a rotary probe (the wizard has its own panel). Routing on `op.kind` is what keeps the two
+/// panels from narrating each other's probes.
+fn probe_result(ui: &mut egui::Ui, view: &ViewState) {
+  use super::view_state::{ProbeKind, ProbeOutcome};
+  let Some(op) = view.probe_op.as_ref().filter(|op| op.kind == ProbeKind::ZeroZ) else {
+    return;
+  };
+  ui.add_space(6.0);
+  if op.awaiting {
+    ui.label(RichText::new("Probing… awaiting result").size(11.0).color(Theme::TEXT_DIM));
+    return;
+  }
+  match op.last.as_ref() {
+    Some(ProbeOutcome::Success { position }) => {
+      // Show the machine-coordinate contact point (X, Y, Z, then any rotary axis) at 3 decimals, the PRB report
+      // precision. A short green confirmation reads as "done" without re-reading the console.
+      let coords = position.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", ");
+      ui.label(RichText::new(format!("Contact at [{coords}]")).size(11.0).color(Theme::OK));
+      ui.label(RichText::new("Work-Z set.").size(11.0).color(Theme::TEXT_DIM));
+    }
+    Some(ProbeOutcome::Failure { reason }) => {
+      ui.label(RichText::new(format!("Probe failed: {reason}")).size(11.0).color(Theme::DANGER));
+      ui.label(RichText::new("Work-Z unchanged.").size(11.0).color(Theme::TEXT_DIM));
+    }
+    // Resolved but no outcome recorded — unreachable in practice (resolving always sets `last`), but render
+    // nothing rather than assume.
+    None => {}
+  }
+}
+
+/// Render the rotary center-finder wizard (DOC-11 §1.2). When no run is active it shows the dowel-diameter /
+/// index-angle inputs and a Start button; when a run is active it guides the operator step by step — issuing each
+/// rotary-safe touch, the move-to-Y-center, and the WCS write — and shows the captured readings + computed
+/// `(Y_c, Z_c)`. The wizard state is owned by the shell (the firmware has no pivot concept) and passed in as a
+/// borrow, so this stays a pure render that only emits intents.
+pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
+  wizard: Option<&super::rotary_center::WizardState>, sink: &mut IntentSink) {
+  use super::rotary_center::WizardStep;
+  section_header(ui, "Rotary center-finder");
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+    let Some(w) = wizard else {
+      // No run: collect the dowel diameter + index angle and offer Start. Only meaningful while idle/connected,
+      // but the inputs stay editable so the operator can set up before connecting.
+      ui.label(RichText::new("Find the A centerline from a known-diameter dowel clamped concentric.").size(11.0)
+        .color(Theme::TEXT_DIM));
+      ui.add_space(4.0);
+      egui::Grid::new("rotary_setup").num_columns(2).show(ui, |ui| {
+        ui.label("Dowel ⌀");
+        ui.add(egui::DragValue::new(&mut state.rotary_dowel_diameter).speed(0.1).range(0.1..=100.0).suffix(" mm"));
+        ui.end_row();
+        ui.label("A angle");
+        ui.add(egui::DragValue::new(&mut state.rotary_index_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
+        ui.end_row();
+      });
+      let enabled = view.connection == ConnectionState::Idle;
+      ui.add_enabled_ui(enabled, |ui| {
+        if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0),
+          egui::Button::new("Start center-finder")).clicked()
+        {
+          sink.push(Intent::RotaryCenterStart {
+            dowel_diameter: state.rotary_dowel_diameter,
+            index_angle_deg: state.rotary_index_angle,
+          });
+        }
+      });
+      return;
+    };
+
+    // A run is active: render the step guidance, the readings so far, and the step's action button. Probing
+    // disables the action (one touch at a time); the latch's awaiting/result is shown by the probe panel above.
+    rotary_run_readings(ui, w);
+    ui.add_space(6.0);
+    let probing = w.is_probing();
+    let idle = view.connection == ConnectionState::Idle;
+    // The action available depends on the step; each is gated on Idle (a probe/move needs an accepting machine)
+    // and disabled while a touch is in flight.
+    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+    match w.step {
+      WizardStep::EnterDowel => {
+        ui.label(RichText::new("Jog to the −Y face approach, then probe.").size(11.0).color(Theme::TEXT_DIM));
+        ui.add_enabled_ui(idle && !probing, |ui| {
+          if ui.add_sized(full, egui::Button::new("Probe Y (left side)")).clicked() {
+            sink.push(Intent::RotaryCenterProbe);
+          }
+        });
+      }
+      WizardStep::ReadyYRight => {
+        ui.label(RichText::new("Jog to the +Y face approach, then probe.").size(11.0).color(Theme::TEXT_DIM));
+        ui.add_enabled_ui(idle && !probing, |ui| {
+          if ui.add_sized(full, egui::Button::new("Probe Y (right side)")).clicked() {
+            sink.push(Intent::RotaryCenterProbe);
+          }
+        });
+      }
+      WizardStep::MoveToYc => {
+        // ONLY the move is offered here — the top probe is locked until the move has actually been sent (the
+        // wizard then advances to MovedToYc). This is the UI half of the type-enforced "move before top" order.
+        ui.label(RichText::new("Move to the Y center before probing the top.").size(11.0).color(Theme::TEXT_DIM));
+        ui.add_enabled_ui(idle, |ui| {
+          if ui.add_sized(full, egui::Button::new("Move to Y center")).clicked() {
+            sink.push(Intent::RotaryCenterMoveToYc);
+          }
+        });
+      }
+      WizardStep::MovedToYc => {
+        // The move was sent; now (and only now) the top probe is offered.
+        ui.label(RichText::new("At the Y center. Probe the dowel top.").size(11.0).color(Theme::TEXT_DIM));
+        ui.add_enabled_ui(idle && !probing, |ui| {
+          if ui.add_sized(full, egui::Button::new("Probe Z (dowel top)")).clicked() {
+            sink.push(Intent::RotaryCenterProbe);
+          }
+        });
+      }
+      WizardStep::Review => {
+        ui.label(RichText::new("Center found. Write it to the active WCS (Y/Z only).").size(11.0)
+          .color(Theme::OK));
+        // The operator picks which feature work-Z0 lands on. Y0 is always the axis centerline; only Z is
+        // selectable. Defaults to the axis centerline (wrap-machining convention).
+        rotary_z_datum_picker(ui, w, sink);
+        ui.add_enabled_ui(idle, |ui| {
+          if ui.add_sized(full, egui::Button::new("Write center → WCS (G10 L2)")).clicked() {
+            sink.push(Intent::RotaryCenterWriteWcs);
+          }
+        });
+      }
+      WizardStep::Aborted => {
+        let reason = w.abort_reason.as_deref().unwrap_or("cancelled");
+        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(Theme::DANGER));
+      }
+      // The probing steps await a result (the probe panel shows it); only Cancel is offered here.
+      WizardStep::ProbeYLeft | WizardStep::ProbeYRight | WizardStep::ProbeZTop => {
+        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(Theme::TEXT_DIM));
+      }
+    }
+    ui.add_space(4.0);
+    if ui.add_sized(full, egui::Button::new("Cancel")).clicked() {
+      sink.push(Intent::RotaryCenterCancel);
+    }
+  });
+}
+
+/// Render the rotary wizard's captured readings + computed center as a compact dim list. Each is shown once
+/// available; `Y_c`/`Z_c` appear as the math resolves them. Pure render of [`super::rotary_center::WizardState`].
+fn rotary_run_readings(ui: &mut egui::Ui, w: &super::rotary_center::WizardState) {
+  let dim = |ui: &mut egui::Ui, text: String| {
+    ui.label(RichText::new(text).size(11.0).color(Theme::TEXT_DIM));
+  };
+  dim(ui, format!("Dowel ⌀ {:.3} mm · A {:.1}°", w.dowel_diameter, w.index_angle_deg));
+  if let Some(y) = w.y_left {
+    dim(ui, format!("Y left  {y:.3}"));
+  }
+  if let Some(y) = w.y_right {
+    dim(ui, format!("Y right {y:.3}"));
+  }
+  if let Some(yc) = w.y_center() {
+    ui.label(RichText::new(format!("Y center {yc:.3}")).size(11.0).color(Theme::TEXT));
+  }
+  if let Some(z) = w.z_top {
+    dim(ui, format!("Z top   {z:.3}"));
+  }
+  if let Some(zc) = w.z_center() {
+    ui.label(RichText::new(format!("Z center {zc:.3}")).size(11.0).color(Theme::TEXT));
+  }
+}
+
+/// Render the Z-datum picker for the WCS write: two selectable labels — the rotary axis centerline (default) or
+/// the probed top surface — plus a one-line clarification and a preview of which Z the offered `G10` will use.
+/// Emits [`Intent::RotaryCenterSetZDatum`] on a change; pure render of the wizard's current selection.
+fn rotary_z_datum_picker(ui: &mut egui::Ui, w: &super::rotary_center::WizardState, sink: &mut IntentSink) {
+  use super::rotary_center::ZDatum;
+  ui.add_space(4.0);
+  ui.label(RichText::new("Work-Z0 datum").size(11.0).color(Theme::TEXT_DIM));
+  ui.horizontal(|ui| {
+    let axis = w.z_datum == ZDatum::AxisCenterline;
+    let top = w.z_datum == ZDatum::TopSurface;
+    if ui.selectable_label(axis, "Axis centerline").clicked() && !axis {
+      sink.push(Intent::RotaryCenterSetZDatum(ZDatum::AxisCenterline));
+    }
+    if ui.selectable_label(top, "Top surface").clicked() && !top {
+      sink.push(Intent::RotaryCenterSetZDatum(ZDatum::TopSurface));
+    }
+  });
+  // One-line clarification of the selected datum, plus the Z value the G10 will carry.
+  let (desc, z) = match w.z_datum {
+    ZDatum::AxisCenterline => ("Z0 at the rotary axis (Z_top − D/2).", w.z_datum_value()),
+    ZDatum::TopSurface => ("Z0 at the probed top surface (Z_top).", w.z_datum_value()),
+  };
+  ui.label(RichText::new(desc).size(11.0).color(Theme::TEXT_DIM));
+  if let Some(z) = z {
+    ui.label(RichText::new(format!("G10 will set Z {z:.3}")).size(11.0).color(Theme::TEXT_DIM));
+  }
+}
+
+/// Render the Phase 2 verify/measure panel (DOC-11 §2): the 180°-flip center-verify and the runout report, both
+/// driven by the shared [`super::angle_sweep::AngleSweep`] engine (passed as `(sweep, kind)` when one is running).
+/// When idle it offers both Start actions; while running it guides the per-angle touches and shows the readings;
+/// on completion it computes the flip residual (with a `G10` correction offer) or the runout TIR/eccentricity
+/// (read-only). The probes use the conventional Y radial axis (matching the center-finder), probing toward −Y.
+pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
+  sweep: Option<(&super::angle_sweep::AngleSweep, super::view_state::ProbeKind)>, sink: &mut IntentSink) {
+  use super::angle_sweep::SweepStep;
+  use super::intent::{Axis, Dir};
+  use super::view_state::ProbeKind;
+  section_header(ui, "Verify · measure");
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+    let idle = view.connection == ConnectionState::Idle;
+    let Some((s, kind)) = sweep else {
+      // No run: collect the shared start angle + (for runout) N, and offer both Start actions.
+      ui.label(RichText::new("180°-flip verify or N-angle runout, probing −Y.").size(11.0).color(Theme::TEXT_DIM));
+      ui.add_space(4.0);
+      egui::Grid::new("verify_setup").num_columns(2).show(ui, |ui| {
+        ui.label("Start A");
+        ui.add(egui::DragValue::new(&mut state.verify_start_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
+        ui.end_row();
+        ui.label("Runout N");
+        ui.add(egui::DragValue::new(&mut state.verify_runout_n).range(2..=36));
+        ui.end_row();
+      });
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new("Start 180°-flip verify")).clicked() {
+          sink.push(Intent::FlipVerifyStart { angle_deg: state.verify_start_angle, axis: Axis::Y, dir: Dir::Neg });
+        }
+        if ui.add_sized(full, egui::Button::new("Start runout report")).clicked() {
+          sink.push(Intent::RunoutStart {
+            n: state.verify_runout_n,
+            start_deg: state.verify_start_angle,
+            axis: Axis::Y,
+            dir: Dir::Neg,
+          });
+        }
+      });
+      return;
+    };
+
+    let title = match kind {
+      ProbeKind::FlipVerify => "180°-flip verify",
+      ProbeKind::Runout => "Runout report",
+      _ => "Verify",
+    };
+    ui.label(RichText::new(title).size(11.0).color(Theme::TEXT));
+    verify_readings_table(ui, s);
+    ui.add_space(6.0);
+    match s.step() {
+      SweepStep::Ready => {
+        ui.label(RichText::new(format!("Jog the approach for touch {} of {}, then probe.",
+          s.current_touch_number(), s.total_touches())).size(11.0).color(Theme::TEXT_DIM));
+        ui.add_enabled_ui(idle, |ui| {
+          if ui.add_sized(full, egui::Button::new("Probe this angle")).clicked() {
+            sink.push(Intent::SweepProbe);
+          }
+        });
+      }
+      SweepStep::Probing => {
+        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(Theme::TEXT_DIM));
+      }
+      SweepStep::Done => verify_done(ui, state, s, kind, idle, full, sink),
+      SweepStep::Aborted => {
+        let reason = s.abort_reason().unwrap_or("cancelled");
+        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(Theme::DANGER));
+      }
+    }
+    ui.add_space(4.0);
+    if ui.add_sized(full, egui::Button::new("Cancel")).clicked() {
+      sink.push(Intent::SweepCancel);
+    }
+  });
+}
+
+/// Render the completed-sweep result: the flip-verify residual + `G10` correction offer, or the read-only runout
+/// TIR / eccentricity. Pure render of the computed values over the sweep's readings.
+fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &super::angle_sweep::AngleSweep,
+  kind: super::view_state::ProbeKind, idle: bool, full: Vec2, sink: &mut IntentSink) {
+  use super::flip_verify::FlipResult;
+  use super::runout::RunoutReport;
+  use super::view_state::ProbeKind;
+  match kind {
+    ProbeKind::FlipVerify => {
+      let Some(result) = FlipResult::from_readings(s.probe_axis(), s.readings()) else {
+        ui.label(RichText::new("Flip verify needs two readings.").size(11.0).color(Theme::DANGER));
+        return;
+      };
+      ui.label(RichText::new(format!("Residual eccentricity {:.3} mm.", result.error()))
+        .size(11.0).color(Theme::OK));
+      ui.label(RichText::new("Apply shifts the active WCS origin on this axis by the residual.")
+        .size(11.0).color(Theme::TEXT_DIM));
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new("Apply correction → WCS (G10 L2)")).clicked() {
+          sink.push(Intent::FlipVerifyWriteCorrection);
+        }
+      });
+    }
+    ProbeKind::Runout => match RunoutReport::from_readings(s.readings()) {
+      Some(r) => {
+        ui.label(RichText::new(format!("TIR {:.3} mm · eccentricity {:.3} mm ({} pts)", r.tir, r.eccentricity,
+          r.count)).size(11.0).color(Theme::OK));
+        ui.label(RichText::new("Read-only — no offset written.").size(11.0).color(Theme::TEXT_DIM));
+      }
+      None => {
+        ui.label(RichText::new("Runout needs at least two readings.").size(11.0).color(Theme::DANGER));
+      }
+    },
+    _ => {}
+  }
+}
+
+/// Render the sweep's per-angle readings as a compact dim list (angle → reading once captured). Pure render of
+/// the shared [`super::angle_sweep::AngleSweep`].
+fn verify_readings_table(ui: &mut egui::Ui, s: &super::angle_sweep::AngleSweep) {
+  let readings = s.readings();
+  for (i, &angle) in s.angles().iter().enumerate() {
+    let text = match readings.get(i) {
+      Some(r) => format!("A{angle:.1}°  →  {r:.3}"),
+      None => format!("A{angle:.1}°  →  —"),
+    };
+    ui.label(RichText::new(text).size(11.0).color(Theme::TEXT_DIM));
+  }
 }
 
 /// Render the bottom dock (design §03): one surface hosting the Console and Program tabs. The shared tab strip

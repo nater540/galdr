@@ -45,6 +45,9 @@ before extending a subsystem.
 | `docs/native-app.md` + `docs/skirnir-design-brief.md` | `skirnir` design. egui (eframe) is the UI; the serial/streaming engine is a framework-agnostic module on `tokio-serial`. **Now built** — read these for intent, but `crates/skirnir/src/` is the source of truth. |
 | `docs/homing-research-findings.md` | DOC-06 background: the verified grblHAL homing/limit behavioral contract that the implementation follows (cited research synthesis). Read before changing homing/limit semantics. |
 | `docs/homing-bench-checklist.md` | Hardware-in-the-loop bring-up procedure for the homing cycle + limit switches. The DOC-06 hardware path is unverified until this is run on the board. |
+| `docs/4th-axis-rotary-design.md` | **DOC-10** full design + TDD spec for the rotary A axis (coordinated rotary about X): `$376`, G93/G94 inverse-time feed, the degrees-as-mm convention, the G93+G38 and rotary-probe-word rejections, and the grblHAL-grounded review corrections. Read before changing 4th-axis kinematics or probe semantics. |
+| `docs/4th-axis-bench-checklist.md` | Hardware-in-the-loop bring-up for the A axis (RMT ch3, TMC node 3, PROVISIONAL GPIOs 18/38/39). The DOC-10 hardware path is compile-only until this is run on the board. |
+| `docs/skirnir-probing-design.md` | **DOC-11** host-side probing design + TDD scope for `skirnir`: typed `[PRB:]` parsing, the probe-result latch, the rotary-safe probe primitive, and the center-finder / 180°-flip / runout wizards. Read before adding probe UI or touching the `[PRB:]` path. Not yet implemented. |
 
 ## Build & test
 

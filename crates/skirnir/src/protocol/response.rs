@@ -8,7 +8,10 @@
 
 /// A single parsed line of firmware output. Only [`Response::Ok`] and [`Response::Error`] move the
 /// character-count window; everything else is informational push output the UI may display.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is intentionally NOT derived: [`Response::ProbeResult`] carries `Vec<f64>`, and `f64` is not `Eq`. The
+/// type stays `PartialEq` (used by tests and event comparisons); nothing keys a `Response` in a hash/tree set.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Response {
   /// `ok` — a line was accepted. Frees the oldest in-flight line from the send-ahead window.
   Ok,
@@ -25,8 +28,15 @@ pub enum Response {
   /// endstop/probe/door signal set.
   Status(String),
 
-  /// `[...]` bracketed push message (banner info, `[MSG:]`, `[PRB:]`, `[OPT:]`, `[G54:]`, ...). Carried
-  /// verbatim (sans square brackets). Recognised sub-kinds (e.g. `[OPT:]`) are interpreted by the engine.
+  /// `[PRB:<x>,<y>,<z>{,<a>…}:<flag>]` — a `G38.x` probe result (or the `$#` query's last-probe echo). The
+  /// `position` is the MACHINE-coordinate position at the trigger instant (1..N axes, in report order); `success`
+  /// is the trailing `:1`/`:0` contact flag. Parsed ahead of the generic [`Response::Message`] so the app gets
+  /// typed access; the body grammar lives in [`crate::protocol::parse_prb_body`].
+  ProbeResult { position: Vec<f64>, success: bool },
+
+  /// `[...]` bracketed push message (banner info, `[MSG:]`, `[OPT:]`, `[G54:]`, ...). Carried verbatim (sans
+  /// square brackets). Recognised sub-kinds (e.g. `[OPT:]`, `[PRB:]`) are typed into their own variants first;
+  /// the rest reach here. Recognised sub-kinds (e.g. `[OPT:]`) are interpreted by the engine.
   Message(String),
 
   /// The welcome banner (`Grbl 1.1f ...` / `GrblHAL 1.1f ...`), emitted on boot and after a soft reset.
@@ -73,6 +83,14 @@ pub fn parse_line(line: &str) -> Option<Response> {
   }
 
   if let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+    // A `[PRB:…]` probe result is typed ahead of the generic message so the app gets a `{position, success}`
+    // rather than raw text. A malformed PRB body (bad coordinate, missing flag) falls through to `Message` so
+    // the console still shows the line verbatim and the parser never panics or fabricates a result.
+    if let Some(prb) = inner.strip_prefix("PRB:")
+      && let Some((position, success)) = crate::protocol::parse_prb_body(prb)
+    {
+      return Some(Response::ProbeResult { position, success });
+    }
     return Some(Response::Message(inner.to_string()));
   }
 
@@ -109,6 +127,9 @@ pub fn is_grbl_evidence(response: &Response, accept_acks: bool) -> bool {
     // `$I` build-info comes back as bracketed `[VER:...]` / `[OPT:...]` push messages; other `[MSG:...]` does not.
     Response::Message(body) => body.starts_with("VER:") || body.starts_with("OPT:"),
     Response::Ok | Response::Error(_) | Response::Alarm(_) => accept_acks,
+    // A `[PRB:…]` result only comes from a board that ran a probe (or answered `$#`), so it is real evidence —
+    // but, like an ack, it is solicited, so the unsolicited port probe (`accept_acks = false`) stays conservative.
+    Response::ProbeResult { .. } => accept_acks,
     // A `$<n>=<value>` line is firmware output, so it is real evidence of a live grblHAL controller (a `$$`
     // dump only comes from a board that answered our query) for the connect handshake — but, like an ack, it
     // is solicited, so the unsolicited port probe (`accept_acks = false`) stays conservative and ignores it.
@@ -170,6 +191,33 @@ mod tests {
       parse_line("[MSG:'$H'|'$X' to unlock]"),
       Some(Response::Message("MSG:'$H'|'$X' to unlock".to_string()))
     );
+  }
+
+  #[test]
+  fn parses_a_four_field_probe_result_ahead_of_the_generic_message() {
+    assert_eq!(
+      parse_line("[PRB:-1.015,0.000,-2.500,90.000:1]"),
+      Some(Response::ProbeResult { position: vec![-1.015, 0.0, -2.5, 90.0], success: true })
+    );
+  }
+
+  #[test]
+  fn parses_a_three_field_failed_probe_result() {
+    assert_eq!(
+      parse_line("[PRB:0.000,0.000,0.000:0]"),
+      Some(Response::ProbeResult { position: vec![0.0, 0.0, 0.0], success: false })
+    );
+  }
+
+  #[test]
+  fn a_malformed_prb_body_falls_through_to_message_not_panic() {
+    // A `[PRB:…]` with a garbled body must not type as a ProbeResult — it stays a generic Message so the console
+    // still shows the line verbatim. (No flag here, so the grammar rejects it.)
+    assert_eq!(parse_line("[PRB:1.0,2.0,3.0]"), Some(Response::Message("PRB:1.0,2.0,3.0".to_string())));
+    // A non-numeric coordinate likewise falls through rather than fabricating a partial reading.
+    assert_eq!(parse_line("[PRB:1.0,bad,3.0:1]"), Some(Response::Message("PRB:1.0,bad,3.0:1".to_string())));
+    // A non-finite coordinate (nan/inf) must also fall through rather than become a Success carrying NaN.
+    assert_eq!(parse_line("[PRB:nan,0.0,0.0:1]"), Some(Response::Message("PRB:nan,0.0,0.0:1".to_string())));
   }
 
   #[test]
