@@ -19,7 +19,8 @@
 use crate::drivers::tmc2209::registers::{
   chopconf, cs_for_current, gconf_uart_control, ifcnt, ihold_irun, ioin_version, pwmconf_stealthchop,
   rms_current_to_cs, slaveconf, CurrentScaling, DrvStatus, CHOPCONF, DRV_STATUS, EXPECTED_VERSION, GCONF,
-  GSTAT, GSTAT_CLEAR_ALL, IFCNT, IHOLD_IRUN, IOIN, PWMCONF, R_SENSE_ADAFRUIT_6121_OHMS, SLAVECONF,
+  GSTAT, GSTAT_CLEAR_ALL, IFCNT, IHOLD_IRUN, IOIN, PWMCONF, R_SENSE_ADAFRUIT_6121_OHMS,
+  R_SENSE_BTT_TMC2209_OHMS, SLAVECONF,
   TPOWERDOWN, TPWMTHRS,
 };
 use crate::drivers::tmc2209::TmcError;
@@ -62,14 +63,22 @@ pub struct TmcConfig {
 }
 
 impl Default for TmcConfig {
-  /// Sensible bring-up defaults for the three NEMA-17 axes on the Adafruit 6121 breakouts: nodes 0/1/2,
-  /// 800 mA run / 400 mA hold, 1/16 microstepping, 0.05 Ω sense, `IHOLDDELAY`=7, `TPOWERDOWN`=20,
-  /// StealthChop everywhere (`TPWMTHRS`=0), `SENDDELAY`=2. These stand in until esp-storage `$`-settings load.
+  /// Sensible bring-up defaults for the four NEMA-17 axes: nodes 0/1/2/3, 800 mA run / 400 mA hold, 1/16
+  /// microstepping, `IHOLDDELAY`=7, `TPOWERDOWN`=20, StealthChop everywhere (`TPWMTHRS`=0), `SENDDELAY`=2.
+  /// These stand in until esp-storage `$`-settings load. The sense-resistor value is selected by the
+  /// `BREADBOARD_STEPSTICKS` toggle below — see `docs/breadboard-bringup.md`.
   fn default() -> Self {
     let axis = |node| AxisConfig { node, run_current_ma: 800, hold_current_ma: 400, microsteps: 16 };
+    // Sense resistor — pick the constant matching your drivers (this is the only line to flip when moving
+    // between the breadboard bring-up and the milled PCB; both values are kept present so the swap is trivial):
+    //   Adafruit 6121 breakout (production / milled PCB) ......... R_SENSE_ADAFRUIT_6121_OHMS (0.05 Ω)
+    //   BTT / Watterott / FYSETC stepstick (breadboard build) ... R_SENSE_BTT_TMC2209_OHMS  (0.11 Ω)
+    // A wrong value mis-scales IRUN/IHOLD by ≈ 2.2× (the ratio of the two senses) and can overheat the motor.
+    const BREADBOARD_STEPSTICKS: bool = false;
+    let r_sense_ohms = if BREADBOARD_STEPSTICKS { R_SENSE_BTT_TMC2209_OHMS } else { R_SENSE_ADAFRUIT_6121_OHMS };
     TmcConfig {
       axes: [axis(0), axis(1), axis(2), axis(3)],
-      r_sense_ohms: R_SENSE_ADAFRUIT_6121_OHMS,
+      r_sense_ohms,
       ihold_delay: 7,
       tpowerdown: 20,
       tpwmthrs: 0,

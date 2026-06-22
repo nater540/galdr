@@ -27,6 +27,17 @@
 //! keep running while a datagram round-trip is in flight — an absent driver no longer stalls the executor for
 //! up to 5 ms. The exchanges are infrequent (a few round-trips at init and one `DRV_STATUS` read per axis per
 //! poll interval), entirely off the real-time path; the core-1 step generation is wholly unaffected.
+//!
+//! ## Breadboard bring-up (BTT / stepstick drivers)
+//! The default build targets the Adafruit 6121 breakout (0.05 Ω sense). When bringing the hardware up on a
+//! breadboard with BTT / Watterott / FYSETC TMC2209 **stepstick** modules (0.11 Ω sense), flip the
+//! `BREADBOARD_STEPSTICKS` toggle in [`TmcConfig::default`](firmware_core::drivers::tmc2209::manager::TmcConfig)
+//! so the current-scale math uses the right sense resistor — a wrong value mis-scales `IRUN`/`IHOLD` by ≈ 2.2×
+//! and can overheat the motor. The wiring differences (VIO → 3.3 V, MS1/MS2 address straps, the single 1 kΩ
+//! UART series resistor, and keeping motor-coil current OFF the breadboard rails) are in
+//! `docs/breadboard-bringup.md`. Note `tmc_r_sense_ohms` is a persisted setting: the compile-time default only
+//! seeds a fresh/erased flash, so on a board with settings already stored, push the value over the `$PBX`
+//! host-sync channel (or erase flash) rather than relying on the rebuild alone.
 
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Pin;

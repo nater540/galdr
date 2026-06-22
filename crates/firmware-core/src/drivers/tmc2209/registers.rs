@@ -167,8 +167,17 @@ pub fn pwmconf_stealthchop() -> u32 {
 // --- Current scaling -----------------------------------------------------------------------------
 
 /// Sense-resistor value on the Adafruit TMC2209 breakout (product 6121): 0.05 Ω (DOC-03 — verify against the
-/// board, this differs from the common 0.11 Ω clone value, and a wrong value silently mis-scales current).
+/// board; a wrong value silently mis-scales current). This is the production / milled-PCB build value; the
+/// common stepstick modules use [`R_SENSE_BTT_TMC2209_OHMS`] instead — pick the one matching your hardware.
 pub const R_SENSE_ADAFRUIT_6121_OHMS: f32 = 0.05;
+
+/// Sense-resistor value on the common BTT / Watterott (SilentStepStick) / FYSETC TMC2209 stepstick modules:
+/// 0.11 Ω. This is the **breadboard bring-up** value (`docs/breadboard-bringup.md`) — verify the silkscreen /
+/// schematic for your board revision, as clones vary. Selecting the wrong sense resistor mis-scales `IRUN` /
+/// `IHOLD` by the ratio of the two values (0.11/0.05 ≈ 2.2×), which can overheat the motor and driver. The
+/// larger 0.11 Ω also gives finer CS resolution at low PCB-milling currents than the 0.05 Ω part (it pushes
+/// the high-sensitivity CS back up toward [`CS_MIN_RECOMMENDED`]).
+pub const R_SENSE_BTT_TMC2209_OHMS: f32 = 0.11;
 
 /// Effective parasitic resistance the datasheet adds to `R_sense` in the current formula (≈ 0.02 Ω of MOSFET
 /// and bond-wire resistance).
