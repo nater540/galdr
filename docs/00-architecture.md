@@ -201,25 +201,45 @@ let _guard = cpu.start_app_core(stack, move || {
 > All thread-mode tasks on core 0 share the executor's task arena; the core 1 executor has its
 > own `APP_CORE_STACK`.
 
+> **Realized task split (implementation note).** The table above is the DOC-00 *plan*; the shipped firmware
+> consolidates it. The core-0 receive path is `usb_rx` (reads USB bytes, intercepts real-time bytes, buffers to
+> `RX_PIPE`) → `line_assembler` (frames lines into `LINE_QUEUE`) → **`comms_consumer`** — a single task that owns the
+> `Parser` and the planner, so the planned `gcode_parser` and `planner` tasks are folded into it (look-ahead runs
+> inline, not in a separate task). There is **no `homing` task**: the `$H` cycle is *commanded* on `comms_consumer`
+> (`handle_home`) but its seek/locate motion runs on core 1's `motion_executor` via the `HOME_REQUEST`/`HOME_RESULT`
+> signals (same for G38 probing via `PROBE_REQUEST`/`PROBE_RESULT`). `status_reporter` ships as `status_responder`,
+> joined by an `auto_report_task` for the `$481` auto-report interval. `main.rs` spawns: `motion_executor` (core 1);
+> `usb_rx`, `line_assembler`, `usb_tx`, `comms_consumer`, `status_responder`, `auto_report_task`, `tmc_manager`, and
+> `spindle` (core 0).
+
 ### Inter-task communication topology
 All primitives from `embassy-sync` with `CriticalSectionRawMutex` (single-core safe, ISR-safe,
 and safe across cores on the S3 because `CriticalSectionRawMutex` disables interrupts on the
 calling core only — acceptable here since the motion executor does not share channels with core-0
 tasks directly; it communicates only through the `BlockQueue` Mutex and feed-hold Signals):
 
-- `usb_rx` → `gcode_parser`: `Channel<CriticalSectionRawMutex, Line, 4>`
-- `usb_rx` → real-time handlers: `Signal`s — `FEED_HOLD`, `CYCLE_START`, `SOFT_RESET`,
-  `STATUS_REQUEST`
-- `gcode_parser` → `planner`: `Channel<_, PlannerCommand, 8>`
-- `planner` → `motion_executor`: `BlockQueue` ring buffer behind
-  `Mutex<CriticalSectionRawMutex, _>` plus a `Signal` `BLOCK_AVAILABLE`
-- `motion_executor` → `status_reporter`: shared `MachineState` in a `Mutex` (live MPos in steps)
-- Any task → `usb_tx`: `Channel<_, Response, 8>`
-- `comms` consumer → `spindle`: the commanded direction in a `SPINDLE_DIRECTION` atomic + a `SPINDLE_UPDATE`
-  `Signal` (re-drive from the override-scaled RPM) and a `SPINDLE_ESTOP` `Signal` (immediate stop). (The DOC-00
-  sketch's single `Signal<SpindleCommand>` was the plan; the implementation splits it so the realized RPM and the
-  e-stop are decoupled from the direction.)
-- Limit-switch ISR → `motion_executor`: `Signal` `LIMIT_TRIGGERED`
+The bullets below are reconciled to the **realized** wiring (the original sketch named separate `gcode_parser`/
+`planner`/`status_reporter`/`homing` tasks — see the task-split note above):
+
+- `usb_rx` (reader half) intercepts real-time bytes — signalling `STATUS_REQUEST`/`SOFT_RESET`, or updating the
+  shared `ControlState` for feed-hold (`!`) / cycle-start (`~`) via `dispatch_realtime` — and pushes the remaining
+  bytes into `RX_PIPE` (`Pipe<CriticalSectionRawMutex, _>`).
+- `line_assembler`: frames `RX_PIPE` bytes into lines on `LINE_QUEUE` (`Channel<CriticalSectionRawMutex, Line, _>`).
+- `comms_consumer`: drains `LINE_QUEUE`, **owns the `Parser` and the `Planner`** and parses → plans inline — so
+  the planned `gcode_parser`/`planner` tasks and the `PlannerCommand` channel between them do not exist.
+- `comms_consumer`/planner → `motion_executor`: the `BlockQueue` ring buffer behind a `Mutex<CriticalSectionRawMutex, _>`
+  plus a `Signal` `BLOCK_AVAILABLE`.
+- `comms_consumer` ↔ `motion_executor` (the `$H` cycle and G38 probe run on core 1): `HOME_REQUEST`/`HOME_RESULT`
+  and `PROBE_REQUEST`/`PROBE_RESULT` `Signal`s.
+- `motion_executor` → `status_responder`: the live machine state in `MACHINE` (`Mutex<_, MachineSnapshot>`) plus the
+  logical limit levels in the `LIMIT_LEVELS` atomic (which sources the `Pn:` field).
+- Limit-switch ISR / sampler → `motion_executor`: `Signal` `LIMIT_TRIGGERED`.
+- Any task → `usb_tx`: the `RESPONSE` `Channel<CriticalSectionRawMutex, Response, _>`.
+- `comms_consumer` → `spindle`: the commanded direction in a `SPINDLE_DIRECTION` atomic + the modal RPM in
+  `PROGRAMMED_SPINDLE_RPM`, with a `SPINDLE_UPDATE` `Signal` (re-drive from the override-scaled RPM) and a
+  `SPINDLE_ESTOP` `Signal` (immediate stop). (The DOC-00 sketch's single `Signal<SpindleCommand>` was the plan; the
+  implementation splits it so the realized RPM and the e-stop are decoupled from the direction.)
+- `auto_report_task`: emits the `<...>` report on the `AUTO_REPORT_INTERVAL_MS` cadence (`$481` auto-report).
 
 ### Inter-task message data structures (sketch)
 ```rust
