@@ -729,7 +729,7 @@ no A word must produce byte-identical blocks/speeds to today.
    `protocol.rs`/`coords.rs` assertions; hand the wire-format delta to the skirnir workstream (DOC-10.9).
 5. **Firmware ch3 / TMC node 3 (compile-only until bench).** Wire RMT ch3 + A-DIR `Output`, `join4`, TMC node
    3 on the shared UART, and the DOC-00 GPIO manifest additions. Compile-verify only; bench-verify A motion
-   per a new `docs/4th-axis-bench-checklist.md` (companion to the homing/spindle checklists).
+   per `docs/4th-axis-bench-checklist.md` (companion to the homing/spindle checklists — now written).
 
 ---
 

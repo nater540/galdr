@@ -1,9 +1,9 @@
-# CNC PCB Milling Machine Firmware — Architecture & Specification Document Set
+# Desktop CNC Milling Machine Firmware — Architecture & Specification Document Set
 ## (ESP32-S3 / Rust / Embassy)
 
 **TL;DR**
 - Complete, implementation-ready specification (DOC-00 through DOC-09) for a grblHAL-compatible
-  3-axis CNC PCB milling firmware on an ESP32-S3, written in `no_std` Rust on esp-hal 1.0.0 with
+  3-axis desktop CNC milling firmware on an ESP32-S3, written in `no_std` Rust on esp-hal 1.0.0 with
   the Embassy async runtime.
 - The ESP32-S3 provides 4 dedicated TX-capable RMT channels — one per axis (X/Y/Z) with a spare —
   resolving the hard blocker on the ESP32-C6. It also adds a hardware single-precision FPU and a
@@ -21,7 +21,8 @@
 ## DOC-00: Project Overview & Hardware Manifest
 
 ### Purpose
-A 3-axis (X/Y/Z) CNC PCB milling machine controller. Host software (e.g. ioSender, UGS, Candle)
+A 3-axis (X/Y/Z) desktop CNC milling machine controller (general-purpose; PCB isolation milling is one
+first-class use case). Host software (e.g. ioSender, UGS, Candle)
 streams grblHAL-compatible GCode over USB CDC serial. The firmware parses GCode, plans coordinated
 multi-axis motion with trapezoidal acceleration and look-ahead, and emits step/direction pulses to
 three TMC2209 stepper drivers, while controlling a WS55-220 brushless spindle driver.
@@ -364,8 +365,8 @@ or equivalent to await all three channel completions before the next burst.
 
 ### Max achievable step rate
 With a 10 µs pulse width and 2 µs minimum LOW, the maximum theoretical rate is
-1 / (10 + 2) µs ≈ 83 kHz per axis. For PCB milling with typical 1/16 microstepping on 2 mm lead
-screws (steps/mm ≈ 800), 83 kHz ≈ 6 250 mm/min — well above PCB milling feed rates. At 1/32 or
+1 / (10 + 2) µs ≈ 83 kHz per axis. For typical desktop milling with 1/16 microstepping on 2 mm lead
+screws (steps/mm ≈ 800), 83 kHz ≈ 6 250 mm/min — well above typical desktop CNC feed rates. At 1/32 or
 higher microstepping headroom remains comfortable.
 
 ---
@@ -482,7 +483,7 @@ is:
 | G1        | Linear feed move                                     |
 | G2 / G3   | CW / CCW arc                                         |
 | G4        | Dwell (P seconds)                                    |
-| G17       | XY plane select (only plane required for PCB milling)|
+| G17       | XY plane select (the only plane currently implemented)|
 | G20 / G21 | Units: inch / mm                                     |
 | G28 / G30 | Go to predefined position                            |
 | G90 / G91 | Absolute / incremental distance mode                 |
@@ -552,7 +553,7 @@ assembly if performance is critical.
 
 ### Block queue data structure
 A ring buffer of planner blocks (`heapless::Vec`-backed, fixed capacity). 16–32 blocks is ample
-for PCB milling look-ahead (grbl uses ~16 on AVR; the S3 can comfortably hold 32). Each block
+for desktop CNC look-ahead (grbl uses ~16 on AVR; the S3 can comfortably hold 32). Each block
 stores: target step counts per axis, total step count for the dominant axis, unit direction vector,
 nominal speed, entry speed (computed), max entry speed, acceleration, and travel in mm.
 
@@ -914,7 +915,7 @@ captures every `StepEvent` for assertion. `embedded-hal-mock` covers GPIO and UA
   to borrow the next channel's block. With all four TX channels in use, keep each channel's burst
   to 48 symbols to avoid allocation failures and a known ESP-IDF two-block bug.
 - **RMT DMA in Rust:** the S3 hardware supports RMT DMA, but esp-hal 1.0.0 does not expose it.
-  The interrupt-driven path is perfectly adequate for PCB milling step rates. Revisit if maximum
+  The interrupt-driven path is perfectly adequate for desktop CNC step rates. Revisit if maximum
   possible step rate becomes a concern.
 - **USB PHY selection:** using `otg_fs` requires burning the `USB_PHY_SEL` eFuse or an external
   PHY. The `usb_serial_jtag` path has no such requirement and is strongly preferred for this

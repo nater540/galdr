@@ -1,7 +1,9 @@
 # Galdr
 
-**Galdr** is a CNC PCB-milling system: custom [grblHAL](https://github.com/grblHAL)-compatible firmware for an
-**ESP32-S3** motion controller, plus **skirnir**, a native desktop GCode sender that streams to it over USB.
+**Galdr** is a compact desktop CNC milling system: custom [grblHAL](https://github.com/grblHAL)-compatible firmware
+for an **ESP32-S3** motion controller, plus **skirnir**, a native desktop GCode sender that streams to it over USB.
+It is general-purpose 2.5D/3-axis milling, with PCB isolation milling and no-touch-plate probing as a first-class
+use case.
 
 The firmware drives three stepper axes through silent [TMC2209](https://www.trinamic.com/) drivers and a WS55-220
 spindle, speaks the grbl v1.1 / grblHAL streaming protocol, and is built around a strict hardware-abstraction boundary
@@ -105,7 +107,7 @@ just monitor      # attach the serial monitor only
 |-----|--------|
 | [`docs/00-architecture.md`](docs/00-architecture.md) | Full firmware spec (DOC-00 – DOC-09): hardware/GPIO manifest, Embassy task split, RMT step generation, TMC2209 driver, GCode parser, motion planner, homing, spindle, USB CDC, testing. **Start here.** |
 | [`docs/gcode-streaming.md`](docs/gcode-streaming.md) | grblHAL streaming protocol: flow control, real-time commands, status reports, handshake, `$`-settings, probing. |
-| [`docs/tlo-offsets.md`](docs/tlo-offsets.md) | Tool-length-offset / Z-probe workflow (G38.x, WPos/MPos/WCO/TLO) for no-touch-plate PCB probing. |
+| [`docs/tlo-offsets.md`](docs/tlo-offsets.md) | Tool-length-offset / Z-probe workflow (G38.x, WPos/MPos/WCO/TLO) for no-touch-plate probing — single-tool re-zero and multi-tool reference-tool offsets (PCB isolation is one worked example). |
 | [`docs/native-app.md`](docs/native-app.md) + [`docs/skirnir-design-brief.md`](docs/skirnir-design-brief.md) | skirnir design and UI brief (the source under `crates/skirnir/src/` is the truth). |
 | [`docs/homing-research-findings.md`](docs/homing-research-findings.md) | The verified grblHAL homing/limit behavioral contract the implementation follows. |
 | [`docs/homing-bench-checklist.md`](docs/homing-bench-checklist.md) | Hardware-in-the-loop bring-up procedure for the homing cycle + limit switches. |

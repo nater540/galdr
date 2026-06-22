@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-**Galdr** is a CNC PCB milling system. The workspace has four crates:
+**Galdr** is a compact desktop CNC milling system (general-purpose 2.5D/3-axis milling; PCB isolation milling is a
+first-class use case, not the only one). The workspace has four crates:
 
 - `crates/firmware-core` — pure, `no_std`, **host-tested** logic: the GCode parser, motion planner, segment
   generator, grblHAL protocol/state machine, the homing state machine (DOC-06), coordinate systems, settings model,
@@ -45,13 +46,14 @@ before extending a subsystem.
 |-----|--------|
 | `docs/00-architecture.md` | Full firmware spec, DOC-00–DOC-09: hardware/GPIO manifest, Embassy task split, RMT step generation, TMC2209 driver, GCode parser, motion planner, homing, spindle, USB CDC, testing. **Start here for firmware work.** |
 | `docs/gcode-streaming.md` | grblHAL streaming protocol: character-counting flow control, real-time commands, status reports, handshake, `$`-settings, probing. Shared contract between firmware and `skirnir`. |
-| `docs/tlo-offsets.md` | Tool-length-offset / Z-probe workflow (G38.x, WPos/MPos/WCO/TLO) for no-touch-plate PCB probing. |
+| `docs/tlo-offsets.md` | Tool-length-offset / Z-probe workflow (G38.x, WPos/MPos/WCO/TLO) for no-touch-plate probing — single-tool re-zero and multi-tool reference-tool offsets (PCB isolation is one worked example). |
 | `docs/native-app.md` + `docs/skirnir-design-brief.md` | `skirnir` design. egui (eframe) is the UI; the serial/streaming engine is a framework-agnostic module on `tokio-serial`. **Now built** — read these for intent, but `crates/skirnir/src/` is the source of truth. |
 | `docs/homing-research-findings.md` | DOC-06 background: the verified grblHAL homing/limit behavioral contract that the implementation follows (cited research synthesis). Read before changing homing/limit semantics. |
 | `docs/homing-bench-checklist.md` | Hardware-in-the-loop bring-up procedure for the homing cycle + limit switches. The DOC-06 hardware path is unverified until this is run on the board. |
 | `docs/4th-axis-rotary-design.md` | **DOC-10** full design + TDD spec for the rotary A axis (coordinated rotary about X): `$376`, G93/G94 inverse-time feed, the degrees-as-mm convention, the G93+G38 and rotary-probe-word rejections, and the grblHAL-grounded review corrections. Read before changing 4th-axis kinematics or probe semantics. |
-| A-axis bench bring-up (not yet a standalone doc) | Hardware-in-the-loop bring-up for the A axis (RMT ch3, TMC node 3, PROVISIONAL GPIOs 18/38/39). The DOC-10 hardware path is compile-only until this is run on the board. *No `4th-axis-bench-checklist.md` exists yet* — the bring-up details currently live in `docs/4th-axis-rotary-design.md` (Phase 5); unlike the homing path, which has `docs/homing-bench-checklist.md`. |
+| `docs/4th-axis-bench-checklist.md` | **DOC-10** hardware-in-the-loop bring-up for the A axis (RMT ch3, TMC node 3, PROVISIONAL GPIOs 18/38/39). The DOC-10 hardware path is compile-only until this is run on the board — companion to the homing/spindle checklists. Covers the 4-field protocol, `$103` calibration, coordinated 4-axis motion, G93/G94 feed timing, and the R5 homing-skip / limit-exclusion guards. |
 | `docs/skirnir-probing-design.md` | **DOC-11** host-side probing design + TDD scope for `skirnir`: typed `[PRB:]` parsing, the probe-result latch, the rotary-safe probe primitive, and the center-finder / 180°-flip / runout wizards. Read before adding probe UI or touching the `[PRB:]` path. **Implemented & host-tested** (Phases 0–2 + the §1.3 profile-persistence store in `crates/skirnir/src/profile.rs`); bench-gated for physical accuracy. |
+| `docs/breadboard-bringup.md` | First-hardware bring-up on a breadboard with **BTT/Watterott TMC2209 stepsticks** (0.11 Ω sense, not the Adafruit 6121's 0.05 Ω): the `BREADBOARD_STEPSTICKS` sense-resistor swap, UART/VIO/MS-address wiring, breadboard power cautions, and the no-opto bare-switch limit shortcut. Read before bringing up drivers/limits off the milled PCB. |
 
 ## Build & test
 

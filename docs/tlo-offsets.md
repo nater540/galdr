@@ -1,7 +1,8 @@
 # grblHAL & ioSender Tool Length Offsets for NO Touch-Plate Probing — Reference for an ESP32-S3 Rust/Embassy Firmware
 
 ## TL;DR
-- For a simple Normally-Open (NO) touch plate on a **single-tool PCB mill, you do not need dynamic TLO at all**: the standard, ioSender-native workflow is a two-stage `G38.2`/`G38.3` probe followed by **`G92`** or **`G10 L2 P1`** to set Z work-zero at the copper surface using `probe_Z + plate_thickness`. `G43.1` is only used for multi-tool "reference tool" workflows via grblHAL's controller-side `$TLR`/`$TPW` system commands.
+- **What TLO is for:** tool-length offset (`G43.1` / `$TLR`/`$TPW`) compensates for *differences in tool length* so Z work-zero is preserved across tool changes. Its real use is **multi-tool jobs** (toolsetter / reference-tool flows). It is a general CNC feature, not PCB-specific — and it is unrelated to PCB height-map autoleveling, which compensates for *workpiece* flatness, not tool length.
+- For any **single-tool job** (PCB isolation milling is the common example) with a simple Normally-Open (NO) touch plate, **you do not need dynamic TLO at all**: the standard, ioSender-native workflow is a two-stage `G38.2`/`G38.3` probe followed by **`G92`** or **`G10 L2 P1`** to set Z work-zero at the surface using `probe_Z + plate_thickness`. `G43.1` is only used for multi-tool "reference tool" workflows via grblHAL's controller-side `$TLR`/`$TPW` system commands.
 - grblHAL stores TLO as a **session-only (RAM, not NVS)** dynamic value applied to one configured linear axis (Z by default); it folds into the Work Coordinate Offset so that `WPos = MPos − WCO`, where `WCO = (G54..G59) + G92 + G43.1 TLO`. It is reported as `[TLO:z]` in the `$#` parameter report and reflected live in the `|WCO:|` status element.
 - Your firmware must: treat the probe as a **dedicated input separate from limits**, honor `$6` invert (set **`$6=1`** for a NO plate), implement `G38.2` (alarm on no-contact), store `[PRB:x,y,z:success]`, implement `G43.1`/`G49` to set/clear the RAM TLO, recompute WCO, and emit `[TLO:]`/`[PRB:]`/`|WCO:|`/`|TLR:|` — clearing TLO on `G49`, on homing of the Z axis, on soft reset (if in motion), and on power cycle.
 
@@ -25,7 +26,7 @@ The Grbl interface doc states it explicitly: "WCO: is simply the sum of the work
 ### 3. G43 vs G43.1 vs G49 in grblHAL
 From grblHAL's `gcode.c`: "G43.1 and G49 are always supported, G43 and G43.2 if `grbl.tool_table.n_tools > 0`."
 - **`G43.1 Z<value>`** — *dynamic* TLO: applies the value in the block directly to the configured axis. This is the command used for touch-plate / toolsetter probing because the offset is computed at runtime from the probe result. It must be alone on its line (no other-axis motion words) or it errors ("[G43.1 Errors]: Motion command in same line").
-- **`G43 H<n>`** — table TLO: looks up tool n in the tool table; only available in builds compiled with a tool table (`n_tools > 0`). Not used for touch-plate probing on a typical hobby PCB mill.
+- **`G43 H<n>`** — table TLO: looks up tool n in the tool table; only available in builds compiled with a tool table (`n_tools > 0`). Not used for touch-plate probing on a typical single-tool hobby mill.
 - **`G43.2`** — additive tool offset (tool table only).
 - **`G49`** — cancels TLO (sets `tool_offset_mode = ToolLengthOffset_Cancel`, offset → 0).
 
@@ -72,18 +73,18 @@ In grblHAL the probe is its own input, never shared with limit switches. Recent 
 - `ALARM:4` ("Probe fail. Probe is not in the expected initial state…") fires if the probe already reads triggered before the move starts — usually wrong `$6` polarity or an already-shorted plate.
 - **`G38.4`/`G38.5`** = probe **away** (stop on loss of contact). Used in edge-of-contact / re-touch strategies, **not** needed for a simple NO Z-probe — use a plain `G0`/`G1` retract instead.
 
-### 9. PCB-milling-specific workflow (single tool)
-For isolation routing the simplest, most robust flow:
+### 9. Worked example: single-tool re-zero (PCB isolation)
+This is one concrete single-tool flow; the same re-zero pattern applies to any single-tool job. For PCB isolation routing the simplest, most robust flow:
 1. Load board, jog to XY origin, set X/Y zero (`G10 L2 P1 X0 Y0` or `G92`).
 2. Place the NO touch plate on the copper; clip the croc lead to the tool/spindle.
 3. Probe Z down with `G38.2`; on contact read `[PRB:…:1]`.
 4. Set Z work-zero so the copper top = Z0: the work-Z value at the probed point = `plate_thickness` (ioSender computes `WorkpieceHeight + TouchPlateHeight`, where WorkpieceHeight = 0 when zeroing on the top surface).
-5. Remove the plate, run the job. Because PCB copper is uneven, most users then add **height-map / autolevel** probing (ioSender's Height Map tab) using the **tool itself** as the probe against the copper — connect probe-ground to the tool and the other input to the copper surface.
+5. Remove the plate, run the job. *(PCB-specific aside, separate from TLO:* because PCB copper is uneven, most PCB users then add **height-map / autolevel** probing — ioSender's Height Map tab — using the **tool itself** as the probe against the copper; connect probe-ground to the tool and the other input to the copper surface. This compensates for *workpiece* flatness, not tool length, so it is not a TLO feature.*)*
 
-This single-tool re-zero approach means **TLO/G43.1 is unnecessary** — you re-establish Z0 at the surface each time. A crocodile-clip touch plate is a thin conductive plate whose **exact thickness must be measured with calipers** and entered as the plate height (do not assume a value; commodity Z-probe pucks and fixture blocks vary widely). Because the probe can share the tool/spindle circuit (croc clip on the bit, other lead on copper), **no separate probe input is needed beyond the one probe pin** — the bit *is* the probe, the same wiring used for autoleveling.
+This single-tool re-zero approach means **TLO/G43.1 is unnecessary** for any single-tool job (PCB or otherwise) — you re-establish Z0 at the surface each time. A crocodile-clip touch plate is a thin conductive plate whose **exact thickness must be measured with calipers** and entered as the plate height (do not assume a value; commodity Z-probe pucks and fixture blocks vary widely). Because the probe can share the tool/spindle circuit (croc clip on the bit, other lead on copper), **no separate probe input is needed beyond the one probe pin** — the bit *is* the probe, the same wiring used for autoleveling.
 
-### 10. Probe debounce / protection (critical for PCB mills)
-A real hazard: grblHAL Issue #353 ("Z Stop in PROBE for PCB Milling", MKS SBASE/LPC1768) documents the tool over-travelling after contact — verbatim: "when the tool touches the PCB, it does not stop at that moment, but continues to advance for another **110 ms**, penetrating the tip of the engraving bit into the copper of the PCB, damaging it." (The user's probe logic there: "3.3V → No touch, 0V → Touch.")
+### 10. Probe debounce / protection (critical when probing into delicate stock)
+A real hazard, acute on thin PCB copper but applicable to any probe: grblHAL Issue #353 ("Z Stop in PROBE for PCB Milling", MKS SBASE/LPC1768) documents the tool over-travelling after contact — verbatim: "when the tool touches the PCB, it does not stop at that moment, but continues to advance for another **110 ms**, penetrating the tip of the engraving bit into the copper of the PCB, damaging it." (The user's probe logic there: "3.3V → No touch, 0V → Touch.")
 
 grblHAL handles probe debouncing in firmware; recent builds added "a new debounce option for input pins that are interrupt capable" in the ioPorts interface, plus an optional **probe-protection plugin** (Expatria `grblhal_probe_plugin`) that halts if the probe is asserted outside a probing move and can block the spindle when a probe is connected. Your Rust/Embassy firmware should:
 - Sample the probe in the **step ISR** so motion stops on the first confirmed trigger;
@@ -125,13 +126,13 @@ From the ioSender source (`CNC Controls Probing` folder) and maintainer statemen
 - **`system.c`** — `$#` (`output_ngc_parameters`, "output offsets, tool table, probing and home position"); clears TLO on homing of the linear axis; raises `grbl.on_report_ngc_parameters`.
 - **`settings.h`/`defaults.h`** — `$6` probe invert, `$19` probe pull-up disable, `$341`+ tool-change settings, `$10`/`$11` report mask, `TOOL_LENGTH_OFFSET_AXIS`.
 
-### Decision: which strategy for a PCB mill?
-1. **Absolute / re-zero (recommended for single-tool PCB work):** probe, then `G10 L2 P1 Z<plate_thickness>` (or `G92 Z<plate_thickness>`) so copper top = Z0. No `G43.1`, no persistence concerns. This is exactly what ioSender's Edge-finder Z probe does.
+### Decision: which strategy?
+1. **Absolute / re-zero (recommended for single-tool work):** probe, then `G10 L2 P1 Z<plate_thickness>` (or `G92 Z<plate_thickness>`) so copper top = Z0. No `G43.1`, no persistence concerns. This is exactly what ioSender's Edge-finder Z probe does.
 2. **Relative / reference-tool (only if you change tools mid-job without re-probing the surface):** establish `$TLR` on tool 1, then `$TPW` per subsequent tool so the controller applies a dynamic `G43.1`-equivalent offset and Z0 is preserved. Adds complexity (G59.3 fixture, `$341` mode) you almost never need for isolation routing + drilling on a hobby mill — you can simply re-probe the copper after a manual tool change instead.
 
 ## Recommendations
 
-**Stage 1 — Minimum viable, single-tool PCB probing (do this first):**
+**Stage 1 — Minimum viable, single-tool touch-plate probing (do this first):**
 1. Implement the probe as a dedicated, debounced input; expose `$6` (invert; document `$6=1` for NO plates) and `$19` (pull-up disable, default 0).
 2. Implement `G38.2` (ALARM:5 on no-contact, ALARM:4 on already-triggered) and `G38.3` (no error). Store `[PRB:x,y,z:flag]` and emit the `[PRB:]` push message on success (gated by the `$10` probe flag).
 3. Implement `G10 L2 P<n>` and `G92` so the sender can set Z0 = `plate_thickness` after probing. Verify `[PRB:…:1]` and the `WPos = MPos − WCO` math.
@@ -144,11 +145,11 @@ From the ioSender source (`CNC Controls Probing` folder) and maintainer statemen
 **Stage 3 — Robustness:**
 7. Add probe-protection (halt if the probe is asserted outside a probing move) and the `Run:2` substate so ioSender shows probing state.
 
-**Benchmarks that change the plan:** If you only ever run single-tool isolation + drill jobs, **stop at Stage 1** — you never need G43.1. If you adopt a fixed toolsetter or ATC, implement Stage 2 fully (the `$TLR`/`$TPW` reference-tool path). If over-travel into copper exceeds ~0.05 mm, lower the probe feed and tighten ISR debounce before changing anything else.
+**Benchmarks that change the plan:** If you only ever run single-tool jobs (e.g. isolation + drill), **stop at Stage 1** — you never need G43.1. If you adopt a fixed toolsetter or ATC, implement Stage 2 fully (the `$TLR`/`$TPW` reference-tool path). If over-travel into copper exceeds ~0.05 mm, lower the probe feed and tighten ISR debounce before changing anything else.
 
 ## Complete Annotated Reference Macro (NO touch plate, Z work-zero)
 
-This is the **absolute / re-zero** macro — the one you actually want for a single-tool PCB job. It is what an ioSender-compatible firmware must support. Plate thickness is the measured value `<PLATE_T>` (e.g. `1.000`).
+This is the **absolute / re-zero** macro — the one you actually want for a single-tool job. It is what an ioSender-compatible firmware must support. Plate thickness is the measured value `<PLATE_T>` (e.g. `1.000`).
 
 ```gcode
 ; --- PRE-CONDITIONS ---

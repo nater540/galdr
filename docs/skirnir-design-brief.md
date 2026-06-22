@@ -10,10 +10,11 @@
 
 ## 1. What skirnir is
 
-`skirnir` is the native desktop **GCode sender** for the Galdr CNC PCB-milling system. It connects to an ESP32-S3
+`skirnir` is the native desktop **GCode sender** for the Galdr desktop CNC milling system. It connects to an ESP32-S3
 running grblHAL-compatible firmware over USB CDC serial, streams GCode programs, and gives the operator live control
-and feedback while a job runs. Linux-first, single-window desktop app. The user is a maker at a workbench milling PCBs
-— they need a dense, glanceable, *confidence-inspiring* control surface, not a consumer app.
+and feedback while a job runs. Linux-first, single-window desktop app. The user is a maker at a workbench running a
+desktop CNC mill (often, but not only, milling PCBs) — they need a dense, glanceable, *confidence-inspiring* control
+surface, not a consumer app.
 
 Primary jobs the UI must support: connect to the board, jog the machine, set work zero (incl. Z-probe touch-off), load
 and stream a GCode program with live progress, watch a digital readout (DRO) of position, see machine state, adjust

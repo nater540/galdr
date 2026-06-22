@@ -209,7 +209,7 @@ J3:  Connector_PinSocket_2.54mm:PinSocket_1x22_P2.54mm_Vertical
   transients from the motor rail / spindle PSU.
 - **Fuse:** a **PTC resettable (2–3 A hold)** or a 3 A blade/glass fuse on the 12 V input. Size above
   peak motor draw (4 × TMC2209 at ~1–1.5 A motor each is mostly handled by per-driver bulk caps; steady
-  12 V draw is well under 2 A for PCB-mill-class NEMA17, but include margin for the spindle if it shares
+  12 V draw is well under 2 A for desktop-CNC-class NEMA17, but include margin for the spindle if it shares
   this jack — if the WS55 spindle has its own PSU, 2 A is ample).
 - **Bulk capacitance:** **470–1000 µF / 25 V** electrolytic on +12V_PROT close to the TMC2209 cluster,
   plus **100 nF** ceramic per driver VM pin and a **100 nF** at the jack. TMC2209 chopping injects ripple

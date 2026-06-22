@@ -1,6 +1,6 @@
 # Opto-isolated limit-switch & probe input stage (Galdr carrier board)
 
-ESP32-S3 + TMC2209 PCB-mill carrier. This document specifies the opto-isolated, fail-safe
+ESP32-S3 + TMC2209 desktop CNC carrier. This document specifies the opto-isolated, fail-safe
 limit-switch input stage and the field connectors, with exact R/C/D values, the proven
 polarity truth table, KiCad symbols/footprints, a netlist for one channel, and a BOM.
 
@@ -278,8 +278,8 @@ tight, same pin order; XH is the recommendation for a vibrating mill.)
 Build **one more identical channel** (PC817 + R1 680 Ω + D1 1N4148 + R2 10 kΩ + R3 1 kΩ +
 C1 100 nF) on its own 3-pin JST-XH, going to GPIO21. The G38.x probe is logically the same
 NC-fail-safe signal, so the same polarity/truth table applies and the same `$5`-free LOW-when-
-intact behavior holds. For a simple PCB-mill "probe" (bit-touches-copper continuity), wire the
-probe contacts as the dry-switch case (pins 2–3); for a real prox/touch probe, use the 3-wire
+intact behavior holds. For a simple continuity "probe" (e.g. a touch plate or bit-touches-copper on
+PCB work), wire the probe contacts as the dry-switch case (pins 2–3); for a real prox/touch probe, use the 3-wire
 case. Treating it identically keeps one BOM line and one mental model.
 
 ---

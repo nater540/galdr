@@ -3,7 +3,7 @@
 ## TL;DR
 - grblHAL is a 32-bit port/rewrite of grbl 1.1f — its own README states it "is a port/rewrite of grbl 1.1f and should be compatible with GCode senders compliant with the specifications for that version." So the streaming protocol is fundamentally grbl 1.1: line-oriented G-code with a single line terminator, acknowledged by `ok`/`error:N`, with flow control done by the *host* tracking in-flight bytes against the controller's serial RX buffer (character counting) or by simple send-response. Your firmware must reproduce grbl 1.1's exact text responses plus grblHAL's bracketed extensions.
 - The biggest grblHAL-specific deltas to implement: a much larger RX buffer (typically 1024 bytes vs. grbl's 128, reported in `[OPT:...]` so hosts read it at runtime), CRLF/LFCR treated as a single line terminator, top-bit-set real-time command equivalents (0x80=`?`, 0x81=`~`, 0x82=`!`, 0x83=`$G`, 0x87=full report, 0x8C=auto-report toggle), the extended `$I`/`$I+` build-info report, runtime enumeration of settings/errors/alarms (`$ES`/`$EE`/`$EA`), persistent error state after an error during a job, and an optional auto-report interval (`$481`).
-- For a PCB-milling Z-probe workflow, implement `G38.2/.3/.4/.5` with the `[PRB:x,y,z:success]` push message; `.2`/`.4` raise `ALARM:4/5` on failure (halting), `.3`/`.5` never alarm. The startup/connect handshake must tolerate that an ESP32-S3 on native USB cannot be hard-reset by the host, so you must emit the welcome banner on boot and answer `0x87`/`$I+` so senders like ioSender can detect readiness.
+- For the Z-probe / touch-off workflow (e.g. PCB surface probing), implement `G38.2/.3/.4/.5` with the `[PRB:x,y,z:success]` push message; `.2`/`.4` raise `ALARM:4/5` on failure (halting), `.3`/`.5` never alarm. The startup/connect handshake must tolerate that an ESP32-S3 on native USB cannot be hard-reset by the host, so you must emit the welcome banner on boot and answer `0x87`/`$I+` so senders like ioSender can detect readiness.
 
 ## Key Findings
 
@@ -194,7 +194,7 @@ Streaming-model differences vs legacy grbl, consolidated: larger RX buffer repor
 7. Implement runtime enumerations `$ES`/`$EE`/`$EA`/`$EG`/`$SED` and advertise `ENUMS,RT+,SED` in `NEWOPT` — this is what makes modern ioSender/gSender build their UI without hardcoding.
 *Benchmark to advance:* character-counting (Aggressive Buffering) streaming of a dense file runs without buffer overflow or planner starvation; a mid-job `error` halts cleanly.
 
-**Stage 3 — PCB-milling probing and polish:**
+**Stage 3 — probing and polish:**
 8. Implement `G38.2/.3/.4/.5` with `[PRB:x,y,z:success]` push and correct ALARM:4/5 behavior; verify height-map probing in ioSender/bCNC reads back PRB Z values.
 9. Implement `$481` auto-report + `0x8C` toggle for low-latency DRO; implement the jog protocol (`$J=`) so jogging never disturbs modal state.
 10. Verify with the **grblHAL simulator** and against ioSender, UGS, and bCNC before hardware.
