@@ -27,9 +27,10 @@
    per-axis approach; `$23=0` homes toward positive (top-right, spindle-up).
 
 3. **Per-axis phases + defaults (3-0).** Fast **seek** at `$25` (default **500 mm/min**) until switch trips →
-   **pull-off** reverse → slow **locate** re-approach at `$24` (default **25 mm/min**) for precise zero →
-   **final `$27` pull-off** (default **1.0 mm**) clear of the switch. `$26` debounce default **250 ms**
-   (5–25 ms typically fine). Locate repeats `N_HOMING_LOCATE_CYCLE` times; total pass count is **odd** so the
+   **pull-off** reverse → slow **locate** re-approach at `$24` (grbl default **25 mm/min**; Galdr's
+   `DEFAULT_HOMING_FEED_MM_MIN` is **100**) for precise zero → **final `$27` pull-off** (default **1.0 mm**) clear
+   of the switch. `$26` debounce (grbl default **250 ms**; Galdr's `DEFAULT_HOMING_DEBOUNCE_MS` is **25 ms**, in the
+   5–25 ms band that is typically fine). Locate repeats `N_HOMING_LOCATE_CYCLE` times; total pass count is **odd** so the
    cycle always ends on a pull-off (off the switch).
 
 4. **`$27` pull-off vs hard-limit re-trigger (3-0).** `$27` exists specifically to move **off all limit

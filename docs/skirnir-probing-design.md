@@ -117,11 +117,29 @@ clamped concentric. **Math (research-confirmed):**
 ### 1.3 Data model — where the rotary center lives
 firmware has **no pivot/kinematics concept**, so `(Y_c, Z_c)` (and the dowel D, A-datum) live as **skirnir
 project/profile state**, projected into firmware only as `G10` WCS offsets and the A-relative geometry baked into
-sent g-code. Persist it with skirnir's existing project/profile store. (See the probing-architecture memory.)
+sent g-code. (See the probing-architecture memory.)
+
+**[implemented — `crates/skirnir/src/profile.rs`]** skirnir had no persistence layer, so a found center evaporated
+on exit and forced a full re-probe every launch. The store is now a **versioned RON file under the OS config dir**
+(`~/.config/skirnir/profile.ron` on Linux, via `directories::ProjectDirs`) — framework-agnostic (no egui/eframe
+`Storage`), so the headless `--cli` path shares the same project state as the GUI and the whole thing unit-tests as
+a pure round-trip. It persists `RotarySetup { y_center, z_center, dowel_diameter, a_datum_deg, z_datum }` plus a
+tight `Prefs` block (last port/baud and the rotary input defaults); transient runtime state is never written. I/O is
+non-fatal by contract: a missing file is the silent first-run default, a corrupt/too-new file falls back to defaults
+**with a notice** (the leading `version` field refuses a newer layout rather than misreading it), and a save returns
+a typed error the shell surfaces instead of panicking. Writes go to a sibling temp + atomic rename so an interrupted
+write can't leave a torn profile. The shell loads on startup (seeding the connect dropdown + rotary inputs) and
+saves at the write-WCS, connect, and `on_exit` points; an `Intent::ApplySavedRotaryCenter` re-emits the persisted
+`G10 L2` (Y/Z only, never A) so a restart restores the center without re-probing — the §1.3 payoff.
 
 ---
 
 ## Phase 2 — Verify / measure
+
+> **Implementation note — probe axis.** Both Phase-2 wizards take an `axis`/`dir` in their intents
+> (`FlipVerifyStart`, `RunoutStart`) and the shared `angle_sweep` engine honors it, but the UI currently hardcodes
+> **−Y** (`views.rs`: `axis: Axis::Y, dir: Dir::Neg`, and the panel label reads "probing −Y"). An X/Y/Z axis picker
+> that threads the selection through is a small host-testable follow-up; the math below is axis-agnostic.
 
 ### 2.1 180°-flip center-verify
 Cancels eccentricity to validate/refine the center: probe a feature at θ (reading `r1`), `G0 A<θ+180>`, probe the
@@ -155,7 +173,7 @@ small table + TIR/eccentricity. TDD: scripted N readings → assert TIR and ecce
 | `app/intent.rs` | New intents: `ProbeRotaryCenter{…}`, `ProbeFlipVerify{…}`, `ProbeRunout{n,…}` (+ the rotary-safe primitive params); harden `ProbeZ`. |
 | `app/shell.rs` | Wizard sequencing (compose the 1.1 primitive; latch results; compute; offer `G10`). |
 | `app/views.rs` | Probe-result panel (XYZ/A + success + retry/cancel); the three wizard panels. |
-| project/profile store | Persist `(Y_c, Z_c)`, dowel D, A-datum. |
+| `profile.rs` (new) | Versioned RON profile store: persist `RotarySetup` `(Y_c, Z_c, D, A-datum, Z-datum)` + `Prefs` (port/baud, rotary input defaults); load on startup, save at write-WCS/connect/exit. |
 
 ## Firmware contract dependencies (all already satisfied)
 - 4-field `[PRB:x,y,z,a:flag]` ✓ (DOC-11 consumes it; DOC-10 firmware side shipped).

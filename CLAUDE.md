@@ -22,11 +22,15 @@ jogging, feed/rapid/spindle overrides, the **`$H` homing cycle**, **hard/soft li
 status reporting** (all DOC-06) exist and are unit-tested off-target. The DOC-06 homing/limit *logic* is host-tested,
 but its hardware boundary — the rising-edge limit IRQ + `$26` debounce, the NC broken-wire fail-safe, and the real
 seek/locate timing — is compile-checked only and **not yet verified on the board** (see
-`docs/homing-bench-checklist.md`). Genuinely stubbed at the hardware boundary (logic exists, no peripheral output):
-**spindle PWM** (DOC-07 — the LEDC drive on GPIO13 is a `TODO` in `main`) and the coolant GPIO. `crates/skirnir` is
+`docs/homing-bench-checklist.md`). **Spindle control (DOC-07)** is likewise implemented and host-tested — the
+`SpindleController` (RPM→duty, M3/M4/M5 sequencing, the M3↔M4 reversal interlock + e-stop) plus the real LEDC drive
+on **GPIO13** (`firmware/src/spindle.rs`), wired in `main` (`spindle::init` + the spawned `spindle` task) — with only
+its hardware boundary (the conditioned 0–10 V curve + real reversal timing) bench-gated, like DOC-06's. The one
+subsystem genuinely stubbed at the hardware boundary (logic exists, no peripheral output) is the **coolant GPIO**
+(no GPIO budgeted, no driver stage yet). `crates/skirnir` is
 now a real app, not a scaffold: an egui/eframe GUI plus a framework-agnostic `tokio-serial` streaming engine
-(character-counting flow control, `<...>`/`Pn:` status parsing, reconnection, endstop indicators), with ~229 host
-tests run over a loopback transport. `docs/` remains the authoritative **design** spec — read the relevant doc
+(character-counting flow control, `<...>`/`Pn:` status parsing, reconnection, endstop indicators, and the DOC-11
+probing/rotary-setup wizards), with ~370 host tests run over a loopback transport. `docs/` remains the authoritative **design** spec — read the relevant doc
 before extending a subsystem.
 
 > Naming note: the docs use generic placeholder names (`pcb-mill-fw`, `cnc-core`, `gcode`, `planner`, `motion`,
@@ -46,8 +50,8 @@ before extending a subsystem.
 | `docs/homing-research-findings.md` | DOC-06 background: the verified grblHAL homing/limit behavioral contract that the implementation follows (cited research synthesis). Read before changing homing/limit semantics. |
 | `docs/homing-bench-checklist.md` | Hardware-in-the-loop bring-up procedure for the homing cycle + limit switches. The DOC-06 hardware path is unverified until this is run on the board. |
 | `docs/4th-axis-rotary-design.md` | **DOC-10** full design + TDD spec for the rotary A axis (coordinated rotary about X): `$376`, G93/G94 inverse-time feed, the degrees-as-mm convention, the G93+G38 and rotary-probe-word rejections, and the grblHAL-grounded review corrections. Read before changing 4th-axis kinematics or probe semantics. |
-| `docs/4th-axis-bench-checklist.md` | Hardware-in-the-loop bring-up for the A axis (RMT ch3, TMC node 3, PROVISIONAL GPIOs 18/38/39). The DOC-10 hardware path is compile-only until this is run on the board. |
-| `docs/skirnir-probing-design.md` | **DOC-11** host-side probing design + TDD scope for `skirnir`: typed `[PRB:]` parsing, the probe-result latch, the rotary-safe probe primitive, and the center-finder / 180°-flip / runout wizards. Read before adding probe UI or touching the `[PRB:]` path. Not yet implemented. |
+| A-axis bench bring-up (not yet a standalone doc) | Hardware-in-the-loop bring-up for the A axis (RMT ch3, TMC node 3, PROVISIONAL GPIOs 18/38/39). The DOC-10 hardware path is compile-only until this is run on the board. *No `4th-axis-bench-checklist.md` exists yet* — the bring-up details currently live in `docs/4th-axis-rotary-design.md` (Phase 5); unlike the homing path, which has `docs/homing-bench-checklist.md`. |
+| `docs/skirnir-probing-design.md` | **DOC-11** host-side probing design + TDD scope for `skirnir`: typed `[PRB:]` parsing, the probe-result latch, the rotary-safe probe primitive, and the center-finder / 180°-flip / runout wizards. Read before adding probe UI or touching the `[PRB:]` path. **Implemented & host-tested** (Phases 0–2 + the §1.3 profile-persistence store in `crates/skirnir/src/profile.rs`); bench-gated for physical accuracy. |
 
 ## Build & test
 
@@ -151,7 +155,8 @@ stock Rust — keep it that way (see "Hardware abstraction" below).
 
 - All hardware access goes behind traits so planner/parser/driver/homing logic is host-testable with recording/mock
   impls; only the firmware wiring layer touches esp-hal. `StepSink`, `TmcBus`, `ProbeInput`, and `DigitalIn` (limit
-  inputs) are implemented; `PwmSink`/`DigitalOut` await the spindle/coolant wiring (DOC-07).
+  inputs) are implemented, as are `PwmSink`/`DigitalOut` for the spindle (`LedcPwmSink` + the polarity-parameterized
+  `GpioOut` for SPIN_EN/SPIN_DIR, DOC-07); only the coolant output is still unwired.
 - **No `unwrap()`/`expect()` in library code** — propagate via `Result`. `expect` is allowed only in `main`/init paths
   where failure is genuinely unrecoverable.
 - **Two-space indentation** (enforced by `.editorconfig`), LF line endings, final newline.
