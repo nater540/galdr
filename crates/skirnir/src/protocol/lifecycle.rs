@@ -39,8 +39,44 @@ impl ConnectionState {
     matches!(self, ConnectionState::Streaming)
   }
 
-  /// Whether the engine currently has a live transport, regardless of streaming progress.
+  /// Whether the link is up and ready (banner/first report confirmed): everything except [`Self::Disconnected`]
+  /// and the not-yet-ready [`Self::Connecting`]. Drives UI that should only act on a *ready* board (e.g. enabling
+  /// jog/stream controls). It is deliberately NOT the test for "is a port open" — see [`Self::has_transport`].
   pub fn is_connected(self) -> bool {
     !matches!(self, ConnectionState::Disconnected | ConnectionState::Connecting)
+  }
+
+  /// Whether a transport is attached — the engine owns an open serial port — regardless of whether readiness has
+  /// been confirmed yet. True for [`Self::Connecting`] AND every connected state; false only for
+  /// [`Self::Disconnected`]. The UI gates its Disconnect affordance on THIS, not [`Self::is_connected`]: a connect
+  /// that stalls in `Connecting` (the ESP32-S3 can fail to volunteer readiness) still holds the OS port open, so
+  /// the operator must always be able to tear it down and release the file descriptor for another tool (espflash).
+  pub fn has_transport(self) -> bool {
+    !matches!(self, ConnectionState::Disconnected)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ConnectionState::*;
+
+  #[test]
+  fn is_connected_is_true_only_once_a_board_is_ready() {
+    // Only the post-handshake states count as connected; `Connecting` is attached-but-not-yet-ready.
+    assert!(!Disconnected.is_connected());
+    assert!(!Connecting.is_connected());
+    for state in [Idle, Streaming, Hold, Alarm, Error] {
+      assert!(state.is_connected(), "{state:?} should read as connected");
+    }
+  }
+
+  #[test]
+  fn has_transport_covers_connecting_so_a_stalled_connect_can_be_torn_down() {
+    // `Disconnected` is the only state with no open port; everything else — crucially `Connecting`, where a stalled
+    // handshake still holds the FD — must report an attached transport so the Disconnect affordance stays available.
+    assert!(!Disconnected.has_transport());
+    for state in [Connecting, Idle, Streaming, Hold, Alarm, Error] {
+      assert!(state.has_transport(), "{state:?} holds an open port and must offer Disconnect");
+    }
   }
 }

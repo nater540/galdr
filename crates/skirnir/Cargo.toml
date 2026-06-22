@@ -44,6 +44,9 @@ anyhow    = "1"
 serde       = { version = "1", features = ["derive"] }
 ron         = "0.12"
 directories = "6"
+# The curated per-setting tooltip descriptions are a runtime-loaded JSON object under the same config dir; the
+# bundled `assets/setting_descriptions.json` is embedded as the first-run seed + fallback. `serde_json` parses it.
+serde_json  = "1"
 # The egui application framework, gated behind `gui`. We use the lightweight glow (OpenGL) backend rather than
 # wgpu — a 2D toolpath `Painter` needs nothing heavier — and drop accesskit / web-screen-reader. `x11` and
 # `wayland` cover both Linux display stacks. egui itself is consumed via `eframe::egui` (no direct dep).

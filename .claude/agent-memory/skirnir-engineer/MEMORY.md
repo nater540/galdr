@@ -6,3 +6,6 @@
 - [Settings/overrides/reconnect](settings-and-overrides.md) — override sliders + fine ±1% stepping, live $-settings text-path model ($$/$ES/write), auto-reconnect backoff policy
 - [Probing pipeline](probing-pipeline.md) — DOC-11 Phase 0: typed [PRB:] parse, event-driven probe latch (view_state), hardened result-gated probe_z (probe_flow), dropped-Eq gotcha
 - [Profile persistence](profile-persistence.md) — DOC-11 §1.3 profile/project store: versioned RON under OS config dir (profile.rs), shell save points, ApplySavedRotaryCenter, test seam, deps
+- [Connecting-state disconnect gap](connecting-state-disconnect-gap.md) — Disconnect UI must gate on has_transport (incl Connecting), not is_connected, else a stalled connect leaks the serial FD
+- [Settings Save model](settings-save-model.md) — explicit Save: settings_staging store, stage-on-any-edit, Save/$$+clear, Refresh/Close discard confirm; supersedes Enter-only commit_setting_edit
+- [Settings tooltips](settings-tooltips.md) — runtime-loaded JSON descriptions (profile.rs pattern) + dynamic $ES meta helpers in views.rs; egui 0.34 ui.close_menu→ui.close()

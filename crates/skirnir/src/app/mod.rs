@@ -25,14 +25,18 @@ pub mod progress;
 pub mod rotary_center;
 pub mod rotary_probe;
 pub mod runout;
+pub mod setting_help;
 pub mod settings_model;
+pub mod settings_staging;
 pub mod view_state;
 
 pub use badge::{BadgeState, TransportGroup};
 pub use intent::{Axis, Dir, Intent, IntentSink, work_offset_line, work_zero_line};
 pub use overrides::{OverrideAxis, clamp_override, override_commands};
 pub use progress::{TimeEstimate, estimate, format_mmss};
+pub use setting_help::SettingDescriptions;
 pub use settings_model::{SettingRow, SettingsModel};
+pub use settings_staging::SettingsStaging;
 pub use view_state::{Banner, CONSOLE_CAPACITY, LogLine, LogSource, Progress, ViewState};
 
 #[cfg(feature = "gui")]

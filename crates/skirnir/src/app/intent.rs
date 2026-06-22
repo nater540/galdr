@@ -81,6 +81,9 @@ pub enum Intent {
 
   /// Send a single manual G-code/`$` line entered in the console.
   SendLine(String),
+  /// Wipe the console log buffer — the right-click "Clear" affordance on the console body. A pure view-state
+  /// mutation (no I/O); the shell handles it by calling [`super::ViewState::clear_console`].
+  ClearConsole,
   /// Inject a real-time single-byte command out-of-band.
   Realtime(RealtimeCommand),
   /// Drive a feed/spindle override slider to an absolute `target` percent. grbl has no "set override to N%"
@@ -111,6 +114,10 @@ pub enum Intent {
   /// Write one setting edit back to the firmware as a `$<n>=<value>` line. The firmware validates the value and
   /// answers `ok`/`error:N`; the shell re-reads the single setting afterwards so the panel reflects the truth.
   WriteSetting { number: u32, value: String },
+  /// Commit every staged settings edit: the shell flushes the dirty store as ordered `$<n>=<value>` writes, then
+  /// `$$` to re-confirm, then clears the staging. The single explicit Save boundary for the settings dialog —
+  /// the per-field edits only stage locally, so this is what actually reaches the firmware.
+  SaveSettings,
 
   /// Run the homing cycle (`$H`).
   Home,

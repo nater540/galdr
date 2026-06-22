@@ -222,6 +222,9 @@ impl SkirnirApp {
     // up pre-filled from last session. A missing/corrupt/too-new file falls back to defaults (never panics); the
     // optional reason is surfaced as a console notice once the view exists (below).
     let (profile, load_notice) = crate::profile::load();
+    // Load the curated per-setting tooltip descriptions once (seeding the on-disk file on first run); the optional
+    // reason is surfaced as a console notice below, like the profile load. Never fails — falls back to bundled.
+    let (descriptions, descriptions_notice) = crate::app::setting_help::load();
     let mut app = SkirnirApp {
       #[cfg(feature = "serial")]
       runtime,
@@ -248,10 +251,17 @@ impl SkirnirApp {
       profile,
       profile_path_override: None,
     };
+    // Install the loaded tooltip descriptions over the bundled default the `from_prefs` UI came up with.
+    app.ui.setting_descriptions = descriptions;
     app.refresh_ports();
     // Surface why the profile fell back to defaults (corrupt / unreadable / no config dir), if it did. A missing
     // file is silent — that is the ordinary first run.
     if let Some(reason) = load_notice {
+      app.notice(reason);
+    }
+    // Likewise surface why setting descriptions fell back to the bundled defaults (corrupt/unreadable file or no
+    // config dir), if they did. A first-run seed reports nothing.
+    if let Some(reason) = descriptions_notice {
       app.notice(reason);
     }
     // If the saved port is still present in the freshly-enumerated list, prefer it as the dropdown selection so a
@@ -445,6 +455,7 @@ impl SkirnirApp {
       Intent::SendLine(line) => {
         self.send_line(line);
       }
+      Intent::ClearConsole => self.view.clear_console(),
       Intent::Realtime(cmd) => {
         self.send_command(Command::Realtime(cmd));
       }
@@ -456,6 +467,7 @@ impl SkirnirApp {
       Intent::ProbeZ { depth, feed, plate_thickness } => self.probe_z(depth, feed, plate_thickness),
       Intent::RequestSettings => self.request_settings(),
       Intent::WriteSetting { number, value } => self.write_setting(number, &value),
+      Intent::SaveSettings => self.save_settings(),
       Intent::Home => {
         self.send_line("$H".to_string());
       }
@@ -729,6 +741,25 @@ impl SkirnirApp {
     self.send_line(line);
     // Re-read all settings so the just-written value (or a rejected, unchanged one) is reflected in the model.
     self.send_line("$$".to_string());
+  }
+
+  /// Commit every staged settings edit (the explicit Save): flush the dirty store as ordered `$<n>=<value>`
+  /// lines through the streaming engine, then `$$` to re-confirm what the firmware actually stored (it
+  /// validates/clamps each write and may answer `error:N`, in which case the re-dump shows the value unchanged),
+  /// then clear the staging so the rows return to showing live values with no modified markers. Each write flows
+  /// through [`Self::send_line`] like any other line, so the engine's flow control is respected; grbl has no
+  /// batch, so the lines are independent and only ascending-ordered for predictability. A no-op when nothing is
+  /// staged (the Save button is disabled then, but this stays safe if it is ever called regardless).
+  fn save_settings(&mut self) {
+    let lines = self.ui.settings_staging.write_lines();
+    if lines.is_empty() {
+      return;
+    }
+    for line in lines {
+      self.send_line(line);
+    }
+    self.send_line("$$".to_string());
+    self.ui.settings_staging.clear();
   }
 
   /// Send one manual line, echoing it to the console as sent traffic. Returns whether it was actually sent (an
@@ -1584,7 +1615,22 @@ impl eframe::App for SkirnirApp {
       egui::Window::new("Settings").open(&mut open).resizable(true).default_size([340.0, 460.0]).show(&ctx, |ui| {
         views::settings(ui, &self.view, &mut self.ui, &mut sink);
       });
-      self.ui.settings_open = open;
+      // The window's `X` set `open` false. With unsaved edits staged, defer the close behind the discard
+      // confirmation rather than dropping them silently; otherwise close as requested. The confirm modal below
+      // resolves a deferred Close by clearing the dialog once Discard is chosen.
+      if !open && views::settings_action_needs_confirm(&self.ui.settings_staging) {
+        self.ui.pending_settings_action = Some(views::PendingSettingsAction::Close);
+      } else {
+        self.ui.settings_open = open;
+      }
+      // Render the "Discard N unsaved change(s)?" modal when a refresh/close is parked; carry out the deferred
+      // action once the operator confirms Discard (the staging is already cleared inside the helper).
+      if let Some(action) = views::settings_discard_confirm(&ctx, &mut self.ui) {
+        match action {
+          views::PendingSettingsAction::Refresh => sink.push(Intent::RequestSettings),
+          views::PendingSettingsAction::Close => self.ui.settings_open = false,
+        }
+      }
     }
 
     // 3. Act on the intents the views emitted this frame, in order.
@@ -2468,5 +2514,64 @@ mod tests {
     let streamed = collect_written(&mut app, &mut controller, 60); // ~300 ms.
     let text = String::from_utf8_lossy(&streamed);
     assert!(!text.contains("$J="), "a nearly-full planner queue must throttle the jog stream; saw {text:?}");
+  }
+
+  /// Saving the settings dialog must flush every staged edit as an ordered `$<n>=<value>` line through the
+  /// streaming engine, then `$$` to re-confirm, then clear the staging so the rows return to live values with no
+  /// modified markers. The explicit Save is the only thing that reaches the firmware — proves an edit is no longer
+  /// dropped on focus-loss (it is staged, then this writes it).
+  #[test]
+  fn saving_flushes_staged_settings_in_order_then_redumps_and_clears() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Stage three edits out of numeric order; Save must emit them ascending.
+    app.ui.settings_staging.stage(110, "800", Some("500"));
+    app.ui.settings_staging.stage(0, "12", Some("10"));
+    app.ui.settings_staging.stage(22, "1", Some("0"));
+
+    app.handle_intent(Intent::SaveSettings);
+    // The writes go through the engine asynchronously; pump events and accumulate the transport bytes until the
+    // last staged write and the trailing `$$` re-dump have both landed (or the budget is exhausted).
+    let mut written = Vec::new();
+    for _ in 0..200 {
+      app.pump_events();
+      written.extend(controller.drain_written());
+      let text = String::from_utf8_lossy(&written);
+      if text.contains("$110=800") && text.contains("$$") {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = String::from_utf8_lossy(&written).into_owned();
+    // Each staged setting is written, the `$$` re-confirm follows, and the order is ascending `$<n>`.
+    let pos0 = text.find("$0=12").expect("the $0 write must be sent");
+    let pos22 = text.find("$22=1").expect("the $22 write must be sent");
+    let pos110 = text.find("$110=800").expect("the $110 write must be sent");
+    assert!(pos0 < pos22 && pos22 < pos110, "staged writes must be sent in ascending order; saw {text:?}");
+    let pos_dump = text.rfind("$$").expect("a $$ re-confirm must follow the writes");
+    assert!(pos110 < pos_dump, "the $$ re-confirm must come after the staged writes; saw {text:?}");
+    // Staging is cleared by Save, so the rows return to showing live values with no pending markers.
+    assert!(app.ui.settings_staging.is_empty(), "Save must clear the staging once the writes are issued");
+  }
+
+  /// Saving with nothing staged must be a quiet no-op: no `$<n>=` write and no `$$` re-dump reaches the firmware
+  /// (the Save button is disabled then, but the handler must stay safe if invoked regardless).
+  #[test]
+  fn saving_with_nothing_staged_sends_nothing() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+    assert!(app.ui.settings_staging.is_empty(), "the test starts with no staged edits");
+
+    app.handle_intent(Intent::SaveSettings);
+    // Pump events so any (erroneous) write would have a chance to flush to the transport, then assert silence.
+    let mut written = Vec::new();
+    for _ in 0..20 {
+      app.pump_events();
+      written.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    let text = String::from_utf8_lossy(&written);
+    assert!(!text.contains('$'), "an empty Save must send no settings traffic at all; saw {text:?}");
   }
 }
