@@ -37,6 +37,13 @@ tokio-serial = { version = "5.5", optional = true }
 # Both already exist in the workspace lock at these majors.
 thiserror = "2"
 anyhow    = "1"
+# The profile/project store (DOC-11 §1.3): serde-derived state persisted as human-readable RON under the OS
+# config dir. Framework-agnostic — NOT eframe's `Storage` — so the headless `--cli` path and the GUI share one
+# store and the whole thing unit-tests as a pure round-trip. `serde` unifies on the workspace's existing 1.x;
+# `ron` is the egui ecosystem's native format; `directories` locates `~/.config/skirnir` (XDG on Linux).
+serde       = { version = "1", features = ["derive"] }
+ron         = "0.12"
+directories = "6"
 # The egui application framework, gated behind `gui`. We use the lightweight glow (OpenGL) backend rather than
 # wgpu — a 2D toolpath `Painter` needs nothing heavier — and drop accesskit / web-screen-reader. `x11` and
 # `wayland` cover both Linux display stacks. egui itself is consumed via `eframe::egui` (no direct dep).

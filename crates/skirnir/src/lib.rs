@@ -13,6 +13,9 @@
 //! - [`reconnect`] — the pure host-side backoff schedule the shell consults to auto-reconnect after a drop
 //!   (notably the ESP32-S3's USB re-enumeration on soft reset). No timer/transport — just the delay decision.
 //! - [`error`] — the typed error surface. The engine never panics on a runtime condition; it surfaces these.
+//! - [`profile`] — the cross-session project/profile store: the rotary-A center and connection/UI defaults
+//!   persisted as a versioned RON file under the OS config dir (DOC-11 §1.3). Framework-agnostic, so the GUI
+//!   and the headless `--cli` path share one store; read failures fall back to defaults rather than panicking.
 //!
 //! The intended boundary: a UI calls [`engine::Engine::connect`] with a transport, then sends
 //! [`engine::Command`]s and drains [`engine::Event`]s over the returned [`engine::EngineHandle`] — never
@@ -23,6 +26,7 @@
 pub mod app;
 pub mod engine;
 pub mod error;
+pub mod profile;
 pub mod protocol;
 pub mod reconnect;
 pub mod transport;
@@ -37,3 +41,5 @@ pub use protocol::{ConnectionState, RealtimeCommand, Response};
 pub use reconnect::{ReconnectConfig, ReconnectPolicy};
 // The typed error surface.
 pub use error::{EngineError, TransportError};
+// The cross-session profile/project store.
+pub use profile::{Prefs, Profile, ProfileError, RotarySetup};

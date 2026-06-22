@@ -15,6 +15,21 @@ use super::view_state::{Banner, LogLine, LogSource, ViewState};
 use crate::protocol::{ConnectionState, RealtimeCommand};
 use crate::transport::ports::PortInfo;
 
+/// The baud range the connection knob accepts and that a loaded profile's baud is held to. The ESP32-S3 native
+/// USB ignores the value, but the host driver and the dropdown want a sane one; both the settings widget and
+/// [`UiState::from_prefs`] use this single range so they cannot drift.
+const BAUD_RANGE: std::ops::RangeInclusive<u32> = 9_600..=2_000_000;
+
+/// The fallback baud when none is remembered or a loaded one is out of [`BAUD_RANGE`].
+const DEFAULT_BAUD: u32 = 115_200;
+
+/// Hold a baud to [`BAUD_RANGE`], falling back to [`DEFAULT_BAUD`] when it is out of range (the settings knob
+/// clamps live edits, but a value loaded from a hand-edited/corrupt profile bypasses that — `0` would fail the
+/// port open). The widget's own range still clamps subsequent edits.
+fn sanitize_baud(baud: u32) -> u32 {
+  if BAUD_RANGE.contains(&baud) { baud } else { DEFAULT_BAUD }
+}
+
 /// Transient widget state the shell owns across frames: selections, text fields, and tunables that belong to
 /// the UI, not to the engine-derived [`ViewState`]. Kept here so the views read and mutate it directly while
 /// the shell persists it.
@@ -104,7 +119,7 @@ impl Default for UiState {
     UiState {
       ports: Vec::new(),
       selected_port: String::new(),
-      baud: 115_200,
+      baud: DEFAULT_BAUD,
       program_path: None,
       program: std::sync::Arc::from([] as [String; 0]),
       toolpath: Vec::new(),
@@ -134,6 +149,22 @@ impl Default for UiState {
 }
 
 impl UiState {
+  /// Build the transient widget state from the persisted [`crate::profile::Prefs`], so the connect dropdown and
+  /// the rotary inputs come up pre-filled from last session. Only the genuinely "remember my last entry" fields
+  /// are seeded (port, baud, rotary input defaults); everything else stays at the [`Default`] value — transient
+  /// runtime state is never restored from a profile.
+  pub fn from_prefs(prefs: &crate::profile::Prefs) -> Self {
+    UiState {
+      selected_port: prefs.last_port.clone().unwrap_or_default(),
+      // Hold a hand-edited or corrupted-but-still-valid baud (e.g. `0`) to the accepted range; an out-of-range
+      // value would otherwise reach `connect` unclamped and fail the port open with no recovery.
+      baud: sanitize_baud(prefs.baud),
+      rotary_dowel_diameter: prefs.rotary_dowel_diameter,
+      rotary_index_angle: prefs.rotary_index_angle,
+      ..UiState::default()
+    }
+  }
+
   /// Clear the connection-scoped transient widget state when the link drops. An in-progress setting edit and
   /// the override sliders' drag positions belong to the session that just ended: on a reconnect to a (possibly
   /// different) board they must not resume editing a stale `$<n>` row or pin a slider to the previous board's
@@ -1069,7 +1100,7 @@ fn probe_result(ui: &mut egui::Ui, view: &ViewState) {
 /// `(Y_c, Z_c)`. The wizard state is owned by the shell (the firmware has no pivot concept) and passed in as a
 /// borrow, so this stays a pure render that only emits intents.
 pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
-  wizard: Option<&super::rotary_center::WizardState>, sink: &mut IntentSink) {
+  wizard: Option<&super::rotary_center::WizardState>, has_saved_center: bool, sink: &mut IntentSink) {
   use super::rotary_center::WizardStep;
   section_header(ui, "Rotary center-finder");
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
@@ -1098,6 +1129,18 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
           });
         }
       });
+      // If a center was saved last session (DOC-11 §1.3), offer to re-apply it to the active WCS without
+      // re-running the center-finder. Enabled only when Idle (the `G10` needs an accepting machine).
+      if has_saved_center {
+        ui.add_space(4.0);
+        ui.add_enabled_ui(enabled, |ui| {
+          if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0),
+            egui::Button::new("Apply saved center")).clicked()
+          {
+            sink.push(Intent::ApplySavedRotaryCenter);
+          }
+        });
+      }
       return;
     };
 
@@ -1877,7 +1920,7 @@ pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   ui.label("Connection");
   ui.horizontal(|ui| {
     ui.label("Baud");
-    ui.add(egui::DragValue::new(&mut state.baud).speed(100.0).range(9_600..=2_000_000));
+    ui.add(egui::DragValue::new(&mut state.baud).speed(100.0).range(BAUD_RANGE));
   });
   ui.separator();
   ui.horizontal(|ui| {
@@ -1968,7 +2011,7 @@ mod tests {
   #[test]
   fn ui_state_has_sane_defaults() {
     let state = UiState::default();
-    assert_eq!(state.baud, 115_200);
+    assert_eq!(state.baud, DEFAULT_BAUD);
     assert_eq!(state.jog_step, 1.0);
     assert!(!state.jog_continuous, "the jog pad defaults to fixed-step, not continuous");
     assert!(state.program.is_empty());
@@ -1977,6 +2020,20 @@ mod tests {
     assert!(!state.show_machine_pos, "the DRO defaults to work coordinates");
     assert_eq!(state.active_tab, DockTab::Console, "the dock opens on the Console tab");
     assert!(!state.dock_collapsed, "the dock opens expanded at its full height");
+  }
+
+  #[test]
+  fn from_prefs_holds_an_out_of_range_baud_to_the_default() {
+    use crate::profile::Prefs;
+    // A valid baud passes through untouched.
+    let ok = UiState::from_prefs(&Prefs { baud: 250_000, ..Prefs::default() });
+    assert_eq!(ok.baud, 250_000, "an in-range baud must be kept as-is");
+    // A hand-edited/corrupt-but-valid-`u32` baud out of range (0, or absurdly high) falls back to the default
+    // rather than reaching `connect` and failing the port open with no recovery.
+    let zero = UiState::from_prefs(&Prefs { baud: 0, ..Prefs::default() });
+    assert_eq!(zero.baud, DEFAULT_BAUD, "a zero baud must fall back to the default");
+    let huge = UiState::from_prefs(&Prefs { baud: 9_000_000, ..Prefs::default() });
+    assert_eq!(huge.baud, DEFAULT_BAUD, "a baud above the accepted range must fall back to the default");
   }
 
   #[test]

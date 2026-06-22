@@ -5,3 +5,4 @@
 - [Jog/keyboard/progress-time](jog-keyboard-progress-time.md) — continuous press-hold jog, key_to_intent hotkeys, app/progress.rs ETA clock; do NOT run cargo fmt (4-space)
 - [Settings/overrides/reconnect](settings-and-overrides.md) — override sliders + fine ±1% stepping, live $-settings text-path model ($$/$ES/write), auto-reconnect backoff policy
 - [Probing pipeline](probing-pipeline.md) — DOC-11 Phase 0: typed [PRB:] parse, event-driven probe latch (view_state), hardened result-gated probe_z (probe_flow), dropped-Eq gotcha
+- [Profile persistence](profile-persistence.md) — DOC-11 §1.3 profile/project store: versioned RON under OS config dir (profile.rs), shell save points, ApplySavedRotaryCenter, test seam, deps

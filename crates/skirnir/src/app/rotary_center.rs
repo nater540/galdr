@@ -40,7 +40,10 @@ pub enum Wcs {
 /// Which physical feature the operator wants work-Z0 to land on when the found center is written to the WCS. A
 /// product choice: wrap machining conventionally zeroes on the rotary AXIS, but some workflows zero on the
 /// probed TOP SURFACE. The Y datum is always the axis centerline (`Y_c`); only Z is selectable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `Serialize`/`Deserialize` are derived so the chosen datum survives a session in skirnir's [`crate::profile`]
+/// store — the variant names are the on-disk tokens, so renaming a variant is a profile-format change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ZDatum {
   /// Work-Z0 = the rotary axis centerline (`Z_c = Z_top − D/2`). The default — standard for wrap machining.
   #[default]

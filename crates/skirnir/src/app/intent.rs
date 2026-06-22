@@ -140,6 +140,10 @@ pub enum Intent {
   RotaryCenterSetZDatum(crate::app::rotary_center::ZDatum),
   /// Cancel the rotary center-finder run, discarding its state.
   RotaryCenterCancel,
+  /// Re-apply the rotary center saved in the profile (DOC-11 §1.3) to the active WCS — the `G10 L2` line the
+  /// last center-finder run persisted (Y/Z only, never A) — so a restart restores the found center without
+  /// re-probing. Inert if no center has ever been saved.
+  ApplySavedRotaryCenter,
 
   /// Start a Phase 2 180°-flip center-verify (DOC-11 §2.1): probe a feature along `axis`/`dir` at `angle_deg`,
   /// then at `angle_deg + 180`, and compute the residual offset from the rotation centerline. Cancels any other

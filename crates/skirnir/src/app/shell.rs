@@ -133,6 +133,16 @@ pub struct SkirnirApp {
   /// [`super::angle_sweep::AngleSweep`] engine and one kind-dispatched pump ([`Self::pump_sweep`]) rather than
   /// each owning a bespoke pump — they are the same "probe at a list of A angles, collect readings" shape.
   sweep: Option<SweepRun>,
+  /// The persisted cross-session profile (DOC-11 §1.3): the rotary-A center and connection/UI defaults. Loaded
+  /// once at startup (seeding [`UiState`]), mutated as the operator finds/writes a center or connects, and
+  /// written back through [`crate::profile::save`] on those changes (with an exit backstop in `App::save`). The
+  /// in-memory copy is the source of truth for a session; disk is the durable mirror, and a failed write is a
+  /// surfaced notice, never a crash.
+  profile: crate::profile::Profile,
+  /// An explicit path to persist the profile to, overriding the default OS config location. `None` in production
+  /// (the OS path is used); set in tests so they round-trip through a temp file instead of the operator's real
+  /// `~/.config/skirnir/profile.ron`. The single seam that keeps the persistence wiring hermetically testable.
+  profile_path_override: Option<std::path::PathBuf>,
 }
 
 /// Which probe-flow "slot" owns the shared latch, for the mutual-cancel guard. Exactly one may be armed at a
@@ -208,6 +218,10 @@ impl SkirnirApp {
   pub fn new(runtime: tokio::runtime::Runtime) -> Self {
     #[cfg(not(feature = "serial"))]
     let _ = runtime; // a gui-only build never opens a port, so the runtime has nothing to host.
+    // Load the persisted profile before building the UI state so the connect dropdown and the rotary inputs come
+    // up pre-filled from last session. A missing/corrupt/too-new file falls back to defaults (never panics); the
+    // optional reason is surfaced as a console notice once the view exists (below).
+    let (profile, load_notice) = crate::profile::load();
     let mut app = SkirnirApp {
       #[cfg(feature = "serial")]
       runtime,
@@ -221,7 +235,7 @@ impl SkirnirApp {
       #[cfg(feature = "serial")]
       reconnect_at: None,
       view: ViewState::default(),
-      ui: UiState::default(),
+      ui: UiState::from_prefs(&profile.prefs),
       override_tracker: super::overrides::OverrideTracker::default(),
       stream_started: None,
       jog_stream: None,
@@ -231,8 +245,22 @@ impl SkirnirApp {
       pending_zero_z: None,
       wizard: None,
       sweep: None,
+      profile,
+      profile_path_override: None,
     };
     app.refresh_ports();
+    // Surface why the profile fell back to defaults (corrupt / unreadable / no config dir), if it did. A missing
+    // file is silent — that is the ordinary first run.
+    if let Some(reason) = load_notice {
+      app.notice(reason);
+    }
+    // If the saved port is still present in the freshly-enumerated list, prefer it as the dropdown selection so a
+    // reconnect lands on last session's board; otherwise the Galdr-ranked first port (set by `refresh_ports`) stands.
+    if let Some(saved) = app.profile.prefs.last_port.clone()
+      && app.ui.ports.iter().any(|port| port.path == saved)
+    {
+      app.ui.selected_port = saved;
+    }
     app
   }
 
@@ -447,6 +475,7 @@ impl SkirnirApp {
         }
       }
       Intent::RotaryCenterCancel => self.wizard = None,
+      Intent::ApplySavedRotaryCenter => self.apply_saved_rotary_center(),
       Intent::FlipVerifyStart { angle_deg, axis, dir } => self.flip_verify_start(angle_deg, axis, dir),
       Intent::RunoutStart { n, start_deg, axis, dir } => self.runout_start(n, start_deg, axis, dir),
       Intent::SweepProbe => self.sweep_probe(),
@@ -468,6 +497,12 @@ impl SkirnirApp {
       self.reconnect_at = None;
       self.reconnect.on_connected(); // reset the schedule for this fresh session.
       self.connect_inner(path, baud);
+      // Remember this endpoint as the default selection next launch. Mirror it into `UiState` first so the
+      // profile snapshot (taken from the live UI state) records exactly what we connected to, even if the connect
+      // came from somewhere other than the dropdown.
+      self.ui.selected_port = path.to_string();
+      self.ui.baud = baud;
+      self.save_profile();
     }
     #[cfg(not(feature = "serial"))]
     {
@@ -1019,8 +1054,47 @@ impl SkirnirApp {
       self.notice("no rotary center to write yet".to_string());
       return;
     };
-    self.send_line(line);
+    // Snapshot the found center for persistence BEFORE the borrow of `run` is dropped — `(Y_c, Z_c)` plus the
+    // dowel/datum that produced them (DOC-11 §1.3). `y_center`/`z_center` are `Some` here because `offer_g10`
+    // returned a line, but fall through cleanly if not rather than unwrapping.
+    let setup = match (run.state.y_center(), run.state.z_center()) {
+      (Some(y_center), Some(z_center)) => Some(crate::profile::RotarySetup {
+        y_center,
+        z_center,
+        dowel_diameter: run.state.dowel_diameter,
+        a_datum_deg: run.state.index_angle_deg,
+        z_datum: run.state.z_datum,
+      }),
+      _ => None,
+    };
+    // Only claim the WCS write — and persist the center for re-apply — if the `G10` actually went out. A dropped
+    // or absent engine makes `send_line` false (and already notices why); claiming success, or saving a center we
+    // could not apply, would mislead the operator. Mirror the guarded `move_to_yc` path.
+    if !self.send_line(line) {
+      return;
+    }
     self.notice("wrote rotary center to the active WCS (Y/Z only)".to_string());
+    // Persist the center so a later session can re-apply it without re-running the whole center-finder.
+    if let Some(setup) = setup {
+      self.save_rotary_center(setup);
+    }
+  }
+
+  /// Re-apply the rotary center saved in the profile (DOC-11 §1.3): re-emit the persisted `G10 L2` line (Y/Z
+  /// only, never A) so a restart restores the found center without re-probing. Inert with a notice if nothing
+  /// has been saved yet.
+  fn apply_saved_rotary_center(&mut self) {
+    let Some(setup) = self.profile.rotary else {
+      self.notice("no saved rotary center to apply — run the center-finder first".to_string());
+      return;
+    };
+    let line = setup.offer_g10();
+    // Don't announce success if the line never left: a dropped/absent engine makes `send_line` false (and already
+    // notices why), so a "re-applied" notice would contradict it.
+    if !self.send_line(line) {
+      return;
+    }
+    self.notice("re-applied the saved rotary center to the active WCS (Y/Z only)".to_string());
   }
 
   /// Drive a running rotary touch one frame: fold a resolved latch result into the wizard, or run the SHARED
@@ -1319,6 +1393,46 @@ impl SkirnirApp {
     self.view.note(text);
   }
 
+  /// Fold the current connection/UI prefs into the in-memory profile, then persist the whole thing to disk. The
+  /// rotary `RotarySetup` is written separately at the moment a center is found/saved ([`Self::save_rotary_center`])
+  /// — here we only refresh the prefs from the live [`UiState`] so the last port/baud and rotary input defaults
+  /// survive. A write failure is surfaced as a notice (never a panic): the in-memory profile is still correct,
+  /// only the durable mirror lagged.
+  fn save_profile(&mut self) {
+    self.snapshot_prefs();
+    if let Err(err) = self.persist_profile() {
+      self.notice(format!("could not save profile: {err}"));
+    }
+  }
+
+  /// Refresh the profile's prefs section from the live [`UiState`] (last port/baud, rotary input defaults). The
+  /// rotary `RotarySetup` is set separately; this only mirrors the "remember my last entry" widget fields.
+  fn snapshot_prefs(&mut self) {
+    self.profile.prefs = crate::profile::Prefs {
+      last_port: if self.ui.selected_port.is_empty() { None } else { Some(self.ui.selected_port.clone()) },
+      baud: self.ui.baud,
+      rotary_dowel_diameter: self.ui.rotary_dowel_diameter,
+      rotary_index_angle: self.ui.rotary_index_angle,
+    };
+  }
+
+  /// Write the in-memory profile to disk: the test-injected [`Self::profile_path_override`] when set, else the
+  /// default OS config location. The single I/O seam so the persistence wiring is hermetically testable.
+  fn persist_profile(&self) -> Result<(), crate::profile::ProfileError> {
+    match &self.profile_path_override {
+      Some(path) => crate::profile::save_to(&self.profile, path),
+      None => crate::profile::save(&self.profile),
+    }
+  }
+
+  /// Persist a found rotary center (DOC-11 §1.3) into the profile and to disk, so a restart can re-apply it
+  /// without re-probing. Records `(Y_c, Z_c, D, A-datum, Z-datum)` from the live wizard state. Surfaces a write
+  /// failure as a notice rather than panicking; the in-memory center remains usable this session either way.
+  fn save_rotary_center(&mut self, setup: crate::profile::RotarySetup) {
+    self.profile.rotary = Some(setup);
+    self.save_profile();
+  }
+
   /// The current stream's elapsed/ETA estimate, or the empty estimate when no stream is timing. The wall-clock
   /// elapsed comes from [`Self::stream_started`]; the projection math lives in the pure [`super::progress`].
   fn stream_time(&self) -> super::progress::TimeEstimate {
@@ -1333,6 +1447,15 @@ impl SkirnirApp {
 }
 
 impl eframe::App for SkirnirApp {
+  /// Persist the profile once on shutdown, as a backstop to the per-change saves (a center write, a connect).
+  /// This captures any prefs the operator changed in the session that did not trigger a save of their own —
+  /// e.g. a tweaked rotary input default — so the next launch comes up with them. A write failure here cannot
+  /// be surfaced (the window is gone), so it is best-effort and silent; the per-change saves are the primary path.
+  fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    self.snapshot_prefs();
+    let _ = self.persist_profile();
+  }
+
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     // 1. Drain engine events into the view state before drawing, so the frame reflects the latest telemetry.
     //    Remember whether anything arrived so we can wake promptly for follow-on telemetry (step 4).
@@ -1433,7 +1556,10 @@ impl eframe::App for SkirnirApp {
           // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
           // the center lives in skirnir state); pass a borrow so the view stays a pure render of it.
           let wizard = self.wizard.as_ref().map(|run| &run.state);
-          views::rotary_center(ui, &self.view, &mut self.ui, wizard, &mut sink);
+          // Whether a center was persisted last session (DOC-11 §1.3): the no-run panel offers a one-click
+          // re-apply so a restart restores the found center without re-probing.
+          let has_saved_center = self.profile.rotary.is_some();
+          views::rotary_center(ui, &self.view, &mut self.ui, wizard, has_saved_center, &mut sink);
           ui.separator();
           // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
           let sweep = self.sweep.as_ref().map(|run| (&run.sweep, run.kind));
@@ -1629,6 +1755,13 @@ mod tests {
     };
     let mut app = SkirnirApp::new(runtime);
     app.engine = Some(handle);
+    // Keep these tests hermetic: `new` reads the real OS profile, so reset to a clean default and redirect every
+    // save to a unique temp file so no test ever touches the operator's config dir. A persistence test reads this
+    // path back; others simply never pollute `~/.config/skirnir`. A nanosecond-stamped name keeps runs distinct.
+    app.profile = crate::profile::Profile::default();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let temp = std::env::temp_dir().join(format!("skirnir-test-profile-{}-{stamp}", std::process::id()));
+    app.profile_path_override = Some(temp.join("profile.ron"));
     // Mirror a user connect: the desire is armed and an endpoint recorded, so the test proves a deliberate
     // disconnect clears them rather than scheduling a reconnect.
     app.auto_reconnect = true;
@@ -1914,6 +2047,109 @@ mod tests {
     assert!(wrote.contains("G10 L2 P0 Y1.000 Z-13.000"), "the WCS write must be G10 L2 Y/Z; saw {wrote:?}");
     let g10 = wrote.lines().find(|l| l.contains("G10")).expect("a G10 line");
     assert!(!g10.contains('A'), "the WCS write must never carry an A word; saw {g10:?}");
+  }
+
+  /// Writing a found rotary center must PERSIST it (DOC-11 §1.3): the wizard's `(Y_c, Z_c, D, A-datum, Z-datum)`
+  /// is saved to the profile file, and a fresh app loading that file restores the center so it can be re-applied
+  /// next session without re-probing. This is the end-to-end persistence wiring over a temp profile file.
+  #[test]
+  fn writing_the_rotary_center_persists_it_and_a_fresh_app_restores_it() {
+    use crate::app::rotary_center::{WizardStep, ZDatum};
+    let dir = std::env::temp_dir().join(format!("skirnir-shell-persist-{}", std::process::id()));
+    let path = dir.join("profile.ron");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (mut app, mut controller) = app_with_engine();
+    // Redirect persistence at the test seam so we round-trip through a temp file, never the operator's real
+    // config dir, and start from a clean default profile regardless of what is on this machine.
+    app.profile = crate::profile::Profile::default();
+    app.profile_path_override = Some(path.clone());
+    flush_handshake(&mut app, &mut controller);
+
+    // Run the full three-touch center-finder: Y_c = (-3+5)/2 = 1.0, Z_c = -10 - 6/2 = -13.0.
+    app.rotary_center_start(6.0, 0.0);
+    controller.drain_written();
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,5.000,0.000:1]");
+    app.rotary_center_move_to_yc();
+    pump_wizard_steps(&mut app, &mut controller, 8);
+    wizard_touch(&mut app, &mut controller, "[PRB:0.000,0.000,-10.000:1]");
+    assert_eq!(app.wizard.as_ref().unwrap().state.step, WizardStep::Review);
+
+    // Writing the WCS must both emit the G10 AND persist the center to the temp file.
+    app.rotary_center_write_wcs();
+    pump_wizard_steps(&mut app, &mut controller, 8);
+    assert!(path.exists(), "writing the center must persist a profile file at the override path");
+    assert_eq!(
+      app.profile.rotary,
+      Some(crate::profile::RotarySetup {
+        y_center: 1.0,
+        z_center: -13.0,
+        dowel_diameter: 6.0,
+        a_datum_deg: 0.0,
+        z_datum: ZDatum::AxisCenterline,
+      }),
+      "the in-memory profile must record the found center",
+    );
+
+    // A fresh load of that file (as a new launch would) must restore the same center.
+    let (reloaded, notice) = crate::profile::load_from(&path);
+    assert_eq!(notice, None, "a clean reload surfaces no notice");
+    let restored = reloaded.rotary.expect("the reloaded profile carries the saved center");
+    assert_eq!(restored.y_center, 1.0);
+    assert_eq!(restored.z_center, -13.0);
+    // And the restored center re-applies as the same G10 L2 line the wizard wrote — no re-probing needed.
+    assert_eq!(restored.offer_g10(), "G10 L2 P0 Y1.000 Z-13.000");
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Re-applying a saved center (the `ApplySavedRotaryCenter` intent) must emit the persisted `G10 L2` line
+  /// (Y/Z only, never A) without running the center-finder — the DOC-11 §1.3 "restore without re-probe" payoff.
+  #[test]
+  fn applying_a_saved_rotary_center_emits_the_g10_without_re_probing() {
+    use crate::app::rotary_center::ZDatum;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+    // Seed a saved center directly (as a load from a previous session would), with no wizard running.
+    app.profile.rotary = Some(crate::profile::RotarySetup {
+      y_center: 1.0,
+      z_center: -13.0,
+      dowel_diameter: 6.0,
+      a_datum_deg: 0.0,
+      z_datum: ZDatum::AxisCenterline,
+    });
+    assert!(app.wizard.is_none(), "no center-finder run is needed to re-apply a saved center");
+    controller.drain_written();
+
+    app.handle_intent(Intent::ApplySavedRotaryCenter);
+    let wrote = String::from_utf8_lossy(&pump_wizard_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(wrote.contains("G10 L2 P0 Y1.000 Z-13.000"), "re-apply must emit the saved G10 L2; saw {wrote:?}");
+    let g10 = wrote.lines().find(|l| l.contains("G10")).expect("a G10 line");
+    assert!(!g10.contains('A'), "the re-apply must never carry an A word; saw {g10:?}");
+  }
+
+  /// Re-applying a saved center with no engine must NOT announce success: `send_line` fails (and already notices
+  /// why), so a "re-applied" notice would contradict the "not connected" one. Mirrors the guarded `move_to_yc`.
+  #[test]
+  fn applying_a_saved_rotary_center_while_disconnected_does_not_claim_success() {
+    use crate::app::rotary_center::ZDatum;
+    let (mut app, _controller) = app_with_engine();
+    // Drop the engine to model a disconnect / mid-session engine loss.
+    app.engine = None;
+    app.profile.rotary = Some(crate::profile::RotarySetup {
+      y_center: 1.0,
+      z_center: -13.0,
+      dowel_diameter: 6.0,
+      a_datum_deg: 0.0,
+      z_datum: ZDatum::AxisCenterline,
+    });
+
+    app.handle_intent(Intent::ApplySavedRotaryCenter);
+    let said_success = app.view.console.iter().any(|l| l.text.contains("re-applied the saved rotary center"));
+    assert!(!said_success, "a failed send must not claim the center was re-applied");
+    let said_failure = app.view.console.iter().any(|l| l.text.contains("not connected"));
+    assert!(said_failure, "the underlying send failure must still be surfaced");
   }
 
   /// Selecting the top-surface Z datum must change the emitted `G10` Z word end-to-end: work-Z0 lands on the
