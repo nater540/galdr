@@ -1043,14 +1043,18 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // drained (no more lines queued), this is a burst boundary — flush the live settings to flash ONCE for
     // the whole burst before blocking for the next event, instead of writing per line. The flush yields the
     // executor while the flash op runs; `is_empty` is the cheap "host paused" signal the brief specifies.
-    if SETTINGS_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
+    // `motion_idle()` additionally defers the persist while a cycle is in flight: the esp-storage flash write
+    // parks the real-time motion core (`multicore_auto_park`), so flushing mid-cycle would briefly stall step
+    // generation — a still-pending change is caught by the safety tick once motion drains to idle.
+    if SETTINGS_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() && motion_idle().await {
       // `false`: this path fires every loop iteration while dirty, so it must NOT re-mark on failure or it would
       // busy-retry a persistently-failing write each loop. A failed write here is retried by the safety timer.
       flush_settings(flash, false).await;
     }
     // Coalesced coordinate persist (Phase B): same burst-boundary rule for the persistent G54-G59 / G28 / G30
-    // record, so a program that re-zeroes several axes appends the coordinate blob once, not per line.
-    if COORDINATES_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
+    // record (also deferred while moving, for the same auto-park reason), so a program that re-zeroes several
+    // axes appends the coordinate blob once, not per line.
+    if COORDINATES_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() && motion_idle().await {
       flush_coordinates(flash, false).await;
     }
     // Race the next line against a soft reset AND a periodic safety flush. A `0x18` resets the parser modal
@@ -1085,13 +1089,19 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
       // planner to the live stop point, and return to Idle. Owned here (the planner owner) so it is race-free
       // with line handling — a cancel and a line never run concurrently in this single in-order consumer.
       Either::First(Either4::Third(())) => cancel_jog_cycle().await,
-      // Safety-interval tick: persist any pending change even if the queue never observably drained. When
-      // nothing is dirty these are cheap no-ops and the loop simply re-arms the timer on the next iteration.
+      // Safety-interval tick: persist any pending change even if the queue never observably drained — but only
+      // while the machine is idle, since the flash write parks the real-time motion core (see `motion_idle`). A
+      // change made mid-cycle therefore persists on the first safety tick AFTER motion drains (<=1s later); the
+      // `||`-guarded `motion_idle()` is skipped entirely when nothing is dirty so an idle board never locks the
+      // planner here. When nothing is dirty these are cheap no-ops and the loop simply re-arms the timer.
       Either::First(Either4::Fourth(())) => {
-        // `true`: the safety interval is the bounded-cadence retry for a failed write — re-marking dirty here lets
-        // the next tick re-attempt, which is exactly the guarantee Bug A defeated (a single failure dropped it).
-        flush_settings(flash, true).await;
-        flush_coordinates(flash, true).await;
+        let pending = SETTINGS_DIRTY.load(Ordering::Acquire) || COORDINATES_DIRTY.load(Ordering::Acquire);
+        if pending && motion_idle().await {
+          // `true`: the safety interval is the bounded-cadence retry for a failed write — re-marking dirty here lets
+          // the next tick re-attempt, which is exactly the guarantee Bug A defeated (a single failure dropped it).
+          flush_settings(flash, true).await;
+          flush_coordinates(flash, true).await;
+        }
       }
       // Hard-limit trip (`$21`, DOC-06): the executor detected a switch trip during normal motion. Enter the
       // LOCKED `ALARM:1` (position is likely lost from the abrupt stop — re-homing recommended) and reset the
@@ -3375,6 +3385,24 @@ async fn planner_blocks_free() -> u8 {
     }
     None => firmware_core::planner::BLOCK_QUEUE_LEN as u8,
   }
+}
+
+/// True when no motion is in flight: the core-1 executor is not mid-block AND the planner queue is fully drained.
+/// This is the exact inverse of the `running` predicate the status reporter uses for `Run`/`Idle` (executor
+/// busy OR blocks queued), so "idle" here means the same `Idle` the host sees. It also reads false during `$H`
+/// homing and jogging, which both run on the executor with `EXECUTOR_RUNNING` set.
+///
+/// Used to defer flash persistence while the machine is moving: the esp-storage flash write parks the real-time
+/// motion core (`multicore_auto_park` in `main`), so flushing mid-cycle would briefly stall step generation. The
+/// settings/coordinate persists are not time-critical, so they wait for the machine to be quiescent (the next
+/// burst boundary or safety tick once motion drains). The soft-reset flush deliberately does NOT consult this —
+/// a reset is already aborting motion, and grbl applies settings on the next reset, so they must be on flash by
+/// then. Checks the cheap [`EXECUTOR_RUNNING`] atom first and only locks the planner if it is clear.
+async fn motion_idle() -> bool {
+  if EXECUTOR_RUNNING.load(Ordering::Acquire) {
+    return false;
+  }
+  planner_blocks_free().await == firmware_core::planner::BLOCK_QUEUE_LEN as u8
 }
 
 /// How long the consumer waits before retrying a [`PlannerError::QueueFull`] command. Short relative to a
