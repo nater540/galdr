@@ -825,8 +825,18 @@ impl Planner {
       unit_vec[axis] = delta_mm[axis] * inv_mm;
     }
 
+    // grbl `ROTARY_FIX` (DOC-10.2): a G94 move that travels on BOTH a linear and a rotary axis is converted to
+    // inverse-time so the feed governs the LINEAR leg (the rotary is slaved), rather than being spread along the
+    // full mixed norm — which would crawl the linear axis. Pure-linear, pure-rotary, and native-G93 moves pass
+    // through unchanged. Rapids ignore the feed entirely, so skip the conversion for them.
+    let (effective_feed, effective_feed_mode) = if rapid {
+      (feed, feed_mode)
+    } else {
+      self.resolve_feed(feed, feed_mode, units, &delta_mm)
+    };
     let acceleration = limiting_acceleration(&unit_vec, &self.config.accel_mm_s2);
-    let nominal_speed = self.nominal_speed_mm_s(feed, units, feed_mode, rapid, millimeters, &unit_vec);
+    let nominal_speed =
+      self.nominal_speed_mm_s(effective_feed, units, effective_feed_mode, rapid, millimeters, &unit_vec);
     let nominal_speed_sq = nominal_speed * nominal_speed;
 
     // The junction cornering limit caps the entry speed; it never exceeds this block's own nominal.
@@ -878,6 +888,42 @@ impl Planner {
       FeedMode::InverseTime => millimeters * feed / 60.0,
     };
     requested_mm_s.min(axis_rate_limit).max(0.0)
+  }
+
+  /// Resolve the effective feed + feed-mode for a non-rapid move, applying grbl's `ROTARY_FIX` mixed-move
+  /// conversion (DOC-10.2). A **mixed** G94 move — one that travels on both a linear axis and a rotary axis (per
+  /// the live `$376` mask) — is converted to inverse-time so its feed `F` governs the LINEAR path: the effective
+  /// inverse-time feed `F' = F × units_scale / linear_len` makes the block finish in `linear_len / F` minutes,
+  /// slaving the rotary axis (it sweeps `Δa` in that time) exactly like a linear-only `X` move at `F`. Without
+  /// this, a `G94` `X10 A90 F600` would spread `F` along the full ~90.5-unit mixed norm and crawl the linear leg.
+  /// Pure-linear and pure-rotary G94 moves keep their plain units/min feed (their full norm IS the linear/rotary
+  /// length, so `F/60` is already right), and a native G93 feed is already inverse-time — all three pass through
+  /// unchanged. `delta_mm` carries the per-axis travel (mm for linear axes, degrees for rotary).
+  fn resolve_feed(&self, feed: f32, feed_mode: FeedMode, units: Units, delta_mm: &[f32; AXES]) -> (f32, FeedMode) {
+    // Only a G94 (units/min) move can need converting; a native G93 feed is already inverse-time.
+    if feed_mode != FeedMode::UnitsPerMin {
+      return (feed, feed_mode);
+    }
+    let mut linear_sq = 0.0f32;
+    let mut rotary_sq = 0.0f32;
+    for axis in 0..AXES {
+      let sq = delta_mm[axis] * delta_mm[axis];
+      if self.config.is_rotary(axis) {
+        rotary_sq += sq;
+      } else {
+        linear_sq += sq;
+      }
+    }
+    let linear_len = libm::sqrtf(linear_sq);
+    let rotary_len = libm::sqrtf(rotary_sq);
+    // Mixed (both legs move): convert to inverse-time with the feed scaled onto the linear path. `units_scale` is
+    // folded in here because the inverse-time branch of `nominal_speed_mm_s` never inch-scales its feed (grbl
+    // never inch-scales an inverse-time `F`), so a G20 mixed move would otherwise lose its inch→mm conversion.
+    if linear_len > LENGTH_EPSILON_MM && rotary_len > LENGTH_EPSILON_MM {
+      (feed * units_scale(units) / linear_len, FeedMode::InverseTime)
+    } else {
+      (feed, feed_mode)
+    }
   }
 
   /// The speed limit in mm/s imposed by the per-axis maximum rates (`$110–$112`) for a move along
@@ -1622,6 +1668,59 @@ mod tests {
     let block = planner.peek_block().expect("a block");
     assert!(block.rapid);
     assert!((block.nominal_speed() - 100.0).abs() < 1e-3);
+  }
+
+  // ---- ROTARY_FIX: mixed linear+rotary G94 feed conversion (DOC-10.2) ---------------------------
+
+  /// Plan a mixed X+A move with the given feed mode (A defaults rotary under `DEFAULT_ROTARY_MASK`).
+  fn xa_move(x: Option<f32>, a: Option<f32>, feed: f32, feed_mode: FeedMode) -> PlannerCommand {
+    PlannerCommand::Move {
+      rapid: false,
+      axes: AxisWords { x, y: None, z: None, a },
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed,
+      feed_mode,
+      machine_coords: false,
+    }
+  }
+
+  #[test]
+  fn mixed_g94_move_runs_the_linear_leg_at_the_commanded_feed() {
+    // grbl ROTARY_FIX (DOC-10.2): a G94 X10 A90 F600 must run the LINEAR leg at F600 (= 10 mm/s), with the
+    // rotary slaved — NOT spread F across the full mixed norm (which the pre-fix code did, crawling X to ~1.1
+    // mm/s). The block's full norm is sqrt(10² + 90²) = 90.554; the linear leg is `nominal × unit_vec[X]`.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&xa_move(Some(10.0), Some(90.0), 600.0, FeedMode::UnitsPerMin)).expect("queued");
+    let block = planner.peek_block().expect("a block");
+    assert!((block.millimeters - 90.5539).abs() < 1e-2, "full all-axis norm is unchanged; got {}", block.millimeters);
+    // Nominal is the full-norm speed that makes the linear leg run at F: 90.554 mm/s (NOT the pre-fix 10 mm/s).
+    assert!((block.nominal_speed() - 90.5539).abs() < 1e-1, "mixed nominal should be ~90.55 mm/s; got {}", block.nominal_speed());
+    // The R2-killing invariant: the linear-axis component speed equals the commanded F (600 mm/min = 10 mm/s).
+    let linear_leg = block.nominal_speed() * block.unit_vec[0].abs();
+    assert!((linear_leg - 10.0).abs() < 1e-2, "the linear leg must run at F600 = 10 mm/s; got {linear_leg}");
+  }
+
+  #[test]
+  fn pure_rotary_g94_move_feed_is_degrees_per_minute_unchanged() {
+    // A pure-rotary G94 move is NOT mixed, so it keeps the plain units/min rule: A90 F600 → 10 deg/s. Its full
+    // norm is just |Δa| = 90, so `F/60` is already correct — the conversion must leave it alone.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&xa_move(None, Some(90.0), 600.0, FeedMode::UnitsPerMin)).expect("queued");
+    let block = planner.peek_block().expect("a block");
+    assert!((block.millimeters - 90.0).abs() < 1e-3);
+    assert!((block.nominal_speed() - 10.0).abs() < 1e-3, "pure-rotary G94 must stay F/60 deg/s; got {}", block.nominal_speed());
+  }
+
+  #[test]
+  fn mixed_g94_converted_feed_is_still_clamped_to_the_axis_rate() {
+    // The converted (inverse-time) feed is still floored by the per-axis max-rate clamp (DOC-10.2 Q3): an
+    // absurd F60000 on X10 A90 would want ~9055 mm/s, but the A axis caps the move at ~100.6 deg/s-equivalent.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&xa_move(Some(10.0), Some(90.0), 60_000.0, FeedMode::UnitsPerMin)).expect("queued");
+    let block = planner.peek_block().expect("a block");
+    // A's component is 90/90.554 = 0.9939; its 6000 mm/min (100 unit/s) cap gives 100/0.9939 ≈ 100.6 mm/s.
+    assert!((block.nominal_speed() - 100.6).abs() < 0.5, "converted feed must clamp to the axis rate; got {}", block.nominal_speed());
   }
 
   // ---- Block queue: fill, drain order, full-queue error -----------------------------------------

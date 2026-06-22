@@ -10,8 +10,10 @@
 > norm + 4-term junction (DOC-10.3), the `$376`-gated G20/G21 units fork (DOC-10.1), arc A-slaving (DOC-10.5),
 > and the rotary soft-limit exemption (DOC-10.6). The firmware ch3/A-DIR/A-limit wiring (Phase 5) is compile-only
 > with PROVISIONAL GPIOs (18/38/39), bench-unverified. Still open: the optional modulo-360 rotary **position
-> rollover** (DOC-10.6, deferred as safe-to-skip), the mixed-G94→inverse-time conversion's rotary leg (needs no
-> further work since `millimeters` is the full norm), and TMC node-3 hardware bring-up.
+> rollover** (DOC-10.6, deferred as safe-to-skip) and TMC node-3 hardware bring-up. (The mixed-G94→inverse-time
+> conversion — earlier mis-noted as "needs no further work since `millimeters` is the full norm" — is **now
+> implemented** in `planner.rs::resolve_feed`; keeping the full-norm `millimeters` was only *half* of grbl's
+> `ROTARY_FIX`, the feed leg was the other half. See DOC-10.2.)
 >
 > **2026-06-20 review corrections (all folded in below):** (1) DOC-10.2 now matches grblHAL's *actual* mixed
 > linear+rotary G94 handling — its `ROTARY_FIX` inverse-time conversion keeping `Block::millimeters` as a single
@@ -262,24 +264,27 @@ planner sets an effective inverse-time feed and realizes the block in `linear_le
 synchronized rotary work needs explicit G93. **`Block::millimeters` is unchanged in meaning** (full all-axis
 norm); only `build_block`'s *speed* derivation forks, and it forks into code G93 needs anyway.
 
-Concretely, `build_block` (`planner.rs:660`) keeps the norm but widens it to `AXES` terms and adds the mixed-move
-feed conversion:
+**[implemented — `planner.rs`]** `build_block` keeps the full `AXES`-term norm as `millimeters` and calls a
+`resolve_feed(feed, feed_mode, units, &delta_mm)` helper that returns `(effective_feed, effective_feed_mode)`:
 
 ```rust
-// Full all-axis norm (deg treated as mm) — the single length quantity, as grbl keeps it. Widen 3 → AXES.
-let mut len_sq = 0.0f32;
-for axis in 0..AXES {
-  len_sq += delta_unit[axis] * delta_unit[axis];
-}
-let millimeters = libm::sqrtf(len_sq);
-
-// G94 mixed linear+rotary → inverse-time conversion (grbl ROTARY_FIX): runs in linear_len / F minutes.
-let (effective_feed, inverse_time) = self.resolve_feed(feed, feed_mode, &delta_unit);
+let (effective_feed, effective_feed_mode) = if rapid {
+  (feed, feed_mode)                                  // rapids ignore the feed; the axis-rate limit governs.
+} else {
+  self.resolve_feed(feed, feed_mode, units, &delta_mm)
+};
+let nominal_speed =
+  self.nominal_speed_mm_s(effective_feed, units, effective_feed_mode, rapid, millimeters, &unit_vec);
 ```
 
-where `resolve_feed` returns the original feed for pure-linear, pure-rotary, and native-G93 moves, and the
-converted `F / linear_len` (flagged inverse-time) for a mixed G94 move. The nominal-speed math (next subsection)
-then handles inverse-time uniformly for both native-G93 and converted-mixed-G94 blocks.
+`resolve_feed` returns the original feed for pure-linear, pure-rotary, and native-G93 moves, and the converted
+`F × units_scale / linear_len` (flagged `InverseTime`) for a mixed G94 move — classifying linear vs rotary by the
+live `$376` mask (`config.is_rotary`), not a hardcoded axis, and folding `units_scale` in so a G20 mixed move keeps
+its inch→mm conversion (the inverse-time branch of `nominal_speed_mm_s` never inch-scales). The nominal-speed math
+(next subsection) then handles inverse-time uniformly for both native-G93 and converted-mixed-G94 blocks. Tests
+(`planner.rs`): a mixed `X10 A90 F600` runs the linear leg at exactly F600 (= 10 mm/s) with the full norm
+unchanged; a pure-rotary `A90 F600` stays `F/60` deg/s; and the converted feed is still floored by the axis-rate
+clamp.
 
 ### G93 inverse-time — deriving nominal speed from duration
 
