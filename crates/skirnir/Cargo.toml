@@ -27,8 +27,9 @@ serial = ["dep:tokio-serial"]
 
 [dependencies]
 # Async runtime + primitives for the engine's driver task and the UI<->engine channels. We keep the feature
-# set tight: the multi-threaded runtime, the proc-macros, async I/O helpers, sync channels, and timers.
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "io-util", "time"] }
+# set tight: the multi-threaded runtime, the proc-macros, async I/O helpers, sync channels, timers, and the
+# `signal` handler the headless `--cli` harness uses for a clean Ctrl-C (soft-reset + disconnect) abort.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "io-util", "time", "signal"] }
 # Production `Transport` over USB CDC serial, gated behind the `serial` feature. Kept behind the trait so the
 # engine never references it; only the `transport::serial` adapter touches this crate. `optional` so a
 # loopback-only build (e.g. tests) need not pull the native serialport stack.
@@ -61,6 +62,13 @@ eframe = { version = "0.34.3", optional = true, default-features = false, featur
 rfd = { version = "0.17.2", optional = true }
 
 [dev-dependencies]
+# The egui UI test harness (kittest + AccessKit), version-matched to egui 0.34. We deliberately take it with
+# NO default features: the `wgpu`/`snapshot` features pull a GPU backend for image-snapshot tests, which we do
+# not use yet — our UI tests drive real pointer interaction over egui's tessellation only, so they run
+# headless/CI-clean with no GPU. Image-snapshot (pixel-diff) tests would need the `wgpu` feature and are a
+# later add. The harness + its tests are `#[cfg(all(test, feature = "gui"))]` (they need `eframe::egui`), so
+# they compile only for the gui-featured test build; a `--no-default-features` test run skips them.
+egui_kittest = { version = "0.34.3", default-features = false }
 # The current-thread runtime + test macro are enough to drive the async engine tests; paused-time helpers
 # come from the `time` feature already enabled above.
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "io-util", "time", "test-util"] }
