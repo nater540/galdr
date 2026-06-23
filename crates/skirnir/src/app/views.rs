@@ -61,12 +61,13 @@ pub struct UiState {
   pub jog_continuous: bool,
   /// The jog feed rate (mm/min).
   pub jog_feed: f64,
-  /// The feed-override slider's transient drag position (percent), or `None` when the slider is idle (it then
-  /// mirrors the live `Ov:` value). Held here so the slider survives across the immediate-mode frames of a drag
-  /// and the live status poll cannot yank the handle while the operator is dragging it.
-  pub feed_override_drag: Option<u32>,
-  /// The spindle-override slider's transient drag position (percent); see [`Self::feed_override_drag`].
-  pub spindle_override_drag: Option<u32>,
+  /// The feed-override slider's feedback state: idle (mirror live), dragging (hold the operator's position so a
+  /// status poll cannot yank it), or holding the committed target after release until the firmware's relative
+  /// ramp converges onto it. Held here so the slider survives the immediate-mode frames of a drag and the
+  /// post-release ramp without snapping back to the lagging `Ov:` value. See [`super::overrides::OverrideFeedback`].
+  pub feed_override_drag: super::overrides::OverrideFeedback,
+  /// The spindle-override slider's feedback state; see [`Self::feed_override_drag`].
+  pub spindle_override_drag: super::overrides::OverrideFeedback,
   /// The manual-command input buffer in the console.
   pub console_input: String,
   /// Probe depth (mm, travelled downward as a positive magnitude here; the shell negates it).
@@ -152,8 +153,8 @@ impl Default for UiState {
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
-      feed_override_drag: None,
-      spindle_override_drag: None,
+      feed_override_drag: super::overrides::OverrideFeedback::default(),
+      spindle_override_drag: super::overrides::OverrideFeedback::default(),
       console_input: String::new(),
       probe_depth: 10.0,
       probe_feed: 50.0,
@@ -205,8 +206,8 @@ impl UiState {
     // different controller) must not resume them or pop a stale discard confirmation.
     self.settings_staging.clear();
     self.pending_settings_action = None;
-    self.feed_override_drag = None;
-    self.spindle_override_drag = None;
+    self.feed_override_drag = super::overrides::OverrideFeedback::default();
+    self.spindle_override_drag = super::overrides::OverrideFeedback::default();
   }
 
   /// Load a program: store its lines (shared, so streaming never re-clones the file) and rebuild the cached
@@ -909,13 +910,16 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   use super::overrides::OverrideAxis;
   section_header(ui, "Overrides");
   let (feed, rapid, spindle) = view.status.as_ref().and_then(|s| s.overrides).unwrap_or((100, 100, 100));
+  // Overrides only do anything on a ready link — a relative ±10/±1/reset byte is a no-op with nothing connected
+  // to act on it — so the whole panel is disabled until the board is connected and ready (Idle/Run/Hold/…).
+  let enabled = view.connection.is_connected();
 
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    override_axis(ui, "Feed", OverrideAxis::Feed, feed, &mut state.feed_override_drag, sink,
+    override_axis(ui, "Feed", OverrideAxis::Feed, feed, enabled, &mut state.feed_override_drag, sink,
       RealtimeCommand::FeedOverrideMinus1, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
       RealtimeCommand::FeedOverridePlus10, RealtimeCommand::FeedOverridePlus1);
     ui.add_space(4.0);
-    override_axis(ui, "Spindle", OverrideAxis::Spindle, spindle, &mut state.spindle_override_drag, sink,
+    override_axis(ui, "Spindle", OverrideAxis::Spindle, spindle, enabled, &mut state.spindle_override_drag, sink,
       RealtimeCommand::SpindleOverrideMinus1, RealtimeCommand::SpindleOverrideMinus10,
       RealtimeCommand::SpindleOverrideReset, RealtimeCommand::SpindleOverridePlus10,
       RealtimeCommand::SpindleOverridePlus1);
@@ -1007,62 +1011,114 @@ fn override_slider(ui: &mut egui::Ui, value: &mut u32, fill_color: Color32) -> e
 /// the same override; the slider is coarse-grained reach, the steppers are precise nudges including the new
 /// fine ±1%.
 ///
-/// `live` is the override the firmware last reported. `drag` is the slider's transient position: it tracks
-/// `live` whenever the slider is idle (so the firmware's truth re-centers it), and the operator's in-progress
-/// drag while held. On release we emit the target only if it moved, so merely touching the slider sends
-/// nothing.
+/// `live` is the override the firmware last reported. `feedback` is the slider's transient feedback state: it
+/// mirrors `live` while idle (so the firmware's truth re-centers the handle), holds the operator's position
+/// during a drag (so a status poll cannot yank it), and — the snap-back fix — holds the committed target after
+/// release until the firmware's relative ramp converges onto it (see [`super::overrides::OverrideFeedback`]). On
+/// release we emit the target only if it moved off `live`, so merely touching the slider sends nothing. The
+/// whole row is disabled unless a live link can act on the override (`enabled`), since overrides are no-ops
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
-fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32,
-  drag: &mut Option<u32>, sink: &mut IntentSink, minus1: RealtimeCommand, minus10: RealtimeCommand,
-  reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
+fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32, enabled: bool,
+  feedback: &mut super::overrides::OverrideFeedback, sink: &mut IntentSink, minus1: RealtimeCommand,
+  minus10: RealtimeCommand, reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
   use super::overrides::OverrideAxis;
 
-  // The slider edits a local mirror seeded from the live value while idle; an active drag holds its own value.
-  let mut value = drag.unwrap_or(live);
+  // Fold the latest live report into the feedback state first: while idle the handle follows `live`; a
+  // post-release hold releases once `live` converges onto the committed target. A drag ignores reports entirely.
+  feedback.observe(live);
+  // The value the handle shows this frame: `live` when idle, the pinned drag/hold value otherwise.
+  let mut value = feedback.display(live);
   // Feed (and rapid) carry the cool control-blue fill; spindle carries the warm motion-orange, matching the
   // design's `#0E86D4` feed bar and `#FF7A1A` spindle bar (the colour that was missing entirely before).
   let fill_color = match axis {
     OverrideAxis::Feed => Theme::ACCENT,
     OverrideAxis::Spindle => Theme::ACCENT_MOTION,
   };
-  // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
-  ui.horizontal(|ui| {
-    ui.label(RichText::new(label).size(11.0).color(Theme::TEXT_DIM));
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(Theme::TEXT));
-      let slider = override_slider(ui, &mut value, fill_color);
-      if slider.dragged() {
-        // While dragging, remember the operator's position so the live status poll cannot yank the handle back.
-        *drag = Some(value);
-      }
-      if slider.drag_stopped() || slider.clicked() {
-        // On release/click, commit the target if it moved off the live value, then let the mirror track live again.
-        if value != live {
-          sink.push(Intent::SetOverride { axis, target: value });
+  ui.add_enabled_ui(enabled, |ui| {
+    // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
+    ui.horizontal(|ui| {
+      ui.label(RichText::new(label).size(11.0).color(Theme::TEXT_DIM));
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(Theme::TEXT));
+        let slider = override_slider(ui, &mut value, fill_color);
+        // A UI test (egui_kittest) needs the slider's on-screen rect to drive a pointer drag at known
+        // coordinates, since the widget is hand-painted and label-less so AccessKit cannot locate it by text.
+        #[cfg(all(test, feature = "gui"))]
+        slider_rect_probe::record(axis, slider.rect);
+        if slider.dragged() {
+          // While dragging, hold the operator's position so the live status poll cannot yank the handle back.
+          feedback.drag_to(value);
         }
-        *drag = None;
-      }
+        if slider.drag_stopped() || slider.clicked() {
+          // On release/click, commit the target if it moved off the live value and HOLD it; the hold survives the
+          // firmware's relative ramp so the handle stays put instead of snapping to the stale `live` and crawling.
+          if value != live {
+            sink.push(Intent::SetOverride { axis, target: value });
+            feedback.commit(value, live);
+          } else {
+            // An empty touch (no movement): nothing committed, so just return to mirroring live.
+            *feedback = super::overrides::OverrideFeedback::Idle;
+          }
+        }
+      });
     });
   });
 
-  // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%.
-  ui.horizontal(|ui| {
-    if ui.button("−10").clicked() {
-      sink.push(Intent::Realtime(minus10));
-    }
-    if ui.button("−1").clicked() {
-      sink.push(Intent::Realtime(minus1));
-    }
-    if ui.button("100").clicked() {
-      sink.push(Intent::Realtime(reset));
-    }
-    if ui.button("+1").clicked() {
-      sink.push(Intent::Realtime(plus1));
-    }
-    if ui.button("+10").clicked() {
-      sink.push(Intent::Realtime(plus10));
-    }
+  // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%. Gated on the same
+  // live link as the slider — a relative override byte is a no-op with nothing connected to act on it.
+  ui.add_enabled_ui(enabled, |ui| {
+    ui.horizontal(|ui| {
+      if ui.button("−10").clicked() {
+        sink.push(Intent::Realtime(minus10));
+      }
+      if ui.button("−1").clicked() {
+        sink.push(Intent::Realtime(minus1));
+      }
+      if ui.button("100").clicked() {
+        sink.push(Intent::Realtime(reset));
+      }
+      if ui.button("+1").clicked() {
+        sink.push(Intent::Realtime(plus1));
+      }
+      if ui.button("+10").clicked() {
+        sink.push(Intent::Realtime(plus10));
+      }
+    });
   });
+}
+
+/// A test-only side channel that records each override slider's on-screen [`egui::Rect`] as it is rendered, so
+/// the egui_kittest harness can compute pointer coordinates inside a slider it cannot otherwise locate (the
+/// widget is hand-painted with no label, so AccessKit exposes no findable node). Compiled only for the
+/// gui-featured test build; the production render path is untouched apart from the cheap `record` call.
+#[cfg(all(test, feature = "gui"))]
+pub(crate) mod slider_rect_probe {
+  use super::super::overrides::OverrideAxis;
+  use eframe::egui::Rect;
+  use std::cell::Cell;
+
+  thread_local! {
+    /// The last-rendered rect of the feed and spindle sliders, in screen coordinates. `None` until first drawn.
+    static FEED: Cell<Option<Rect>> = const { Cell::new(None) };
+    static SPINDLE: Cell<Option<Rect>> = const { Cell::new(None) };
+  }
+
+  /// Record the slider rect for `axis` from the just-completed render of that axis's row.
+  pub(crate) fn record(axis: OverrideAxis, rect: Rect) {
+    match axis {
+      OverrideAxis::Feed => FEED.with(|c| c.set(Some(rect))),
+      OverrideAxis::Spindle => SPINDLE.with(|c| c.set(Some(rect))),
+    }
+  }
+
+  /// The last-recorded rect for `axis`, or `None` if that axis has not been rendered yet this thread.
+  pub(crate) fn last(axis: OverrideAxis) -> Option<Rect> {
+    match axis {
+      OverrideAxis::Feed => FEED.with(Cell::get),
+      OverrideAxis::Spindle => SPINDLE.with(Cell::get),
+    }
+  }
 }
 
 /// Render the probe panel: depth/feed/plate inputs and a "Probe Z" action that the shell sequences.
@@ -2299,16 +2355,17 @@ mod tests {
       editing_setting: Some((110, "250".to_string())),
       settings_staging: staging,
       pending_settings_action: Some(PendingSettingsAction::Refresh),
-      feed_override_drag: Some(140),
-      spindle_override_drag: Some(90),
+      feed_override_drag: super::super::overrides::OverrideFeedback::Dragging(140),
+      spindle_override_drag: super::super::overrides::OverrideFeedback::Holding { target: 90, committed_from: 100 },
       ..UiState::default()
     };
     state.on_disconnected();
     assert_eq!(state.editing_setting, None, "an in-progress setting edit must not survive a disconnect");
     assert!(state.settings_staging.is_empty(), "staged settings edits must not survive a disconnect");
     assert_eq!(state.pending_settings_action, None, "a pending discard confirmation must not survive a disconnect");
-    assert_eq!(state.feed_override_drag, None, "the feed-override drag must reset on a disconnect");
-    assert_eq!(state.spindle_override_drag, None, "the spindle-override drag must reset on a disconnect");
+    let idle = super::super::overrides::OverrideFeedback::Idle;
+    assert_eq!(state.feed_override_drag, idle, "the feed-override feedback must reset to Idle on a disconnect");
+    assert_eq!(state.spindle_override_drag, idle, "the spindle-override feedback must reset to Idle on a disconnect");
   }
 
   #[test]

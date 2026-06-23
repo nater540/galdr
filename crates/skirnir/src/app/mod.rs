@@ -50,6 +50,11 @@ pub mod theme;
 #[cfg(feature = "gui")]
 pub mod views;
 
+/// The egui_kittest UI test harness, compiled only for the gui-featured test build. See the module docs for how
+/// to add UI tests; it hosts the override-slider regression tests.
+#[cfg(all(test, feature = "gui"))]
+mod ui_test;
+
 #[cfg(feature = "gui")]
 pub use shell::{SkirnirApp, run};
 #[cfg(feature = "gui")]

@@ -13,7 +13,7 @@
   "$19": "Disable the internal pull-up on the probe pin (Galdr/grblHAL). Set it when the probe circuit supplies its own pull-up or pull-down and the internal one would fight it.",
   "$20": "Enable soft limits: refuse any move that would exceed the axis max-travel ($130…). Requires homing ($22) to be enabled first, since the limits are measured from the homed origin.",
   "$21": "Enable hard limits: an asserted limit switch during motion triggers an immediate alarm/stop. Protects the machine when a move would otherwise crash into an end-stop.",
-  "$22": "Enable the homing cycle ($H). Required before soft limits ($20) can be turned on; many homing settings ($23–$27) only take effect once this is enabled. Applies on the next reset.",
+  "$22": "Enable the homing cycle ($H). Required before soft limits ($20) can be turned on; many homing settings ($23-$27) only take effect once this is enabled. Applies on the next reset.",
   "$23": "Homing direction invert mask (per-axis bitfield): chooses which way each axis seeks its limit switch during homing. Set it so each axis homes toward its switch, not away from it.",
   "$24": "Homing locate feed rate (mm/min): the slow second approach used to precisely find the switch after the fast seek. Slower is more repeatable.",
   "$25": "Homing search seek rate (mm/min): the fast initial approach toward the limit switch during homing, before the slow locate pass ($24).",
@@ -49,5 +49,5 @@
   "$376": "Rotary-axes bitmask (Galdr DOC-10): marks which axes are angular (degrees, continuous rollover) rather than linear. On this machine only bit 3 (the A axis) is meaningful — $376=8 makes A rotary, $376=0 treats A as a 4th linear axis.",
   "$392": "Spindle spin-up delay in seconds (Galdr DOC-07): after M3/M4 the planner inserts a synchronised dwell of this long so the spindle reaches speed before the first cut. 0 disables the delay.",
   "$393": "Spindle reverse dwell in seconds (Galdr DOC-07): the spin-down pause forced on an M3↔M4 direction reversal — the spindle is stopped and allowed to settle before reversing, protecting the drive.",
-  "$481": "Auto status-report interval in milliseconds (grblHAL $481): when non-zero the firmware pushes a `<…>` report on this cadence without the sender polling `?`. 0 disables it; valid non-zero values are 100–1000 ms."
+  "$481": "Auto status-report interval in milliseconds (grblHAL $481): when non-zero the firmware pushes a `<…>` report on this cadence without the sender polling `?`. 0 disables it; valid non-zero values are 100-1000 ms."
 }

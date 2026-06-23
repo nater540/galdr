@@ -9,3 +9,4 @@
 - [Connecting-state disconnect gap](connecting-state-disconnect-gap.md) — Disconnect UI must gate on has_transport (incl Connecting), not is_connected, else a stalled connect leaks the serial FD
 - [Settings Save model](settings-save-model.md) — explicit Save: settings_staging store, stage-on-any-edit, Save/$$+clear, Refresh/Close discard confirm; supersedes Enter-only commit_setting_edit
 - [Settings tooltips](settings-tooltips.md) — runtime-loaded JSON descriptions (profile.rs pattern) + dynamic $ES meta helpers in views.rs; egui 0.34 ui.close_menu→ui.close()
+- [egui_kittest UI harness](egui-kittest-ui-harness.md) — per-view closure harness, label-less widget rect-probe seam, pointer-drag API quirks; the pattern for UI-bug repros
