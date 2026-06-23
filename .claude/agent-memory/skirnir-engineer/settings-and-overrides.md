@@ -16,9 +16,21 @@ vs a drifted `current`), else greedy ±10 decades then ±1 units; empty when cur
 guards a stale reported `current` from an unbounded run. NEW `Intent::SetOverride{axis,target}` (carries only
 the intent); the SHELL reads live `Ov:` (`view.status.overrides`, default 100) and emits the steps via
 `set_override`. Rapid stays preset-only (100/50/25), never routes through stepping. View: `override_axis(...)`
-renders a `Slider` (10–200%, commits `SetOverride` on `drag_stopped` only if moved) + a `−10 −1 100 +1 +10`
-stepper row. Slider transient state = `UiState.feed_override_drag`/`spindle_override_drag: Option<u32>`
-(tracks live while idle, pins during drag, so the status poll can't yank the handle mid-drag).
+renders a hand-painted `override_slider` (10–200%, commits `SetOverride` on `drag_stopped`/click only if moved)
++ a `−10 −1 100 +1 +10` stepper row.
+
+**Slider feedback state machine (fix for the snap-back/self-crawl bug).** Slider transient state is
+`UiState.feed_override_drag`/`spindle_override_drag: overrides::OverrideFeedback` (a pure enum in
+`app/overrides.rs`, NOT gui-gated, unit-tested): `Idle` (mirror live), `Dragging(u32)` (hold operator pos,
+ignore polls), `Holding{target, committed_from}` (after release, HOLD the committed target while the firmware's
+RELATIVE ramp crawls toward it). The OLD `Option<u32>` design cleared to `None` on release → next frame
+reverted to STALE `live` (Ov: lags) → handle snapped to centre, then the tracker's ±10/±1 ramp made the bar
+visibly creep. Fix: on release `feedback.commit(target, live)` and emit `SetOverride`; each frame `observe(live)`
+releases the hold to `Idle` ONLY once `live` reaches-or-PASSES target (passed covers clamp-at-10/200 + unit
+overshoot, so it can't stick forever). `display(live)` = what the handle shows. The `OverrideTracker` stepping
+is UNCHANGED — the fix is the UI feedback loop only. Override panel is now `add_enabled_ui`-gated on
+`view.connection.is_connected()` (overrides are no-ops with no live link). Regression-tested via the
+[[egui-kittest-ui-harness]] (drives a real pointer drag, asserts commit + hold-against-lagging-live).
 
 **Live `$`-settings sync (TEXT path, see [[engine-architecture]] for why not binary `$PBX`).**
 `protocol/settings.rs` (pure): `parse_setting_value("$0=10")` (rejects `$N0=`/`$J=`/`$H` — non-numeric key;

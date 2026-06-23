@@ -842,6 +842,14 @@ impl Parser {
         next_state.spindle_speed = word.value;
         Ok(())
       }
+      // Tool select (`T<n>`): accepted as a no-op. This machine has no automatic tool changer and does not
+      // implement `M6`, so there is nothing for a tool word to act on — but CAM posts (e.g. Vectric) emit `T1`
+      // before starting the spindle, and rejecting it would abort the whole program with `error:20`. grbl itself
+      // only stores the pending tool until an `M6` consumes it; here it is simply consumed.
+      b'T' => Ok(()),
+      // Line number (`N<n>`): a sequence label some posts prefix to every line. It carries no machine action, so
+      // it is accepted and ignored — grbl uses it only for error reporting, which this firmware does by other means.
+      b'N' => Ok(()),
       _ => Err(GcodeError::UnsupportedCommand),
     }
   }
@@ -1018,7 +1026,7 @@ impl Parser {
     })
   }
 
-  /// Apply an `M` word from the supported subset (M3/M4/M5 spindle, M30 program end). M3/M4/M5 update BOTH the
+  /// Apply an `M` word from the supported subset (M3/M4/M5 spindle, M2/M30 program end). M3/M4/M5 update BOTH the
   /// per-line `pending_spindle` (for a spindle-only line's single emit) and the sticky modal `next_state.spindle`
   /// (modal group 7) so the commanded direction survives a line that also carries a move.
   fn apply_m_word(
@@ -1047,7 +1055,10 @@ impl Parser {
         next_state.spindle = SpindleState::Stop;
         Ok(())
       }
-      30 => {
+      // M2 (program end) and M30 (program end + rewind) both end the program. This firmware has no pallet/rewind
+      // distinction, so both reset the parser to its start-of-program state via the same `ProgramEnd`. M2 had been
+      // missing, which aborted any CAM file that ends with `M2` (most do) on `error:20` at the final line.
+      2 | 30 => {
         guard.claim(Group::Stop)?;
         acc.pending_program_end = true;
         Ok(())
@@ -1972,6 +1983,34 @@ mod tests {
     let mut parser = Parser::new();
     let cmd = parser.parse_line(b"M30").expect("valid");
     assert_eq!(cmd, Some(PlannerCommand::ProgramEnd));
+  }
+
+  #[test]
+  fn parse_program_end_m2() {
+    // M2 ends the program exactly like M30; most CAM posts (e.g. Vectric) terminate with M2, and it had been
+    // rejected as `error:20`.
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"M2").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::ProgramEnd));
+  }
+
+  #[test]
+  fn parse_tool_select_is_accepted_as_noop() {
+    // A standalone tool select (Vectric posts emit `T1` before the spindle starts) must not abort the program;
+    // it carries no motion, so the line yields no command.
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"T1").expect("tool select is accepted");
+    assert_eq!(cmd, None);
+  }
+
+  #[test]
+  fn parse_line_number_prefix_is_ignored() {
+    // A leading sequence number must be ignored, not rejected, and must not change the motion on the line.
+    let mut with_n = Parser::new();
+    let mut without = Parser::new();
+    let a = with_n.parse_line(b"N10 G0 X5").expect("line number accepted");
+    let b = without.parse_line(b"G0 X5").expect("valid");
+    assert_eq!(a, b, "a leading line number must not change the parsed command");
   }
 
   #[test]

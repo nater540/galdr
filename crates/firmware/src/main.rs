@@ -282,8 +282,14 @@ async fn main(spawner: Spawner) {
   //     defaults, so a bad flash region can never wedge boot — seed the live `SETTINGS`, and derive the
   //     planner / motion / TMC configs from it. The flash is shared `&'static` so the consumer can persist
   //     `$x=val` writes at runtime.
-  let flash: &'static storage::SharedFlash =
-    FLASH.init(Mutex::new(storage::FlashState::new(FlashStorage::new(peripherals.FLASH))));
+  // `multicore_auto_park` is REQUIRED on this dual-core board: esp-storage defaults to `MultiCoreStrategy::Error`,
+  // which refuses every flash write while the other core is running (returns `OtherCoreRunning`). Core 1 (`APP_CPU`)
+  // permanently runs the `motion_executor`, so without auto-park every settings/coordinate persist fails silently
+  // and nothing is ever written to flash. Auto-park briefly parks the other core for the (infrequent, idle-time)
+  // write and unparks it after, so persistence actually commits.
+  let flash: &'static storage::SharedFlash = FLASH.init(Mutex::new(storage::FlashState::new(
+    FlashStorage::new(peripherals.FLASH).multicore_auto_park(),
+  )));
   let settings = {
     let mut store = storage::FlashRecordStore::settings(flash);
     // Use the reporting loader so a present-but-undecodable record (a CRC mismatch, a write the reset button

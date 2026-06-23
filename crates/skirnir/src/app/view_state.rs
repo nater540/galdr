@@ -443,6 +443,12 @@ impl ViewState {
     }
   }
 
+  /// Empty the console buffer. Drives the right-click "Clear" affordance — a pure state mutation the shell calls
+  /// in response to [`crate::app::Intent::ClearConsole`], so the view stays a renderer and the wipe is testable.
+  pub fn clear_console(&mut self) {
+    self.console.clear();
+  }
+
   /// Append a console line, evicting the oldest once at capacity so the buffer never grows without bound.
   fn log(&mut self, source: LogSource, text: String) {
     if self.console.len() >= CONSOLE_CAPACITY {
@@ -683,6 +689,17 @@ mod tests {
     assert_eq!(view.console.len(), CONSOLE_CAPACITY);
     // The oldest 50 lines were evicted; the front is now line 50.
     assert_eq!(view.console.front().unwrap().text, "G0 X50");
+  }
+
+  #[test]
+  fn clear_console_empties_a_populated_buffer() {
+    let mut view = ViewState::default();
+    for i in 0..5 {
+      view.note_sent(format!("G0 X{i}"));
+    }
+    assert_eq!(view.console.len(), 5, "the console is populated before the clear");
+    view.clear_console();
+    assert!(view.console.is_empty(), "clear_console wipes every line");
   }
 
   #[test]

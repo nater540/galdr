@@ -148,6 +148,17 @@ pub static MOTION_PARKED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// waiter (the same rule [`SOFT_RESET`]/[`MOTION_RESET`] follow) so it is never lost to another waiter.
 pub static JOG_CANCEL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// `0x86` (graceful program stop, Galdr extension) — set by the non-blocking reader half ONLY when the live
+/// [`ControlState::program_stop_quiesces`] gate is true (Run/Hold), consumed by `comms_consumer` (which owns the
+/// planner). The consumer runs [`program_stop_cycle`]: it flushes the WHOLE planner queue + any in-progress arc,
+/// parks the executor at the active block's boundary with a real acknowledgment (reusing [`quiesce_executor`]),
+/// syncs the planner's commanded position to the live stop point, clears the program/modal-run state (mirroring
+/// `M30`), and returns the machine to Idle (NOT alarm) with position RETAINED. It differs from `0x18` ([`SOFT_RESET`])
+/// which aborts to `ALARM:3` and re-emits the banner. Like [`SOFT_RESET`], this single `Signal` is `.wait()`'d at
+/// both the consumer's main-loop select AND the back-pressure/arc-drive waits, which is safe because the consumer is
+/// only ever blocked at ONE of those at a time (an embassy `Signal` wakes exactly one waiter).
+pub static PROGRAM_STOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// `0x18` (soft reset) — set by `usb_rx`, consumed by `comms_consumer` (it rebuilds the parser/planner and
 /// emits the banner) and by `plan_command`'s back-pressure retry. The CORE-1 motion executor does NOT share
 /// this Signal — it has its own [`MOTION_RESET`] — because an embassy `Signal` wakes only one waiter
@@ -213,6 +224,19 @@ pub fn limit_levels() -> [bool; AXES] {
 /// the signal. A `Signal` (not a counter) is sufficient because the executor re-checks the queue under the
 /// lock after each wake and loops until it is drained, so a coalesced multi-block signal loses no block.
 pub static BLOCK_AVAILABLE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Motion-executor → consumer "a queue slot just freed" wake (Bug 4: chunk-boundary decelerate-to-stop on large
+/// arcs). Raised by the core-1 executor the instant it pops a block, so [`drive_pending_arc`] refills an
+/// in-progress over-subdivided arc PROACTIVELY — the moment a slot opens — rather than only after the fixed
+/// [`QUEUE_FULL_RETRY`] poll interval. Keeping the planner buffer topped up while an arc is pending stops the
+/// executor from draining down to the look-ahead's forced-stop chunk tail before the next chunk arrives, which
+/// otherwise stamps a dwell mark (a physical decelerate-to-stop and re-accelerate) at every ~`BLOCK_QUEUE_LEN`
+/// segment boundary of the milled curve. A `Signal` (not a counter) suffices: `drive_pending_arc` re-checks the
+/// queue under the lock after each wake and resumes until the arc completes, so a coalesced multi-pop wake is
+/// fine. It is ONLY consumed by the arc-drive loop, so a slot-freed wake raised while no arc is pending is simply
+/// overwritten by the next pop and costs nothing. The timer race remains as a backstop so a missed/foregone
+/// signal (e.g. the executor parked on a hold) can never wedge the drive loop.
+pub static SLOT_FREED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// Limit-switch rising-edge trip → executor idle-trip seam (DOC-06). The core-1 executor's idle loop awaits a
 /// rising edge on the X/Y/Z limit pins via the interrupt-driven `Input::wait_for_rising_edge`, runs the `$26`
@@ -947,6 +971,17 @@ fn dispatch_realtime(cmd: RealtimeCommand) {
         JOG_CANCEL.signal(());
       }
     }
+    RealtimeCommand::ProgramStop => {
+      // Graceful program stop (`0x86`, Galdr extension): a controlled decelerate-to-Idle that flushes the program
+      // and RETAINS position, distinct from the `0x18` abort. Only meaningful while a program is running or held —
+      // the host-tested `program_stop_quiesces` gate is true exactly for `Normal`/`Hold`, so a `0x86` from Idle is
+      // a (cheap) no-op there and from Alarm/Check/Sleep/Jog is ignored entirely (a jog has its own `0x85` cancel).
+      // When the gate holds, wake the consumer (the planner owner) to run the boundary stop + full flush + sync;
+      // this reader half stays non-blocking (a synchronous `Cell` load + a coalesced `Signal`).
+      if control_state().program_stop_quiesces() {
+        PROGRAM_STOP.signal(());
+      }
+    }
     RealtimeCommand::Override(byte) => {
       // A feed / rapid / spindle / coolant override byte (Phase E, DOC-08 §3). Mutate the shared OVERRIDES in the
       // non-blocking reader half — a `Cell` swap, no await — so the change shows in the very next `?` (`Ov:` and
@@ -1043,14 +1078,18 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // drained (no more lines queued), this is a burst boundary — flush the live settings to flash ONCE for
     // the whole burst before blocking for the next event, instead of writing per line. The flush yields the
     // executor while the flash op runs; `is_empty` is the cheap "host paused" signal the brief specifies.
-    if SETTINGS_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
+    // `motion_idle()` additionally defers the persist while a cycle is in flight: the esp-storage flash write
+    // parks the real-time motion core (`multicore_auto_park`), so flushing mid-cycle would briefly stall step
+    // generation — a still-pending change is caught by the safety tick once motion drains to idle.
+    if SETTINGS_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() && motion_idle().await {
       // `false`: this path fires every loop iteration while dirty, so it must NOT re-mark on failure or it would
       // busy-retry a persistently-failing write each loop. A failed write here is retried by the safety timer.
       flush_settings(flash, false).await;
     }
     // Coalesced coordinate persist (Phase B): same burst-boundary rule for the persistent G54-G59 / G28 / G30
-    // record, so a program that re-zeroes several axes appends the coordinate blob once, not per line.
-    if COORDINATES_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() {
+    // record (also deferred while moving, for the same auto-park reason), so a program that re-zeroes several
+    // axes appends the coordinate blob once, not per line.
+    if COORDINATES_DIRTY.load(Ordering::Acquire) && LINE_QUEUE.is_empty() && motion_idle().await {
       flush_coordinates(flash, false).await;
     }
     // Race the next line against a soft reset AND a periodic safety flush. A `0x18` resets the parser modal
@@ -1070,11 +1109,13 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     let events = select4(LINE_QUEUE.receive(), SOFT_RESET.wait(), JOG_CANCEL.wait(), Timer::after(SETTINGS_FLUSH_SAFETY));
     // Race the four primary events against a hard-limit trip from the core-1 executor (DOC-06): a limit pressed
     // during normal motion must halt the program and enter `ALARM:1` regardless of what the consumer is waiting on.
-    match select(events, HARD_LIMIT_TRIPPED.wait()).await {
-      Either::First(Either4::First(line)) => handle_line(line.as_slice(), &mut parser, &mut state, flash).await,
+    // Also race a graceful program stop (`0x86`): a controlled decelerate-to-Idle + full flush that, unlike the
+    // hard-limit trip and the `0x18` reset, raises no alarm and retains position. Nested `select`s keep each arm typed.
+    match select(select(events, HARD_LIMIT_TRIPPED.wait()), PROGRAM_STOP.wait()).await {
+      Either::First(Either::First(Either4::First(line))) => handle_line(line.as_slice(), &mut parser, &mut state, flash).await,
       // A soft reset must not lose a pending settings change: persist before rebuilding the pipeline (grbl
       // applies most settings on the next reset, so they MUST be on flash by the time the reset takes them).
-      Either::First(Either4::Second(())) => {
+      Either::First(Either::First(Either4::Second(()))) => {
         // `true`: a failed persist here must be retried (by the safety timer or the next reset), not dropped —
         // grbl applies settings on the next reset, so a lost write would mean the reset takes stale flash values.
         flush_settings(flash, true).await;
@@ -1084,20 +1125,26 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
       // Jog cancel (`0x85`, Phase D): reuse the feed-hold block-boundary stop, flush the jog blocks, sync the
       // planner to the live stop point, and return to Idle. Owned here (the planner owner) so it is race-free
       // with line handling — a cancel and a line never run concurrently in this single in-order consumer.
-      Either::First(Either4::Third(())) => cancel_jog_cycle().await,
-      // Safety-interval tick: persist any pending change even if the queue never observably drained. When
-      // nothing is dirty these are cheap no-ops and the loop simply re-arms the timer on the next iteration.
-      Either::First(Either4::Fourth(())) => {
-        // `true`: the safety interval is the bounded-cadence retry for a failed write — re-marking dirty here lets
-        // the next tick re-attempt, which is exactly the guarantee Bug A defeated (a single failure dropped it).
-        flush_settings(flash, true).await;
-        flush_coordinates(flash, true).await;
+      Either::First(Either::First(Either4::Third(()))) => cancel_jog_cycle().await,
+      // Safety-interval tick: persist any pending change even if the queue never observably drained — but only
+      // while the machine is idle, since the flash write parks the real-time motion core (see `motion_idle`). A
+      // change made mid-cycle therefore persists on the first safety tick AFTER motion drains (<=1s later); the
+      // `||`-guarded `motion_idle()` is skipped entirely when nothing is dirty so an idle board never locks the
+      // planner here. When nothing is dirty these are cheap no-ops and the loop simply re-arms the timer.
+      Either::First(Either::First(Either4::Fourth(()))) => {
+        let pending = SETTINGS_DIRTY.load(Ordering::Acquire) || COORDINATES_DIRTY.load(Ordering::Acquire);
+        if pending && motion_idle().await {
+          // `true`: the safety interval is the bounded-cadence retry for a failed write — re-marking dirty here lets
+          // the next tick re-attempt, which is exactly the guarantee Bug A defeated (a single failure dropped it).
+          flush_settings(flash, true).await;
+          flush_coordinates(flash, true).await;
+        }
       }
       // Hard-limit trip (`$21`, DOC-06): the executor detected a switch trip during normal motion. Enter the
       // LOCKED `ALARM:1` (position is likely lost from the abrupt stop — re-homing recommended) and reset the
       // pipeline so the queue is flushed and the machine sits in a clean, clearly-halted alarm. Only a soft
       // reset clears a locked alarm.
-      Either::Second(()) => {
+      Either::First(Either::Second(())) => {
         // Guard against a STALE trip clobbering an already-halted machine (Finding #5b): raise `ALARM:1` only
         // from a state where the machine could actually be MOVING (`Normal`/`Hold`/`Jog`/`Check`). The
         // host-tested `hard_limit_alarm_applies` predicate decides. If we are already in an alarm (or asleep), a
@@ -1111,6 +1158,12 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
           reset_pipeline(&mut parser, &mut state).await;
         }
       }
+      // Graceful program stop (`0x86`, Galdr extension): a controlled decelerate-to-Idle that flushes the program
+      // and RETAINS position — the operator's "stop the job cleanly", distinct from the `0x18` abort. Owned here
+      // (the planner owner) so it is race-free with line handling; the reader half only signalled it after the
+      // `program_stop_quiesces` gate held. Re-checks the live state inside the cycle so a state change between the
+      // signal and here (e.g. a soft reset winning a tie) makes it a benign no-op.
+      Either::Second(()) => program_stop_cycle(&mut parser, &mut state).await,
     }
   }
 }
@@ -1215,12 +1268,21 @@ fn force_spindle_off() {
 /// default modal state, clear the gcode error-hold, flush the planner queue, reset the non-position snapshot
 /// fields to idle, and emit the guaranteed readiness banner. The `RX_PIPE`, the `line_assembler`'s partial
 /// line, and `LINE_QUEUE` were already cleared by `usb_rx`; this completes the warm reset for the downstream
-/// half so a fresh stream starts from defaults at the origin.
+/// half so a fresh stream starts from the documented modal defaults.
 ///
-/// The LIVE MACHINE POSITION is deliberately NOT touched here: the core-1 motion executor is its single owner
-/// (it zeroes the [`LIVE_POSITION`] atomics on [`MOTION_RESET`]), so the consumer writing it too would be a
-/// cross-core stale-overwrite race (Finding #3). Resetting `MACHINE` to idle here only restores the fields
-/// the executor does not own (run-state / feed / spindle / RX-free); `status_responder` reads MPos live.
+/// ## Machine position is RETAINED (Change A)
+/// The LIVE MACHINE POSITION is deliberately NOT zeroed: matching grbl, a `0x18` abort RETAINS MPos so `$X`
+/// unlocks at the same coordinates. The core-1 motion executor is the single owner of the live [`LIVE_POSITION`]
+/// atomics and now RETAINS them across [`MOTION_RESET`] (it re-publishes the last step position, never zeroes it),
+/// so the consumer must NOT write them — that would be a cross-core stale-overwrite race (Finding #3). But the
+/// rebuilt [`Planner`] starts at the step origin, so this SYNCS its commanded position to the retained live step
+/// position via [`Planner::sync_position`], keeping the planner's notion of position consistent with the retained
+/// MPos: a subsequent ABSOLUTE move then resolves relative to the retained position, not the origin. Resetting
+/// `MACHINE` to idle here only restores the fields the executor does not own (run-state / feed / spindle /
+/// RX-free); `status_responder` reads MPos live. (Small accepted race: on an abort DURING motion the executor may
+/// still be finishing its mid-block abort when this reads `LIVE_POSITION`; the step counter only advances
+/// monotonically within a block, so the read is a valid recent step position — "suspect" exactly as grbl
+/// documents an aborted-mid-move position, recovered by `$H`.)
 async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   // `Parser` exposes no in-place reset; reconstructing it restores the documented power-on modal defaults
   // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state.
@@ -1235,16 +1297,22 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   state.spin_up = SpinUpGate::new();
   state.last_spindle_dir = SpindleState::Stop;
   state.last_spindle_rpm = 0;
-  // Reconstruct the planner to clear the block queue, machine position, work offset, and junction state in
-  // one step (it has no public flush), rebuilding it from the LIVE settings so any `$x=val` changes made
-  // before the reset take effect now (grbl applies most settings on the next reset). Snapshot the settings
-  // first so the `SETTINGS` lock is released before the `PLANNER` lock is taken. Reset the published
-  // snapshot's non-position fields to idle; the live MPos atomics are zeroed by the executor on
-  // `MOTION_RESET`, not here (single-owner, no race).
+  // Reconstruct the planner to clear the block queue, work offset, and junction state in one step (it has no
+  // public flush), rebuilding it from the LIVE settings so any `$x=val` changes made before the reset take effect
+  // now (grbl applies most settings on the next reset). Snapshot the settings first so the `SETTINGS` lock is
+  // released before the `PLANNER` lock is taken. The rebuilt planner starts at the step origin, but the live MPos
+  // is RETAINED (Change A) by the executor, so SYNC the planner's commanded position to the retained live step
+  // position — keeping the planner consistent with the retained MPos so a subsequent absolute move resolves from it
+  // rather than the origin. `sync_position` only sets the position + clears junction state, so it is safe before the
+  // WCO push below (which sets the work offset, untouched here). Reset the published snapshot's non-position fields
+  // to idle; the live MPos atomics are retained by the executor on `MOTION_RESET`, not written here (no race).
   let planner_config = settings_snapshot().await.planner_config();
+  let retained_steps = read_live_position();
   {
     let mut guard = PLANNER.lock().await;
-    *guard = Some(Planner::new(planner_config));
+    let mut planner = Planner::new(planner_config);
+    planner.sync_position(retained_steps);
+    *guard = Some(planner);
   }
   // Coordinate model on soft reset (grbl): the SESSION-only offsets (G92, dynamic TLO) clear to identity while
   // the persistent G54-G59 / G28 / G30 survive. Clear the volatile offsets, then push the recomputed WCO into
@@ -1424,9 +1492,19 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
       // the spindle reaches speed before it cuts. The host-tested `SpinUpGate` decides WHEN; this injects the
       // dwell ahead of the move. `inject_spin_up_dwell` is a no-op (and returns Continue) for a rapid / non-move
       // command or when no spin-up is owed; it returns Aborted only if a soft reset preempted the awaited dwell.
-      if let SpinUpInjection::Aborted = inject_spin_up_dwell(&command, state).await {
-        apply_soft_reset(parser, state).await;
-        return;
+      match inject_spin_up_dwell(&command, state).await {
+        SpinUpInjection::Continue => {}
+        // A soft reset preempted the awaited spin-up dwell: run the warm reset and drop the move.
+        SpinUpInjection::Aborted => {
+          apply_soft_reset(parser, state).await;
+          return;
+        }
+        // A graceful program stop preempted the spin-up dwell's back-pressured enqueue: run the clean stop (Idle,
+        // position retained, no alarm) and drop the move.
+        SpinUpInjection::Stopped => {
+          program_stop_cycle(parser, state).await;
+          return;
+        }
       }
       // G28/G30 (DOC-05 group-0 motion) is intercepted here, ahead of the generic `plan_command`: it must read the
       // stored predefined position from the consumer-owned coordinate model, so it cannot be planned by the planner
@@ -1463,6 +1541,12 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
         // A soft reset arrived while this command was back-pressured: abort it (the host discards pending
         // acks on `0x18`), emit no response, and run the soft-reset transition whose signal was consumed here.
         PlanResult::Aborted => apply_soft_reset(parser, state).await,
+        // A graceful program stop (`0x86`) arrived while this command was back-pressured: abandon the line (no
+        // `ok` — the host discards pending acks the moment it sends the stop) and run the clean stop whose
+        // [`PROGRAM_STOP`] signal was consumed in the back-pressure wait. Returns to Idle with position retained,
+        // no alarm — unlike `Aborted`'s warm reset. The `program_stop_cycle` re-checks the live state, so a stop
+        // that raced a soft reset (which already moved us out of Run/Hold) is a benign no-op.
+        PlanResult::Stopped => program_stop_cycle(parser, state).await,
         // An M3/M4/M5 (DOC-07): the spindle outputs were ALREADY driven from the modal spindle state by
         // `sync_spindle_from_modal` (above, on the clean parse), so a spindle-only line just `ok`s here. Driving
         // off modal state — not this per-line outcome — is what makes an M3/M4/M5 sharing a line with a move work.
@@ -1518,6 +1602,12 @@ enum PlanResult {
   SoftLimitAlarm,
   /// A soft reset preempted the command while it was back-pressured; the consumed signal must be honored.
   Aborted,
+  /// A graceful program stop (`0x86`) preempted the command while it was back-pressured (or driving a pending
+  /// arc): the consumed [`PROGRAM_STOP`] signal must be honored by running [`program_stop_cycle`]. Distinct from
+  /// [`Aborted`](PlanResult::Aborted) — a stop returns to Idle with position retained and raises no alarm, where
+  /// the `0x18` abort runs the warm reset. The in-flight line is abandoned with no `ok` (the host discards pending
+  /// acks the moment it sends the stop).
+  Stopped,
   /// An M3/M4/M5 spindle command (DOC-07): the planner passed it through with no motion. The consumer publishes
   /// the commanded direction, wakes the [`spindle`] task to drive the outputs, and notes the spin-up gate so the
   /// next cutting move gets a `$392` dwell. Carried out of `plan_command` so the side effects run in the
@@ -1593,6 +1683,17 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
         BLOCK_AVAILABLE.signal(());
         return PlanResult::Accepted;
       }
+      // An over-subdivided arc fed only PART of its segments — the rest are saved as an in-progress arc (DOC-05
+      // resumable arc). The line must NOT be acked yet: wake the executor to drain the chunk we just queued, then
+      // drive `resume_arc` until the whole arc is enqueued. This is what lets an arc with more than the queue's
+      // worth of segments stream without ever dead-locking on a permanent `QueueFull`. A soft reset mid-arc aborts
+      // it (the executor's reset clears the queue and `abort_arc` drops the in-progress arc).
+      Ok(PlannerOutcome::ArcPending { enqueued }) => {
+        if enqueued > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+        return drive_pending_arc().await;
+      }
       // A coordinate-system / offset op: surface it so the consumer applies it to the shared coordinate model
       // with the live machine position in hand, then pushes the recomputed WCO back into the planner.
       Ok(PlannerOutcome::Coordinate(op)) => return PlanResult::Coordinate(op),
@@ -1628,9 +1729,12 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // the delay is short relative to a block's execution time, so a normal retry wins the freed slot
       // promptly without busy-spinning the CPU.
       Err(PlannerError::QueueFull) => {
-        match select(Timer::after(QUEUE_FULL_RETRY), SOFT_RESET.wait()).await {
+        // Race the retry delay against a soft reset (`0x18` → abort) AND a graceful program stop (`0x86` → clean
+        // stop): both abandon a stuck back-pressured line at once rather than after the executor frees a slot.
+        match select(Timer::after(QUEUE_FULL_RETRY), select(SOFT_RESET.wait(), PROGRAM_STOP.wait())).await {
           Either::First(()) => {}
-          Either::Second(()) => return PlanResult::Aborted,
+          Either::Second(Either::First(())) => return PlanResult::Aborted,
+          Either::Second(Either::Second(())) => return PlanResult::Stopped,
         }
       }
       // A program move/arc that left the `$20` soft-limit envelope: this is a SYSTEM ALARM in grbl (`ALARM:2`),
@@ -1638,6 +1742,81 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // it as a distinct result the caller routes to the alarm path.
       Err(PlannerError::MoveExceedsTravel) => return PlanResult::SoftLimitAlarm,
       // A genuine geometry error (bad arc): surface the grblHAL code to the caller.
+      Err(other) => return PlanResult::Error(other.code()),
+    }
+  }
+}
+
+/// Drive an in-progress (over-subdivided) arc to completion, feeding its remaining segments into the planner as
+/// the core-1 motion executor frees queue slots (DOC-05 resumable arc). The first chunk has ALREADY been enqueued
+/// by [`plan_command`]; this loops [`Planner::resume_arc`](firmware_core::planner::Planner::resume_arc) — waking
+/// the executor after each chunk and yielding for it to drain — until the whole arc is enqueued, at which point the
+/// line is acked exactly ONCE ([`PlanResult::Accepted`]). It NEVER acks while the arc is still pending, so the
+/// host's character-counting flow control throttles correctly and the stream can never dead-lock on an arc larger
+/// than the queue. The resume wait is raced against [`SOFT_RESET`] so a `0x18` aborts a stuck arc at once — the
+/// executor's reset clears the queue and the planner rebuild drops the in-progress arc, so the abort is clean.
+///
+/// ## Proactive (event-driven) refill — Bug 4
+/// The refill is woken by [`SLOT_FREED`] (raised the instant the executor pops a block) raced against a short
+/// [`QUEUE_FULL_RETRY`] timer backstop and [`SOFT_RESET`]. Refilling the moment a slot opens — rather than only
+/// after the full poll interval — keeps the planner buffer topped up while the arc is pending, so the executor
+/// never drains down to the look-ahead's forced-stop chunk tail before the next chunk lands. That is what makes a
+/// large arc execute as CONTINUOUS motion across chunk boundaries (proven host-side in
+/// `over_subdivided_arc_carries_velocity_across_chunk_boundaries`) instead of stamping a decelerate-to-stop dwell
+/// mark at each ~`BLOCK_QUEUE_LEN` boundary. RESIDUAL: the genuine last available block always decelerates to a
+/// stop (the executor must be able to halt there — a hard safety invariant); at an extreme feed where the
+/// executor could empty the queue between a pop and the refill completing, motion would still momentarily stop —
+/// safe, never a step loss — but at realistic PCB-milling feeds/segment timing the producer stays ahead and the
+/// curve is smooth.
+///
+/// ## Termination — Bug 9
+/// The loop exits ONLY on `Queued` (the arc completed), `SOFT_RESET`, or an `Err` from `resume_arc`. A genuine
+/// (non-`QueueFull`) per-segment error now PROPAGATES out of `resume_arc` with the in-progress arc cleared, so the
+/// `Err(other)` arm returns `error:N` and the loop ends — a deterministic segment error can no longer spin here
+/// forever. A `resume_arc` that enqueues zero (the queue is still full) is benign: it simply waits for the next
+/// `SLOT_FREED`/timer wake, and the loop PROGRESSES because each executor pop frees a slot the next resume claims.
+async fn drive_pending_arc() -> PlanResult {
+  loop {
+    // Refill on the executor's "slot freed" wake the instant it pops a block (proactive refill, Bug 4), with a
+    // short timer backstop so a foregone signal (e.g. the executor parked on a hold) cannot wedge the loop, and a
+    // soft reset so `0x18` aborts at once. The timer is short relative to a block's execution time, so even on the
+    // backstop path a freed slot is claimed promptly.
+    // Also race a graceful program stop (`0x86`): a stop arriving mid-arc-drive abandons the remaining segments at
+    // once (the stop's `abort_arc` + `flush_queue` drops the in-progress arc and the queued chunks) and runs the
+    // clean stop, exactly as `0x18` runs the abort. Reported as `Stopped` so the caller runs `program_stop_cycle`.
+    match select(select(SLOT_FREED.wait(), Timer::after(QUEUE_FULL_RETRY)), select(SOFT_RESET.wait(), PROGRAM_STOP.wait())).await {
+      Either::First(_) => {}
+      Either::Second(Either::First(())) => return PlanResult::Aborted,
+      Either::Second(Either::Second(())) => return PlanResult::Stopped,
+    }
+    // Feed the next chunk under the planner lock (scoped so it is dropped before any await). A missing planner is
+    // a wiring bug surfaced loudly rather than fabricating an `ok`, exactly as `plan_command` does.
+    let outcome = {
+      let mut guard = PLANNER.lock().await;
+      match guard.as_mut() {
+        Some(planner) => planner.resume_arc(),
+        None => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
+      }
+    };
+    match outcome {
+      // The final chunk is in: every segment is enqueued, so wake the executor for the last blocks and ack once.
+      Ok(PlannerOutcome::Queued { blocks }) => {
+        if blocks > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+        return PlanResult::Accepted;
+      }
+      // More segments fed (or none yet, if no slot freed): wake the executor for whatever we just queued and loop.
+      Ok(PlannerOutcome::ArcPending { enqueued }) => {
+        if enqueued > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+      }
+      // `resume_arc` only ever returns an arc outcome on success; any other Ok variant is an invariant break,
+      // surfaced loudly rather than silently acking a half-fed arc.
+      Ok(_) => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
+      // A genuine per-segment planner error (Bug 9): `resume_arc` has already cleared the in-progress arc, so we
+      // surface `error:N` and STOP driving — the deterministic error can never spin this loop forever.
       Err(other) => return PlanResult::Error(other.code()),
     }
   }
@@ -1678,11 +1857,13 @@ async fn handle_go_to_predefined(is_g28: bool, intermediate: &firmware_core::gco
       }
       // Back-pressure: yield to the executor and retry the whole call. The call is atomic (enqueues nothing unless
       // both sub-moves fit), so the retry re-resolves from the un-advanced position — see the doc comment. Race the
-      // retry against a soft reset so `0x18` aborts a stuck recall at once.
+      // retry against a soft reset (`0x18` → abort) AND a graceful program stop (`0x86` → clean stop) so either
+      // abandons a stuck recall at once.
       Err(PlannerError::QueueFull) => {
-        match select(Timer::after(QUEUE_FULL_RETRY), SOFT_RESET.wait()).await {
+        match select(Timer::after(QUEUE_FULL_RETRY), select(SOFT_RESET.wait(), PROGRAM_STOP.wait())).await {
           Either::First(()) => {}
-          Either::Second(()) => return PlanResult::Aborted,
+          Either::Second(Either::First(())) => return PlanResult::Aborted,
+          Either::Second(Either::Second(())) => return PlanResult::Stopped,
         }
       }
       // The intermediate left the `$20` envelope: a SYSTEM ALARM (`ALARM:2`), not an `error:N` line — no motion
@@ -1744,6 +1925,10 @@ enum SpinUpInjection {
   /// A soft reset arrived while awaiting the spin-up dwell; the caller must run the soft-reset transition and
   /// drop the move (the host discards pending acks on `0x18`).
   Aborted,
+  /// A graceful program stop (`0x86`) arrived while the spin-up dwell's enqueue was back-pressured; the caller must
+  /// run [`program_stop_cycle`] and drop the move. Distinct from [`Aborted`](SpinUpInjection::Aborted) — a stop
+  /// returns to Idle with position retained and no alarm, where the `0x18` abort runs the warm reset.
+  Stopped,
 }
 
 /// DOC-07 spin-up dwell injection. Before the FIRST cutting move (a G1 feed `Move` or any `Arc`) after an M3/M4,
@@ -1781,8 +1966,10 @@ async fn inject_spin_up_dwell(
   // Flush the planner's look-ahead at the boundary so the cut starts from rest: plan a synchronized G4 dwell (the
   // planner pins the preceding block to a stop). `plan_command` returns `PlanResult::Dwell` for it, or `Aborted`
   // if a soft reset preempted a back-pressured enqueue.
-  if let PlanResult::Aborted = plan_command(&PlannerCommand::Dwell { seconds: dwell_s }).await {
-    return SpinUpInjection::Aborted;
+  match plan_command(&PlannerCommand::Dwell { seconds: dwell_s }).await {
+    PlanResult::Aborted => return SpinUpInjection::Aborted,
+    PlanResult::Stopped => return SpinUpInjection::Stopped,
+    _ => {}
   }
   // Run the SAME synchronized dwell a real `G4` uses (wait for prior motion to drain, then hold `$392` so the
   // spindle reaches speed), raced against a soft reset — one dwell mechanism, no ad-hoc timer.
@@ -2304,6 +2491,99 @@ async fn cancel_jog_cycle() {
   //    awaiting the next block — and return to Normal/Idle with no alarm, no modal change.
   release_hold();
   set_control_state(ControlState::Jog.cancel_jog());
+}
+
+/// Run a graceful program stop (`0x86`, Galdr extension) end to end, GENERALIZING [`cancel_jog_cycle`] from a jog
+/// to a running program. It decelerates the running/held program to a controlled stop at the active block's
+/// boundary (no step loss), flushes the WHOLE planner queue + any in-progress arc, syncs the planner's commanded
+/// position to the actual live stop point, clears the program/modal-run state (mirroring `M30`), DROPS the aborted
+/// program's buffered inbound stream (so no already-streamed line is re-parsed/executed/`ok`'d after the stop), and
+/// returns the machine to Idle (NOT alarm) with position RETAINED. It raises no alarm and re-emits no banner — the
+/// operator's clean "stop the job", distinct from the `0x18` abort ([`apply_soft_reset`] → `ALARM:3` + banner + warm
+/// reset).
+///
+/// ## How it composes the existing machinery
+/// The boundary-stop + sync is the SAME [`quiesce_executor`] / [`release_hold`] primitive jog-cancel uses (so the
+/// stop is a real parked acknowledgment, not a poll); the difference is it flushes EVERY queued block via
+/// [`Planner::flush_queue`] (not just trailing jogs) and [`Planner::abort_arc`] (so a partially-streamed arc is
+/// discarded), then clears the modal/spindle/override state exactly as [`program_end`] (`M30`) does — WITHOUT a
+/// warm reset (no parser rebuild that loses coordinates, no `force_spindle_off`-driven banner, no position zero).
+///
+/// ## Safe from Run or Hold, benign otherwise
+/// The reader half only signals this when [`ControlState::program_stop_quiesces`] holds, but the state can change
+/// between the signal and here (a soft reset winning a tie), so this RE-CHECKS the live state and is a benign no-op
+/// if a program is no longer running/held. A soft reset landing mid-quiesce is honored (the quiesce reports
+/// `ResetPreempted` and the re-signalled `0x18` runs its own reset), so the abort always wins a race with the stop.
+///
+// TODO(DOC-02 Stage-2): mid-block ramp-down. Like jog-cancel and feed-hold, we stop at the current block boundary
+// rather than ramping velocity down mid-block; a smooth mid-block deceleration is the shared Stage-2 refinement.
+async fn program_stop_cycle(parser: &mut Parser, state: &mut ConsumerState) {
+  // Re-check the live state: the reader gated on `program_stop_quiesces`, but a soft reset could have won a tie and
+  // moved us out of Run/Hold. A stop is only meaningful from a running/held program; anything else is a no-op.
+  if !control_state().program_stop_quiesces() {
+    return;
+  }
+  // 1. Flush the WHOLE queue (program + any trailing jog blocks) AND any in-progress arc FIRST, under the planner
+  //    lock, so the executor has nothing more to pop after it finishes the active block — the in-flight block stops
+  //    at its boundary and no flushed-away block follows it. `abort_arc` drops a partially-streamed over-subdivided
+  //    arc so its remaining segments are never fed after the stop.
+  {
+    let mut guard = PLANNER.lock().await;
+    if let Some(planner) = guard.as_mut() {
+      planner.flush_queue();
+      planner.abort_arc();
+    }
+  }
+  // 2. Park the executor at the active block's boundary via the shared quiesce primitive (raises the hold level and
+  //    AWAITS a real parked acknowledgment). A soft reset mid-quiesce is honored — the reset supersedes the stop.
+  match quiesce_executor().await {
+    QuiesceOutcome::Parked => {}
+    // The reset already cleared the hold level, flushed the planner, and (now) RETAINED the position; abandon the
+    // stop and let `comms_consumer` run the re-signalled reset. Do NOT release the hold — the reset already did.
+    QuiesceOutcome::ResetPreempted => return,
+  }
+  // 3. Sync the planner's commanded position to the ACTUAL live stop point so a subsequent move resolves from where
+  //    the machine really stopped (the executor is genuinely parked now, so the live position is stable to read).
+  //    This is also what keeps the planner's commanded position consistent with the RETAINED live MPos (Change A).
+  let stop_steps = read_live_position();
+  {
+    let mut guard = PLANNER.lock().await;
+    if let Some(planner) = guard.as_mut() {
+      planner.sync_position(stop_steps);
+    }
+  }
+  // 4. Release the hold so the executor leaves its parked branch (its queue is empty, so it returns to awaiting the
+  //    next block) and clear the program/modal-run state, mirroring `M30`: stop the spindle, reset the parser modal
+  //    state + spindle tracking to power-on defaults, select G54, and reset the live overrides — so the next stream
+  //    starts clean. Coordinates/offsets and the live MACHINE POSITION are deliberately RETAINED (this is a clean
+  //    stop, not a warm reset): no banner, no parser-rebuild that drops the WCS, no position zero.
+  release_hold();
+  force_spindle_off();
+  PROGRAMMED_SPINDLE_RPM.store(0, Ordering::Release);
+  *parser = Parser::new();
+  state.spin_up = SpinUpGate::new();
+  state.last_spindle_dir = SpindleState::Stop;
+  state.last_spindle_rpm = 0;
+  sync_active_wcs(0).await;
+  set_overrides(Overrides::new());
+  reset_ov_reporter();
+  // 5. Discard the aborted program's BUFFERED INBOUND stream, mirroring the `0x18` soft-reset flush in
+  //    `dispatch_realtime` (drop every buffered RX byte, every framed-but-unconsumed line, and the assembler's
+  //    partial line). Without this, the ~50 lines the host already streamed before the `0x86` survive the stop in
+  //    `RX_PIPE`/`LINE_QUEUE`; `line_assembler` would keep feeding them to this consumer, which would re-plan and
+  //    execute them (the DRO keeps running) and `ok` each — spurious acks to a host that reset its window on the
+  //    host-side stop, plus an `error:1` from a leaked partial line. This is done AFTER `quiesce_executor` returns:
+  //    bytes already in flight on USB keep landing in `RX_PIPE` for the whole quiesce-await window (the reader half
+  //    stays non-blocking), so flushing earlier would leave those late arrivals buffered. The host stops sending the
+  //    moment it issues `0x86`, so the tail is finite and fully arrived by the parked acknowledgment — one flush here
+  //    drops it cleanly. The `ResetPreempted` early-return above skips this deliberately: a soft reset winning the
+  //    tie already ran the identical flush in the reader half, so there is nothing left to clear.
+  RX_PIPE.clear();
+  while LINE_QUEUE.try_receive().is_ok() {}
+  LINE_RESET.signal(());
+  // Finally, latch the control state back to Idle-capable `Normal` (NO alarm). `program_stop` maps Run/Hold → Normal
+  // and is a no-op elsewhere; the reported `?` state re-derives Idle from the now-empty queue.
+  set_control_state(control_state().program_stop());
 }
 
 /// Apply a coordinate-system / offset op to the shared [`COORDINATES`] model, then push the recomputed WCO into
@@ -3375,6 +3655,24 @@ async fn planner_blocks_free() -> u8 {
     }
     None => firmware_core::planner::BLOCK_QUEUE_LEN as u8,
   }
+}
+
+/// True when no motion is in flight: the core-1 executor is not mid-block AND the planner queue is fully drained.
+/// This is the exact inverse of the `running` predicate the status reporter uses for `Run`/`Idle` (executor
+/// busy OR blocks queued), so "idle" here means the same `Idle` the host sees. It also reads false during `$H`
+/// homing and jogging, which both run on the executor with `EXECUTOR_RUNNING` set.
+///
+/// Used to defer flash persistence while the machine is moving: the esp-storage flash write parks the real-time
+/// motion core (`multicore_auto_park` in `main`), so flushing mid-cycle would briefly stall step generation. The
+/// settings/coordinate persists are not time-critical, so they wait for the machine to be quiescent (the next
+/// burst boundary or safety tick once motion drains). The soft-reset flush deliberately does NOT consult this —
+/// a reset is already aborting motion, and grbl applies settings on the next reset, so they must be on flash by
+/// then. Checks the cheap [`EXECUTOR_RUNNING`] atom first and only locks the planner if it is clear.
+async fn motion_idle() -> bool {
+  if EXECUTOR_RUNNING.load(Ordering::Acquire) {
+    return false;
+  }
+  planner_blocks_free().await == firmware_core::planner::BLOCK_QUEUE_LEN as u8
 }
 
 /// How long the consumer waits before retrying a [`PlannerError::QueueFull`] command. Short relative to a

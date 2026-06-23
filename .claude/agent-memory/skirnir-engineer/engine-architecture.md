@@ -18,13 +18,45 @@ the pure core; the engine is just the async pump + channel glue, so the contract
 
 **Channel topology.** `Engine::connect(transport) -> EngineHandle` spawns the driver via `tokio::spawn`.
 UI -> engine: `UnboundedSender<Command>` (StreamProgram/SendLine/Realtime/Disconnect). Engine -> UI:
-`UnboundedReceiver<Event>` (StateChanged/Response/Progress/Fault/Disconnected). The driver loop is `biased`
-toward commands so disconnect/soft-reset are honored under inbound flood. Writes are awaited inline (outside
-`select!`) so a real-time byte / granted line is never torn by cancellation. Loop exits emit exactly one
+`UnboundedReceiver<Event>` (StateChanged/Response/Progress/Fault/Disconnected). Loop exits emit exactly one
 `Event::Disconnected` (None=clean EOF/requested, Some=I/O error).
+
+**Prioritized write loop (load-bearing — fixes the streaming-deadlock bug).** `Effect` has TWO write variants:
+`WriteRealtime(Vec<u8>)` (out-of-band `?`/`!`/`~`/`0x18`/overrides — `begin_handshake` probes + `on_realtime`)
+and `WriteLine(Vec<u8>)` (counted program/manual lines — `on_send_line` + `release_ready_lines`). Provenance is
+in the PURE core so the priority contract is testable. The driver does NOT write inline; `apply_effects` is now
+SYNCHRONOUS + INFALLIBLE — it just sorts byte-effects into `Driver.realtime_out: VecDeque<u8>` /
+`Driver.line_out: VecDeque<Vec<u8>>` and forwards informational effects. So feeding the core (commands, inbound
+acks, poll) can NEVER park the loop. Each iteration, in strict priority: (1) `flush_realtime` writes all queued
+realtime bytes, RACED against `command_rx` so a Disconnect mid-flush ends the loop and cancelled bytes are
+`requeue_realtime_front`'d (order preserved); (2) if a line is queued, `write_pending_line` writes the front
+line RACED against command_rx + status_poll (NOT read — only one transport borrow per `select!`), so a parked
+line write under backpressure yields to Stop/Disconnect/poll/realtime; (3) else `select!` over command / poll /
+read, `biased` so command+poll sit AHEAD of read (the read arm can no longer starve the `?` poll → DRO stays
+live during a hot stream). Teardown does a best-effort `realtime_out` flush (a Stop issued just before Disconnect
+still reaches the wire) but NEVER flushes `line_out` (don't push an aborted job). WHY two queues + races instead
+of inline await: the old single inline `write_all().await` parked the whole task under serial backpressure
+(Stop/Disconnect dead) and, with biased read-first, starved the `?` poll (DRO freeze). grbl contract
+(`docs/gcode-streaming.md` §3) says realtime bytes may be sent mid-line, so realtime-before-line is always safe.
 
 **RX buffer.** `DEFAULT_RX_BUFFER = 1024`; refined at runtime from `[OPT:...]` (3rd CSV field) via
 `rx_buffer_from_opt`, applied by `ProtocolCore` on a `Response::Message`.
+
+**Stray-ack tolerance — TWO distinct mechanisms in `ProtocolCore` (both gate the `UnexpectedAck` fault in `on_ack`,
+checked in this order).** (1) `trailing_acks: usize` — COUNT-bounded, BANNER-scoped only: a boot banner may re-ack
+each line that was in flight when the firmware reset (connect race, the `$I`-racing-banner case); `reset_window(true)`
+grants exactly `inflight_kinds.len()`. A host reset/stop grants ZERO here (would linger unspent + mask a real over-ack).
+(2) `ignore_stray_acks: bool` — BASELINE-bounded latch for the post-Stop/Abort stray-ack STORM: set in the `ProgramStop`
+(`0x86`) AND `SoftReset` (`0x18`) arms of `on_realtime` (both empty the window via `reset_window(false)`), it silently
+tolerates ANY number of unmatched acks (in-flight count is unknown, and more arrive until the companion firmware fix
+lands) while quiescent post-stop. WHY: per the grbl contract the host discards pending acks on a reset — without this,
+every Stop/Abort spammed the console with `Fault(UnexpectedAck)`. It is NOT count-bounded; it CLEARS the instant a
+baseline is re-established: the next counted line sent (`on_send_line`/`release_ready_lines`, at the `flow.on_line_sent`
+site), a banner (the `0x18` reset's own boot banner, in `on_response`), or a session boundary (`on_connected`/
+`on_disconnected`). That keeps the genuine-bug guard: a spurious double-ok during ACTIVE streaming still faults because
+the latch is long cleared by then. Tests: `a_{program_stop,soft_reset}_silently_tolerates_in_flight_acks_until_a_line_
+re_establishes_counting`, `the_soft_reset_banner_clears_the_post_reset_stray_ack_latch`, and the renamed
+`a_{program_stop,soft_reset}_does_not_widen_the_banner_trailing_ack_budget` (prove the count-budget stays banner-only).
 
 **In-flight line-kind FIFO (load-bearing invariant).** `ProtocolCore` keeps `inflight_kinds: VecDeque<
 InflightKind{Program,Other}>` in LOCK-STEP with `FlowWindow`'s in-flight set. Push a kind on EVERY send:
@@ -44,6 +76,13 @@ port — `cargo test -p skirnir --no-default-features` passes, proving the gate 
 
 **Testability.** `Transport` trait uses `impl Future` (no boxing). `LoopbackController` injects "firmware"
 bytes and captures written bytes; engine integration tests drive scripted exchanges under `#[tokio::test]`.
+`LoopbackController::gate_writes()`/`release_writes()` (a shared `WriteGate` Notify/AtomicBool) make
+`write_all` PARK until released — the seam for simulating serial backpressure (firmware not draining RX mid-cut).
+Default state open, so existing tests are unaffected. Used by the realtime-preemption + Disconnect-while-pending
+deadlock tests. Poll-starvation is hard to repro under `start_paused` (an always-ready read busy-loops); the
+trick that works is a transport delivering a BURST of immediately-ready reads with NO `.await` between them
+(awaiting an already-ready future does not yield to the scheduler) so the engine drains the whole burst before a
+read-after-poll loop would ever reach the timer — assert the `?` poll lands BEFORE the burst of line writes.
 
 **Status field parsing.** `src/protocol/status.rs`: `parse_status(body) -> StatusReport` over the verbatim
 `<...>` body (`Response::Status` still carries the raw string; the structured parse lives in the reducer/UI,

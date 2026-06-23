@@ -109,6 +109,14 @@ impl Metrics {
   pub const PROGRESS_W: f32 = 260.0;
   /// Dock / override progress-bar height (`height:6px`, design §03).
   pub const PROGRESS_H: f32 = 6.0;
+  /// Horizontal gap between the dock progress readout's fields and their `·` separators. The strip's right
+  /// closure inherits the tab row's zeroed `item_spacing`, so the readout sets this explicitly to keep its
+  /// fields from running together (the crammed `9%0:51` the user flagged).
+  pub const DOCK_PROGRESS_GAP: f32 = 8.0;
+  /// Width the dock progress readout reserves for its text fields (count, two `·` separators, percent, clock)
+  /// beside the bar. When the strip cannot hold this plus [`Self::PROGRESS_W`], the bar is dropped first so the
+  /// block degrades gracefully on a narrow window instead of overflowing into an unpainted gap.
+  pub const DOCK_PROGRESS_TEXT_RESERVE: f32 = 190.0;
   /// Console / command-line body padding x (`padding:…14px`/`…12px`, design §03 — use 14 to match the log).
   pub const CONSOLE_PAD_X: f32 = 14.0;
   /// Send-button horizontal padding (`padding:0 16px`, design §03).

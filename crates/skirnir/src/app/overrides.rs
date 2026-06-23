@@ -22,6 +22,14 @@ pub const OVERRIDE_MAX: u32 = 200;
 /// The neutral 100% override the `reset` command snaps to, and the value a slider centres on.
 pub const OVERRIDE_NEUTRAL: u32 = 100;
 
+/// The maximum number of status observations a post-release [`OverrideFeedback::Holding`] hold tolerates without
+/// the firmware reaching the committed target before it releases anyway (Bug 7). The firmware crawls one ±10/±1
+/// step per `?`/`Ov:` round-trip, so the worst-case legal ramp across the full 10–200 span is ~19 coarse steps;
+/// this bound generously exceeds that, so the converging case always releases on arrival first, while a firmware
+/// that will NEVER land on the target (adjusted in ALARM, an external change, a short settle) cannot pin a stale
+/// value on the handle indefinitely — once the bound is spent the hold falls back to mirroring live.
+pub const OVERRIDE_HOLD_MAX_OBSERVATIONS: u32 = 40;
+
 /// Which relative-override channel a stepping request targets. Rapid is deliberately absent: grbl exposes only
 /// the 100/50/25 rapid presets (no ±), so the rapid control stays a preset picker, not a slider, and never
 /// routes through this stepping. Both variants here carry the full ±10 / ±1 / reset command set.
@@ -175,6 +183,97 @@ impl OverrideTracker {
   }
 }
 
+/// The per-axis feedback state of an override slider: what the handle should show across the immediate-mode
+/// frames of a drag and, crucially, what it should show *after release* while the firmware ramps to the
+/// commanded value.
+///
+/// grbl overrides are relative and ramp over several `?`/`Ov:` round-trips (the firmware crawls toward the
+/// target one ±10/±1 step per poll), so on release the live `Ov:` value still lags far behind the commanded
+/// target. The previous design dropped the transient value to `None` on release and reverted to live, which
+/// snapped the handle back to centre and then let it visibly creep as `live` caught up. This state machine
+/// instead **holds the committed target** on the handle until reality converges, so the handle stays where the
+/// operator put it and the fill tracks `live` underneath it without a snap or a self-propelled crawl past it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverrideFeedback {
+  /// No interaction: the handle mirrors the live `Ov:` value the firmware reports. The resting state.
+  #[default]
+  Idle,
+  /// The operator is dragging the handle, which sits at this value (percent). The live status poll is ignored
+  /// while held so a poll cannot yank the handle out from under the pointer mid-drag.
+  Dragging(u32),
+  /// The drag was released with a committed target (percent); the handle holds this value while the firmware
+  /// ramps toward it. Carries the `live` value observed at commit time so convergence can tell whether the
+  /// firmware has begun moving, distinguishing "still lagging at the old value" from "has reached the target".
+  Holding {
+    /// The committed target percent the handle holds and the firmware is ramping toward (already clamped).
+    target: u32,
+    /// The live `Ov:` value at the moment of release, so a later report can be classified as movement toward
+    /// the target rather than the pre-command lag.
+    committed_from: u32,
+    /// How many non-converging status observations the hold has seen so far. Bounded by
+    /// [`OVERRIDE_HOLD_MAX_OBSERVATIONS`]: once it is reached the hold releases even if the target was never
+    /// reached, so a firmware that will never land on the target cannot pin a stale handle value forever (Bug 7).
+    observations: u32,
+  },
+}
+
+impl OverrideFeedback {
+  /// The value the handle should display this frame, given the live `Ov:` value. `Idle` follows `live`; a drag
+  /// or a post-release hold shows its own pinned value so neither a status poll nor the firmware's ramp moves
+  /// the handle away from where the operator left it.
+  pub fn display(self, live: u32) -> u32 {
+    match self {
+      OverrideFeedback::Idle => live,
+      OverrideFeedback::Dragging(value) => value,
+      OverrideFeedback::Holding { target, .. } => target,
+    }
+  }
+
+  /// Enter (or continue) a drag with the handle at `value`. Called every frame the slider is being dragged.
+  pub fn drag_to(&mut self, value: u32) {
+    *self = OverrideFeedback::Dragging(value);
+  }
+
+  /// Commit the drag on release: hold the (clamped) `target` and remember the `live` value seen at release so
+  /// convergence can later distinguish the lagging poll from a real arrival. The handle keeps showing `target`
+  /// until [`Self::observe`] decides the firmware has converged onto it and returns to [`Self::Idle`].
+  pub fn commit(&mut self, target: u32, live: u32) {
+    *self = OverrideFeedback::Holding {
+      target: clamp_override(target),
+      committed_from: clamp_override(live),
+      observations: 0,
+    };
+  }
+
+  /// Fold a freshly-reported live `Ov:` value into the feedback state, releasing the post-release hold once the
+  /// firmware has converged. Only `Holding` reacts; `Idle`/`Dragging` ignore reports (idle simply renders the
+  /// live value, and a drag must never be perturbed by a poll).
+  ///
+  /// The hold releases — returning to [`Self::Idle`] so the handle resumes tracking `live` — once `live` has
+  /// **reached or passed the target** in the direction of travel: at or beyond `target` when ramping up, at or
+  /// below it when ramping down. For the normal converging ramp this fires within a few polls: the committed
+  /// `target` is clamped to grbl's 10–200 span and the [`OverrideTracker`] emits the exact ±10/±1 steps onto it,
+  /// so the firmware lands on (or, on a unit overshoot, just past) the target quickly; "passed" catches the
+  /// clamp-at-bound and overshoot cases. Lagging reports still on the near side of the target keep the hold —
+  /// exactly the snap-back the old design suffered.
+  ///
+  /// A second, bounded escape (Bug 7) guarantees the hold cannot stick forever when the firmware never lands on
+  /// the target — e.g. an override adjusted while in ALARM (ignored by the firmware), an external/competing
+  /// change, or a settle short of the target. Each non-converging observation increments a counter; once it
+  /// reaches [`OVERRIDE_HOLD_MAX_OBSERVATIONS`] the hold releases anyway, falling back to mirroring live, so a
+  /// stuck override can never pin a wrong DRO value on the handle indefinitely.
+  pub fn observe(&mut self, live: u32) {
+    if let OverrideFeedback::Holding { target, committed_from, observations } = *self {
+      let reached = if target >= committed_from { live >= target } else { live <= target };
+      if reached || observations + 1 >= OVERRIDE_HOLD_MAX_OBSERVATIONS {
+        *self = OverrideFeedback::Idle;
+      } else {
+        *self = OverrideFeedback::Holding { target, committed_from, observations: observations + 1 };
+      }
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -304,5 +403,103 @@ mod tests {
     tracker.command(OverrideAxis::Feed, 100, 150);
     let spindle = tracker.command(OverrideAxis::Spindle, 100, 120);
     assert_eq!(spindle.len(), 2); // 100 -> 120 on spindle, unaffected by the feed estimate.
+  }
+
+  #[test]
+  fn feedback_idle_mirrors_the_live_value() {
+    // At rest the handle simply shows whatever the firmware last reported.
+    let fb = OverrideFeedback::Idle;
+    assert_eq!(fb.display(137), 137);
+    assert_eq!(fb.display(100), 100);
+  }
+
+  #[test]
+  fn feedback_drag_shows_its_own_value_and_ignores_the_live_poll() {
+    // While dragging, the handle holds the operator's position — a status poll at a different value must not
+    // move it (the mid-drag "yank" bug).
+    let mut fb = OverrideFeedback::Idle;
+    fb.drag_to(160);
+    assert_eq!(fb.display(100), 160, "the live poll must not pull the handle off the drag position");
+    // A status report mid-drag is ignored entirely.
+    fb.observe(100);
+    assert_eq!(fb.display(100), 160);
+  }
+
+  #[test]
+  fn feedback_holds_the_committed_target_against_a_stale_live() {
+    // The core snap-back fix: on release the handle holds the commanded target even though the firmware's `Ov:`
+    // still lags at the pre-command value for several polls.
+    let mut fb = OverrideFeedback::Idle;
+    fb.drag_to(150);
+    fb.commit(150, 100); // released at 150, firmware still reports 100.
+    assert_eq!(fb.display(100), 150, "the handle holds the target, it does NOT snap to the stale live value");
+    // A lagging report still showing the pre-command value leaves the hold in place.
+    fb.observe(100);
+    assert_eq!(fb.display(100), 150);
+    // The firmware crawls partway — still short of the target — so the handle keeps holding (no creep).
+    fb.observe(130);
+    assert_eq!(fb.display(130), 150, "a partial ramp does not release the hold; the handle stays put");
+  }
+
+  #[test]
+  fn feedback_releases_the_hold_once_live_reaches_the_target() {
+    // Once reality converges onto the commanded value, the hold clears and the handle resumes tracking `live`.
+    let mut fb = OverrideFeedback::Idle;
+    fb.commit(150, 100);
+    fb.observe(150); // the firmware has arrived.
+    assert_eq!(fb, OverrideFeedback::Idle, "reaching the target releases the post-release hold");
+    // Now idle, the handle follows live again — including an external change after convergence.
+    assert_eq!(fb.display(140), 140);
+  }
+
+  #[test]
+  fn feedback_releases_when_live_passes_the_target_on_a_unit_overshoot() {
+    // Ramping down, a firmware that lands one unit past the target (or clamps) must still release the hold, so
+    // it can never stick. 120 -> overshoot to 119 still counts as reached when ramping down.
+    let mut fb = OverrideFeedback::Idle;
+    fb.commit(120, 150); // committed down from 150 to 120.
+    fb.observe(119); // overshot by a unit.
+    assert_eq!(fb, OverrideFeedback::Idle, "passing the target on the travel side releases the hold");
+  }
+
+  #[test]
+  fn feedback_hold_releases_after_a_bounded_number_of_non_converging_observations() {
+    // Bug 7: a Holding hold must not pin the handle forever if the firmware never lands on the target — e.g. the
+    // override was adjusted while in ALARM (the firmware ignores it), an external/competing change moved it, or it
+    // settled short. After a bounded number of status observations that never reach the target, the hold releases
+    // and the handle falls back to mirroring live, so it can never show a percentage the firmware is not at.
+    let mut fb = OverrideFeedback::Idle;
+    fb.commit(150, 100); // ramping up to 150; the firmware will never get there (stuck at 100).
+    // Feed many lagging reports that never reach the target; the hold must NOT stick indefinitely.
+    for _ in 0..OVERRIDE_HOLD_MAX_OBSERVATIONS {
+      assert_eq!(fb.display(100), 150, "the hold keeps the handle on the target while within the escape bound");
+      fb.observe(100);
+    }
+    // The escape bound is now spent: the hold has released and the handle mirrors live again.
+    assert_eq!(fb, OverrideFeedback::Idle, "a stuck override must not pin the handle past the escape bound");
+    assert_eq!(fb.display(100), 100, "after release the handle falls back to the live value");
+  }
+
+  #[test]
+  fn feedback_converging_hold_still_releases_on_arrival_within_the_bound() {
+    // The normal converging case is unchanged: a hold that reaches its target releases immediately on arrival,
+    // well within the escape bound, and never snaps back in the meantime.
+    let mut fb = OverrideFeedback::Idle;
+    fb.commit(150, 100);
+    fb.observe(120); // partial ramp, still short — stays held.
+    assert_eq!(fb.display(120), 150);
+    fb.observe(150); // arrived.
+    assert_eq!(fb, OverrideFeedback::Idle, "reaching the target still releases the hold within the bound");
+  }
+
+  #[test]
+  fn feedback_clamps_a_committed_target_to_the_grbl_range() {
+    // A target beyond grbl's bounds is held at the clamped value, matching what the firmware will actually
+    // reach, so convergence lands exactly and the hold releases.
+    let mut fb = OverrideFeedback::Idle;
+    fb.commit(1000, 100); // clamps to 200.
+    assert_eq!(fb.display(100), 200);
+    fb.observe(200);
+    assert_eq!(fb, OverrideFeedback::Idle);
   }
 }

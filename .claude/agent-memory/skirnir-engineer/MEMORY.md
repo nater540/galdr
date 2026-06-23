@@ -6,3 +6,10 @@
 - [Settings/overrides/reconnect](settings-and-overrides.md) — override sliders + fine ±1% stepping, live $-settings text-path model ($$/$ES/write), auto-reconnect backoff policy
 - [Probing pipeline](probing-pipeline.md) — DOC-11 Phase 0: typed [PRB:] parse, event-driven probe latch (view_state), hardened result-gated probe_z (probe_flow), dropped-Eq gotcha
 - [Profile persistence](profile-persistence.md) — DOC-11 §1.3 profile/project store: versioned RON under OS config dir (profile.rs), shell save points, ApplySavedRotaryCenter, test seam, deps
+- [Connecting-state disconnect gap](connecting-state-disconnect-gap.md) — Disconnect UI must gate on has_transport (incl Connecting), not is_connected, else a stalled connect leaks the serial FD
+- [Settings Save model](settings-save-model.md) — explicit Save: settings_staging store, stage-on-any-edit, Save/$$+clear, Refresh/Close discard confirm; supersedes Enter-only commit_setting_edit
+- [Settings tooltips](settings-tooltips.md) — runtime-loaded JSON descriptions (profile.rs pattern) + dynamic $ES meta helpers in views.rs; egui 0.34 ui.close_menu→ui.close()
+- [egui_kittest UI harness](egui-kittest-ui-harness.md) — per-view closure harness, label-less widget rect-probe seam, pointer-drag API quirks; the pattern for UI-bug repros
+- [Engine write cancel-safety](engine-write-cancel-safety.md) — cursor-based write path, Transport::write primitive, Effect::AbortQueued on soft-reset/banner, timeout-bounded teardown, loopback partial-write seam
+- [header_bar item_spacing leak](header-bar-itemspacing-leak.md) — tab_strip's left-closure item_spacing.x=0 leaks into the shared right closure; header-strip right content must set its own spacing
+- [Graceful program-stop](graceful-program-stop.md) — 0x86 ProgramStop (clean Stop) vs 0x18 SoftReset (Abort/E-stop); two-control split, abort_enabled gating, re-Run

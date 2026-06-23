@@ -247,8 +247,19 @@ impl Block {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PlannerOutcome {
   /// `n` linear blocks were enqueued (1 for a move, ≥1 for a subdivided arc). Zero means the command
-  /// was a no-op move (target equals current position, no axis travelled).
+  /// was a no-op move (target equals current position, no axis travelled). For an arc this also signals the
+  /// FINAL chunk: the whole arc is now enqueued (`blocks` is the count fed in this last chunk), so the consumer
+  /// acks the line. A zero-block [`resume_arc`](Planner::resume_arc) with no arc in progress also reports this.
   Queued { blocks: usize },
+  /// A G2/G3 arc subdivided into more segments than currently fit, so only `enqueued` of its remaining segments
+  /// were fed into the queue this chunk; the rest are saved as an in-progress arc (DOC-05). The consumer must NOT
+  /// ack the line yet: it lets the motion executor drain block(s), then calls [`resume_arc`](Planner::resume_arc)
+  /// to feed the next chunk, repeating until an arc outcome reports [`Queued`](PlannerOutcome::Queued) (complete).
+  /// This is what lets an arc larger than [`BLOCK_QUEUE_LEN`] segments stream without ever dead-locking on a
+  /// permanent [`QueueFull`](PlannerError::QueueFull) — chord accuracy (`$12`) is preserved because the segment
+  /// count is unchanged; the segments are merely fed in chunks. `enqueued` may be 0 when no slot is free yet (the
+  /// queue is full of program blocks ahead of the arc); the consumer simply drains and resumes again.
+  ArcPending { enqueued: usize },
   /// A G4 dwell for `seconds`. The preceding block has been pinned to a full stop so the dwell starts
   /// from rest, as grbl requires (a dwell is a synchronized motion boundary).
   Dwell { seconds: f32 },
@@ -362,6 +373,43 @@ struct ArcRequest<'a> {
   machine_coords: bool,
 }
 
+/// The saved state of an arc that could not enqueue all its segments at once, so the planner feeds it into the
+/// block buffer INCREMENTALLY as the executor frees slots (grbl's resumable-arc model, DOC-05). It is pure,
+/// `Copy` geometry — center, radius, the per-segment angular step, the Z/A helix interpolation params, the
+/// per-segment feed, and the index of the NEXT segment to emit — so [`Planner::resume_arc`] can recompute each
+/// remaining chord deterministically. An arc whose segments all fit in one [`plan_arc`](Planner::plan_arc) call
+/// never creates one of these; only an over-subdivided arc (more segments than free queue space) does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ArcInProgress {
+  /// Arc center in machine mm (XY plane). The chord vertices are `center + radius·(cos θ, sin θ)`.
+  center: [f32; 2],
+  /// Arc radius in mm.
+  radius: f32,
+  /// Angle (radians) of the START radius vector — segment `k` ends at `theta_start + theta_step·k`.
+  theta_start: f32,
+  /// Signed per-segment angular step (radians); its sign carries the sweep direction (CW negative / CCW positive).
+  theta_step: f32,
+  /// Total number of segments the arc subdivides into (the fixed `arc_segment_count`, unchanged by chunking).
+  segments: u32,
+  /// 1-based index of the NEXT segment to emit. Starts at 1 and advances by one per enqueued segment; the arc is
+  /// complete when this exceeds [`segments`](ArcInProgress::segments).
+  next_seg: u32,
+  /// Z at the arc start (mm); the helix linearly interpolates Z from here to `z_start + z_delta` across segments.
+  z_start: f32,
+  /// Total Z travel across the whole arc (mm); segment `k` ends at `z_start + z_delta·(k/segments)`.
+  z_delta: f32,
+  /// A (rotary, degrees) at the arc start; the A axis is slaved linearly across the arc exactly like the Z helix.
+  a_start: f32,
+  /// Total A travel across the whole arc (degrees); segment `k` ends at `a_start + a_delta·(k/segments)`.
+  a_delta: f32,
+  /// The per-segment feed value handed to each chord's [`enqueue_move`](Planner::enqueue_move).
+  seg_feed: f32,
+  /// The active units for the segments' feed/geometry words.
+  units: Units,
+  /// The active feed-rate mode (G94 units/min or G93 inverse-time) for the segments.
+  feed_mode: FeedMode,
+}
+
 /// The motion planner. Holds machine settings, the block ring buffer, the current machine position in
 /// steps, the current G92 work offset in mm, and the trailing junction state (previous block's unit
 /// vector and nominal speed) used to compute the next junction's cornering limit.
@@ -393,6 +441,17 @@ pub struct Planner {
   /// block's exit speed and shaped that block's deceleration to it, so changing it now would create a
   /// velocity discontinuity / missed steps at the junction. Cleared when the queue drains empty.
   head_busy: bool,
+  /// An over-subdivided arc still feeding its segments into the queue, or `None` when no arc is in progress. Set
+  /// by [`plan_arc`](Planner::plan_arc) when not all segments fit; advanced and finally cleared by
+  /// [`resume_arc`](Planner::resume_arc); dropped by [`abort_arc`](Planner::abort_arc) on a soft reset.
+  arc_in_progress: Option<ArcInProgress>,
+  /// Test-only fault-injection seam: when set, the NEXT per-segment enqueue inside
+  /// [`enqueue_arc_chunk`](Planner::enqueue_arc_chunk) returns this error instead of building a block, exercising
+  /// the genuine-error (non-`QueueFull`) abort path. Production code never sets it; today's real `enqueue_move`
+  /// can only fail `QueueFull` (the chunk loop reserves a slot first), so without this seam the genuine-error
+  /// branch would be untestable. Compiled out of the firmware binary entirely.
+  #[cfg(test)]
+  inject_seg_error: Option<PlannerError>,
 }
 
 impl Planner {
@@ -407,6 +466,9 @@ impl Planner {
       prev_unit_vec: [0.0; AXES],
       prev_nominal_speed_sq: 0.0,
       head_busy: false,
+      arc_in_progress: None,
+      #[cfg(test)]
+      inject_seg_error: None,
     }
   }
 
@@ -543,8 +605,9 @@ impl Planner {
           feed_mode: *feed_mode,
           machine_coords: *machine_coords,
         };
-        let queued = self.plan_arc(&request)?;
-        Ok(PlannerOutcome::Queued { blocks: queued })
+        // The arc planner is resumable: it returns `Queued` when the whole arc fit in one chunk, or `ArcPending`
+        // when only part fit (the consumer drives `resume_arc` for the rest). Either is surfaced as-is.
+        self.plan_arc(&request)
       }
       PlannerCommand::Probe { kind, axes, units, distance, feed } => {
         // Resolve the work-coordinate probe target to an absolute MACHINE step target exactly as a move does (a
@@ -706,6 +769,25 @@ impl Planner {
     // The active (front) jog block keeps executing to its boundary; dropping the trailing junction state means a
     // post-cancel move corners from rest. `head_busy` is left as-is: if the front block is still in flight the
     // executor's committed entry must not be disturbed, and an emptied queue clears it on the next pop anyway.
+    self.prev_unit_vec = [0.0; AXES];
+    self.prev_nominal_speed_sq = 0.0;
+    flushed
+  }
+
+  /// Drain EVERY queued block on a graceful program stop (`0x86`), returning how many were removed. Unlike
+  /// [`flush_jog_blocks`](Planner::flush_jog_blocks) (which spares program blocks and drains only trailing jogs),
+  /// this clears the WHOLE queue — program moves and jogs alike — so the executor has nothing more to pop after it
+  /// decelerates the active block to its boundary. The machine POSITION is deliberately not touched (the executor
+  /// owns the live position; the caller follows this with [`sync_position`](Planner::sync_position) to the actual
+  /// stop point), and the trailing junction state is reset so the next planned move corners from rest, matching the
+  /// executor stopping the active block at its boundary. A no-op on an empty queue, so the caller may invoke it
+  /// unconditionally on the stop path.
+  pub fn flush_queue(&mut self) -> usize {
+    let flushed = self.queue.len();
+    self.queue.clear();
+    // The active block already popped by the executor keeps running to its boundary; dropping the trailing
+    // junction state means a post-stop move corners from rest. `head_busy` is left as-is: an emptied queue clears
+    // it on the next pop anyway, and the executor's committed entry for an in-flight block must not be disturbed.
     self.prev_unit_vec = [0.0; AXES];
     self.prev_nominal_speed_sq = 0.0;
     flushed
@@ -1057,10 +1139,18 @@ impl Planner {
     // The newest block already decelerates to zero (reverse pass invariant); nothing else to pin.
   }
 
-  /// Plan a G2/G3 arc by chord-tolerance subdivision into short linear blocks. The arc is in the G17
-  /// (XY) plane; Z is linearly interpolated across the segments (helical support falls out for free).
-  /// Returns the number of segments enqueued, or [`PlannerError::InvalidArc`] for bad geometry.
-  fn plan_arc(&mut self, request: &ArcRequest) -> Result<usize, PlannerError> {
+  /// Plan a G2/G3 arc by chord-tolerance subdivision into short linear blocks. The arc is in the G17 (XY) plane;
+  /// Z and the rotary A are linearly interpolated across the segments (helical support falls out for free). The
+  /// arc is RESUMABLE: it feeds as many of its `arc_segment_count` segments as currently fit into the queue, and
+  /// if not all fit it saves the remainder as an [`ArcInProgress`] and returns [`PlannerOutcome::ArcPending`] so
+  /// the consumer can drain the executor and call [`resume_arc`](Planner::resume_arc) for the next chunk. This is
+  /// what lets an arc with MORE than [`BLOCK_QUEUE_LEN`] segments stream without ever dead-locking on a permanent
+  /// [`QueueFull`] (the prior all-or-nothing check returned `QueueFull` forever for such an arc). Chord accuracy
+  /// (`$12`) is preserved: the segment count is `arc_segment_count`, unchanged — the segments are just chunked.
+  ///
+  /// Returns [`PlannerError::InvalidArc`] for bad geometry. A single chunk that completes the whole arc reports
+  /// [`PlannerOutcome::Queued`]; a partial chunk reports [`PlannerOutcome::ArcPending`].
+  fn plan_arc(&mut self, request: &ArcRequest) -> Result<PlannerOutcome, PlannerError> {
     let scale = units_scale(request.units);
     let start = self.position_mm();
     let target = self.arc_endpoint_mm(request.axes, scale, request.distance, request.machine_coords, &start);
@@ -1081,16 +1171,6 @@ impl Planner {
     let sweep = arc_sweep_angle(r0, r1, request.cw);
     let segments = arc_segment_count(radius, sweep, self.config.arc_tolerance_mm);
 
-    // All-or-nothing back-pressure: an arc subdivides into `segments` linear blocks, but a pure-sync
-    // planner cannot yield mid-arc to let the executor drain. If the whole arc would not fit in the
-    // remaining queue space, enqueue nothing and leave the planner position untouched so the caller can
-    // drain the motion executor and re-issue the same arc cleanly. This realizes the DOC-05 warning that
-    // an over-fine `$12` starves the queue — it surfaces as recoverable back-pressure, never lost
-    // geometry. (A zero-length / single-point arc still produces ≥ 1 segment by `arc_segment_count`.)
-    if self.queue.len() + segments as usize > BLOCK_QUEUE_LEN {
-      return Err(PlannerError::QueueFull);
-    }
-
     let z_start = start[2];
     let z_delta = target[2] - z_start;
     // The rotary A axis is slaved linearly across the arc exactly like the Z helix (DOC-10.5): it advances
@@ -1110,27 +1190,125 @@ impl Planner {
       FeedMode::UnitsPerMin => request.feed,
       FeedMode::InverseTime => request.feed * segments as f32,
     };
-    let mut enqueued = 0usize;
-    for seg in 1..=segments {
-      let theta = theta_start + theta_step * seg as f32;
-      let x = center[0] + radius * libm::cosf(theta);
-      let y = center[1] + radius * libm::sinf(theta);
-      let frac = seg as f32 / segments as f32;
-      let z = z_start + z_delta * frac;
-      let a = a_start + a_delta * frac;
-      let seg_target = self.mm_target_to_steps(&[x, y, z, a]);
-      // Each segment is a linear feed move; the arc feed applies (already in active units). Enqueue without
-      // look-ahead — the all-or-nothing pre-check above guaranteed the queue has room for every segment, so
-      // this cannot hit `QueueFull` mid-arc, and the per-segment junction state still advances so adjacent
-      // segments corner against each other. The single `recalculate()` below then resolves all entry speeds
-      // in one O(n) reverse+forward pass instead of one pass per segment (which would be O(n²)).
-      enqueued += self.enqueue_move(seg_target, seg_feed, request.units, request.feed_mode, false, false)?;
+    // Seed the resumable arc at segment 1 and feed the first chunk. `enqueue_arc_chunk` enqueues as many of the
+    // remaining segments as fit, advances `next_seg`, runs one `recalculate()`, and reports complete/pending. The
+    // arc is passed BY VALUE (the `Option` is resolved here, where it is provably `Some`), so the chunk method has
+    // no panic path; it stores the advanced arc back into `arc_in_progress` itself when segments remain.
+    let arc = ArcInProgress {
+      center,
+      radius,
+      theta_start,
+      theta_step,
+      segments,
+      next_seg: 1,
+      z_start,
+      z_delta,
+      a_start,
+      a_delta,
+      seg_feed,
+      units: request.units,
+      feed_mode: request.feed_mode,
+    };
+    self.enqueue_arc_chunk(arc)
+  }
+
+  /// Continue feeding an in-progress arc into the block buffer (DOC-05 resumable arc): enqueue as many of the
+  /// arc's remaining segments as currently fit, then report whether the arc is now complete. The consumer drives
+  /// this after the motion executor frees queue slots, repeating until an arc outcome is
+  /// [`PlannerOutcome::Queued`] (complete). When no arc is in progress this is an idempotent no-op reporting
+  /// `Queued { blocks: 0 }`, so a spurious resume can never spin. Never returns
+  /// [`PlannerError::QueueFull`] — back-pressure on a still-full queue surfaces as `ArcPending { enqueued: 0 }`,
+  /// which simply asks the consumer to drain and resume again. A GENUINE per-segment error (e.g. degenerate
+  /// geometry, or any future deterministic segment failure) instead clears the in-progress arc and returns that
+  /// [`PlannerError`], so a never-fitting/always-erroring segment can never spin the consumer's drive loop forever
+  /// (Bug 9): the consumer surfaces it as `error:N` and stops driving the arc.
+  pub fn resume_arc(&mut self) -> Result<PlannerOutcome, PlannerError> {
+    // Resolve the `Option` here so the chunk method takes the arc by value and has no panic path. `None` is the
+    // idempotent no-op (a spurious resume). A genuine per-segment error PROPAGATES (Bug 9): the chunk method
+    // clears `arc_in_progress` and returns `Err`, so the consumer surfaces `error:N` instead of retrying forever.
+    match self.arc_in_progress {
+      None => Ok(PlannerOutcome::Queued { blocks: 0 }),
+      Some(arc) => self.enqueue_arc_chunk(arc),
     }
-    // Resolve look-ahead once across the whole arc. This is exactly equivalent to recalculating after each
-    // segment, because the reverse/forward passes always sweep the entire queue — only the final state of
-    // the queue matters, and it is identical either way.
+  }
+
+  /// True when an over-subdivided arc is still feeding segments into the queue (the consumer must keep resuming
+  /// before acking the line). Exposed for the consumer's drive loop and for tests/diagnostics.
+  pub fn arc_pending(&self) -> bool {
+    self.arc_in_progress.is_some()
+  }
+
+  /// Discard any in-progress arc cleanly, leaving the planner consistent. Called on a soft reset / abort so a
+  /// half-fed arc cannot resume after the stream is reset (DOC-05). Already-enqueued segments are NOT removed
+  /// here — the soft-reset path clears the queue separately (the firmware rebuilds the planner outright); this
+  /// only drops the "more segments pending" state so a later [`resume_arc`](Planner::resume_arc) is a no-op.
+  pub fn abort_arc(&mut self) {
+    self.arc_in_progress = None;
+  }
+
+  /// Enqueue the next chunk of the in-progress arc: as many remaining segments as fit in the free queue space,
+  /// stopping at the first that would not fit. Advances `next_seg` per enqueued segment so a later resume picks
+  /// up exactly where this chunk stopped (no segment dropped or duplicated), runs one `recalculate()` so the
+  /// queued blocks always carry resolved entry speeds, and clears `arc_in_progress` once the final segment is
+  /// fed. The single recalculate per chunk is correct because the reverse/forward passes always sweep the whole
+  /// queue — only the queue's final contents matter, identical to recalculating after each segment.
+  ///
+  /// The caller resolves the `Option<ArcInProgress>` (an arc-in-progress is provably present at both call sites:
+  /// [`plan_arc`] has just constructed it, [`resume_arc`] has just checked it is `Some`), so the arc is passed in
+  /// by value — the missing-arc case is unrepresentable here and there is no panic path (no `unwrap`/`expect`).
+  fn enqueue_arc_chunk(&mut self, mut arc: ArcInProgress) -> Result<PlannerOutcome, PlannerError> {
+    let mut enqueued = 0usize;
+    // Feed segments until the arc is exhausted OR the queue is full. The free-slot guard is the backstop that
+    // makes this terminate: with no free slot it enqueues nothing and returns pending, so the caller drains.
+    while arc.next_seg <= arc.segments && self.queue.len() < BLOCK_QUEUE_LEN {
+      let seg = arc.next_seg;
+      let theta = arc.theta_start + arc.theta_step * seg as f32;
+      let x = arc.center[0] + arc.radius * libm::cosf(theta);
+      let y = arc.center[1] + arc.radius * libm::sinf(theta);
+      let frac = seg as f32 / arc.segments as f32;
+      let z = arc.z_start + arc.z_delta * frac;
+      let a = arc.a_start + arc.a_delta * frac;
+      let seg_target = self.mm_target_to_steps(&[x, y, z, a]);
+      // The fault-injection seam (tests only): force the next enqueue to fail with a genuine, non-`QueueFull`
+      // error so the abort/propagate path below is exercised. No-op in production (the field is `None`/absent).
+      #[cfg(test)]
+      let result = match self.inject_seg_error.take() {
+        Some(err) => Err(err),
+        None => self.enqueue_move(seg_target, arc.seg_feed, arc.units, arc.feed_mode, false, false),
+      };
+      #[cfg(not(test))]
+      let result = self.enqueue_move(seg_target, arc.seg_feed, arc.units, arc.feed_mode, false, false);
+      match result {
+        // A real block (Ok(1)) or a degenerate zero-length segment (Ok(0)): the segment is consumed either way,
+        // so advance `next_seg` so a later resume picks up after it (no segment retried or duplicated).
+        Ok(n) => enqueued += n,
+        // Legitimate back-pressure: the queue filled while feeding (only possible via the loop guard racing the
+        // queue length — defensive). Stop the chunk WITHOUT advancing past the unfed segment so the next resume
+        // retries exactly it, and report `ArcPending` so the caller drains and resumes. No segment is lost.
+        Err(PlannerError::QueueFull) => break,
+        // A GENUINE per-segment error (bad geometry / future per-segment failures): this is deterministic and
+        // would recur on every retry, so silently breaking would spin `drive_pending_arc` forever (Bug 9). Abort
+        // the in-progress arc, resolve look-ahead over whatever was already enqueued so the queue stays valid,
+        // and PROPAGATE the error — the consumer surfaces it as `error:N` and stops driving the arc.
+        Err(other) => {
+          self.arc_in_progress = None;
+          self.recalculate();
+          return Err(other);
+        }
+      }
+      arc.next_seg += 1;
+    }
+    // Resolve look-ahead once across the current queue so the queued blocks have final entry speeds.
     self.recalculate();
-    Ok(enqueued)
+    if arc.next_seg > arc.segments {
+      // The whole arc is fed: clear the in-progress state and report the line complete (this final chunk's count).
+      self.arc_in_progress = None;
+      Ok(PlannerOutcome::Queued { blocks: enqueued })
+    } else {
+      // More segments remain: save the advanced progress and ask the caller to drain and resume.
+      self.arc_in_progress = Some(arc);
+      Ok(PlannerOutcome::ArcPending { enqueued })
+    }
   }
 
   /// Resolve an arc endpoint to absolute machine mm, honouring units, distance mode, and the G53
@@ -1504,6 +1682,74 @@ mod tests {
     planner.plan_jog(&jog(Some(2.0), None, None, 600.0, false), None).expect("jog");
     assert_eq!(planner.flush_jog_blocks(), 2);
     assert!(planner.is_empty());
+  }
+
+  // ---- Graceful program stop: flush the whole queue, abort the arc, retain position --------------
+
+  #[test]
+  fn flush_queue_drains_every_queued_block_program_and_jog_alike() {
+    // A graceful program stop (`0x86`) flushes the WHOLE queue, not just jog blocks: program moves and any
+    // trailing jog blocks are all discarded so the executor has nothing more to pop after the active block. This
+    // is the program-stop counterpart to `flush_jog_blocks` (which spares program blocks).
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(1.0), None, None, 600.0, false)).expect("move");
+    planner.plan_command(&mm_move(Some(2.0), None, None, 600.0, false)).expect("move");
+    planner.plan_jog(&jog(Some(3.0), None, None, 600.0, false), None).expect("jog");
+    assert_eq!(planner.queued_len(), 3);
+    let flushed = planner.flush_queue();
+    assert_eq!(flushed, 3, "every queued block is flushed regardless of jog tag");
+    assert!(planner.is_empty(), "the queue is empty after a full flush");
+  }
+
+  #[test]
+  fn flush_queue_resets_trailing_junction_so_next_move_corners_from_rest() {
+    // After flushing the queue at a program stop the executor decelerates the active block to a boundary stop, so
+    // the next planned move must corner from rest (the trailing junction state is dropped, like `flush_jog_blocks`
+    // and `sync_position` do). Position is NOT touched by the flush — that is the executor/`sync_position` job.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("move");
+    planner.plan_command(&mm_move(Some(20.0), None, None, 600.0, false)).expect("move");
+    planner.flush_queue();
+    planner.plan_command(&mm_move(Some(30.0), None, None, 600.0, false)).expect("move");
+    let block = planner.peek_block().expect("a block");
+    assert!(block.entry_speed_sq < 1e-3, "the post-stop move starts at rest");
+  }
+
+  #[test]
+  fn flush_queue_on_an_empty_queue_is_a_noop() {
+    // A program stop issued from Idle (nothing queued) is benign: the flush removes nothing and the planner is
+    // unchanged, so the bin can call it unconditionally on the quiesce path.
+    let mut planner = Planner::new(test_config());
+    assert_eq!(planner.flush_queue(), 0);
+    assert!(planner.is_empty());
+  }
+
+  #[test]
+  fn rebuilt_planner_synced_to_retained_position_resolves_absolute_moves_from_it() {
+    // Change A regression: a soft reset RETAINS the live machine position (it no longer zeroes MPos). The bin
+    // rebuilds the planner (which starts at the step origin) then `sync_position`s it to the RETAINED live step
+    // position, so a subsequent ABSOLUTE move resolves relative to the retained position, not 0. Model that here:
+    // drive to X10 Y5 (1000, 500 steps), then rebuild + sync to the retained position and confirm an absolute
+    // X10 Y5 is now a no-op move (same target) rather than a fresh 10 mm move from the origin.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(10.0), Some(5.0), None, 600.0, false)).expect("queued");
+    let retained = planner.position_steps();
+    assert_eq!(retained, [1000, 500, 0, 0]);
+    // The reset rebuilds the planner from defaults, which starts at the origin...
+    let mut rebuilt = Planner::new(test_config());
+    assert_eq!(rebuilt.position_steps(), [0, 0, 0, 0]);
+    // ...then the consumer syncs it to the RETAINED position so commanded position matches the retained MPos.
+    rebuilt.sync_position(retained);
+    assert_eq!(rebuilt.position_steps(), retained);
+    // An absolute move back to the same coordinates now resolves to the SAME target (a no-op), proving the move
+    // is relative to the retained position. Were the position zeroed, this would resolve to a fresh 1000/500 move.
+    let target = rebuilt.resolve_target(
+      &AxisWords { x: Some(10.0), y: Some(5.0), z: None, a: None },
+      Units::Millimeter,
+      DistanceMode::Absolute,
+      false,
+    );
+    assert_eq!(target, retained, "absolute move resolves from the retained position, not the origin");
   }
 
   #[test]
@@ -1992,15 +2238,219 @@ mod tests {
     }
   }
 
+  /// Drive an in-progress arc to completion the way the consumer does on hardware: enqueue a chunk, drain the
+  /// (now-) queued blocks like the executor, then resume — repeating until the arc reports complete. Returns the
+  /// total segments enqueued across every chunk and the number of resume cycles it took. A defensive iteration
+  /// cap turns a hypothetical never-completing arc into a test failure rather than an infinite loop.
+  fn drive_arc_to_completion(planner: &mut Planner) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut cycles = 0usize;
+    loop {
+      cycles += 1;
+      assert!(cycles < 1000, "resumable arc failed to complete within a sane number of cycles");
+      // Mimic the executor draining every queued block FIRST so the resume finds free slots, exactly as the
+      // hardware consumer does (it lets the executor drain, then resumes). A resume into the now-empty queue
+      // MUST make progress (enqueue ≥ 1 segment), or the arc could never complete — a starvation bug.
+      drain_all(planner);
+      let outcome = planner.resume_arc().expect("resume must not error on a never-too-big arc");
+      match outcome {
+        PlannerOutcome::ArcPending { enqueued } => {
+          assert!(enqueued > 0, "a resume into an empty queue must enqueue at least one segment");
+          total += enqueued;
+        }
+        PlannerOutcome::Queued { blocks } => {
+          total += blocks;
+          return (total, cycles);
+        }
+        other => panic!("expected an arc outcome, got {other:?}"),
+      }
+    }
+  }
+
+  /// Pop and discard every queued block, returning how many were drained (the test stand-in for the executor).
+  fn drain_all(planner: &mut Planner) -> usize {
+    let mut n = 0;
+    while planner.pop_block().is_some() {
+      n += 1;
+    }
+    n
+  }
+
   #[test]
-  fn over_subdivided_arc_backpressures_without_mutating_state() {
-    let mut planner = Planner::new(test_config()); // default 0.002 mm tolerance → ~79 segments.
-    let start = planner.position_steps();
-    // The arc needs more blocks than the queue holds; back-pressure must be all-or-nothing so the caller
-    // can drain the executor and retry. Nothing is enqueued and the position is untouched on failure.
-    assert_eq!(planner.plan_command(&ccw_quarter_arc()), Err(PlannerError::QueueFull));
-    assert!(planner.is_empty());
-    assert_eq!(planner.position_steps(), start);
+  fn over_subdivided_arc_never_permanently_queue_fulls() {
+    // The regression: an arc subdividing into MORE than BLOCK_QUEUE_LEN segments must NOT return a permanent
+    // QueueFull from an empty queue (the deadlock). The default 0.002 mm tolerance on this radius-10 quarter
+    // circle needs ~79 segments — far over the 32-block queue. The first plan_command must enqueue a partial
+    // chunk and report the arc as pending, never error.
+    let mut planner = Planner::new(test_config());
+    let outcome = planner.plan_command(&ccw_quarter_arc()).expect("a too-big arc must NOT QueueFull");
+    let enqueued = match outcome {
+      PlannerOutcome::ArcPending { enqueued } => enqueued,
+      other => panic!("expected ArcPending for an over-subdivided arc, got {other:?}"),
+    };
+    assert!(enqueued > 0, "the first chunk must enqueue at least one segment");
+    assert!(enqueued <= BLOCK_QUEUE_LEN, "a chunk can never exceed the queue capacity");
+    assert!(planner.arc_pending(), "the arc must be saved as in-progress after a partial enqueue");
+  }
+
+  #[test]
+  fn over_subdivided_arc_fully_enqueues_via_resume_cycles() {
+    // The full resumable contract: an over-subdivided arc enqueues EVERY one of its `arc_segment_count`
+    // segments across multiple drain/resume cycles, the line completing exactly once, and ends at the true arc
+    // endpoint — i.e. chord tolerance ($12) is preserved (segment count unchanged, just fed in chunks).
+    let mut planner = Planner::new(test_config());
+    // The geometry the chunked path must match: same center/radius/sweep the non-chunked path would compute.
+    let radius = 10.0_f32;
+    let sweep = core::f32::consts::FRAC_PI_2; // a CCW quarter circle.
+    let expected_segments = arc_segment_count(radius, sweep, test_config().arc_tolerance_mm) as usize;
+    assert!(expected_segments > BLOCK_QUEUE_LEN, "this test needs an arc bigger than the queue");
+
+    let first = planner.plan_command(&ccw_quarter_arc()).expect("first chunk");
+    let first_enqueued = match first {
+      PlannerOutcome::ArcPending { enqueued } => enqueued,
+      other => panic!("expected ArcPending, got {other:?}"),
+    };
+    let (resumed, _cycles) = drive_arc_to_completion(&mut planner);
+    let total = first_enqueued + resumed;
+    assert_eq!(total, expected_segments, "every segment must be enqueued, none dropped or duplicated");
+    assert!(!planner.arc_pending(), "the arc must be cleared once complete");
+    // The endpoint must be the true arc endpoint (10, 10) → (1000, 1000) steps: chord accuracy preserved.
+    assert_eq!(planner.position_steps(), [1000, 1000, 0, 0]);
+    // A second resume with no arc in progress is an idempotent no-op (defensive backstop): it completes with
+    // zero blocks and never spins.
+    assert_eq!(planner.resume_arc(), Ok(PlannerOutcome::Queued { blocks: 0 }));
+  }
+
+  #[test]
+  fn chunked_arc_geometry_stays_on_the_circle() {
+    // Chunking must not corrupt the geometry: every vertex an over-subdivided (chunked) arc produces must lie on
+    // the true circle within chord tolerance, and the accumulated endpoint must be the exact arc endpoint. The
+    // chunked planner is driven across resume cycles; each chunk's blocks are accumulated into a running position
+    // (the test stand-in for the executor), then drained so the next chunk fits.
+    let mut chunked = Planner::new(test_config()); // fine tolerance → forced chunking.
+    let center = [0.0_f32, 10.0_f32];
+    let radius = 10.0_f32;
+    let mut pos = [0i32; AXES];
+
+    // Accumulate every queued block's vertex into `pos`, checking each lies on the circle, then drain the queue.
+    let accumulate = |planner: &mut Planner, pos: &mut [i32; AXES]| {
+      while let Some(b) = planner.pop_block() {
+        for (axis, p) in pos.iter_mut().enumerate() {
+          *p += b.steps[axis];
+        }
+        let x = pos[0] as f32 / 100.0;
+        let y = pos[1] as f32 / 100.0;
+        let dist = libm::sqrtf((x - center[0]) * (x - center[0]) + (y - center[1]) * (y - center[1]));
+        assert!((dist - radius).abs() < 0.05, "chunked vertex ({x}, {y}) off circle by {}", (dist - radius).abs());
+      }
+    };
+
+    let mut outcome = chunked.plan_command(&ccw_quarter_arc()).expect("first chunk");
+    loop {
+      match outcome {
+        PlannerOutcome::ArcPending { .. } => {
+          accumulate(&mut chunked, &mut pos);
+          outcome = chunked.resume_arc().expect("resume");
+        }
+        PlannerOutcome::Queued { .. } => {
+          accumulate(&mut chunked, &mut pos);
+          break;
+        }
+        other => panic!("unexpected {other:?}"),
+      }
+    }
+    assert_eq!(pos, [1000, 1000, 0, 0], "chunked arc must reach the true endpoint");
+  }
+
+  #[test]
+  fn chunked_arc_resolves_lookahead_entry_speeds() {
+    // After each chunk the planner runs a recalculate, so the QUEUED blocks always have resolved entry speeds:
+    // the newest queued block decelerates toward a stop (its entry never exceeds what reverse-pass allows) and
+    // no block's entry exceeds its own cornering/nominal cap. Check this on the first chunk's live queue.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&ccw_quarter_arc()).expect("first chunk");
+    assert!(planner.queued_len() > 1);
+    for block in planner.queue.iter() {
+      assert!(
+        block.entry_speed_sq <= block.max_entry_speed_sq + 1e-3,
+        "entry {} exceeds cap {}",
+        block.entry_speed_sq,
+        block.max_entry_speed_sq,
+      );
+      assert!(block.entry_speed_sq >= -1e-6, "entry speed must be non-negative");
+    }
+  }
+
+  #[test]
+  fn abort_arc_discards_in_progress_arc_cleanly() {
+    // A soft reset mid-arc must drop the in-progress arc and leave the planner consistent: no pending arc, and a
+    // subsequent resume is a no-op. (The firmware soft-reset path rebuilds the planner outright, but abort_arc is
+    // the explicit, host-tested seam guaranteeing the in-progress arc state cannot survive a reset.)
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&ccw_quarter_arc()).expect("first chunk");
+    assert!(planner.arc_pending());
+    planner.abort_arc();
+    assert!(!planner.arc_pending(), "abort must clear the in-progress arc");
+    assert_eq!(planner.resume_arc(), Ok(PlannerOutcome::Queued { blocks: 0 }), "no arc → idempotent no-op");
+  }
+
+  #[test]
+  fn small_arc_that_fits_enqueues_in_one_shot() {
+    // The non-regression: a coarse arc that subdivides into FEWER than BLOCK_QUEUE_LEN segments must still
+    // enqueue in a single plan_command call as a plain Queued outcome — never chunked, never ArcPending.
+    let mut planner = Planner::new(coarse_arc_config());
+    let outcome = planner.plan_command(&ccw_quarter_arc()).expect("queued");
+    let blocks = match outcome {
+      PlannerOutcome::Queued { blocks } => blocks,
+      other => panic!("a queue-fitting arc must be Queued in one shot, got {other:?}"),
+    };
+    assert!(blocks > 1 && blocks <= BLOCK_QUEUE_LEN);
+    assert!(!planner.arc_pending(), "a one-shot arc leaves no in-progress state");
+    assert_eq!(planner.position_steps(), [1000, 1000, 0, 0]);
+  }
+
+  #[test]
+  fn arc_resumes_correctly_when_program_blocks_occupy_the_queue() {
+    // The realistic case: program blocks already fill part of the queue when a big arc arrives, so the first
+    // chunk fits FEWER segments. The arc must still enqueue every segment as those program blocks drain, and the
+    // arc's first segment must corner against the trailing program block (look-ahead spans the boundary).
+    let mut planner = Planner::new(test_config());
+    // Pre-fill the queue with collinear +X moves up to near capacity so the arc's first chunk is small.
+    for n in 1..=(BLOCK_QUEUE_LEN - 2) {
+      planner.plan_command(&mm_move(Some(n as f32), None, None, 600.0, false)).expect("queued");
+    }
+    let pre = planner.queued_len();
+    assert_eq!(pre, BLOCK_QUEUE_LEN - 2);
+    // The arc starts from the current position (BLOCK_QUEUE_LEN-2 mm on X); compute its true endpoint so the
+    // completion check is independent of the chunking. Use a relative CCW arc by I/J so the start does not matter.
+    let arc = PlannerCommand::Arc {
+      cw: false,
+      axes: AxisWords { x: Some((pre as f32) + 10.0), y: Some(10.0), z: None, a: None },
+      i: Some(0.0),
+      j: Some(10.0),
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
+      machine_coords: false,
+    };
+    let expected_end = [((pre as i32) + 10) * 100, 1000, 0, 0];
+    let first = planner.plan_command(&arc).expect("first chunk must not error");
+    let first_enqueued = match first {
+      PlannerOutcome::ArcPending { enqueued } => enqueued,
+      // If the whole arc happened to fit it would be Queued — accept that too, but this geometry over-subdivides.
+      PlannerOutcome::Queued { blocks } => {
+        assert_eq!(planner.position_steps(), expected_end);
+        assert!(blocks > 0);
+        return;
+      }
+      other => panic!("unexpected {other:?}"),
+    };
+    assert!(first_enqueued >= 1, "with two free slots the first chunk fits at least one segment");
+    let (resumed, _cycles) = drive_arc_to_completion(&mut planner);
+    let _ = first_enqueued + resumed;
+    assert!(!planner.arc_pending());
+    assert_eq!(planner.position_steps(), expected_end, "the arc must reach its true endpoint");
   }
 
   #[test]
@@ -2526,5 +2976,124 @@ mod tests {
     // The trailing (reversing) block must start from rest.
     let reversing = planner.queue.back().expect("second block");
     assert_eq!(reversing.entry_speed_sq, 0.0, "a rotary reversal corners to a full stop");
+  }
+
+  // --- Bug 9: a genuine (non-QueueFull) per-segment enqueue error must surface, not spin forever -------------
+
+  #[test]
+  fn arc_chunk_surfaces_a_genuine_segment_error_and_clears_the_arc() {
+    // A resumable arc whose per-segment enqueue fails for a reason OTHER than QueueFull must abort the in-progress
+    // arc and PROPAGATE the error, rather than silently breaking into a permanent `ArcPending { enqueued: 0 }` that
+    // the consumer's `drive_pending_arc` would retry forever (the latent infinite loop). The fault is injected via
+    // a test-only seam since today's `enqueue_move` can only fail QueueFull (the real path is guarded against it).
+    let mut planner = Planner::new(test_config());
+    // Seed the arc so it is genuinely in progress (the default fine tolerance over-subdivides past the queue), but
+    // arm the next segment enqueue to fail with InvalidArc — a stand-in for any future deterministic segment error.
+    let first = planner.plan_command(&ccw_quarter_arc()).expect("first chunk seeds the in-progress arc");
+    assert!(matches!(first, PlannerOutcome::ArcPending { .. }), "the over-subdivided arc must be pending");
+    assert!(planner.arc_pending());
+    planner.inject_seg_error = Some(PlannerError::InvalidArc);
+    // Drain the queue so the next resume has free slots — proving the break is NOT a QueueFull backpressure stop.
+    drain_all(&mut planner);
+    let err = planner.resume_arc().expect_err("a genuine segment error must surface as Err, not ArcPending");
+    assert_eq!(err, PlannerError::InvalidArc, "the genuine segment error is propagated verbatim");
+    assert!(!planner.arc_pending(), "a genuine segment error must clear the in-progress arc (no permanent pending)");
+    // A follow-up resume is the idempotent no-op, confirming the loop can never spin on the failed segment again.
+    assert_eq!(planner.resume_arc(), Ok(PlannerOutcome::Queued { blocks: 0 }));
+  }
+
+  // --- Bug 4: velocity must carry across chunk boundaries under proactive (low-watermark) refill ----------------
+
+  /// Drive an over-subdivided arc through a given pop/refill cadence, recording each executed block's EXIT speed —
+  /// the speed the executor decelerates to at that block's end, which equals the FOLLOWING block's planned entry
+  /// speed (the executor reads it exactly this way in `take_block`). A zero exit mid-arc is a physical
+  /// decelerate-to-stop — a dwell mark on the curve. Returns the executed exits in execution order.
+  /// `drain_all_per_chunk` selects the cadence: `true` reproduces the OLD behavior (drain the whole resident chunk,
+  /// THEN refill — so the executor always reaches the reverse-pass-forced zero-exit chunk tail), `false` is the
+  /// PROACTIVE low-watermark refill (top the buffer up the instant a slot frees, so that tail is never reached).
+  fn arc_execution_exit_speeds(drain_all_per_chunk: bool) -> heapless::Vec<f32, 256> {
+    let mut planner = Planner::new(test_config());
+    let first = planner.plan_command(&ccw_quarter_arc()).expect("first chunk");
+    assert!(matches!(first, PlannerOutcome::ArcPending { .. }), "the arc must span more than one chunk");
+    let mut exits: heapless::Vec<f32, 256> = heapless::Vec::new();
+    let mut guard = 0usize;
+    loop {
+      guard += 1;
+      assert!(guard < 10_000, "arc drive failed to complete within a sane number of iterations");
+      let popped = if drain_all_per_chunk {
+        // OLD cadence: pop every resident block before refilling. The last block of each chunk peeks an empty
+        // queue → exit 0 (the reverse-pass-forced tail), which is the dwell mark Bug 4 is about.
+        let mut any = false;
+        while planner.pop_block().is_some() {
+          let exit = planner.peek_block().map(|n| n.entry_speed_sq).unwrap_or(0.0);
+          exits.push(exit).expect("exit buffer overflow");
+          any = true;
+        }
+        any
+      } else {
+        // PROACTIVE cadence: pop exactly ONE block (the executor consuming a block), recording its exit (the new
+        // head's planned entry), then fall through to refill so the buffer is topped up before the next pop.
+        match planner.pop_block() {
+          Some(_block) => {
+            let exit = planner.peek_block().map(|n| n.entry_speed_sq).unwrap_or(0.0);
+            exits.push(exit).expect("exit buffer overflow");
+            true
+          }
+          None => false,
+        }
+      };
+      if !popped && !planner.arc_pending() {
+        break;
+      }
+      // Refill the moment a slot freed (the low-watermark mechanism `drive_pending_arc` uses on hardware via the
+      // `SLOT_FREED` wake). Under the proactive cadence this keeps the queue full so the executor never outruns the
+      // producer to the forced-stop tail; under the drain-all cadence the damage is already recorded above.
+      if planner.arc_pending() {
+        planner.resume_arc().expect("resume must not error on a healthy arc");
+      }
+    }
+    exits
+  }
+
+  #[test]
+  fn over_subdivided_arc_carries_velocity_across_chunk_boundaries() {
+    // Geometry-equivalence (every vertex on the circle) is proven elsewhere; this is the missing VELOCITY-
+    // equivalence regression that distinguishes a chunked arc from a single-shot one. A single-shot arc keeps all
+    // segments resident, so ONLY the true final segment decelerates to a stop — every interior junction cruises.
+    // The resumable path must reproduce that under the executor's REAL cadence: pop one block, refill promptly (a
+    // low-watermark / `SLOT_FREED`-driven refill), so the queue never collapses to the reverse-pass's forced-stop
+    // tail mid-arc. The metric is each executed block's EXIT speed (the next block's planned entry — exactly what
+    // the executor decelerates to); a zero exit mid-arc is a physical decelerate-to-stop, i.e. a dwell mark.
+    let radius = 10.0_f32;
+    let sweep = core::f32::consts::FRAC_PI_2;
+    let total_segments = arc_segment_count(radius, sweep, test_config().arc_tolerance_mm) as usize;
+    assert!(total_segments > BLOCK_QUEUE_LEN, "this test needs an arc that spans more than one chunk");
+
+    // The PROACTIVE refill (what `drive_pending_arc` now does on a `SLOT_FREED` wake): the executor must NEVER hit
+    // a zero exit in the interior — every chunk boundary is crossed under continuous motion, like a single-shot arc.
+    let proactive = arc_execution_exit_speeds(false);
+    assert_eq!(proactive.len(), total_segments, "every segment must execute exactly once");
+    let interior_stops = proactive[..proactive.len() - 1].iter().filter(|&&e| e <= 1e-3).count();
+    assert_eq!(
+      interior_stops, 0,
+      "proactive refill must carry velocity across every chunk boundary (no interior decelerate-to-stop)",
+    );
+    // The true final segment legitimately ends at rest (the program may stop there): its exit is zero. This is the
+    // safety invariant — the genuine last available block is always stoppable.
+    assert!(*proactive.last().expect("at least one segment") <= 1e-3, "the true arc tail decelerates to a stop");
+
+    // The metric has teeth: the OLD drain-the-whole-chunk-then-refill cadence DID stamp a dwell mark at every
+    // ~BLOCK_QUEUE_LEN boundary (interior zero-exits = the chunk boundaries crossed). Proving the proactive path's
+    // zero is a real improvement over the regressed behavior, not an assertion that can never trip.
+    let drain_all = arc_execution_exit_speeds(true);
+    let old_interior_stops = drain_all[..drain_all.len() - 1].iter().filter(|&&e| e <= 1e-3).count();
+    assert!(
+      old_interior_stops >= 1,
+      "the drain-all cadence is expected to force interior stops — the metric must be able to detect them",
+    );
+    assert!(
+      interior_stops < old_interior_stops,
+      "proactive refill ({interior_stops}) must strictly improve on the drain-all cadence ({old_interior_stops})",
+    );
   }
 }

@@ -40,8 +40,11 @@ impl Transport for SerialTransport {
     self.stream.read(buf).await.map_err(map_io)
   }
 
-  async fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
-    self.stream.write_all(data).await.map_err(map_io)
+  async fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+    // The cancel-safe primitive: `AsyncWriteExt::write` resolves after a single underlying write, so a future
+    // dropped before it resolves has written nothing. The engine advances a cursor by the returned count and
+    // resumes from it on the next call, so a write pre-empted under backpressure never re-sends a byte.
+    self.stream.write(data).await.map_err(map_io)
   }
 }
 

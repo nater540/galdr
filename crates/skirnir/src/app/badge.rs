@@ -126,8 +126,15 @@ pub struct TransportGroup {
   pub run_active: bool,
   /// Whether the Hold segment is enabled (only meaningful while running/jogging).
   pub hold_enabled: bool,
-  /// Whether the Stop (soft-reset) segment is enabled (any live connection can be stopped/reset).
+  /// Whether the Stop (graceful program-stop, `0x86`) segment is enabled. The everyday "stop the job cleanly"
+  /// control: it needs a live, ready board, so it is gated like the rest of the group (off while Disconnected /
+  /// Connecting). Contrast [`Self::abort_enabled`].
   pub stop_enabled: bool,
+  /// Whether the separate Abort / E-stop control (the hard soft-reset, `0x18` → `ALARM:3`) is enabled. Broader
+  /// than [`Self::stop_enabled`]: it is live the instant a transport is attached — including mid-handshake
+  /// (`Connecting`), where a stalled board still holds the FD — so the operator can always force an emergency
+  /// reset without waiting for readiness. Mirrors [`ConnectionState::has_transport`](crate::protocol::ConnectionState::has_transport).
+  pub abort_enabled: bool,
 }
 
 impl TransportGroup {
@@ -135,45 +142,61 @@ impl TransportGroup {
   /// gates whether the Run segment can *start* a stream from Idle.
   pub fn for_state(state: BadgeState, has_program: bool) -> Self {
     match state {
-      // No live connection: the whole group is inert.
-      BadgeState::Disconnected | BadgeState::Connecting => TransportGroup {
+      // No transport at all: the whole group is inert, Abort included (nothing to reset).
+      BadgeState::Disconnected => TransportGroup {
         run_enabled: false,
         run_is_resume: false,
         run_active: false,
         hold_enabled: false,
         stop_enabled: false,
+        abort_enabled: false,
       },
-      // Idle: Run can start a stream if a program is loaded; nothing to hold; stop/reset is always available.
+      // Connecting: a transport is open but the board is not yet ready. No clean Run/Hold/Stop, but the hard Abort
+      // must stay live so a stalled handshake can be force-reset and the FD released.
+      BadgeState::Connecting => TransportGroup {
+        run_enabled: false,
+        run_is_resume: false,
+        run_active: false,
+        hold_enabled: false,
+        stop_enabled: false,
+        abort_enabled: true,
+      },
+      // Idle: Run can start a stream if a program is loaded; nothing to hold; clean stop and hard abort available.
       BadgeState::Idle | BadgeState::Check | BadgeState::Sleep => TransportGroup {
         run_enabled: has_program,
         run_is_resume: false,
         run_active: false,
         hold_enabled: false,
         stop_enabled: true,
+        abort_enabled: true,
       },
-      // Actively moving: the leading segment is emphasised; hold and stop are live.
+      // Actively moving: the leading segment is emphasised; hold, clean stop and hard abort are all live.
       BadgeState::Run | BadgeState::Jog | BadgeState::Home => TransportGroup {
         run_enabled: false,
         run_is_resume: false,
         run_active: true,
         hold_enabled: true,
         stop_enabled: true,
+        abort_enabled: true,
       },
-      // Held or door-suspended: the leading segment becomes "Resume"; stop stays live.
+      // Held or door-suspended: the leading segment becomes "Resume"; clean stop and hard abort stay live.
       BadgeState::Hold | BadgeState::Door => TransportGroup {
         run_enabled: true,
         run_is_resume: true,
         run_active: false,
         hold_enabled: false,
         stop_enabled: true,
+        abort_enabled: true,
       },
-      // Faulted: only stop/reset (and the banner's own actions) can recover; no run/hold.
+      // Faulted: a graceful stop is a no-op here, but the operator can still issue it; the hard Abort is the real
+      // recovery. Keep both live alongside the banner's own actions; no run/hold.
       BadgeState::Alarm | BadgeState::Error => TransportGroup {
         run_enabled: false,
         run_is_resume: false,
         run_active: false,
         hold_enabled: false,
         stop_enabled: true,
+        abort_enabled: true,
       },
     }
   }
@@ -249,6 +272,44 @@ mod tests {
   fn transport_group_is_inert_while_disconnected() {
     let group = TransportGroup::for_state(BadgeState::Disconnected, true);
     assert!(!group.run_enabled && !group.hold_enabled && !group.stop_enabled);
+    // With no transport there is nothing to abort either.
+    assert!(!group.abort_enabled, "Abort is inert with no open transport");
+  }
+
+  #[test]
+  fn abort_is_available_whenever_a_transport_is_attached_including_while_connecting() {
+    // Abort (the emergency hard reset, `0x18`) must reach the board the instant a transport is open — even mid-
+    // handshake (`Connecting`), where a stalled board still holds the FD — so the operator can always force a reset.
+    // It is the one transport control that does not wait for readiness, mirroring the lifecycle's `has_transport`.
+    assert!(!TransportGroup::for_state(BadgeState::Disconnected, false).abort_enabled);
+    for state in [
+      BadgeState::Connecting,
+      BadgeState::Idle,
+      BadgeState::Run,
+      BadgeState::Jog,
+      BadgeState::Home,
+      BadgeState::Hold,
+      BadgeState::Door,
+      BadgeState::Check,
+      BadgeState::Sleep,
+      BadgeState::Alarm,
+      BadgeState::Error,
+    ] {
+      assert!(
+        TransportGroup::for_state(state, false).abort_enabled,
+        "{state:?} holds a transport and must allow Abort",
+      );
+    }
+  }
+
+  #[test]
+  fn the_graceful_stop_and_the_hard_abort_are_independently_gated() {
+    // Stop (graceful, `0x86`) is gated like the rest of the transport group — it needs a live, ready board. Abort
+    // (hard, `0x18`) is broader: it is live the moment a transport attaches. While `Connecting` the two diverge,
+    // which is the whole point of splitting them: no clean stop yet, but an emergency reset always.
+    let connecting = TransportGroup::for_state(BadgeState::Connecting, true);
+    assert!(!connecting.stop_enabled, "no graceful Stop before the board is ready");
+    assert!(connecting.abort_enabled, "Abort is available while connecting");
   }
 
   #[test]

@@ -10,6 +10,7 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, ScrollArea, Vec2};
 use super::badge::{BadgeState, TransportGroup};
 use super::intent::{Axis, Dir, Intent, IntentSink};
 use super::metrics::Metrics;
+use super::settings_model::SettingRow;
 use super::theme::Theme;
 use super::view_state::{Banner, LogLine, LogSource, ViewState};
 use crate::protocol::{ConnectionState, RealtimeCommand};
@@ -60,12 +61,13 @@ pub struct UiState {
   pub jog_continuous: bool,
   /// The jog feed rate (mm/min).
   pub jog_feed: f64,
-  /// The feed-override slider's transient drag position (percent), or `None` when the slider is idle (it then
-  /// mirrors the live `Ov:` value). Held here so the slider survives across the immediate-mode frames of a drag
-  /// and the live status poll cannot yank the handle while the operator is dragging it.
-  pub feed_override_drag: Option<u32>,
-  /// The spindle-override slider's transient drag position (percent); see [`Self::feed_override_drag`].
-  pub spindle_override_drag: Option<u32>,
+  /// The feed-override slider's feedback state: idle (mirror live), dragging (hold the operator's position so a
+  /// status poll cannot yank it), or holding the committed target after release until the firmware's relative
+  /// ramp converges onto it. Held here so the slider survives the immediate-mode frames of a drag and the
+  /// post-release ramp without snapping back to the lagging `Ov:` value. See [`super::overrides::OverrideFeedback`].
+  pub feed_override_drag: super::overrides::OverrideFeedback,
+  /// The spindle-override slider's feedback state; see [`Self::feed_override_drag`].
+  pub spindle_override_drag: super::overrides::OverrideFeedback,
   /// The manual-command input buffer in the console.
   pub console_input: String,
   /// Probe depth (mm, travelled downward as a positive magnitude here; the shell negates it).
@@ -85,9 +87,19 @@ pub struct UiState {
   /// Whether the settings window is open.
   pub settings_open: bool,
   /// The setting currently being edited in the panel, as `(number, edit_buffer)`, or `None` when no row is in
-  /// edit mode. Held here so the in-progress text survives the immediate-mode frames of an edit and the live
-  /// `$$` re-dump cannot overwrite the operator's keystrokes mid-edit; committed (Enter/focus-loss) → cleared.
+  /// edit mode. Held here so the in-progress text survives the immediate-mode frames of an edit; leaving the
+  /// field (Enter or focus-loss) stages the value into [`Self::settings_staging`] and clears this, so a value is
+  /// never lost the way it was when only Enter committed.
   pub editing_setting: Option<(u32, String)>,
+  /// The locally-staged firmware-settings edits awaiting an explicit Save. Editing any value stages it here
+  /// (on Enter or focus-loss) rather than writing immediately, so a typed value is never silently dropped; Save
+  /// flushes the lot and clears it, a confirmed Discard clears it without writing. A row is shown "modified"
+  /// exactly while it has an entry here.
+  pub settings_staging: super::settings_staging::SettingsStaging,
+  /// A settings dialog action (Refresh or Close) the operator requested while edits were still staged, parked
+  /// here until they answer the "Discard N unsaved change(s)?" confirmation. `None` when no confirmation is
+  /// pending; the modal is shown exactly while this is `Some`.
+  pub pending_settings_action: Option<PendingSettingsAction>,
   /// DRO coordinate toggle: `true` shows machine position emphasised, `false` shows work position (the design
   /// default — WPos is the active toggle in the mock).
   pub show_machine_pos: bool,
@@ -96,11 +108,25 @@ pub struct UiState {
   /// Whether the console shows every received line. When `false` (the default), bare `ok` acknowledgements are
   /// hidden so continuous jogging — which acks each `$J=` line — does not bury the log in `‹ ok` noise.
   pub verbose: bool,
+  /// The curated per-setting tooltip descriptions, loaded once at startup from the runtime JSON file (seeded from
+  /// the bundled default) and parsed into a number→text map. Held here so the settings tooltip is a pure render of
+  /// already-parsed state — the file is never re-read or re-parsed per frame. An absent number degrades to no prose.
+  pub setting_descriptions: super::setting_help::SettingDescriptions,
   /// The active tab in the bottom dock: Console or Program (design §03 — the two tabs share one dock surface).
   pub active_tab: DockTab,
   /// Whether the bottom dock is collapsed to just its tab strip, hiding the console/program body so the toolpath
   /// and panels reclaim the space. Defaults to expanded (the design opens the dock at its full 200px height).
   pub dock_collapsed: bool,
+}
+
+/// A settings dialog action the operator requested while edits were still staged, deferred behind the discard
+/// confirmation. Both actions throw away the staged edits when confirmed; they differ only in what happens next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingSettingsAction {
+  /// Refresh ($$): re-fetch the controller's settings, which would overwrite the staged values with live ones.
+  Refresh,
+  /// Close the settings dialog, abandoning the staged edits.
+  Close,
 }
 
 /// The two tabs hosted by the bottom dock (design §03). The dock is a single surface whose body switches
@@ -127,8 +153,8 @@ impl Default for UiState {
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
-      feed_override_drag: None,
-      spindle_override_drag: None,
+      feed_override_drag: super::overrides::OverrideFeedback::default(),
+      spindle_override_drag: super::overrides::OverrideFeedback::default(),
       console_input: String::new(),
       probe_depth: 10.0,
       probe_feed: 50.0,
@@ -139,9 +165,14 @@ impl Default for UiState {
       verify_runout_n: 4,
       settings_open: false,
       editing_setting: None,
+      settings_staging: super::settings_staging::SettingsStaging::new(),
+      pending_settings_action: None,
       show_machine_pos: false,
       auto_scroll: true,
       verbose: false,
+      // Default to the bundled descriptions so a `Default`-built UI (and every test that uses one) has working
+      // tooltips without touching disk; the real app replaces this with the loaded set in `SkirnirApp::new`.
+      setting_descriptions: super::setting_help::SettingDescriptions::bundled(),
       active_tab: DockTab::default(),
       dock_collapsed: false,
     }
@@ -171,8 +202,12 @@ impl UiState {
   /// override. Mirrors `ViewState::on_disconnected` for the transient state the reducer cannot reach.
   pub fn on_disconnected(&mut self) {
     self.editing_setting = None;
-    self.feed_override_drag = None;
-    self.spindle_override_drag = None;
+    // Staged but unsaved settings edits belong to the board that just dropped; a reconnect (possibly to a
+    // different controller) must not resume them or pop a stale discard confirmation.
+    self.settings_staging.clear();
+    self.pending_settings_action = None;
+    self.feed_override_drag = super::overrides::OverrideFeedback::default();
+    self.spindle_override_drag = super::overrides::OverrideFeedback::default();
   }
 
   /// Load a program: store its lines (shared, so streaming never re-clones the file) and rebuild the cached
@@ -386,10 +421,18 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
     ui.spacing_mut().item_spacing.x = Metrics::TOOLBAR_GAP;
     ui.spacing_mut().button_padding = Metrics::TOOLBAR_BUTTON_PAD;
     ui.spacing_mut().interact_size.y = Metrics::TOOLBAR_CONTROL_H;
+    // Gate the teardown affordance on whether a transport is ATTACHED, not on whether the board is fully ready.
+    // A connect that stalls in `Connecting` (the ESP32-S3 can fail to volunteer readiness) still holds the OS port
+    // open; without a Disconnect here the operator could not release the FD short of killing the process, blocking
+    // espflash / another sender. While still `Connecting` the button reads "Cancel" (cancelling the connect); once
+    // ready it reads "Disconnect". Both push the same intent — the shell sends `Command::Disconnect`, which ends the
+    // engine task and drops the serial stream regardless of which lifecycle state it was in.
+    let attached = view.connection.has_transport();
     let connected = view.connection.is_connected();
 
-    if connected {
-      if ui.button("Disconnect").clicked() {
+    if attached {
+      let label = if connected { "Disconnect" } else { "Cancel" };
+      if ui.button(label).clicked() {
         sink.push(Intent::Disconnect);
       }
     } else {
@@ -459,10 +502,11 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
   });
 }
 
-/// The Run/Hold/Stop segmented group. The leading segment starts a stream (Idle) or resumes (Hold); Hold issues
-/// a feed-hold; Stop issues a soft reset. Enable/emphasis come from the pure [`TransportGroup`] matrix so the
-/// view stays a renderer.
-fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
+/// The Run/Hold/Stop segmented group plus a separate Abort control. The leading segment starts a stream (Idle) or
+/// resumes (Hold); Hold issues a feed-hold; Stop issues the GRACEFUL program stop (`0x86` — decelerate, flush,
+/// return to Idle, no alarm); the standalone Abort issues the HARD soft-reset (`0x18` → `ALARM:3`). Enable/emphasis
+/// come from the pure [`TransportGroup`] matrix so the view stays a renderer.
+pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
   use egui::CornerRadius;
   let group = TransportGroup::for_state(view.badge_state(), !state.program.is_empty());
 
@@ -495,11 +539,33 @@ fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &
   if ui.add_enabled(group.hold_enabled, hold).on_hover_text("Feed hold (!)").clicked() {
     sink.push(Intent::Realtime(RealtimeCommand::FeedHold));
   }
-  let stop = egui::Button::new(RichText::new("■ Stop").color(Theme::DANGER)).corner_radius(right);
-  if ui.add_enabled(group.stop_enabled, stop).on_hover_text("Soft reset (0x18)").clicked() {
+  // Stop is now the GRACEFUL program stop (`0x86`): the everyday "stop the job cleanly" button. It decelerates to a
+  // block boundary, flushes the queue and returns to Idle with no alarm, so it reads as a normal-weight control
+  // (amber, not danger-red) — the hard reset lives in the separate Abort button beside the group.
+  let stop = egui::Button::new(RichText::new("■ Stop").color(Theme::STATE_HOLD)).corner_radius(right);
+  if ui
+    .add_enabled(group.stop_enabled, stop)
+    .on_hover_text("Stop the job cleanly (0x86) — decelerate, flush, return to Idle")
+    .clicked()
+  {
+    sink.push(Intent::Realtime(RealtimeCommand::ProgramStop));
+  }
+  // Restore the toolbar gap before the standalone Abort so it sits apart from the joined segments, signalling it is
+  // a separate, weightier action rather than a fourth segment of the group.
+  ui.spacing_mut().item_spacing.x = prev_gap;
+
+  // Abort / E-stop: the HARD soft-reset (`0x18` → `ALARM:3`). Visually distinct — danger-red, fully rounded, set
+  // apart from the segmented group — and available the instant a transport is attached (even mid-handshake), so the
+  // operator always has an emergency reset. The graceful Stop above is the routine control; this is the panic stop.
+  let abort = egui::Button::new(RichText::new("⏹ Abort").color(Theme::DANGER))
+    .corner_radius(Metrics::CONTROL_RADIUS);
+  if ui
+    .add_enabled(group.abort_enabled, abort)
+    .on_hover_text("Emergency hard reset (0x18) — aborts to ALARM and resets the controller")
+    .clicked()
+  {
     sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
   }
-  ui.spacing_mut().item_spacing.x = prev_gap;
 }
 
 /// Render the digital readout: a WPos/MPos toggle, large per-axis rows (coloured letter + big tabular value +
@@ -867,13 +933,16 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   use super::overrides::OverrideAxis;
   section_header(ui, "Overrides");
   let (feed, rapid, spindle) = view.status.as_ref().and_then(|s| s.overrides).unwrap_or((100, 100, 100));
+  // Overrides only do anything on a ready link — a relative ±10/±1/reset byte is a no-op with nothing connected
+  // to act on it — so the whole panel is disabled until the board is connected and ready (Idle/Run/Hold/…).
+  let enabled = view.connection.is_connected();
 
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    override_axis(ui, "Feed", OverrideAxis::Feed, feed, &mut state.feed_override_drag, sink,
+    override_axis(ui, "Feed", OverrideAxis::Feed, feed, enabled, &mut state.feed_override_drag, sink,
       RealtimeCommand::FeedOverrideMinus1, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
       RealtimeCommand::FeedOverridePlus10, RealtimeCommand::FeedOverridePlus1);
     ui.add_space(4.0);
-    override_axis(ui, "Spindle", OverrideAxis::Spindle, spindle, &mut state.spindle_override_drag, sink,
+    override_axis(ui, "Spindle", OverrideAxis::Spindle, spindle, enabled, &mut state.spindle_override_drag, sink,
       RealtimeCommand::SpindleOverrideMinus1, RealtimeCommand::SpindleOverrideMinus10,
       RealtimeCommand::SpindleOverrideReset, RealtimeCommand::SpindleOverridePlus10,
       RealtimeCommand::SpindleOverridePlus1);
@@ -965,62 +1034,114 @@ fn override_slider(ui: &mut egui::Ui, value: &mut u32, fill_color: Color32) -> e
 /// the same override; the slider is coarse-grained reach, the steppers are precise nudges including the new
 /// fine ±1%.
 ///
-/// `live` is the override the firmware last reported. `drag` is the slider's transient position: it tracks
-/// `live` whenever the slider is idle (so the firmware's truth re-centers it), and the operator's in-progress
-/// drag while held. On release we emit the target only if it moved, so merely touching the slider sends
-/// nothing.
+/// `live` is the override the firmware last reported. `feedback` is the slider's transient feedback state: it
+/// mirrors `live` while idle (so the firmware's truth re-centers the handle), holds the operator's position
+/// during a drag (so a status poll cannot yank it), and — the snap-back fix — holds the committed target after
+/// release until the firmware's relative ramp converges onto it (see [`super::overrides::OverrideFeedback`]). On
+/// release we emit the target only if it moved off `live`, so merely touching the slider sends nothing. The
+/// whole row is disabled unless a live link can act on the override (`enabled`), since overrides are no-ops
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
-fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32,
-  drag: &mut Option<u32>, sink: &mut IntentSink, minus1: RealtimeCommand, minus10: RealtimeCommand,
-  reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
+fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32, enabled: bool,
+  feedback: &mut super::overrides::OverrideFeedback, sink: &mut IntentSink, minus1: RealtimeCommand,
+  minus10: RealtimeCommand, reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
   use super::overrides::OverrideAxis;
 
-  // The slider edits a local mirror seeded from the live value while idle; an active drag holds its own value.
-  let mut value = drag.unwrap_or(live);
+  // Fold the latest live report into the feedback state first: while idle the handle follows `live`; a
+  // post-release hold releases once `live` converges onto the committed target. A drag ignores reports entirely.
+  feedback.observe(live);
+  // The value the handle shows this frame: `live` when idle, the pinned drag/hold value otherwise.
+  let mut value = feedback.display(live);
   // Feed (and rapid) carry the cool control-blue fill; spindle carries the warm motion-orange, matching the
   // design's `#0E86D4` feed bar and `#FF7A1A` spindle bar (the colour that was missing entirely before).
   let fill_color = match axis {
     OverrideAxis::Feed => Theme::ACCENT,
     OverrideAxis::Spindle => Theme::ACCENT_MOTION,
   };
-  // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
-  ui.horizontal(|ui| {
-    ui.label(RichText::new(label).size(11.0).color(Theme::TEXT_DIM));
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(Theme::TEXT));
-      let slider = override_slider(ui, &mut value, fill_color);
-      if slider.dragged() {
-        // While dragging, remember the operator's position so the live status poll cannot yank the handle back.
-        *drag = Some(value);
-      }
-      if slider.drag_stopped() || slider.clicked() {
-        // On release/click, commit the target if it moved off the live value, then let the mirror track live again.
-        if value != live {
-          sink.push(Intent::SetOverride { axis, target: value });
+  ui.add_enabled_ui(enabled, |ui| {
+    // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
+    ui.horizontal(|ui| {
+      ui.label(RichText::new(label).size(11.0).color(Theme::TEXT_DIM));
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(Theme::TEXT));
+        let slider = override_slider(ui, &mut value, fill_color);
+        // A UI test (egui_kittest) needs the slider's on-screen rect to drive a pointer drag at known
+        // coordinates, since the widget is hand-painted and label-less so AccessKit cannot locate it by text.
+        #[cfg(all(test, feature = "gui"))]
+        slider_rect_probe::record(axis, slider.rect);
+        if slider.dragged() {
+          // While dragging, hold the operator's position so the live status poll cannot yank the handle back.
+          feedback.drag_to(value);
         }
-        *drag = None;
-      }
+        if slider.drag_stopped() || slider.clicked() {
+          // On release/click, commit the target if it moved off the live value and HOLD it; the hold survives the
+          // firmware's relative ramp so the handle stays put instead of snapping to the stale `live` and crawling.
+          if value != live {
+            sink.push(Intent::SetOverride { axis, target: value });
+            feedback.commit(value, live);
+          } else {
+            // An empty touch (no movement): nothing committed, so just return to mirroring live.
+            *feedback = super::overrides::OverrideFeedback::Idle;
+          }
+        }
+      });
     });
   });
 
-  // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%.
-  ui.horizontal(|ui| {
-    if ui.button("−10").clicked() {
-      sink.push(Intent::Realtime(minus10));
-    }
-    if ui.button("−1").clicked() {
-      sink.push(Intent::Realtime(minus1));
-    }
-    if ui.button("100").clicked() {
-      sink.push(Intent::Realtime(reset));
-    }
-    if ui.button("+1").clicked() {
-      sink.push(Intent::Realtime(plus1));
-    }
-    if ui.button("+10").clicked() {
-      sink.push(Intent::Realtime(plus10));
-    }
+  // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%. Gated on the same
+  // live link as the slider — a relative override byte is a no-op with nothing connected to act on it.
+  ui.add_enabled_ui(enabled, |ui| {
+    ui.horizontal(|ui| {
+      if ui.button("−10").clicked() {
+        sink.push(Intent::Realtime(minus10));
+      }
+      if ui.button("−1").clicked() {
+        sink.push(Intent::Realtime(minus1));
+      }
+      if ui.button("100").clicked() {
+        sink.push(Intent::Realtime(reset));
+      }
+      if ui.button("+1").clicked() {
+        sink.push(Intent::Realtime(plus1));
+      }
+      if ui.button("+10").clicked() {
+        sink.push(Intent::Realtime(plus10));
+      }
+    });
   });
+}
+
+/// A test-only side channel that records each override slider's on-screen [`egui::Rect`] as it is rendered, so
+/// the egui_kittest harness can compute pointer coordinates inside a slider it cannot otherwise locate (the
+/// widget is hand-painted with no label, so AccessKit exposes no findable node). Compiled only for the
+/// gui-featured test build; the production render path is untouched apart from the cheap `record` call.
+#[cfg(all(test, feature = "gui"))]
+pub(crate) mod slider_rect_probe {
+  use super::super::overrides::OverrideAxis;
+  use eframe::egui::Rect;
+  use std::cell::Cell;
+
+  thread_local! {
+    /// The last-rendered rect of the feed and spindle sliders, in screen coordinates. `None` until first drawn.
+    static FEED: Cell<Option<Rect>> = const { Cell::new(None) };
+    static SPINDLE: Cell<Option<Rect>> = const { Cell::new(None) };
+  }
+
+  /// Record the slider rect for `axis` from the just-completed render of that axis's row.
+  pub(crate) fn record(axis: OverrideAxis, rect: Rect) {
+    match axis {
+      OverrideAxis::Feed => FEED.with(|c| c.set(Some(rect))),
+      OverrideAxis::Spindle => SPINDLE.with(|c| c.set(Some(rect))),
+    }
+  }
+
+  /// The last-recorded rect for `axis`, or `None` if that axis has not been rendered yet this thread.
+  pub(crate) fn last(axis: OverrideAxis) -> Option<Rect> {
+    match axis {
+      OverrideAxis::Feed => FEED.with(Cell::get),
+      OverrideAxis::Spindle => SPINDLE.with(Cell::get),
+    }
+  }
 }
 
 /// Render the probe panel: depth/feed/plate inputs and a "Probe Z" action that the shell sequences.
@@ -1452,30 +1573,54 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
   ui.add_sized(size, button).on_hover_text(hint).clicked()
 }
 
-/// Draw the §03 dock progress readout: `acked / total`, the 260px green bar, the percent, and the elapsed /
+/// Draw the §03 dock progress readout: `acked / total`, the green bar, the percent, and the elapsed /
 /// estimated-total `m:ss / m:ss` clock, shown only while a program is loaded/streaming (`total > 0`). The
 /// strip's right closure lays out right-to-left, so the widgets are drawn rightmost-first; that puts the
 /// clock at the left edge of the block and the count nearest the percent, reading left→right as the design's
-/// `acked/total · bar · NN% · m:ss / m:ss`.
+/// `acked/total · bar · NN% · m:ss / m:ss` with dim `·` separators between the textual fields.
+///
+/// The strip's `right` closure inherits the tab row's `item_spacing.x = 0` (it is the same child `ui`), which is
+/// why the percent and clock previously ran together with no gap. This sets its own roomy row spacing so the
+/// fields breathe, and degrades on a narrow strip by dropping the bar first (the least-important field — the
+/// percent and count carry the same information) so the block never overflows into an unpainted gap.
 fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time: super::progress::TimeEstimate) {
-  use super::progress::format_mmss;
+  use super::progress::format_progress_clock;
   if progress.total == 0 {
     return;
   }
-  // Rightmost: the elapsed / estimated-total clock. `total` is `None` until the ETA is projectable, rendering
-  // the elapsed against a `--:--` placeholder rather than a wild early guess.
-  let clock = format!("{} / {}", format_mmss(Some(time.elapsed)), format_mmss(time.total));
+  // Own the row spacing rather than inheriting the tab strip's zeroed `item_spacing.x`. A roomy 8px gap gives
+  // every field air and sits between the adjacent fields and the `·` separators so nothing abuts its neighbour.
+  ui.spacing_mut().item_spacing.x = Metrics::DOCK_PROGRESS_GAP;
+  // Decide up front whether the bar fits. The toggle was already drawn (this `ui` excludes it), so the remaining
+  // width must hold the bar plus the textual fields; when it can't, drop the bar rather than overflow the strip.
+  let draw_bar = ui.available_width() >= Metrics::PROGRESS_W + Metrics::DOCK_PROGRESS_TEXT_RESERVE;
+
+  // Rightmost: the elapsed / estimated-total clock. `total` is `None` until the ETA is projectable, so its right
+  // half shows the dim `--:--` placeholder rather than a wild early guess (see `format_progress_clock`).
+  let clock = format_progress_clock(time.elapsed, time.total);
   ui.label(RichText::new(clock).monospace().size(10.5).color(Theme::TEXT_DIM));
+  dock_progress_separator(ui);
   let pct = (progress.fraction() * 100.0).round() as u32;
   ui.label(RichText::new(format!("{pct}%")).monospace().size(11.0).color(Theme::TEXT));
-  let (rect, _) = ui.allocate_exact_size(Vec2::new(Metrics::PROGRESS_W, Metrics::PROGRESS_H), egui::Sense::hover());
-  let painter = ui.painter();
-  painter.rect_filled(rect, 2.0, Theme::INSET);
-  let mut fill = rect;
-  fill.set_width(rect.width() * progress.fraction());
-  painter.rect_filled(fill, 2.0, Theme::STATE_RUN);
+  if draw_bar {
+    dock_progress_separator(ui);
+    let bar = Vec2::new(Metrics::PROGRESS_W, Metrics::PROGRESS_H);
+    let (rect, _) = ui.allocate_exact_size(bar, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, Theme::INSET);
+    let mut fill = rect;
+    fill.set_width(rect.width() * progress.fraction());
+    painter.rect_filled(fill, 2.0, Theme::STATE_RUN);
+  }
+  dock_progress_separator(ui);
   ui.label(RichText::new(format!("{} / {}", progress.acked, progress.total)).monospace().size(10.5)
     .color(Theme::TEXT_DIM));
+}
+
+/// Draw the dim middot that separates the dock progress fields (the design's `·`). Pulled out so every gap in
+/// [`dock_progress`] uses one consistent glyph and colour instead of repeating the `RichText` at each call site.
+fn dock_progress_separator(ui: &mut egui::Ui) {
+  ui.label(RichText::new("·").size(11.0).color(Theme::TEXT_DISABLED));
 }
 
 /// Render the Program tab body: the loaded file's lines with the acked line highlighted, drawn lazily so a
@@ -1538,7 +1683,7 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     .collect();
 
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-  ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(state.auto_scroll).show_rows(
+  let scroll = ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(state.auto_scroll).show_rows(
     ui,
     row_height,
     visible.len(),
@@ -1555,6 +1700,16 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
       }
     },
   );
+  // Right-clicking anywhere over the console viewport (a row or the empty space below the last line) offers a
+  // single "Clear" action. `interact` over the scroll-area rect makes the whole body — not just a painted row —
+  // catch the secondary click, so the menu is reliable on a sparse or empty console.
+  let console_rect = scroll.inner_rect;
+  ui.interact(console_rect, ui.id().with("console_context"), egui::Sense::click()).context_menu(|ui| {
+    if ui.button("Clear").clicked() {
+      sink.push(Intent::ClearConsole);
+      ui.close();
+    }
+  });
 
   // Manual command entry: the input fills the row and Send sits flush to its right (design §03 command line),
   // sending on Enter or the button, only while connected.
@@ -1898,19 +2053,20 @@ fn gcode_words(code: &str) -> impl Iterator<Item = (char, &str)> {
   })
 }
 
-/// Decide what a committed/abandoned settings edit produces: `Some(WriteSetting)` when the edit was committed
-/// (Enter / focus-loss) AND the buffer actually differs from the live value, else `None`. Pure so the
-/// commit policy — "only write a real change" — is unit-tested without a window. A trimmed-equal buffer is a
-/// no-op (the firmware would just echo the same value), so it sends nothing and the link stays quiet.
-fn commit_setting_edit(committed: bool, number: u32, buffer: &str, live: Option<&str>) -> Option<Intent> {
-  if !committed {
-    return None;
-  }
-  let trimmed = buffer.trim();
-  if trimmed.is_empty() || live == Some(trimmed) {
-    return None;
-  }
-  Some(Intent::WriteSetting { number, value: trimmed.to_string() })
+/// Whether leaving a settings field should stage its buffer (vs. abandon it). Leaving on Enter *or* plain
+/// focus-loss stages — the fix for the old silent-drop bug, where focus-loss without Enter discarded the edit —
+/// while Escape abandons. Pure so the stage-vs-abandon policy is unit-tested without a window; whether the
+/// staged value is a real change (and so actually marks the row dirty) is decided by
+/// [`super::settings_staging::SettingsStaging::stage`], which drops a value equal to the live one.
+fn setting_edit_should_stage(abandoned: bool) -> bool {
+  !abandoned
+}
+
+/// Whether a settings dialog action (Refresh/Close) needs the discard confirmation: only when edits are still
+/// staged. Pure so the confirm gate is unit-tested without a window — with nothing staged, Refresh/Close proceed
+/// immediately (the pre-existing behaviour); with edits staged, the caller parks the action behind the modal.
+pub fn settings_action_needs_confirm(staging: &super::settings_staging::SettingsStaging) -> bool {
+  !staging.is_empty()
 }
 
 /// Render the settings window: the connection-level baud knob plus the same live `$NNN` settings list the
@@ -1925,69 +2081,178 @@ pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   ui.separator();
   ui.horizontal(|ui| {
     ui.label(RichText::new("Firmware settings").color(Theme::TEXT));
-    settings_refresh_button(ui, view, sink);
+    settings_save_button(ui, view, state, sink);
+    settings_refresh_button(ui, view, state, sink);
   });
+  // The explicit-Save model: edits stage locally and only reach the controller on Save. The note also flags that
+  // some settings (e.g. `$22` homing) take effect only after the next reset, so a saved value may look inert.
+  ui.label(RichText::new("Edits stage locally — Save writes them. Some settings (e.g. $22 homing) apply on the \
+    next reset.").size(10.0).color(Theme::TEXT_DIM));
   ui.add_space(4.0);
-  settings_list(ui, view, state, sink);
+  settings_list(ui, view, state);
 }
 
-/// The "fetch settings from the firmware" button: enabled only when connected (a `$$`/`$ES` request would just
-/// error while disconnected). Emits [`Intent::RequestSettings`], which the shell turns into `$ES` + `$$`.
-fn settings_refresh_button(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
+/// The "Save" button: flushes every staged edit to the controller via [`Intent::SaveSettings`]. Enabled only
+/// when connected *and* something is staged (nothing to write otherwise), so it greys out until the operator
+/// actually changes a value. Saving each `$<n>=<value>` flows through the streaming engine, then `$$` re-confirms.
+fn settings_save_button(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
   let connected = !matches!(view.connection, ConnectionState::Disconnected | ConnectionState::Connecting);
-  ui.add_enabled_ui(connected, |ui| {
-    if ui.button("Refresh ($$)").on_hover_text("Fetch $$ values and $ES labels from the controller").clicked() {
-      sink.push(Intent::RequestSettings);
+  let dirty = !state.settings_staging.is_empty();
+  let label = if dirty { format!("Save ({})", state.settings_staging.len()) } else { "Save".to_string() };
+  ui.add_enabled_ui(connected && dirty, |ui| {
+    if ui.button(label).on_hover_text("Write every staged setting to the controller").clicked() {
+      sink.push(Intent::SaveSettings);
     }
   });
 }
 
+/// The "fetch settings from the firmware" button: enabled only when connected (a `$$`/`$ES` request would just
+/// error while disconnected). With unsaved edits staged it parks behind the discard confirmation (a refresh
+/// would overwrite them with live values); with nothing staged it emits [`Intent::RequestSettings`] directly,
+/// which the shell turns into `$ES` + `$$`.
+fn settings_refresh_button(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let connected = !matches!(view.connection, ConnectionState::Disconnected | ConnectionState::Connecting);
+  ui.add_enabled_ui(connected, |ui| {
+    if ui.button("Refresh ($$)").on_hover_text("Fetch $$ values and $ES labels from the controller").clicked() {
+      if settings_action_needs_confirm(&state.settings_staging) {
+        // Defer the fetch behind the discard modal when edits are staged; the modal emits it on confirm so the
+        // request never silently clobbers staged edits without the operator's say-so.
+        state.pending_settings_action = Some(PendingSettingsAction::Refresh);
+      } else {
+        // Nothing staged → fetch straight away, the pre-existing behaviour (no confirmation needed).
+        sink.push(Intent::RequestSettings);
+      }
+    }
+  });
+}
+
+/// The PRIMARY, dynamic tooltip lines derived from the `$ES`/`$$` metadata on `row` — the bits that are always
+/// accurate per-firmware: the enumerated name (or a `$<n>` fallback), the unit, and the advertised `min..max`
+/// range when present. Pure (no egui) so it unit-tests off-screen. A row with no metadata at all returns an empty
+/// vec; the renderer still shows the bare `$<n>` heading, so the tooltip is never an empty box.
+pub fn setting_tooltip_meta(row: &SettingRow) -> Vec<String> {
+  let mut lines = Vec::new();
+  let Some(meta) = &row.meta else { return lines };
+  // The enumerated name, when the firmware advertised a non-empty one (the heading already carries `$<n>`, so this
+  // line is the human name only).
+  if !meta.name.is_empty() {
+    lines.push(meta.name.clone());
+  }
+  if !meta.unit.is_empty() {
+    lines.push(format!("Unit: {}", meta.unit));
+  }
+  // The advertised bounds, shown as whichever ends the firmware gave: a full `min..max`, or a one-sided `≥ min` /
+  // `≤ max` when only one end was enumerated.
+  match (&meta.min, &meta.max) {
+    (Some(min), Some(max)) => lines.push(format!("Range: {min}..{max}")),
+    (Some(min), None) => lines.push(format!("Range: ≥ {min}")),
+    (None, Some(max)) => lines.push(format!("Range: ≤ {max}")),
+    (None, None) => {}
+  }
+  lines
+}
+
+/// Render the rich hover panel for one setting: a heading line (`$<number>` plus the disambiguated display name),
+/// the PRIMARY dynamic `meta_lines` from `$ES`, and the curated prose from `descriptions` when the number is known.
+/// Degrades gracefully — a setting with neither metadata nor a description still shows the bare `$<number>` heading,
+/// never an empty box. Kept thin (a pure render of already-decided state); the decisions live in
+/// [`setting_tooltip_meta`] and [`super::setting_help`].
+pub fn settings_tooltip_ui(
+  ui: &mut egui::Ui,
+  number: u32,
+  heading_name: &str,
+  meta_lines: &[String],
+  descriptions: &super::setting_help::SettingDescriptions,
+) {
+  // Keep the panel from stretching to the screen edge on a long sentence; a fixed cap reads as a tidy tooltip.
+  ui.set_max_width(320.0);
+  // Heading: always present, so an unknown, metadata-less setting still shows `$<n>` (optionally with its name).
+  let heading = if heading_name.is_empty() {
+    format!("${number}")
+  } else {
+    format!("${number} · {heading_name}")
+  };
+  ui.label(RichText::new(heading).size(11.5).color(Theme::TEXT).strong());
+  for line in meta_lines {
+    ui.label(RichText::new(line).size(11.0).color(Theme::TEXT_DIM));
+  }
+  // The curated explanation, when the number is in the loaded set. Separated from the metadata by a thin rule so
+  // the "what it does" prose reads distinctly from the "$ES says" facts above it.
+  if let Some(desc) = descriptions.description(number) {
+    ui.separator();
+    ui.label(RichText::new(desc).size(11.0).color(Theme::TEXT_DIM));
+  }
+}
+
 /// Render the live settings rows: each is a violet `$<n>` key, the enumerated label, and an editable value
 /// field. A click into a value enters edit mode (a transient buffer in [`UiState::editing_setting`] seeded from
-/// the live value); Enter or focus-loss commits a [`Intent::WriteSetting`] if the value changed, Escape
-/// abandons it. When no settings are known yet the section prompts the operator to refresh.
-fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+/// the current — staged-or-live — value); Enter or focus-loss *stages* the value (never silently dropped, the
+/// fix for the old commit bug), Escape abandons it. A staged row is shown with an accent marker and its staged
+/// value, until Save writes it or a confirmed Discard clears it. When no settings are known the section prompts
+/// a refresh.
+fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   if view.settings.is_empty() {
     ui.label(RichText::new("No settings loaded — Refresh to fetch the controller's $$ / $ES.").size(11.0)
       .color(Theme::TEXT_DIM));
     return;
   }
-  // The committed edit (if any) is acted on after the row loop so we never mutate `editing_setting` mid-borrow.
-  let mut commit: Option<(bool, u32, String)> = None;
+  // The staged edit (if any) is applied after the row loop so we never mutate `editing_setting` mid-borrow.
+  let mut stage: Option<(bool, u32, String)> = None;
   // `auto_shrink([false, false])`: fill the host's available height so the surrounding Settings window resizes
   // vertically instead of snapping back to a fixed list height.
   egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
     egui::Grid::new("settings_list").num_columns(3).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
       for row in view.settings.rows() {
-        ui.label(RichText::new(format!("${}", row.number)).monospace().size(11.0).color(Theme::LOG_STATUS));
+        let dirty = state.settings_staging.is_dirty(row.number);
+        // The `$<n>` key turns to the accent-motion colour while the row has a staged edit, so a glance down the
+        // list shows exactly which settings are modified and unsaved.
+        let key_color = if dirty { Theme::ACCENT_MOTION } else { Theme::LOG_STATUS };
+        ui.label(RichText::new(format!("${}", row.number)).monospace().size(11.0).color(key_color));
         // The label disambiguates grblHAL's per-axis settings (e.g. `$150/$151/$152` all named "Microsteps")
-        // by appending the axis letter; a setting with a unique name is shown verbatim.
+        // by appending the axis letter; a setting with a unique name is shown verbatim. A modified row prefixes a
+        // dot so the marker survives even without colour.
         let label = view.settings.display_label(row);
         let unit = row.unit();
-        let label_text = if unit.is_empty() { label } else { format!("{label} ({unit})") };
-        ui.label(RichText::new(label_text).size(11.0).color(Theme::TEXT_DIM));
+        let base = if unit.is_empty() { label.clone() } else { format!("{label} ({unit})") };
+        let label_text = if dirty { format!("• {base}") } else { base };
+        let label_color = if dirty { Theme::TEXT } else { Theme::TEXT_DIM };
+        // Hovering the label cell explains the setting: the `$ES`-learned name/unit/range (PRIMARY, always
+        // accurate per-firmware) plus the curated prose from [`super::setting_help`] when the number is known. A
+        // row with neither still degrades to a bare `$<n>` line — never an empty box.
+        let number = row.number;
+        let heading_name = label; // the disambiguated display label, for the tooltip heading.
+        let meta_lines = setting_tooltip_meta(row);
+        let descriptions = &state.setting_descriptions;
+        ui.label(RichText::new(label_text).size(11.0).color(label_color)).on_hover_ui(|ui| {
+          settings_tooltip_ui(ui, number, &heading_name, &meta_lines, descriptions);
+        });
 
-        // The value cell: an in-edit row binds the transient buffer; an idle row shows the live value, which a
-        // click promotes into edit mode seeded from that value.
+        // The value cell: an in-edit row binds the transient buffer; an idle row shows the staged value when
+        // dirty, else the live value, which a click promotes into edit mode seeded from whatever is shown.
         let editing_this = matches!(&state.editing_setting, Some((n, _)) if *n == row.number);
         if editing_this {
           if let Some((_, buffer)) = state.editing_setting.as_mut() {
             let resp = ui.add(egui::TextEdit::singleline(buffer).desired_width(72.0));
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let abandoned = ui.input(|i| i.key_pressed(egui::Key::Escape));
-            // Leave edit mode on any of: Enter (commit), Escape (abandon), or focus moving elsewhere (commit
-            // the buffer as-is, matching how a spreadsheet cell behaves). `commit_setting_edit` then decides
-            // whether the change is worth a write. Escape forces a non-commit even though it also drops focus.
+            // Leave edit mode on any of: Enter, Escape (abandon), or focus moving elsewhere. Enter and focus-loss
+            // both stage (the silent-drop fix); only Escape abandons. `setting_edit_should_stage` encodes that.
             if enter || abandoned || resp.lost_focus() {
-              commit = Some((enter && !abandoned, row.number, buffer.clone()));
+              stage = Some((abandoned, row.number, buffer.clone()));
             }
           }
         } else {
-          let shown = row.value.clone().unwrap_or_else(|| "—".to_string());
-          if ui.add(egui::Button::new(RichText::new(shown).monospace().size(11.0).color(Theme::TEXT))
+          // Show the staged value while dirty (the pending edit), else the live value, else an em-dash placeholder.
+          let shown = state.settings_staging.staged_value(row.number).map(str::to_string)
+            .or_else(|| row.value.clone()).unwrap_or_else(|| "—".to_string());
+          let value_color = if dirty { Theme::ACCENT_MOTION } else { Theme::TEXT };
+          if ui.add(egui::Button::new(RichText::new(shown).monospace().size(11.0).color(value_color))
             .fill(Theme::INSET)).on_hover_text("Click to edit").clicked()
           {
-            state.editing_setting = Some((row.number, row.value.clone().unwrap_or_default()));
+            // Seed the buffer from what the row currently shows (staged value if dirty, else live).
+            let seed = state.settings_staging.staged_value(row.number).map(str::to_string)
+              .or_else(|| row.value.clone()).unwrap_or_default();
+            state.editing_setting = Some((row.number, seed));
           }
         }
         ui.end_row();
@@ -1995,13 +2260,43 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
     });
   });
 
-  if let Some((committed, number, buffer)) = commit {
-    if let Some(intent) = commit_setting_edit(committed, number, &buffer, view.settings.value_of(number)) {
-      sink.push(intent);
+  if let Some((abandoned, number, buffer)) = stage {
+    if setting_edit_should_stage(abandoned) {
+      // `stage` already drops a no-op (value equal to live), so an unchanged edit leaves the row unmarked.
+      state.settings_staging.stage(number, &buffer, view.settings.value_of(number));
     }
-    // Leave edit mode whether we wrote or not, so the row returns to showing the live value.
+    // Leave edit mode whether we staged a change or not, so the row returns to a button showing its value.
     state.editing_setting = None;
   }
+}
+
+/// Render the "Discard N unsaved change(s)?" confirmation when a refresh/close was requested with edits staged.
+/// Returns the deferred action to perform once the operator confirms Discard (and the staging has been cleared),
+/// or `None` if there is no pending action or the operator chose Cancel (Keep editing). Modal: it grabs focus so
+/// the operator must resolve it before doing anything else. Splitting the decision out keeps the caller's branch
+/// on the returned action small and explicit.
+pub fn settings_discard_confirm(ctx: &egui::Context, state: &mut UiState) -> Option<PendingSettingsAction> {
+  let action = state.pending_settings_action?;
+  let n = state.settings_staging.len();
+  let mut resolved = None;
+  egui::Window::new("Discard unsaved changes?")
+    .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+      ui.label(format!("Discard {n} unsaved change(s)?"));
+      ui.add_space(8.0);
+      ui.horizontal(|ui| {
+        if ui.button("Discard").clicked() {
+          // Throw the staged edits away, then let the caller carry out the deferred action against clean state.
+          state.settings_staging.clear();
+          state.pending_settings_action = None;
+          resolved = Some(action);
+        }
+        if ui.button("Cancel (Keep editing)").clicked() {
+          // Abort the refresh/close; the staged edits and the dialog stay exactly as they were.
+          state.pending_settings_action = None;
+        }
+      });
+    });
+  resolved
 }
 
 #[cfg(test)]
@@ -2020,6 +2315,51 @@ mod tests {
     assert!(!state.show_machine_pos, "the DRO defaults to work coordinates");
     assert_eq!(state.active_tab, DockTab::Console, "the dock opens on the Console tab");
     assert!(!state.dock_collapsed, "the dock opens expanded at its full height");
+  }
+
+  /// Build a `SettingRow` with no `$ES` metadata (value only) — a row that has arrived before its enumeration.
+  fn row_without_meta(number: u32) -> SettingRow {
+    SettingRow { number, value: Some("10".to_string()), meta: None }
+  }
+
+  /// Build a `SettingRow` carrying `$ES` metadata, for the with-metadata tooltip path.
+  fn row_with_meta(number: u32, name: &str, unit: &str, min: Option<&str>, max: Option<&str>) -> SettingRow {
+    SettingRow {
+      number,
+      value: Some("10".to_string()),
+      meta: Some(crate::protocol::SettingMeta {
+        number,
+        group: 0,
+        name: name.to_string(),
+        unit: unit.to_string(),
+        min: min.map(str::to_string),
+        max: max.map(str::to_string),
+      }),
+    }
+  }
+
+  #[test]
+  fn tooltip_meta_is_empty_without_es_metadata() {
+    // A row that has a value but no `$ES` row yet carries no dynamic lines; the renderer still shows the bare
+    // `$<n>` heading, so the tooltip is never an empty box even here.
+    assert!(setting_tooltip_meta(&row_without_meta(0)).is_empty(), "no metadata → no dynamic lines");
+  }
+
+  #[test]
+  fn tooltip_meta_lists_name_unit_and_full_range() {
+    // The full case: name, unit, and a two-sided range all enumerated.
+    let row = row_with_meta(110, "Max rate", "mm/min", Some("0"), Some("10000"));
+    let lines = setting_tooltip_meta(&row);
+    assert_eq!(lines, vec!["Max rate".to_string(), "Unit: mm/min".to_string(), "Range: 0..10000".to_string()]);
+  }
+
+  #[test]
+  fn tooltip_meta_handles_a_one_sided_range_and_a_unitless_setting() {
+    // Only a max advertised, and no unit (a unitless bitmask like a status-report mask): the unit line is omitted
+    // and the range is shown one-sided.
+    let row = row_with_meta(10, "Report mask", "", None, Some("255"));
+    let lines = setting_tooltip_meta(&row);
+    assert_eq!(lines, vec!["Report mask".to_string(), "Range: ≤ 255".to_string()]);
   }
 
   #[test]
@@ -2053,18 +2393,30 @@ mod tests {
 
   #[test]
   fn disconnect_clears_transient_edit_and_drag_state() {
-    // An in-progress setting edit and the override slider drags belong to the ended session; a disconnect must
-    // wipe them so a reconnect never resumes a stale `$<n>` edit or a slider pinned to the old board's override.
+    // An in-progress setting edit, the staged settings edits, a pending discard confirmation, and the override
+    // slider drags belong to the ended session; a disconnect must wipe them so a reconnect never resumes a stale
+    // `$<n>` edit, write the old board's staged values, or pop a leftover confirmation.
+    let mut staging = super::super::settings_staging::SettingsStaging::new();
+    staging.stage(110, "250", Some("500"));
     let mut state = UiState {
       editing_setting: Some((110, "250".to_string())),
-      feed_override_drag: Some(140),
-      spindle_override_drag: Some(90),
+      settings_staging: staging,
+      pending_settings_action: Some(PendingSettingsAction::Refresh),
+      feed_override_drag: super::super::overrides::OverrideFeedback::Dragging(140),
+      spindle_override_drag: super::super::overrides::OverrideFeedback::Holding {
+        target: 90,
+        committed_from: 100,
+        observations: 0,
+      },
       ..UiState::default()
     };
     state.on_disconnected();
     assert_eq!(state.editing_setting, None, "an in-progress setting edit must not survive a disconnect");
-    assert_eq!(state.feed_override_drag, None, "the feed-override drag must reset on a disconnect");
-    assert_eq!(state.spindle_override_drag, None, "the spindle-override drag must reset on a disconnect");
+    assert!(state.settings_staging.is_empty(), "staged settings edits must not survive a disconnect");
+    assert_eq!(state.pending_settings_action, None, "a pending discard confirmation must not survive a disconnect");
+    let idle = super::super::overrides::OverrideFeedback::Idle;
+    assert_eq!(state.feed_override_drag, idle, "the feed-override feedback must reset to Idle on a disconnect");
+    assert_eq!(state.spindle_override_drag, idle, "the spindle-override feedback must reset to Idle on a disconnect");
   }
 
   #[test]
@@ -2112,23 +2464,21 @@ mod tests {
   }
 
   #[test]
-  fn a_settings_edit_writes_only_a_real_change() {
-    // A committed edit that differs from the live value produces a write.
-    assert_eq!(
-      commit_setting_edit(true, 0, "12", Some("10")),
-      Some(Intent::WriteSetting { number: 0, value: "12".to_string() })
-    );
-    // A committed edit equal to the live value (after trim) is a no-op: nothing is sent.
-    assert_eq!(commit_setting_edit(true, 0, " 10 ", Some("10")), None);
-    // An abandoned edit (Escape / focus-loss without Enter) never writes, even if the value changed.
-    assert_eq!(commit_setting_edit(false, 0, "12", Some("10")), None);
-    // An empty buffer never writes — there is no value to set.
-    assert_eq!(commit_setting_edit(true, 0, "  ", Some("10")), None);
-    // A first-ever value (no live value yet) still writes the change.
-    assert_eq!(
-      commit_setting_edit(true, 5, "1", None),
-      Some(Intent::WriteSetting { number: 5, value: "1".to_string() })
-    );
+  fn leaving_a_settings_field_stages_unless_abandoned() {
+    // Enter and plain focus-loss both stage (the silent-drop fix); only Escape (abandoned) discards. The value's
+    // realness is handled separately by the staging store, so this is purely the stage-vs-abandon decision.
+    assert!(setting_edit_should_stage(false), "leaving on Enter / focus-loss stages the edit");
+    assert!(!setting_edit_should_stage(true), "Escape abandons — nothing is staged");
+  }
+
+  #[test]
+  fn a_refresh_or_close_needs_confirmation_only_with_staged_edits() {
+    // Nothing staged → Refresh/Close proceed with no dialog (the pre-existing behaviour).
+    let mut staging = super::super::settings_staging::SettingsStaging::new();
+    assert!(!settings_action_needs_confirm(&staging), "no staged edits → no discard confirmation");
+    // A real staged edit → a refresh/close must confirm before throwing it away.
+    staging.stage(0, "12", Some("10"));
+    assert!(settings_action_needs_confirm(&staging), "staged edits gate a refresh/close behind the confirmation");
   }
 
   #[test]
