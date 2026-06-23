@@ -89,6 +89,25 @@ pub(crate) fn build_dock_harness(
     )
 }
 
+/// Build a kittest harness that renders just the [`views::transport_group`] (the Run/Hold/Stop segmented group plus
+/// the standalone Abort control) into a fixed-size window, folding each frame's intents into the [`HarnessState`].
+/// Isolating the group keeps the assertions about which intent each button fires independent of the rest of the
+/// toolbar (the port combo, file dialog, etc.).
+pub(crate) fn build_transport_group_harness(state: HarnessState) -> Harness<'static, HarnessState> {
+  Harness::builder()
+    .with_size(egui::vec2(420.0, 80.0))
+    .build_ui_state(
+      |ui, state: &mut HarnessState| {
+        ui.horizontal(|ui| {
+          let mut sink = IntentSink::new();
+          views::transport_group(ui, &state.view, &state.ui, &mut sink);
+          state.intents.extend(sink.drain());
+        });
+      },
+      state,
+    )
+}
+
 /// The screen-space point a pointer must be at to drive `axis`'s slider to `target` percent, derived from the
 /// slider's recorded rect (the view records it each render via [`slider_rect_probe`]). The slider maps pointer-x
 /// linearly across the track onto the `OVERRIDE_MIN..=OVERRIDE_MAX` span, so we invert that mapping. Returns
@@ -272,5 +291,82 @@ mod tests {
         .any(|i| matches!(i, Intent::SetOverride { .. })),
       "a disabled override panel must not emit SetOverride from a pointer drag"
     );
+  }
+
+  /// A connected, actively-running [`ViewState`] (`Streaming` + `<Run>`), so the transport group's Stop and Abort
+  /// controls are both enabled and clickable.
+  fn view_running() -> ViewState {
+    let status = StatusReport {
+      machine_state: MachineState { state: RunState::Run, substate: None },
+      position_kind: PositionKind::Machine,
+      position: Vec::new(),
+      wco: None,
+      feed_speed: None,
+      overrides: None,
+      pins: Vec::new(),
+      buffer: None,
+      line: None,
+    };
+    let mut view = ViewState::default();
+    view.connection = ConnectionState::Streaming;
+    view.status = Some(status);
+    view
+  }
+
+  #[test]
+  fn the_transport_group_stop_button_issues_the_graceful_program_stop_not_a_soft_reset() {
+    // The everyday Stop is the GRACEFUL program stop (`0x86`): clicking it must emit ProgramStop and must NOT emit
+    // the hard SoftReset — the regression this guards is Stop secretly alarming the controller.
+    use crate::protocol::RealtimeCommand;
+    let state = HarnessState::new(view_running(), UiState::default());
+    let mut harness = build_transport_group_harness(state);
+    harness.run();
+
+    harness.get_by_label("■ Stop").click();
+    harness.run();
+
+    let intents = &harness.state().intents;
+    assert!(
+      intents.iter().any(|i| matches!(i, Intent::Realtime(RealtimeCommand::ProgramStop))),
+      "Stop must emit the graceful ProgramStop",
+    );
+    assert!(
+      !intents.iter().any(|i| matches!(i, Intent::Realtime(RealtimeCommand::SoftReset))),
+      "Stop must NOT emit the hard SoftReset",
+    );
+  }
+
+  #[test]
+  fn the_transport_group_abort_button_issues_the_hard_soft_reset() {
+    // The separate Abort / E-stop is the HARD soft-reset (`0x18`): clicking it must emit SoftReset (and not the
+    // graceful ProgramStop). The two controls are distinct and fire distinct intents.
+    use crate::protocol::RealtimeCommand;
+    let state = HarnessState::new(view_running(), UiState::default());
+    let mut harness = build_transport_group_harness(state);
+    harness.run();
+
+    harness.get_by_label("⏹ Abort").click();
+    harness.run();
+
+    let intents = &harness.state().intents;
+    assert!(
+      intents.iter().any(|i| matches!(i, Intent::Realtime(RealtimeCommand::SoftReset))),
+      "Abort must emit the hard SoftReset",
+    );
+    assert!(
+      !intents.iter().any(|i| matches!(i, Intent::Realtime(RealtimeCommand::ProgramStop))),
+      "Abort must NOT emit the graceful ProgramStop",
+    );
+  }
+
+  #[test]
+  fn the_transport_group_exposes_both_a_stop_and_a_separate_abort_control() {
+    // Both controls are rendered side by side while running, so the operator has the clean Stop and the emergency
+    // Abort available at once — the user's explicit two-control design.
+    let state = HarnessState::new(view_running(), UiState::default());
+    let mut harness = build_transport_group_harness(state);
+    harness.run();
+    assert!(harness.query_by_label("■ Stop").is_some(), "the graceful Stop control must be present");
+    assert!(harness.query_by_label("⏹ Abort").is_some(), "the separate Abort control must be present");
   }
 }

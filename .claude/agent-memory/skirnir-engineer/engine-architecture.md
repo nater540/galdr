@@ -42,6 +42,22 @@ of inline await: the old single inline `write_all().await` parked the whole task
 **RX buffer.** `DEFAULT_RX_BUFFER = 1024`; refined at runtime from `[OPT:...]` (3rd CSV field) via
 `rx_buffer_from_opt`, applied by `ProtocolCore` on a `Response::Message`.
 
+**Stray-ack tolerance — TWO distinct mechanisms in `ProtocolCore` (both gate the `UnexpectedAck` fault in `on_ack`,
+checked in this order).** (1) `trailing_acks: usize` — COUNT-bounded, BANNER-scoped only: a boot banner may re-ack
+each line that was in flight when the firmware reset (connect race, the `$I`-racing-banner case); `reset_window(true)`
+grants exactly `inflight_kinds.len()`. A host reset/stop grants ZERO here (would linger unspent + mask a real over-ack).
+(2) `ignore_stray_acks: bool` — BASELINE-bounded latch for the post-Stop/Abort stray-ack STORM: set in the `ProgramStop`
+(`0x86`) AND `SoftReset` (`0x18`) arms of `on_realtime` (both empty the window via `reset_window(false)`), it silently
+tolerates ANY number of unmatched acks (in-flight count is unknown, and more arrive until the companion firmware fix
+lands) while quiescent post-stop. WHY: per the grbl contract the host discards pending acks on a reset — without this,
+every Stop/Abort spammed the console with `Fault(UnexpectedAck)`. It is NOT count-bounded; it CLEARS the instant a
+baseline is re-established: the next counted line sent (`on_send_line`/`release_ready_lines`, at the `flow.on_line_sent`
+site), a banner (the `0x18` reset's own boot banner, in `on_response`), or a session boundary (`on_connected`/
+`on_disconnected`). That keeps the genuine-bug guard: a spurious double-ok during ACTIVE streaming still faults because
+the latch is long cleared by then. Tests: `a_{program_stop,soft_reset}_silently_tolerates_in_flight_acks_until_a_line_
+re_establishes_counting`, `the_soft_reset_banner_clears_the_post_reset_stray_ack_latch`, and the renamed
+`a_{program_stop,soft_reset}_does_not_widen_the_banner_trailing_ack_budget` (prove the count-budget stays banner-only).
+
 **In-flight line-kind FIFO (load-bearing invariant).** `ProtocolCore` keeps `inflight_kinds: VecDeque<
 InflightKind{Program,Other}>` in LOCK-STEP with `FlowWindow`'s in-flight set. Push a kind on EVERY send:
 `Program` in `release_ready_lines`, `Other` in `on_send_line` (manual/jog). `on_ack` pops the oldest kind and

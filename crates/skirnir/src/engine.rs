@@ -778,6 +778,43 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn a_program_stop_discards_queued_program_lines_after_the_0x86() {
+    // The graceful Stop reuses the AbortQueued line-drop guarantee: a held program line must never reach the wire
+    // after the 0x86, exactly as the soft-reset does after the 0x18 — only the byte and the (no-alarm) semantics
+    // differ. Gate writes so a line parks, queue it, Stop, then release and assert the wire order.
+    let (mut handle, mut controller) = connect_idle().await;
+
+    controller.gate_writes();
+    assert!(handle.send(Command::StreamProgram(vec!["G0 X100".to_string()].into())));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
+    wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 1, .. })).await;
+    // Ack the in-flight line so the core's flow accounting stays clean (the firmware echoed an `ok` for it).
+    assert!(controller.inject_line("ok"));
+
+    // Operator hits the graceful Stop while the line write parks. Release the gate; the 0x86 must reach the wire
+    // and the held program line must NEVER appear after it.
+    assert!(handle.send(Command::Realtime(RealtimeCommand::ProgramStop)));
+    controller.release_writes();
+    let first = wait_for_written(&mut controller).await;
+    assert_eq!(first, vec![0x86], "the program-stop byte must reach the wire");
+
+    // Drain everything else the engine writes for a moment; no chunk may be the discarded program line.
+    let mut tail: Vec<u8> = Vec::new();
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+      while let Some(chunk) = controller.try_take_written() {
+        tail.extend_from_slice(&chunk);
+      }
+    }
+    assert!(
+      !tail.windows(b"G0 X100".len()).any(|w| w == b"G0 X100"),
+      "the aborted program line must be discarded, never written after the 0x86; saw tail {tail:?}",
+    );
+    // A program stop must NOT take the lifecycle to Alarm — it ends cleanly to Idle.
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+  }
+
+  #[tokio::test]
   async fn a_preempted_line_write_is_resumed_byte_exact_not_re_sent() {
     // Bug 2/8 (cancel safety): a line write that is split across calls — the transport accepts only a prefix per
     // `write` — must put each byte on the wire exactly once. We cap the per-write size to 2 bytes so the 6-byte

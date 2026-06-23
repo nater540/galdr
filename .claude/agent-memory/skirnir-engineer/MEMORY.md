@@ -12,3 +12,4 @@
 - [egui_kittest UI harness](egui-kittest-ui-harness.md) — per-view closure harness, label-less widget rect-probe seam, pointer-drag API quirks; the pattern for UI-bug repros
 - [Engine write cancel-safety](engine-write-cancel-safety.md) — cursor-based write path, Transport::write primitive, Effect::AbortQueued on soft-reset/banner, timeout-bounded teardown, loopback partial-write seam
 - [header_bar item_spacing leak](header-bar-itemspacing-leak.md) — tab_strip's left-closure item_spacing.x=0 leaks into the shared right closure; header-strip right content must set its own spacing
+- [Graceful program-stop](graceful-program-stop.md) — 0x86 ProgramStop (clean Stop) vs 0x18 SoftReset (Abort/E-stop); two-control split, abort_enabled gating, re-Run

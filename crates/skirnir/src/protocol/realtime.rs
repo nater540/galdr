@@ -8,8 +8,14 @@
 /// A real-time command the host can inject at any instant. Each maps to exactly one byte on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RealtimeCommand {
-  /// `0x18` (Ctrl-X) — soft reset / abort. Halts motion, resets the parser/planner, re-emits the banner.
+  /// `0x18` (Ctrl-X) — soft reset / abort. Halts motion, resets the parser/planner, re-emits the banner, and
+  /// latches `ALARM:3`. The emergency hard reset; contrast [`Self::ProgramStop`], the clean stop.
   SoftReset,
+  /// `0x86` — graceful program stop. From Run/Hold the firmware decelerates to the current block boundary, flushes
+  /// the planner queue, kills the spindle, resets overrides to 100% and the modal state to power-on, and returns to
+  /// `Idle` — NO alarm, NO banner, with MPos retained at the stop point. A benign no-op from Idle/Alarm/Check/Sleep/
+  /// Jog. This is the everyday "stop the job cleanly" command; [`Self::SoftReset`] is the hard abort that alarms.
+  ProgramStop,
   /// `?` — request a status report (`<...>`).
   StatusReport,
   /// `~` — cycle start / resume.
@@ -65,6 +71,7 @@ impl RealtimeCommand {
   pub fn byte(self) -> u8 {
     match self {
       RealtimeCommand::SoftReset => 0x18,
+      RealtimeCommand::ProgramStop => 0x86,
       RealtimeCommand::StatusReport => b'?',
       RealtimeCommand::CycleStart => b'~',
       RealtimeCommand::FeedHold => b'!',
@@ -98,6 +105,9 @@ mod tests {
   #[test]
   fn core_realtime_bytes_match_the_grbl_spec() {
     assert_eq!(RealtimeCommand::SoftReset.byte(), 0x18);
+    // The graceful program stop is its own byte, distinct from the hard soft-reset.
+    assert_eq!(RealtimeCommand::ProgramStop.byte(), 0x86);
+    assert_ne!(RealtimeCommand::ProgramStop.byte(), RealtimeCommand::SoftReset.byte());
     assert_eq!(RealtimeCommand::StatusReport.byte(), b'?');
     assert_eq!(RealtimeCommand::CycleStart.byte(), b'~');
     assert_eq!(RealtimeCommand::FeedHold.byte(), b'!');

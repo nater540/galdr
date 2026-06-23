@@ -502,10 +502,11 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
   });
 }
 
-/// The Run/Hold/Stop segmented group. The leading segment starts a stream (Idle) or resumes (Hold); Hold issues
-/// a feed-hold; Stop issues a soft reset. Enable/emphasis come from the pure [`TransportGroup`] matrix so the
-/// view stays a renderer.
-fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
+/// The Run/Hold/Stop segmented group plus a separate Abort control. The leading segment starts a stream (Idle) or
+/// resumes (Hold); Hold issues a feed-hold; Stop issues the GRACEFUL program stop (`0x86` — decelerate, flush,
+/// return to Idle, no alarm); the standalone Abort issues the HARD soft-reset (`0x18` → `ALARM:3`). Enable/emphasis
+/// come from the pure [`TransportGroup`] matrix so the view stays a renderer.
+pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
   use egui::CornerRadius;
   let group = TransportGroup::for_state(view.badge_state(), !state.program.is_empty());
 
@@ -538,11 +539,33 @@ fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &
   if ui.add_enabled(group.hold_enabled, hold).on_hover_text("Feed hold (!)").clicked() {
     sink.push(Intent::Realtime(RealtimeCommand::FeedHold));
   }
-  let stop = egui::Button::new(RichText::new("■ Stop").color(Theme::DANGER)).corner_radius(right);
-  if ui.add_enabled(group.stop_enabled, stop).on_hover_text("Soft reset (0x18)").clicked() {
+  // Stop is now the GRACEFUL program stop (`0x86`): the everyday "stop the job cleanly" button. It decelerates to a
+  // block boundary, flushes the queue and returns to Idle with no alarm, so it reads as a normal-weight control
+  // (amber, not danger-red) — the hard reset lives in the separate Abort button beside the group.
+  let stop = egui::Button::new(RichText::new("■ Stop").color(Theme::STATE_HOLD)).corner_radius(right);
+  if ui
+    .add_enabled(group.stop_enabled, stop)
+    .on_hover_text("Stop the job cleanly (0x86) — decelerate, flush, return to Idle")
+    .clicked()
+  {
+    sink.push(Intent::Realtime(RealtimeCommand::ProgramStop));
+  }
+  // Restore the toolbar gap before the standalone Abort so it sits apart from the joined segments, signalling it is
+  // a separate, weightier action rather than a fourth segment of the group.
+  ui.spacing_mut().item_spacing.x = prev_gap;
+
+  // Abort / E-stop: the HARD soft-reset (`0x18` → `ALARM:3`). Visually distinct — danger-red, fully rounded, set
+  // apart from the segmented group — and available the instant a transport is attached (even mid-handshake), so the
+  // operator always has an emergency reset. The graceful Stop above is the routine control; this is the panic stop.
+  let abort = egui::Button::new(RichText::new("⏹ Abort").color(Theme::DANGER))
+    .corner_radius(Metrics::CONTROL_RADIUS);
+  if ui
+    .add_enabled(group.abort_enabled, abort)
+    .on_hover_text("Emergency hard reset (0x18) — aborts to ALARM and resets the controller")
+    .clicked()
+  {
     sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
   }
-  ui.spacing_mut().item_spacing.x = prev_gap;
 }
 
 /// Render the digital readout: a WPos/MPos toggle, large per-axis rows (coloured letter + big tabular value +

@@ -105,6 +105,17 @@ pub struct ProtocolCore {
   /// genuine over-acknowledgement (no preceding banner) does. Tolerance is scoped to the banner path only: a user
   /// soft-reset (`0x18`) discards its in-flight lines without re-acking them, so it grants no budget here.
   trailing_acks: usize,
+  /// Latched true after a host-issued reset/stop that empties the window (`SoftReset` `0x18` / `ProgramStop` `0x86`)
+  /// so the residual acks IN FLIGHT for lines the firmware accepted just before the stop are silently tolerated
+  /// rather than faulted as spurious. Per the grbl contract the host discards pending acks on a reset, so a stray
+  /// `ok`/`error` arriving while the window is empty post-stop is expected, not a protocol violation — without this
+  /// every Stop/Abort would spam the console with spurious-ack faults. Unlike [`Self::trailing_acks`] this is NOT
+  /// count-bounded (the in-flight count is unknown, and more may arrive until a companion firmware fix lands): it is
+  /// instead BASELINE-bounded — cleared the instant counting demonstrably resumes (the next line sent or program
+  /// streamed), a session boundary (connect/disconnect), or the reset's own boot banner re-establishes a known empty
+  /// window. That keeps the genuine-bug guard intact: a spurious double-ok during ACTIVE streaming still faults,
+  /// because by then the latch is long cleared.
+  ignore_stray_acks: bool,
 }
 
 impl Default for ProtocolCore {
@@ -125,6 +136,7 @@ impl ProtocolCore {
       program_sent: 0,
       program_acked: 0,
       trailing_acks: 0,
+      ignore_stray_acks: false,
     }
   }
 
@@ -149,9 +161,10 @@ impl ProtocolCore {
   /// The driver reports the transport is now attached; move Disconnected -> Connecting.
   pub fn on_connected(&mut self) -> Vec<Effect> {
     let mut out = Vec::new();
-    // A fresh session starts with no tolerated trailing acks, so a budget left over from a previous link's
-    // teardown can never suppress a genuine spurious ack here.
+    // A fresh session starts with no tolerated trailing acks and no post-reset latch, so neither a budget nor a
+    // latch left over from a previous link's teardown can suppress a genuine spurious ack here.
     self.trailing_acks = 0;
+    self.ignore_stray_acks = false;
     self.transition(ConnectionState::Connecting, &mut out);
     out
   }
@@ -185,8 +198,9 @@ impl ProtocolCore {
   pub fn on_disconnected(&mut self) -> Vec<Effect> {
     let mut out = Vec::new();
     self.clear_program();
-    // The session is over and the next `on_connected` zeroes the budget, so a dropped link tolerates nothing.
+    // The session is over and the next `on_connected` zeroes the budget/latch, so a dropped link tolerates nothing.
     self.reset_window(false);
+    self.ignore_stray_acks = false;
     self.transition(ConnectionState::Disconnected, &mut out);
     out
   }
@@ -241,6 +255,8 @@ impl ProtocolCore {
       Err(err) => out.push(Effect::Fault(err)),
       Ok(true) => {
         self.flow.on_line_sent(encoded.len());
+        // A real counted line is back in flight: counting has resumed, so any post-reset stray-ack tolerance ends.
+        self.ignore_stray_acks = false;
         // Manual/jog lines occupy the window but are not program progress; record their kind so their ack is
         // routed away from program accounting and the error-hold.
         self.inflight_kinds.push_back(InflightKind::Other);
@@ -266,13 +282,41 @@ impl ProtocolCore {
       RealtimeCommand::CycleStart if self.state == ConnectionState::Hold => {
         self.transition(ConnectionState::Streaming, &mut out);
       }
+      RealtimeCommand::ProgramStop => {
+        // The graceful program stop (`0x86`): a CLEAN host-side end of the active stream. Like a soft reset it
+        // must drop any queued/in-flight program lines (so none reach the wire after the stop and command the
+        // motion the operator just ended) and clear the window — and, identically, the firmware discards those
+        // in-flight lines WITHOUT re-acking them, so we grant no trailing-ack tolerance. The crucial difference
+        // from `SoftReset`: the firmware decelerates to Idle with NO alarm and NO banner, so we take none of the
+        // banner/alarm reset path — we simply leave Streaming/Hold for Idle. The session stays connected and the
+        // loaded program is untouched (the UI keeps it), so a later Run re-streams it from the start.
+        self.clear_program();
+        // Reset the progress readout so the dock reflects the stop (the bar clears / hides) instead of freezing at
+        // the line it stopped on; a later Run re-emits progress via on_stream_program.
+        self.emit_progress(&mut out);
+        self.reset_window(false);
+        // Tolerate the acks the firmware may still have IN FLIGHT for lines it accepted just before the stop: with
+        // the window now empty they arrive unmatched, but per the grbl contract a reset/stop discards pending acks,
+        // so they are expected — not spurious. The latch clears once counting demonstrably resumes (see its docs).
+        self.ignore_stray_acks = true;
+        out.push(Effect::AbortQueued);
+        if self.state.is_connected() {
+          self.transition(ConnectionState::Idle, &mut out);
+        }
+      }
       RealtimeCommand::SoftReset => {
         // A soft reset aborts everything; the firmware will re-emit the banner, which we also react to. It
         // discards its in-flight lines without re-acking them, so grant no trailing-ack tolerance here — that
         // would linger unspent and mask a genuine over-acknowledgement later in the session. Tell the driver to
         // drop any queued/in-flight program lines too, so none reach the wire after the 0x18 (the safety bug).
         self.clear_program();
+        // Reset the progress readout so a stale bar does not survive the abort (a later Run re-emits progress).
+        self.emit_progress(&mut out);
         self.reset_window(false);
+        // As with the program stop, silently tolerate the acks already in flight for lines accepted just before the
+        // 0x18 — the host discards pending acks on a reset. The reset's own boot banner (or the next sent line) will
+        // re-establish a baseline and clear this latch, so a genuine over-ack later in the session still faults.
+        self.ignore_stray_acks = true;
         out.push(Effect::AbortQueued);
         if self.state.is_connected() {
           self.transition(ConnectionState::Idle, &mut out);
@@ -333,6 +377,10 @@ impl ProtocolCore {
         // The board reset, so the driver must drop any queued/in-flight program lines it still holds (Bug 1).
         self.clear_program();
         self.reset_window(true);
+        // The banner re-establishes a known, freshly-cleared window — a definite baseline — so the post-reset
+        // stray-ack latch ends here too. Past this point an unmatched ack is no longer a discarded-stream straggler
+        // (those are now covered by `reset_window`'s count budget) but a genuine over-ack worth faulting.
+        self.ignore_stray_acks = false;
         out.push(Effect::AbortQueued);
         self.transition(ConnectionState::Idle, &mut out);
       }
@@ -356,10 +404,15 @@ impl ProtocolCore {
   fn on_ack(&mut self, is_error: bool, out: &mut Vec<Effect>) {
     if let Err(err) = self.flow.on_ack() {
       // An ack with nothing in flight. If a line was still counted when the firmware last emitted a boot banner,
-      // this is its harmless trailing ack — absorb one from the budget and move on. Otherwise it is a genuine
-      // over-acknowledgement: surface it; do not corrupt the window.
+      // this is its harmless trailing ack — absorb one from the count-based budget and move on.
       if self.trailing_acks > 0 {
         self.trailing_acks -= 1;
+        return;
+      }
+      // Otherwise, if the host just issued a reset/stop, this is a residual ack for a line accepted just before the
+      // stop — expected, not spurious. Tolerate it silently (the latch stays set until counting resumes; see its
+      // docs). Only with neither the budget nor the latch is it a genuine over-acknowledgement worth surfacing.
+      if self.ignore_stray_acks {
         return;
       }
       out.push(Effect::Fault(err));
@@ -430,6 +483,8 @@ impl ProtocolCore {
       // matching, so a logic slip degrades to a no-op break rather than a panic on the hot path.
       let Some(line) = self.program.pop_front() else { break };
       self.flow.on_line_sent(line.len());
+      // A real counted line is back in flight: counting has resumed, so any post-reset stray-ack tolerance ends.
+      self.ignore_stray_acks = false;
       self.inflight_kinds.push_back(InflightKind::Program);
       self.program_sent += 1;
       out.push(Effect::WriteLine(line));
@@ -650,6 +705,152 @@ mod tests {
   }
 
   #[test]
+  fn a_program_stop_cleanly_ends_the_stream_without_the_banner_or_alarm_reset_path() {
+    // The graceful stop (`0x86`): like Stop it must abort the host-side stream (drop queued lines via AbortQueued,
+    // clear the program, leave Streaming for Idle), but UNLIKE the soft-reset it must NOT take the banner/alarm path
+    // — the firmware decelerates to Idle with NO alarm and NO banner — and it must not mark the session
+    // disconnected. The 0x86 byte rides the out-of-band real-time path.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(8);
+    core.on_stream_program(["G00", "G01", "G02"]); // two released, one held
+    assert_eq!(core.state(), ConnectionState::Streaming);
+    let effects = core.on_realtime(RealtimeCommand::ProgramStop);
+    // The 0x86 byte reaches the wire out-of-band.
+    assert!(writes(&effects).iter().any(|w| w == &vec![0x86]), "the program-stop byte must be emitted");
+    assert!(!writes(&effects).iter().any(|w| w == &vec![0x18]), "a program stop must NOT emit the soft-reset byte");
+    // The driver is told to discard queued/in-flight program lines, exactly as a Stop does.
+    assert!(effects.iter().any(|e| matches!(e, Effect::AbortQueued)), "a program stop must emit AbortQueued");
+    // The lifecycle leaves Streaming for Idle — the program is ended, not paused.
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+    // No alarm transition is taken (the firmware does not alarm on a clean stop).
+    assert!(!transitioned_to(&effects, ConnectionState::Alarm), "a program stop must not enter Alarm");
+    // The window is reset and the program counters cleared so a subsequent re-Run starts from a clean slate.
+    assert_eq!(core.flow().inflight_bytes(), 0, "the program stop clears the in-flight window");
+    // A held line must not resurrect: nothing further is released after the stop.
+    let after = core.on_response(Response::Ok);
+    assert!(writes(&after).is_empty(), "no program line may release after a program stop");
+  }
+
+  #[test]
+  fn a_program_stop_does_not_widen_the_banner_trailing_ack_budget() {
+    // A program stop tolerates stray acks via the post-reset LATCH (see the latch tests below), not by widening the
+    // count-based banner budget. This guards the scoping: once the latch is cleared (the host sends a line, resuming
+    // counting), there is no lingering `trailing_acks` budget to mask a genuine over-ack — it faults again.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(128);
+    core.on_stream_program(["G0 X10"]); // one line in flight
+    core.on_realtime(RealtimeCommand::ProgramStop);
+    // Re-establish a counted baseline so the latch clears, then ack it cleanly — now no tolerance remains.
+    core.on_send_line("G0 X0");
+    core.on_response(Response::Ok); // acks the line just sent, window empty again
+    let effects = core.on_response(Response::Ok); // a genuine over-ack now that the latch is cleared
+    assert!(
+      effects.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))),
+      "after the latch clears a program stop leaves no count-budget masking a later unmatched ack",
+    );
+  }
+
+  #[test]
+  fn a_program_stop_silently_tolerates_in_flight_acks_until_a_line_re_establishes_counting() {
+    // The robustness fix: when the operator issues a graceful stop the firmware may still have a few acks IN FLIGHT
+    // for lines it accepted just before the stop. With the window emptied those acks arrive unmatched; the host MUST
+    // silently tolerate them (the grbl reset-discards-pending-acks contract) rather than faulting after every Stop.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(128);
+    core.on_stream_program(["G0 X1", "G0 X2", "G0 X3"]); // three lines in flight
+    core.on_realtime(RealtimeCommand::ProgramStop);
+    // Several stray acks for the discarded in-flight lines: none may fault while we are quiescent post-stop.
+    for _ in 0..4 {
+      let effects = core.on_response(Response::Ok);
+      assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Fault(_))),
+        "a stray ack after a program stop must be silently tolerated, not faulted",
+      );
+    }
+    // The latch clears the instant the host re-establishes a counted baseline (sends a real line)...
+    core.on_send_line("G0 X0");
+    core.on_response(Response::Ok); // acks that line cleanly
+    // ...so a genuine over-acknowledgement during normal operation faults again — the bug guard is preserved.
+    let after = core.on_response(Response::Ok);
+    assert!(
+      after.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))),
+      "once counting resumes a genuine spurious ok must fault again",
+    );
+  }
+
+  #[test]
+  fn a_soft_reset_silently_tolerates_in_flight_acks_until_a_line_re_establishes_counting() {
+    // Same robustness fix for the hard reset (`0x18`): acks already in flight when the operator hits Abort arrive
+    // with an emptied window and must be silently discarded (the host discards pending acks on 0x18), not faulted.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(128);
+    core.on_stream_program(["G0 X1", "G0 X2", "G0 X3"]);
+    core.on_realtime(RealtimeCommand::SoftReset);
+    for _ in 0..4 {
+      let effects = core.on_response(Response::Ok);
+      assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Fault(_))),
+        "a stray ack after a soft reset must be silently tolerated, not faulted",
+      );
+    }
+    // A fresh program re-establishes counting and clears the latch...
+    core.on_stream_program(["G0 X0"]);
+    core.on_response(Response::Ok); // acks the streamed line
+    // ...so a later genuine over-ack faults again.
+    let after = core.on_response(Response::Ok);
+    assert!(
+      after.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))),
+      "once a fresh program is streamed a genuine spurious ok must fault again",
+    );
+  }
+
+  #[test]
+  fn the_soft_reset_banner_clears_the_post_reset_stray_ack_latch() {
+    // The `0x18` reset is followed by the firmware re-emitting its boot banner. The banner re-establishes a known,
+    // freshly-cleared baseline, so it clears the post-reset latch: a spurious ok arriving AFTER the banner (no longer
+    // a discarded-stream ack) must fault again. This bounds the latch even if the host never sends another line.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(128);
+    core.on_stream_program(["G0 X1"]);
+    core.on_realtime(RealtimeCommand::SoftReset);
+    // One in-flight stray ack is tolerated before the banner arrives.
+    let stray = core.on_response(Response::Ok);
+    assert!(!stray.iter().any(|e| matches!(e, Effect::Fault(_))), "the pre-banner stray ack is tolerated");
+    core.on_response(Response::Banner("GrblHAL 1.1f".to_string())); // baseline re-established, latch cleared
+    let after = core.on_response(Response::Ok); // now a genuine over-ack
+    assert!(
+      after.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))),
+      "after the reset banner clears the latch a spurious ok must fault again",
+    );
+  }
+
+  #[test]
+  fn a_program_stop_from_idle_is_a_benign_no_op_on_the_lifecycle() {
+    // From Idle (no stream running) the firmware treats `0x86` as a no-op; the host must still emit the byte but
+    // leave the lifecycle in Idle rather than churning it.
+    let mut core = idle_core();
+    let effects = core.on_realtime(RealtimeCommand::ProgramStop);
+    assert!(writes(&effects).iter().any(|w| w == &vec![0x86]), "the program-stop byte is still emitted from Idle");
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
+  fn a_program_stop_while_held_ends_the_stream_to_idle() {
+    // Stop must work from a feed-hold too: the operator paused, then chose to end the job. Hold -> Idle, queue
+    // dropped.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(8);
+    core.on_stream_program(["G00", "G01", "G02"]);
+    core.on_realtime(RealtimeCommand::FeedHold);
+    assert_eq!(core.state(), ConnectionState::Hold);
+    let effects = core.on_realtime(RealtimeCommand::ProgramStop);
+    assert!(effects.iter().any(|e| matches!(e, Effect::AbortQueued)));
+    assert!(transitioned_to(&effects, ConnectionState::Idle));
+    assert_eq!(core.state(), ConnectionState::Idle);
+  }
+
+  #[test]
   fn a_feed_hold_does_not_emit_abort_queued() {
     // A feed-hold (`!`) pauses; queued lines resume on cycle-start and must NOT be discarded. Only a soft reset
     // (or a controller-reset banner) aborts the queue.
@@ -677,24 +878,27 @@ mod tests {
   }
 
   #[test]
-  fn a_soft_reset_grants_no_trailing_ack_tolerance() {
-    // A user soft-reset (`0x18`) discards its in-flight lines without re-acking them, so it must NOT widen the
-    // spurious-ack tolerance. Otherwise the unspent budget would linger across the still-connected session and
-    // mask a genuine over-acknowledgement later — the regression this scoping prevents.
+  fn a_soft_reset_does_not_widen_the_banner_trailing_ack_budget() {
+    // A soft reset (`0x18`) tolerates stray acks via the post-reset LATCH (cleared as soon as counting resumes), NOT
+    // by widening the count-based banner budget. This guards the scoping: once the latch is cleared there is no
+    // lingering `trailing_acks` budget to mask a genuine over-acknowledgement later in the still-connected session.
     let mut core = connected_core();
     core.flow.set_rx_buffer(128);
     core.on_stream_program(["G0 X10"]); // one line released and in flight
     assert!(core.flow().inflight_bytes() > 0, "the streamed line occupies the window");
 
-    // The operator hits Stop: the soft reset clears the window but grants no trailing-ack budget.
+    // The operator hits Stop: the soft reset clears the window.
     core.on_realtime(RealtimeCommand::SoftReset);
     assert_eq!(core.flow().inflight_bytes(), 0, "the soft reset cleared the in-flight line");
 
-    // An unmatched ack now (the firmware does not re-ack a discarded line) must surface as a spurious-ack fault.
+    // Re-establish a counted baseline so the latch clears, then ack it cleanly — now no tolerance remains.
+    core.on_send_line("G0 X0");
+    core.on_response(Response::Ok); // acks the line just sent, window empty again
+    // A genuine over-ack now must surface as a spurious-ack fault — the count-budget was never widened.
     let effects = core.on_response(Response::Ok);
     assert!(
       effects.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))),
-      "a soft reset must not tolerate a later unmatched ack",
+      "after the latch clears a soft reset leaves no count-budget masking a later unmatched ack",
     );
   }
 
@@ -776,6 +980,24 @@ mod tests {
       Effect::Progress { sent, acked, total } => Some((*sent, *acked, *total)),
       _ => None,
     })
+  }
+
+  #[test]
+  fn a_program_stop_resets_the_progress_readout() {
+    let mut core = connected_core();
+    core.on_stream_program(["G0 X1", "G0 Y1", "G0 Z1"]);
+    core.on_response(Response::Ok); // advance some progress so the bar is non-zero before the stop
+    let stop = core.on_realtime(RealtimeCommand::ProgramStop);
+    assert_eq!(last_progress(&stop), Some((0, 0, 0)), "a program stop must reset the dock progress readout");
+  }
+
+  #[test]
+  fn a_soft_reset_resets_the_progress_readout() {
+    let mut core = connected_core();
+    core.on_stream_program(["G0 X1", "G0 Y1"]);
+    core.on_response(Response::Ok);
+    let reset = core.on_realtime(RealtimeCommand::SoftReset);
+    assert_eq!(last_progress(&reset), Some((0, 0, 0)), "a soft reset must reset the dock progress readout");
   }
 
   #[test]
