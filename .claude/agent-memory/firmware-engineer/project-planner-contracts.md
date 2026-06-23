@@ -1,6 +1,6 @@
 ---
 name: project-planner-contracts
-description: Galdr motion planner (DOC-05) design decisions that the downstream motion executor (DOC-02) must honor — arc back-pressure, squared speeds, entry-speed semantics.
+description: Galdr motion planner (DOC-05) design decisions — RESUMABLE arc back-pressure (2026-06-23 deadlock fix), squared speeds, entry-speed semantics, planner-owns-geometry.
 metadata:
   type: project
 ---
@@ -12,13 +12,22 @@ no_std, host-tested). Decisions a future subsystem author needs that are NOT obv
 its sole producer/owner; the planner consumes via `crate::gcode::PlannerCommand`. Relocating would
 churn 60+ passing parser tests for no structural gain. Revisit only if a third stakeholder appears.
 
-**Arc back-pressure is all-or-nothing.** `plan_arc` pre-checks `queue.len() + segments > BLOCK_QUEUE_LEN`
-and returns `PlannerError::QueueFull` WITHOUT enqueuing anything or mutating `position_steps`. A pure-sync
-planner cannot yield mid-arc to let the executor drain. **Why:** DOC-05 warns an over-fine `$12` starves
-the 32-block queue; this surfaces it as recoverable back-pressure, never lost geometry. **How to apply:**
-the async planner task (firmware bin, not yet written) owns the drain-and-retry loop — on `QueueFull` it
-must pump the motion executor to free blocks, then re-issue the SAME arc command. A 10 mm-radius quarter
-arc at default `$12`=0.002 needs ~79 segments > 32, so this path is hit in normal use, not just edge cases.
+**Arc back-pressure is RESUMABLE / incremental (fixed 2026-06-23 — replaced the old all-or-nothing deadlock).**
+The previous `plan_arc` did `if queue.len() + segments > BLOCK_QUEUE_LEN { return QueueFull }` — all-or-nothing.
+That DEADLOCKED any arc that subdivides into MORE than `BLOCK_QUEUE_LEN`(=32) segments: from an empty queue
+`0 + segments > 32` returns QueueFull unconditionally, forever, and the comms retry loop spins, never acks, the
+host send-window fills, stream dead. Real-world trigger: `T1_Test.tap` arc `G2X39.499Y48.894I-15.898J10.840`
+(radius ~19.24mm, sweep ~39.4°) = 48 segments at default `$12=0.002`. Now `plan_arc` feeds segments
+INCREMENTALLY: it saves an `ArcInProgress` (center/radius/theta_start/theta_step/segments/next_seg/z+a interp/
+seg_feed/units/feed_mode) and the new `enqueue_arc_chunk` enqueues as many remaining segments as fit, recalc once
+per chunk, advances `next_seg`. Returns `PlannerOutcome::Queued{blocks}` when the whole arc fit (complete) or the
+new `PlannerOutcome::ArcPending{enqueued}` when partial. New pub API: `resume_arc()` (idempotent no-op
+`Queued{blocks:0}` when no arc), `arc_pending()`, `abort_arc()` (soft-reset drops in-progress arc — though
+`Planner::new` rebuild already nulls it). **Chord accuracy preserved:** segment count is still
+`arc_segment_count`, only chunked. **How to apply:** the comms consumer (`drive_pending_arc` in comms.rs) drives
+it — on `ArcPending` it wakes the executor (`BLOCK_AVAILABLE`), yields `QUEUE_FULL_RETRY` (racing `SOFT_RESET`),
+calls `resume_arc`, loops until `Queued`, acks ONCE. Never returns `QueueFull` for arcs anymore. `QueueFull` from
+the planner now only comes from single moves / `plan_go_to_predefined` (still all-or-nothing, correctly).
 
 **Speeds are stored squared throughout** (grbl's `entry_speed_sqr` model). `Block.entry_speed_sq`,
 `nominal_speed_sq`, `max_entry_speed_sq` are all (mm/s)². The reverse/forward passes are sqrt-free
@@ -36,11 +45,12 @@ and arc subdivision (`acosf(1 − $12/r)` chord-tolerance). Planner works in ste
 travel are derived back from the step delta for cornering/ramp math. Per-axis accel/rate limits
 (`$120..122`/`$110..112`) are applied along the unit vector (grbl per-axis limiting).
 
-**Arc planning is O(n), not O(n²) (fixed 2026-06-16 #8).** `plan_arc` now calls `enqueue_move` (build+enqueue
-+advance junction/position state, NO look-ahead) per segment, then `recalculate()` EXACTLY ONCE after the loop.
-`plan_line` = `enqueue_move` + `recalculate()` (single move keeps immediate look-ahead). Equivalence is exact
-because reverse/forward passes always sweep the WHOLE queue — only final queue state matters (host test
-`recalculate_once_equals_recalculate_per_segment` proves it). The all-or-nothing QueueFull pre-check guarantees
-`enqueue_move` can't hit QueueFull mid-arc.
+**Arc planning is O(n) per chunk, not O(n²) (fixed 2026-06-16 #8; chunked 2026-06-23).** `enqueue_arc_chunk`
+calls `enqueue_move` (build+enqueue+advance junction/position state, NO look-ahead) per segment, then
+`recalculate()` EXACTLY ONCE after the chunk. `plan_line` = `enqueue_move` + `recalculate()` (single move keeps
+immediate look-ahead). Equivalence is exact because reverse/forward passes always sweep the WHOLE queue — only
+final queue state matters (host test `recalculate_once_equals_recalculate_per_segment` proves it). The
+`queue.len() < BLOCK_QUEUE_LEN` free-slot guard in the chunk loop is the termination backstop — a full queue
+enqueues nothing and returns `ArcPending{enqueued:0}` rather than ever hitting QueueFull mid-chunk.
 
 See [[project-galdr-overview]], [[project-build-constraints]], [[project-motion-contracts]].

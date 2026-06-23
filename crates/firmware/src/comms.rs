@@ -1603,6 +1603,17 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
         BLOCK_AVAILABLE.signal(());
         return PlanResult::Accepted;
       }
+      // An over-subdivided arc fed only PART of its segments — the rest are saved as an in-progress arc (DOC-05
+      // resumable arc). The line must NOT be acked yet: wake the executor to drain the chunk we just queued, then
+      // drive `resume_arc` until the whole arc is enqueued. This is what lets an arc with more than the queue's
+      // worth of segments stream without ever dead-locking on a permanent `QueueFull`. A soft reset mid-arc aborts
+      // it (the executor's reset clears the queue and `abort_arc` drops the in-progress arc).
+      Ok(PlannerOutcome::ArcPending { enqueued }) => {
+        if enqueued > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+        return drive_pending_arc().await;
+      }
       // A coordinate-system / offset op: surface it so the consumer applies it to the shared coordinate model
       // with the live machine position in hand, then pushes the recomputed WCO back into the planner.
       Ok(PlannerOutcome::Coordinate(op)) => return PlanResult::Coordinate(op),
@@ -1648,6 +1659,58 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // it as a distinct result the caller routes to the alarm path.
       Err(PlannerError::MoveExceedsTravel) => return PlanResult::SoftLimitAlarm,
       // A genuine geometry error (bad arc): surface the grblHAL code to the caller.
+      Err(other) => return PlanResult::Error(other.code()),
+    }
+  }
+}
+
+/// Drive an in-progress (over-subdivided) arc to completion, feeding its remaining segments into the planner as
+/// the core-1 motion executor frees queue slots (DOC-05 resumable arc). The first chunk has ALREADY been enqueued
+/// by [`plan_command`]; this loops [`Planner::resume_arc`](firmware_core::planner::Planner::resume_arc) — waking
+/// the executor after each chunk and yielding for it to drain — until the whole arc is enqueued, at which point the
+/// line is acked exactly ONCE ([`PlanResult::Accepted`]). It NEVER acks while the arc is still pending, so the
+/// host's character-counting flow control throttles correctly and the stream can never dead-lock on an arc larger
+/// than the queue. The resume wait is raced against [`SOFT_RESET`] so a `0x18` aborts a stuck arc at once — the
+/// executor's reset clears the queue and the planner rebuild drops the in-progress arc, so the abort is clean.
+///
+/// Defensive backstop against an infinite spin: a `resume_arc` that enqueues zero (the queue is still full of the
+/// chunk we just fed) is fine — it simply yields again — but the loop only ever PROGRESSES because each yield lets
+/// the executor pop blocks, and `resume_arc` enqueues at least one segment the moment a slot frees. The
+/// short-relative-to-block-time `QUEUE_FULL_RETRY` delay keeps the yield from busy-spinning the CPU.
+async fn drive_pending_arc() -> PlanResult {
+  loop {
+    // Yield so the core-1 executor drains the chunk we just queued, racing a soft reset so `0x18` aborts at once.
+    // The delay is short relative to a block's execution time, so a freed slot is claimed promptly.
+    match select(Timer::after(QUEUE_FULL_RETRY), SOFT_RESET.wait()).await {
+      Either::First(()) => {}
+      Either::Second(()) => return PlanResult::Aborted,
+    }
+    // Feed the next chunk under the planner lock (scoped so it is dropped before any await). A missing planner is
+    // a wiring bug surfaced loudly rather than fabricating an `ok`, exactly as `plan_command` does.
+    let outcome = {
+      let mut guard = PLANNER.lock().await;
+      match guard.as_mut() {
+        Some(planner) => planner.resume_arc(),
+        None => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
+      }
+    };
+    match outcome {
+      // The final chunk is in: every segment is enqueued, so wake the executor for the last blocks and ack once.
+      Ok(PlannerOutcome::Queued { blocks }) => {
+        if blocks > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+        return PlanResult::Accepted;
+      }
+      // More segments fed (or none yet, if no slot freed): wake the executor for whatever we just queued and loop.
+      Ok(PlannerOutcome::ArcPending { enqueued }) => {
+        if enqueued > 0 {
+          BLOCK_AVAILABLE.signal(());
+        }
+      }
+      // `resume_arc` only ever returns an arc outcome and never errors; any other result is an invariant break,
+      // surfaced loudly rather than silently acking a half-fed arc.
+      Ok(_) => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
       Err(other) => return PlanResult::Error(other.code()),
     }
   }
