@@ -69,6 +69,26 @@ pub(crate) fn build_overrides_harness(state: HarnessState) -> Harness<'static, H
     )
 }
 
+/// Build a kittest harness that renders the real [`views::dock`] (tab strip + progress readout + body) into a
+/// fixed-size window, folding each frame's intents into the [`HarnessState`]. `time` is the elapsed/ETA estimate
+/// the progress clock formats; it is fixed so the rendered readout is deterministic across runs. The width is
+/// set wide enough that the full readout (count · bar · percent · clock) lays out without the narrow-strip
+/// degradation, so a structural assertion can rely on every field being present.
+pub(crate) fn build_dock_harness(
+  state: HarnessState, time: super::progress::TimeEstimate,
+) -> Harness<'static, HarnessState> {
+  Harness::builder()
+    .with_size(egui::vec2(900.0, 260.0))
+    .build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        views::dock(ui, &state.view, &mut state.ui, time, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    )
+}
+
 /// The screen-space point a pointer must be at to drive `axis`'s slider to `target` percent, derived from the
 /// slider's recorded rect (the view records it each render via [`slider_rect_probe`]). The slider maps pointer-x
 /// linearly across the track onto the `OVERRIDE_MIN..=OVERRIDE_MAX` span, so we invert that mapping. Returns
@@ -85,8 +105,12 @@ pub(crate) fn slider_point_for(axis: OverrideAxis, target: u32) -> Option<egui::
 mod tests {
   use super::*;
   use crate::app::overrides::OverrideFeedback;
+  use crate::app::progress::TimeEstimate;
+  use crate::app::view_state::Progress;
   use crate::protocol::ConnectionState;
   use crate::protocol::status::{MachineState, PositionKind, RunState, StatusReport};
+  use egui_kittest::kittest::Queryable;
+  use std::time::Duration;
 
   /// A minimal connected [`ViewState`] reporting the given `(feed, rapid, spindle)` overrides, so the override
   /// panel is enabled and seeds the sliders from a live `Ov:` value.
@@ -178,6 +202,45 @@ mod tests {
       harness.state().ui.spindle_override_drag,
       OverrideFeedback::Idle,
       "a converged live value releases the hold so the handle resumes tracking reality"
+    );
+  }
+
+  /// A streaming [`ViewState`] with a loaded program of `total` lines, `acked` of them acknowledged, so the dock
+  /// progress readout renders its count/bar/percent/clock (the readout is shown only while `total > 0`).
+  fn view_streaming(acked: usize, total: usize) -> ViewState {
+    let mut view = ViewState::default();
+    view.connection = ConnectionState::Streaming;
+    view.progress = Progress { sent: acked, acked, total };
+    view
+  }
+
+  /// Regression for the crammed dock progress readout: render the real [`views::dock`] with a loaded, mid-stream
+  /// program and a projectable estimate, and assert the readout's fields are present as distinct, separated labels
+  /// — the percent (`9%`) and the clock (`0:51 / 9:36`) are separate nodes with a `·` separator between them, not
+  /// the run-together `9%0:51` the user reported. Layout pixels are visual, but this proves the fields exist as
+  /// separate widgets rather than one fused string, which is the structural half of the fix.
+  #[test]
+  fn the_dock_progress_readout_renders_separated_fields_not_a_crammed_run_on() {
+    // 45 of 500 lines acked ⇒ 9%. Elapsed 51s with a 9:36 projected total reproduces the screenshot's clock.
+    let view = view_streaming(45, 500);
+    let time = TimeEstimate {
+      elapsed: Duration::from_secs(51),
+      remaining: Some(Duration::from_secs(525)),
+      total: Some(Duration::from_secs(576)),
+    };
+    let state = HarnessState::new(view, UiState::default());
+    let mut harness = build_dock_harness(state, time);
+    harness.run();
+
+    // Every field is its own label node: the count, the percent, the elapsed/total clock, and at least one `·`
+    // separator between them. If the percent and clock had run together there would be no standalone `9%` node.
+    assert!(harness.query_by_label("45 / 500").is_some(), "the acked/total count must render as its own label");
+    assert!(harness.query_by_label("9%").is_some(), "the percent must render as its own label, not fused to the clock");
+    assert!(harness.query_by_label("0:51 / 9:36").is_some(), "the elapsed/total clock must render as its own label");
+    // Three `·` separators sit between the four fields (count · bar · percent · clock) when the bar is shown.
+    assert!(
+      harness.query_all_by_label("·").count() >= 2,
+      "`·` separators must sit between the readout's fields so they never run together"
     );
   }
 

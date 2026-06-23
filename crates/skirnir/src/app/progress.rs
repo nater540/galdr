@@ -63,6 +63,14 @@ pub fn format_mmss(duration: Option<Duration>) -> String {
   format!("{minutes}:{seconds:02}")
 }
 
+/// Format the dock's elapsed/total run clock as the design's `m:ss / m:ss` pair — elapsed on the left, the
+/// projected total on the right. `total` is `None` until the ETA is projectable, so the right half shows the
+/// `--:--` placeholder rather than a wild early guess. Keeping this here gives the view one tested source for
+/// the clock string instead of an inline `format!`.
+pub fn format_progress_clock(elapsed: Duration, total: Option<Duration>) -> String {
+  format!("{} / {}", format_mmss(Some(elapsed)), format_mmss(total))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -122,5 +130,13 @@ mod tests {
     // Hours roll into minutes (no hours slot in the design's compact clock).
     assert_eq!(format_mmss(Some(Duration::from_secs(3600 + 9))), "60:09");
     assert_eq!(format_mmss(None), "--:--");
+  }
+
+  #[test]
+  fn format_progress_clock_pairs_elapsed_with_total_and_dashes_an_absent_total() {
+    // The projectable case: both halves render as `m:ss`, separated by ` / `.
+    assert_eq!(format_progress_clock(Duration::from_secs(51), Some(Duration::from_secs(576))), "0:51 / 9:36");
+    // Before the ETA is projectable the total is `None`, so the right half is the dim placeholder, not a guess.
+    assert_eq!(format_progress_clock(Duration::from_secs(5), None), "0:05 / --:--");
   }
 }

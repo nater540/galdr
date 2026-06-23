@@ -1550,30 +1550,54 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
   ui.add_sized(size, button).on_hover_text(hint).clicked()
 }
 
-/// Draw the §03 dock progress readout: `acked / total`, the 260px green bar, the percent, and the elapsed /
+/// Draw the §03 dock progress readout: `acked / total`, the green bar, the percent, and the elapsed /
 /// estimated-total `m:ss / m:ss` clock, shown only while a program is loaded/streaming (`total > 0`). The
 /// strip's right closure lays out right-to-left, so the widgets are drawn rightmost-first; that puts the
 /// clock at the left edge of the block and the count nearest the percent, reading left→right as the design's
-/// `acked/total · bar · NN% · m:ss / m:ss`.
+/// `acked/total · bar · NN% · m:ss / m:ss` with dim `·` separators between the textual fields.
+///
+/// The strip's `right` closure inherits the tab row's `item_spacing.x = 0` (it is the same child `ui`), which is
+/// why the percent and clock previously ran together with no gap. This sets its own roomy row spacing so the
+/// fields breathe, and degrades on a narrow strip by dropping the bar first (the least-important field — the
+/// percent and count carry the same information) so the block never overflows into an unpainted gap.
 fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time: super::progress::TimeEstimate) {
-  use super::progress::format_mmss;
+  use super::progress::format_progress_clock;
   if progress.total == 0 {
     return;
   }
-  // Rightmost: the elapsed / estimated-total clock. `total` is `None` until the ETA is projectable, rendering
-  // the elapsed against a `--:--` placeholder rather than a wild early guess.
-  let clock = format!("{} / {}", format_mmss(Some(time.elapsed)), format_mmss(time.total));
+  // Own the row spacing rather than inheriting the tab strip's zeroed `item_spacing.x`. A roomy 8px gap gives
+  // every field air and sits between the adjacent fields and the `·` separators so nothing abuts its neighbour.
+  ui.spacing_mut().item_spacing.x = Metrics::DOCK_PROGRESS_GAP;
+  // Decide up front whether the bar fits. The toggle was already drawn (this `ui` excludes it), so the remaining
+  // width must hold the bar plus the textual fields; when it can't, drop the bar rather than overflow the strip.
+  let draw_bar = ui.available_width() >= Metrics::PROGRESS_W + Metrics::DOCK_PROGRESS_TEXT_RESERVE;
+
+  // Rightmost: the elapsed / estimated-total clock. `total` is `None` until the ETA is projectable, so its right
+  // half shows the dim `--:--` placeholder rather than a wild early guess (see `format_progress_clock`).
+  let clock = format_progress_clock(time.elapsed, time.total);
   ui.label(RichText::new(clock).monospace().size(10.5).color(Theme::TEXT_DIM));
+  dock_progress_separator(ui);
   let pct = (progress.fraction() * 100.0).round() as u32;
   ui.label(RichText::new(format!("{pct}%")).monospace().size(11.0).color(Theme::TEXT));
-  let (rect, _) = ui.allocate_exact_size(Vec2::new(Metrics::PROGRESS_W, Metrics::PROGRESS_H), egui::Sense::hover());
-  let painter = ui.painter();
-  painter.rect_filled(rect, 2.0, Theme::INSET);
-  let mut fill = rect;
-  fill.set_width(rect.width() * progress.fraction());
-  painter.rect_filled(fill, 2.0, Theme::STATE_RUN);
+  if draw_bar {
+    dock_progress_separator(ui);
+    let bar = Vec2::new(Metrics::PROGRESS_W, Metrics::PROGRESS_H);
+    let (rect, _) = ui.allocate_exact_size(bar, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, Theme::INSET);
+    let mut fill = rect;
+    fill.set_width(rect.width() * progress.fraction());
+    painter.rect_filled(fill, 2.0, Theme::STATE_RUN);
+  }
+  dock_progress_separator(ui);
   ui.label(RichText::new(format!("{} / {}", progress.acked, progress.total)).monospace().size(10.5)
     .color(Theme::TEXT_DIM));
+}
+
+/// Draw the dim middot that separates the dock progress fields (the design's `·`). Pulled out so every gap in
+/// [`dock_progress`] uses one consistent glyph and colour instead of repeating the `RichText` at each call site.
+fn dock_progress_separator(ui: &mut egui::Ui) {
+  ui.label(RichText::new("·").size(11.0).color(Theme::TEXT_DISABLED));
 }
 
 /// Render the Program tab body: the loaded file's lines with the acked line highlighted, drawn lazily so a

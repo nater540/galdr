@@ -11,3 +11,4 @@
 - [Settings tooltips](settings-tooltips.md) — runtime-loaded JSON descriptions (profile.rs pattern) + dynamic $ES meta helpers in views.rs; egui 0.34 ui.close_menu→ui.close()
 - [egui_kittest UI harness](egui-kittest-ui-harness.md) — per-view closure harness, label-less widget rect-probe seam, pointer-drag API quirks; the pattern for UI-bug repros
 - [Engine write cancel-safety](engine-write-cancel-safety.md) — cursor-based write path, Transport::write primitive, Effect::AbortQueued on soft-reset/banner, timeout-bounded teardown, loopback partial-write seam
+- [header_bar item_spacing leak](header-bar-itemspacing-leak.md) — tab_strip's left-closure item_spacing.x=0 leaks into the shared right closure; header-strip right content must set its own spacing
