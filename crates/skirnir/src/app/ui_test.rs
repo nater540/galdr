@@ -169,7 +169,7 @@ mod tests {
   fn the_spindle_hold_releases_once_the_live_value_converges() {
     let mut ui = UiState::default();
     // Seed the feedback as if a drag to 150 had just been committed from a live of 100.
-    ui.spindle_override_drag = OverrideFeedback::Holding { target: 150, committed_from: 100 };
+    ui.spindle_override_drag = OverrideFeedback::Holding { target: 150, committed_from: 100, observations: 0 };
     let state = HarnessState::new(view_with_overrides(100, 100, 150), ui);
     let mut harness = build_overrides_harness(state);
     // Render once with the converged live (spindle now reports 150%): the view's `observe` should clear the hold.

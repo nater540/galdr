@@ -50,6 +50,12 @@ pub enum Effect {
   /// counted against the window. The driver must emit it ahead of any queued line bytes and must never let a
   /// pending line write block it — that is what keeps Stop/feed-hold/poll responsive mid-stream.
   WriteRealtime(Vec<u8>),
+  /// Discard every queued/in-flight program line the driver is holding. Emitted on a soft reset (`0x18`) and on
+  /// a controller-reset banner: lines already released into the driver's outbound queue (or mid-write) must NOT
+  /// reach the wire after the abort, or they command the very motion the operator just stopped. A feed-hold does
+  /// NOT emit this — held lines resume on cycle-start. The core has already dropped its own program; this is the
+  /// signal for the driver to drop its outbound copies too, keeping the core the single source of truth.
+  AbortQueued,
   /// The lifecycle moved to a new state; the driver should surface this to the UI.
   StateChanged(ConnectionState),
   /// A parsed firmware response worth surfacing (status, message, banner, error, alarm, ...).
@@ -263,9 +269,11 @@ impl ProtocolCore {
       RealtimeCommand::SoftReset => {
         // A soft reset aborts everything; the firmware will re-emit the banner, which we also react to. It
         // discards its in-flight lines without re-acking them, so grant no trailing-ack tolerance here — that
-        // would linger unspent and mask a genuine over-acknowledgement later in the session.
+        // would linger unspent and mask a genuine over-acknowledgement later in the session. Tell the driver to
+        // drop any queued/in-flight program lines too, so none reach the wire after the 0x18 (the safety bug).
         self.clear_program();
         self.reset_window(false);
+        out.push(Effect::AbortQueued);
         if self.state.is_connected() {
           self.transition(ConnectionState::Idle, &mut out);
         }
@@ -322,8 +330,10 @@ impl ProtocolCore {
         // A banner means the controller reset: abort any stream, clear the window, return to Idle. (When this
         // banner is the readiness evidence above, the Idle transition is already pending; transition() dedupes.)
         // Tolerate the in-flight lines' trailing acks — this is the connect/reset race the budget exists for.
+        // The board reset, so the driver must drop any queued/in-flight program lines it still holds (Bug 1).
         self.clear_program();
         self.reset_window(true);
+        out.push(Effect::AbortQueued);
         self.transition(ConnectionState::Idle, &mut out);
       }
       // `[OPT:...]` RX sizing already handled above; nothing further for messages.
@@ -620,6 +630,50 @@ mod tests {
     // The budget is spent: a *second* unmatched ack (a genuine over-acknowledgement) still faults.
     let again = core.on_response(Response::Ok);
     assert!(again.iter().any(|e| matches!(e, Effect::Fault(EngineError::UnexpectedAck))));
+  }
+
+  #[test]
+  fn a_soft_reset_emits_abort_queued_so_the_driver_discards_unsent_lines() {
+    // Bug 1: a Stop must not just clear the core's program — it must tell the driver to DROP any program lines
+    // already released into its outbound queue, or they reach the wire AFTER the 0x18 and command aborted motion.
+    // The core is the source of truth, so it emits an explicit `AbortQueued` effect alongside the soft-reset byte.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(8);
+    core.on_stream_program(["G00", "G01", "G02"]); // two released, one held
+    let effects = core.on_realtime(RealtimeCommand::SoftReset);
+    assert!(
+      effects.iter().any(|e| matches!(e, Effect::AbortQueued)),
+      "a soft reset must emit AbortQueued so the driver discards queued/in-flight program lines",
+    );
+    // The 0x18 byte is still emitted out-of-band.
+    assert!(writes(&effects).iter().any(|w| w == &vec![0x18]));
+  }
+
+  #[test]
+  fn a_feed_hold_does_not_emit_abort_queued() {
+    // A feed-hold (`!`) pauses; queued lines resume on cycle-start and must NOT be discarded. Only a soft reset
+    // (or a controller-reset banner) aborts the queue.
+    let mut core = connected_core();
+    core.flow.set_rx_buffer(8);
+    core.on_stream_program(["G00", "G01", "G02"]);
+    let effects = core.on_realtime(RealtimeCommand::FeedHold);
+    assert!(
+      !effects.iter().any(|e| matches!(e, Effect::AbortQueued)),
+      "a feed-hold must not discard queued lines — they resume on cycle-start",
+    );
+  }
+
+  #[test]
+  fn a_banner_mid_stream_emits_abort_queued() {
+    // A boot banner means the controller reset: like a soft reset, the driver must discard queued/in-flight lines
+    // so none reach the freshly-reset board.
+    let mut core = connected_core();
+    core.on_stream_program(["G0 X1", "G0 Y1"]);
+    let effects = core.on_response(Response::Banner("Grbl 1.1f".to_string()));
+    assert!(
+      effects.iter().any(|e| matches!(e, Effect::AbortQueued)),
+      "a controller-reset banner must emit AbortQueued so queued lines are discarded",
+    );
   }
 
   #[test]

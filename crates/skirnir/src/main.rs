@@ -56,20 +56,22 @@ mod cli {
   }
 
   /// Map a run [`Outcome`] (plus whether any `error:N`/`ALARM:N` was observed) to a process exit code, so the
-  /// harness is scriptable: 0 = success, 2 = stall/timeout, 3 = completed/closed but the firmware reported an
-  /// error or alarm, 4 = transport I/O failure, 130 = interrupted (the conventional SIGINT code).
+  /// harness is scriptable: 0 = success, 2 = stall/timeout, 3 = the firmware reported an error or alarm, 4 =
+  /// transport I/O failure, 130 = interrupted (the conventional SIGINT code).
+  ///
+  /// A firmware `error:N`/`ALARM:N` yields 3 even when the run later ends as a `Timeout` (Bug 5): after an error
+  /// the firmware error-holds and stops acking, so `acked` never reaches `total` and the run falls through to the
+  /// idle timeout — but the rejected line is the real failure and must not be masked as a mere stall. Interrupt
+  /// (130) and an I/O disconnect (4) keep their own codes, since those describe how the run was cut short rather
+  /// than a firmware rejection within it.
   fn exit_code(outcome: Outcome, had_error: bool) -> i32 {
     match outcome {
       Outcome::Interrupted => 130,
-      Outcome::Timeout => 2,
       Outcome::IoDisconnect => 4,
-      Outcome::Completed | Outcome::CleanDisconnect => {
-        if had_error {
-          3
-        } else {
-          0
-        }
-      }
+      // Any other ending after a firmware error/alarm is an error (3), including a post-error stall.
+      _ if had_error => 3,
+      Outcome::Timeout => 2,
+      Outcome::Completed | Outcome::CleanDisconnect => 0,
     }
   }
 
@@ -231,6 +233,12 @@ mod cli {
       assert_eq!(exit_code(Outcome::Completed, false), 0);
       assert_eq!(exit_code(Outcome::CleanDisconnect, false), 0);
       assert_eq!(exit_code(Outcome::Completed, true), 3, "a completed run that saw error:N fails");
+      assert_eq!(
+        exit_code(Outcome::Timeout, true),
+        3,
+        "a run that saw error:N then stalled is an error (3), not a stall (2) — the firmware error-holds and \
+         stops acking, so acked never reaches total; the rejected line must not be masked as a timeout",
+      );
       assert_eq!(exit_code(Outcome::Timeout, false), 2);
       assert_eq!(exit_code(Outcome::IoDisconnect, false), 4);
       assert_eq!(exit_code(Outcome::Interrupted, false), 130);

@@ -28,7 +28,31 @@ pub trait Transport: Send {
   /// (the peer closed / the device disappeared); the engine treats that as a disconnect.
   fn read(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send;
 
+  /// Write some prefix of `data`, returning how many bytes were accepted (`1..=data.len()` on success). This is
+  /// the cancel-safety primitive: a single `write` resolves after at most one syscall, so a future dropped
+  /// *before* it resolves has written nothing, and one dropped *after* has written exactly the returned count —
+  /// never anything in between. The driver advances a cursor by the returned count and only retires a line once
+  /// the cursor reaches its end, so a write pre-empted under serial backpressure resumes from the cursor and
+  /// never re-sends already-sent bytes. (`AsyncWriteExt::write` over a serial port has exactly this contract.)
+  fn write(&mut self, data: &[u8]) -> impl std::future::Future<Output = Result<usize, TransportError>> + Send;
+
   /// Write the entire `data` slice, retrying short writes internally. Returns only once every byte has been
   /// handed to the transport, so the caller's character-count accounting stays accurate.
-  fn write_all(&mut self, data: &[u8]) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+  ///
+  /// This is a provided convenience built on the cancel-safe [`Self::write`] primitive; it is NOT cancel-safe
+  /// (a partial write completed before cancellation is lost to the caller), so the engine's hot write arms use
+  /// cursor-tracked [`Self::write`] calls directly. It remains for teardown/best-effort flushes where a single
+  /// abandonment is acceptable.
+  fn write_all(&mut self, data: &[u8]) -> impl std::future::Future<Output = Result<(), TransportError>> + Send {
+    async move {
+      let mut offset = 0;
+      while offset < data.len() {
+        match self.write(&data[offset..]).await? {
+          0 => return Err(TransportError::Closed),
+          n => offset += n,
+        }
+      }
+      Ok(())
+    }
+  }
 }

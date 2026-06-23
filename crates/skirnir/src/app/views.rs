@@ -2356,7 +2356,11 @@ mod tests {
       settings_staging: staging,
       pending_settings_action: Some(PendingSettingsAction::Refresh),
       feed_override_drag: super::super::overrides::OverrideFeedback::Dragging(140),
-      spindle_override_drag: super::super::overrides::OverrideFeedback::Holding { target: 90, committed_from: 100 },
+      spindle_override_drag: super::super::overrides::OverrideFeedback::Holding {
+        target: 90,
+        committed_from: 100,
+        observations: 0,
+      },
       ..UiState::default()
     };
     state.on_disconnected();

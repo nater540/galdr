@@ -11,7 +11,7 @@
 //! a disconnect — exactly how a real device disappearing behaves.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -31,12 +31,32 @@ struct WriteGate {
   open: Arc<AtomicBool>,
   /// Notified whenever the gate is reopened, waking a parked `write_all`.
   reopened: Arc<Notify>,
+  /// The maximum number of bytes a single `write` may accept before short-writing, or `0` for unlimited. Lets a
+  /// test split a write so the cursor-tracked driver path can be proved to put each byte on the wire exactly once.
+  partial_limit: Arc<AtomicUsize>,
 }
 
 impl WriteGate {
-  /// A fresh, open gate (writes pass straight through).
+  /// A fresh, open gate (writes pass straight through, no partial-write cap).
   fn new() -> Self {
-    Self { open: Arc::new(AtomicBool::new(true)), reopened: Arc::new(Notify::new()) }
+    Self {
+      open: Arc::new(AtomicBool::new(true)),
+      reopened: Arc::new(Notify::new()),
+      partial_limit: Arc::new(AtomicUsize::new(0)),
+    }
+  }
+
+  /// Set the per-`write` byte cap, or clear it. `0` (the `None` case) means unlimited — the whole slice is taken.
+  fn set_partial_limit(&self, limit: Option<usize>) {
+    self.partial_limit.store(limit.unwrap_or(0), Ordering::SeqCst);
+  }
+
+  /// How many bytes a single `write` may accept of a `len`-byte slice, honouring the partial cap (0 = unlimited).
+  fn allowed(&self, len: usize) -> usize {
+    match self.partial_limit.load(Ordering::SeqCst) {
+      0 => len,
+      cap => cap.min(len),
+    }
   }
 
   /// Close the gate so subsequent `write_all`s park until [`Self::open_gate`] is called.
@@ -125,6 +145,13 @@ impl LoopbackController {
     self.gate.open_gate();
   }
 
+  /// Cap how many bytes a single `write` accepts (or clear the cap with `None`). With a limit set, the transport
+  /// short-writes — accepting at most `limit` bytes per call — so a test can split a write across calls and prove
+  /// the engine's cursor-tracked write path resumes from where it left off without ever re-sending a byte.
+  pub fn set_partial_write_limit(&self, limit: Option<usize>) {
+    self.gate.set_partial_limit(limit);
+  }
+
   /// Drain every chunk the engine has written so far into a single flat byte vector. Useful for asserting on
   /// the exact wire stream after driving an exchange to a known quiescent point.
   pub fn drain_written(&mut self) -> Vec<u8> {
@@ -196,14 +223,21 @@ impl Transport for LoopbackTransport {
     }
   }
 
-  async fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
+  async fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
     // Honour the write gate first: while a test holds it closed we park here, exactly as a real port pends when
     // the firmware stops draining RX. The await is cancel-safe, so a `select!` that drops this future loses no
-    // captured bytes (none were forwarded yet). With the gate open (the default) this returns immediately.
+    // captured bytes (none were forwarded yet, since capture happens only after the gate opens below).
     self.gate.wait_open().await;
-    // Forwarding to the controller cannot short-write; the whole slice is captured atomically. A send error
-    // means the controller was dropped, which we report as a closed transport.
-    self.outbound_tx.send(data.to_vec()).map_err(|_| TransportError::Closed)
+    if data.is_empty() {
+      return Ok(0);
+    }
+    // Accept at most the configured partial-write cap (default: the whole slice). Capturing only the accepted
+    // prefix models a real port short-write, so the engine's cursor must advance by the returned count and
+    // resume from there — proving each byte is captured exactly once across a split. A send error means the
+    // controller was dropped, which we report as a closed transport.
+    let n = self.gate.allowed(data.len());
+    self.outbound_tx.send(data[..n].to_vec()).map_err(|_| TransportError::Closed)?;
+    Ok(n)
   }
 }
 
@@ -256,6 +290,36 @@ mod tests {
     controller.release_writes();
     write.await.expect("write completes once the gate reopens");
     assert_eq!(controller.try_take_written().as_deref(), Some(b"G0 X1\n".as_slice()));
+  }
+
+  #[tokio::test]
+  async fn write_returns_the_count_it_accepted() {
+    // The cancel-safe primitive: an ungated `write` accepts (and captures) the whole slice in one call.
+    let (mut transport, mut controller) = LoopbackTransport::new();
+    let n = transport.write(b"G0 X1\n").await.expect("write");
+    assert_eq!(n, 6);
+    assert_eq!(controller.try_take_written().as_deref(), Some(b"G0 X1\n".as_slice()));
+  }
+
+  #[tokio::test]
+  async fn a_partial_write_accepts_only_the_limit_then_pends() {
+    // The Bug 2/8 test seam: with a partial-write limit set, a single `write` accepts at most `limit` bytes and
+    // captures exactly those; a follow-up `write` of the remainder accepts the rest — proving the cursor model
+    // puts each byte on the wire exactly once even when a write is split.
+    let (mut transport, mut controller) = LoopbackTransport::new();
+    controller.set_partial_write_limit(Some(2));
+    let n1 = transport.write(b"ABCDE").await.expect("first partial write");
+    assert_eq!(n1, 2, "only the limit is accepted in one write");
+    assert_eq!(controller.try_take_written().as_deref(), Some(b"AB".as_slice()));
+    // The next write resumes from the caller's cursor (the remainder); still capped at the limit.
+    let n2 = transport.write(b"CDE").await.expect("second partial write");
+    assert_eq!(n2, 2);
+    assert_eq!(controller.try_take_written().as_deref(), Some(b"CD".as_slice()));
+    // Lifting the limit lets the final byte through whole.
+    controller.set_partial_write_limit(None);
+    let n3 = transport.write(b"E").await.expect("final write");
+    assert_eq!(n3, 1);
+    assert_eq!(controller.try_take_written().as_deref(), Some(b"E".as_slice()));
   }
 
   #[tokio::test]

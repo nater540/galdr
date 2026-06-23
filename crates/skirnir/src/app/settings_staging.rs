@@ -13,7 +13,7 @@
 //! its rows to [`SettingsStaging::staged_value`]/[`SettingsStaging::is_dirty`] for the modified marker, and the
 //! shell flushes [`SettingsStaging::write_lines`] through the streaming engine on Save.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::protocol::setting_write_line;
 
@@ -24,6 +24,14 @@ use crate::protocol::setting_write_line;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettingsStaging {
   staged: BTreeMap<u32, String>,
+  /// Edits issued by a Save and awaiting the post-write `$$` re-dump's confirmation: `$<n>` → the value we
+  /// wrote. A setting stays in `staged` (dirty, visible) while it is here; [`Self::confirm`] removes it from
+  /// `staged` only when the re-dump shows it actually took the written value, and flags it [`Self::rejected`]
+  /// otherwise — so a firmware-refused setting (out-of-range/read-only → `error:N`) is never silently dropped.
+  pending: BTreeMap<u32, String>,
+  /// Settings whose last Save was rejected (the re-dump came back unchanged). They remain dirty so the operator
+  /// keeps seeing their edit; the shell surfaces these `$<n>` to the console so the failure is not silent.
+  rejected: BTreeSet<u32>,
 }
 
 impl SettingsStaging {
@@ -38,6 +46,11 @@ impl SettingsStaging {
   /// leaves a phantom modified marker or a no-op write. An empty (whitespace-only) edit is also treated as "no
   /// change": it clears any staging rather than staging a blank the firmware would reject.
   pub fn stage(&mut self, number: u32, value: &str, live: Option<&str>) {
+    // A fresh edit supersedes any prior Save still awaiting confirmation for this setting, and clears a stale
+    // rejected flag — the operator is acting on the row again, so neither the old save's confirmation nor its
+    // failure should still apply.
+    self.pending.remove(&number);
+    self.rejected.remove(&number);
     let trimmed = value.trim();
     if trimmed.is_empty() || live == Some(trimmed) {
       self.staged.remove(&number);
@@ -67,18 +80,71 @@ impl SettingsStaging {
     self.staged.len()
   }
 
-  /// Drop every staged edit without writing. Called by a confirmed Discard, by Save once the writes are issued,
-  /// and on disconnect so a reconnect never resumes editing the previous board's settings.
+  /// Drop every staged edit (and any pending/rejected bookkeeping) without writing. Called by a confirmed
+  /// Discard and on disconnect so a reconnect never resumes editing the previous board's settings.
   pub fn clear(&mut self) {
     self.staged.clear();
+    self.pending.clear();
+    self.rejected.clear();
   }
 
   /// The ordered `$<n>=<value>` write lines a Save must send, one per staged setting, in ascending `$<n>` order.
   /// Built through the shared [`setting_write_line`] so the wire form lives in one tested place. The shell sends
-  /// each through the streaming engine (then `$$` to re-confirm) and clears staging; grbl has no batch, so order
-  /// between independent writes does not matter — ascending is chosen only for predictability.
+  /// each through the streaming engine (then `$$` to re-confirm); grbl has no batch, so order between independent
+  /// writes does not matter — ascending is chosen only for predictability. Prefer [`Self::begin_save`], which
+  /// also arms the per-setting confirmation so a rejected write is not silently dropped.
   pub fn write_lines(&self) -> Vec<String> {
     self.staged.iter().map(|(number, value)| setting_write_line(*number, value)).collect()
+  }
+
+  /// Issue a Save: return the ordered `$<n>=<value>` write lines AND arm each staged edit for confirmation by the
+  /// post-write `$$` re-dump. Crucially this does NOT drop the staged edits — they stay dirty and visible until
+  /// [`Self::confirm`] sees the re-dump prove each one took (or refuse it). This is the Bug 6 fix: clearing on
+  /// Save before any `ok`/`error` returned silently lost a firmware-rejected setting; now a rejection survives.
+  pub fn begin_save(&mut self) -> Vec<String> {
+    self.rejected.clear();
+    self.pending = self.staged.clone();
+    self.write_lines()
+  }
+
+  /// Fold one re-dumped live `$<n>=<value>` value into a pending Save's confirmation. Only a setting currently
+  /// awaiting confirmation (armed by [`Self::begin_save`] and not since re-edited) reacts: if the re-dumped
+  /// `live` value equals the value we wrote, the write took — the edit is cleared (no longer dirty). If it does
+  /// not, the firmware refused it (clamp/read-only → `error:N`, value reverted): the edit stays staged and dirty
+  /// and is flagged [`Self::rejected`], so it remains visible to the operator instead of vanishing.
+  pub fn confirm(&mut self, number: u32, live: &str) {
+    let Some(written) = self.pending.get(&number) else {
+      return;
+    };
+    // A re-edit after Save (which dropped the pending entry) is handled by the early return above; here the
+    // pending value is still the one we wrote, so the re-dump is the authoritative verdict on it.
+    if written == live.trim() {
+      self.staged.remove(&number);
+      self.rejected.remove(&number);
+    } else {
+      self.rejected.insert(number);
+    }
+    self.pending.remove(&number);
+  }
+
+  /// The `$<n>` numbers whose last Save was rejected by the firmware (the re-dump came back unchanged). The view
+  /// uses this to flag the rejected rows; ascending order, matching the rest of the staging API. Non-draining —
+  /// the flags persist (the rows stay dirty) until the operator re-edits or discards. See [`Self::take_rejected`]
+  /// for the shell's one-shot console reporting.
+  pub fn rejected(&self) -> impl Iterator<Item = u32> + '_ {
+    self.rejected.iter().copied()
+  }
+
+  /// Whether setting `number`'s last Save was rejected by the firmware, for the view's per-row "rejected" marker.
+  pub fn is_rejected(&self, number: u32) -> bool {
+    self.rejected.contains(&number)
+  }
+
+  /// Drain and return the rejected `$<n>` set so the shell reports each refused setting to the console exactly
+  /// once. The settings stay staged/dirty (the operator's edit remains visible for a retry); only the
+  /// not-yet-reported flag is consumed here, so a rejection is announced once rather than every frame.
+  pub fn take_rejected(&mut self) -> Vec<u32> {
+    std::mem::take(&mut self.rejected).into_iter().collect()
   }
 }
 
@@ -151,6 +217,63 @@ mod tests {
     staging.stage(0, "13", Some("10"));
     assert_eq!(staging.len(), 1);
     assert_eq!(staging.staged_value(0), Some("13"));
+  }
+
+  #[test]
+  fn begin_save_returns_the_write_lines_but_keeps_rows_dirty_until_confirmed() {
+    // Bug 6: Save must NOT drop the staged edits the instant the writes are issued — a setting the firmware
+    // rejects (error:N) would then silently vanish. `begin_save` hands back the write lines and marks the edits
+    // pending-confirmation, but they stay dirty and visible until the post-write `$$` re-dump confirms each one.
+    let mut staging = SettingsStaging::new();
+    staging.stage(0, "12", Some("10"));
+    staging.stage(110, "800", Some("500"));
+    let lines = staging.begin_save();
+    assert_eq!(lines, vec!["$0=12".to_string(), "$110=800".to_string()]);
+    // The rows remain dirty and show their staged values — nothing is dropped yet.
+    assert!(staging.is_dirty(0) && staging.is_dirty(110), "edits stay dirty until the re-dump confirms them");
+    assert_eq!(staging.staged_value(0), Some("12"));
+    assert!(!staging.is_empty());
+  }
+
+  #[test]
+  fn confirm_clears_an_accepted_setting_and_keeps_a_rejected_one_dirty() {
+    // The heart of Bug 6: after Save's `$$` re-dump, the firmware shows the new value for an accepted write and
+    // the OLD value for a rejected one. Confirming with the re-dumped live value must clear the accepted row and
+    // keep the rejected row staged/dirty so the operator still sees their failed edit, rather than it vanishing.
+    let mut staging = SettingsStaging::new();
+    staging.stage(0, "12", Some("10")); // will be accepted (re-dump shows 12)
+    staging.stage(110, "999999", Some("500")); // will be rejected (re-dump still shows 500)
+    staging.begin_save();
+    // The re-dump lands: $0 took the new value, $110 was refused and reverted.
+    staging.confirm(0, "12");
+    staging.confirm(110, "500");
+    assert!(!staging.is_dirty(0), "an accepted setting clears once the re-dump confirms it took");
+    assert!(staging.is_dirty(110), "a rejected setting stays dirty and visible, not silently dropped");
+    assert_eq!(staging.staged_value(110), Some("999999"), "the rejected edit is still shown to the operator");
+    assert_eq!(staging.rejected().collect::<Vec<_>>(), vec![110], "the rejected `$N` is reportable to the console");
+  }
+
+  #[test]
+  fn confirm_for_an_unsaved_setting_is_ignored() {
+    // A `$$` re-dump value for a setting that was never saved (e.g. an unrelated dump) must not touch staging.
+    let mut staging = SettingsStaging::new();
+    staging.stage(0, "12", Some("10"));
+    staging.confirm(0, "10"); // no begin_save yet: this is just an ambient dump, not a save confirmation.
+    assert!(staging.is_dirty(0), "an ambient dump value must not clear a freshly-staged, unsaved edit");
+  }
+
+  #[test]
+  fn re_staging_a_pending_setting_supersedes_the_pending_save() {
+    // If the operator edits a setting again after Save but before the re-dump lands, the new edit takes over: the
+    // row is dirty with the new value and is no longer pending the old save's confirmation.
+    let mut staging = SettingsStaging::new();
+    staging.stage(0, "12", Some("10"));
+    staging.begin_save();
+    staging.stage(0, "15", Some("10")); // re-edited after Save.
+    // The old save's confirmation must not clear the freshly re-staged value.
+    staging.confirm(0, "12");
+    assert!(staging.is_dirty(0), "a re-edit after Save supersedes the pending confirmation");
+    assert_eq!(staging.staged_value(0), Some("15"));
   }
 
   #[test]

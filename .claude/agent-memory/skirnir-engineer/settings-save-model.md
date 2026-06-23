@@ -18,8 +18,14 @@ ANY edit (Enter or focus-loss), so a typed value is never lost by construction.
 - `UiState` (in `app/views.rs`) gained `settings_staging: SettingsStaging` and
   `pending_settings_action: Option<PendingSettingsAction>` (Refresh/Close); `on_disconnected` clears both.
   `editing_setting` is still the transient text buffer; leaving the field stages instead of writing.
-- Save handler: `SkirnirApp::save_settings` (`app/shell.rs`) — flushes each `$N=V` via `send_line` (respects flow
-  control), then `$$`, then clears staging. Wired through `Intent::SaveSettings` (in `app/intent.rs`).
+- Save handler: `SkirnirApp::save_settings` (`app/shell.rs`) — calls `begin_save()` (NOT clear): returns the
+  ordered `$N=V` write lines AND arms each edit for confirmation, then sends them + `$$`. Edits stay dirty/visible
+  until the re-dump confirms. Wired through `Intent::SaveSettings` (in `app/intent.rs`).
+- Bug-6 confirmation: `SettingsStaging` has `pending`/`rejected` sets. `pump_events` (shell.rs) calls
+  `confirm(number, value)` on each `Response::Setting` re-dump line: a value matching what we wrote clears the
+  edit; a reverted value (firmware refused → error:N) keeps it staged/dirty and flags it `rejected`. The shell
+  drains `take_rejected()` after the event loop and `view.note(...)`s each refused `$N` to the console, so a
+  rejected setting is never silently dropped. `stage()` re-edit and `clear()` reset pending+rejected.
 - Refresh with staged edits parks `PendingSettingsAction::Refresh`; close-with-dirty (window X) parks `Close`.
   The `views::settings_discard_confirm` modal resolves them; shell carries out the action on confirmed Discard.
 - Dirty rows show `Theme::ACCENT_MOTION` (orange) key/value + a `•` label prefix, and display the staged value.

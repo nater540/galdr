@@ -294,8 +294,21 @@ impl SkirnirApp {
       if matches!(event, crate::engine::Event::Response(crate::protocol::Response::Status(_))) {
         self.last_status_at = Some(Instant::now());
       }
+      // A `$<n>=<value>` re-dump line confirms (or refutes) a pending Save: feed it to the staging store so an
+      // accepted edit clears and a firmware-rejected one stays dirty and visible rather than silently vanishing
+      // (Bug 6). `confirm` is a no-op unless that `$<n>` is awaiting a Save's confirmation, so this is cheap and
+      // safe to call on every settings line. We do it before `view.apply` consumes the event.
+      if let crate::engine::Event::Response(crate::protocol::Response::Setting { number, value }) = &event {
+        self.ui.settings_staging.confirm(*number, value);
+      }
       self.view.apply(event);
       saw_any = true;
+    }
+    // Report any settings the firmware refused during a Save's re-dump, so the operator is told which `$<n>`
+    // edits did not take instead of a row quietly reverting. Draining the set here means each rejection is noted
+    // once; the row stays dirty so the failed value remains on screen for a retry.
+    for number in self.ui.settings_staging.take_rejected() {
+      self.view.note(format!("setting ${number} rejected by the firmware — value unchanged"));
     }
     // A live, healthy link clears the backoff so the *next* drop starts fresh: once the lifecycle reaches a
     // connected state, the reconnect succeeded (or never dropped), so reset the schedule.
@@ -751,7 +764,12 @@ impl SkirnirApp {
   /// batch, so the lines are independent and only ascending-ordered for predictability. A no-op when nothing is
   /// staged (the Save button is disabled then, but this stays safe if it is ever called regardless).
   fn save_settings(&mut self) {
-    let lines = self.ui.settings_staging.write_lines();
+    // `begin_save` returns the write lines AND arms each edit for confirmation by the `$$` re-dump below — it does
+    // NOT clear the staging. Clearing on Save (the old behaviour) silently dropped a firmware-rejected setting:
+    // the re-dump reverted the row and the operator never learned the write failed. Now each edit stays dirty and
+    // visible until `pump_events` folds the re-dump in via `SettingsStaging::confirm`, which clears an accepted
+    // setting and flags a rejected one for the console notice (Bug 6).
+    let lines = self.ui.settings_staging.begin_save();
     if lines.is_empty() {
       return;
     }
@@ -759,7 +777,6 @@ impl SkirnirApp {
       self.send_line(line);
     }
     self.send_line("$$".to_string());
-    self.ui.settings_staging.clear();
   }
 
   /// Send one manual line, echoing it to the console as sent traffic. Returns whether it was actually sent (an
@@ -2517,11 +2534,11 @@ mod tests {
   }
 
   /// Saving the settings dialog must flush every staged edit as an ordered `$<n>=<value>` line through the
-  /// streaming engine, then `$$` to re-confirm, then clear the staging so the rows return to live values with no
-  /// modified markers. The explicit Save is the only thing that reaches the firmware — proves an edit is no longer
-  /// dropped on focus-loss (it is staged, then this writes it).
+  /// streaming engine, then `$$` to re-confirm. The explicit Save is the only thing that reaches the firmware —
+  /// proves an edit is no longer dropped on focus-loss (it is staged, then this writes it). The edits stay staged
+  /// until the re-dump confirms them (Bug 6), so this test only asserts the write/order/re-dump traffic.
   #[test]
-  fn saving_flushes_staged_settings_in_order_then_redumps_and_clears() {
+  fn saving_flushes_staged_settings_in_order_then_redumps() {
     let (mut app, mut controller) = app_with_engine();
     flush_handshake(&mut app, &mut controller);
 
@@ -2551,8 +2568,49 @@ mod tests {
     assert!(pos0 < pos22 && pos22 < pos110, "staged writes must be sent in ascending order; saw {text:?}");
     let pos_dump = text.rfind("$$").expect("a $$ re-confirm must follow the writes");
     assert!(pos110 < pos_dump, "the $$ re-confirm must come after the staged writes; saw {text:?}");
-    // Staging is cleared by Save, so the rows return to showing live values with no pending markers.
-    assert!(app.ui.settings_staging.is_empty(), "Save must clear the staging once the writes are issued");
+    // The edits remain staged and dirty until the re-dump confirms them — Save no longer drops them up front, so
+    // a firmware rejection cannot vanish silently (Bug 6). Confirmation/clearing is exercised below.
+    assert!(!app.ui.settings_staging.is_empty(), "Save arms confirmation; edits persist until the re-dump lands");
+    assert!(app.ui.settings_staging.is_dirty(0), "a saved-but-unconfirmed edit stays dirty");
+  }
+
+  /// Bug 6 end to end: after Save, the firmware's `$$` re-dump confirms one write and refutes another (the
+  /// rejected one comes back unchanged). The accepted setting must clear from staging while the rejected one
+  /// stays staged/dirty (so the operator still sees their edit) and is announced in the console — never silently
+  /// dropped. Driven over the loopback so the real reduce/confirm path is exercised.
+  #[test]
+  fn a_rejected_setting_survives_save_while_an_accepted_one_clears() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Stage two edits: $0 will be accepted (re-dump shows the new value), $110 will be rejected (re-dump reverts).
+    app.ui.settings_staging.stage(0, "12", Some("10"));
+    app.ui.settings_staging.stage(110, "999999", Some("500"));
+    app.handle_intent(Intent::SaveSettings);
+
+    // Let the writes flush, then the firmware answers: an `ok` per write, then the `$$` re-dump. $0 took the new
+    // value; $110 was refused and reverted to its old value. (The acks keep flow control honest; the re-dump
+    // values are the authoritative verdict the confirm path reads.)
+    pump_until(&mut app, |_| false); // pump a few frames so the writes reach the wire.
+    controller.drain_written();
+    assert!(controller.inject_line("ok")); // $0=12
+    assert!(controller.inject_line("error:3")); // $110 rejected
+    assert!(controller.inject_line("ok")); // the $$ line itself
+    assert!(controller.inject_line("$0=12")); // re-dump: accepted
+    assert!(controller.inject_line("$110=500")); // re-dump: reverted (rejected)
+
+    assert!(
+      pump_until(&mut app, |a| !a.ui.settings_staging.is_dirty(0) && a.ui.settings_staging.is_dirty(110)),
+      "after the re-dump, the accepted $0 must clear and the rejected $110 must stay dirty",
+    );
+    assert_eq!(
+      app.ui.settings_staging.staged_value(110),
+      Some("999999"),
+      "the rejected edit's value must remain visible to the operator, not vanish",
+    );
+    // The rejection is announced in the console so the operator learns the write failed.
+    let noted_rejection = app.view.console.iter().any(|l| l.text.contains("$110") && l.text.contains("rejected"));
+    assert!(noted_rejection, "a rejected setting must produce a console notice naming the failed $N");
   }
 
   /// Saving with nothing staged must be a quiet no-op: no `$<n>=` write and no `$$` re-dump reaches the firmware

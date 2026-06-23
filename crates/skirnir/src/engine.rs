@@ -44,6 +44,11 @@ const READ_CHUNK: usize = 256;
 /// The `?` rides the out-of-band real-time path (uncounted), so polling never disturbs the send-ahead window.
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How long the teardown flush of pending real-time bytes may block before disconnect proceeds regardless. A
+/// few hundred ms is ample for a healthy port to accept a one-or-two-byte Stop, while guaranteeing an alive-but-
+/// wedged/backpressured port cannot hold teardown hostage and leak the serial FD (Bug 3).
+const TEARDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
+
 /// A host intent sent from the UI to the engine. Each is fed straight into the [`ProtocolCore`]; the engine
 /// adds no policy of its own beyond carrying out the resulting effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +139,8 @@ impl Engine {
       event_tx,
       realtime_out: VecDeque::new(),
       line_out: VecDeque::new(),
+      realtime_in_flight: None,
+      line_in_flight: None,
     };
     let task = tokio::spawn(driver.run(command_rx));
     EngineHandle { command_tx, event_rx, task }
@@ -155,6 +162,15 @@ struct Driver<T: Transport> {
   /// writing one is the *lowest* write priority, racing against commands/poll/realtime so it can never wedge the
   /// loop while it parks under backpressure.
   line_out: VecDeque<Vec<u8>>,
+  /// The real-time batch currently being written, as `(bytes, cursor)`: `cursor` is how many bytes the transport
+  /// has already accepted. Persisting the cursor across loop iterations is what makes the write cancel-safe — a
+  /// `write` pre-empted by a racing command leaves the cursor where it was, and the next attempt resumes from it
+  /// rather than re-sending already-sent bytes (the duplicated-handshake-batch bug). Cleared once fully written.
+  realtime_in_flight: Option<(Vec<u8>, usize)>,
+  /// The program/manual line currently being written, as `(bytes, cursor)`, with the same cancel-safe cursor
+  /// semantics as [`Self::realtime_in_flight`]: a partial write under backpressure is resumed from the cursor, so
+  /// a line is never torn or duplicated, and the character-count window stays in sync. Dropped on `AbortQueued`.
+  line_in_flight: Option<(Vec<u8>, usize)>,
 }
 
 impl<T: Transport> Driver<T> {
@@ -198,7 +214,7 @@ impl<T: Transport> Driver<T> {
       // so a Stop/Disconnect/poll/realtime cancels a parked line write under backpressure instead of wedging the
       // loop. Reads are deliberately excluded from this race: only ONE arm may borrow the transport per
       // `select!`, and buffered `ok`s lost no ground while we write (we drain them the moment the write returns).
-      if !self.line_out.is_empty() {
+      if self.line_in_flight.is_some() || !self.line_out.is_empty() {
         match self.write_pending_line(&mut command_rx, &mut status_poll).await {
           FlushOutcome::Continue => continue,
           FlushOutcome::WriteFailed(err) => break Some(err),
@@ -240,13 +256,20 @@ impl<T: Transport> Driver<T> {
 
     // Best-effort teardown flush of any pending real-time bytes (most importantly a soft-reset/feed-hold the
     // operator issued just before disconnecting): leaving the machine in a safe stopped state matters more than a
-    // microsecond of teardown latency. The write is awaited so a Stop that was waiting on serial room still
-    // reaches the wire once room frees; a genuinely dead port returns an error promptly rather than hanging, so
-    // this cannot wedge teardown. We do NOT flush queued program lines here — a teardown must not push more of an
-    // aborted job at the controller.
-    if !self.realtime_out.is_empty() {
-      let bytes: Vec<u8> = self.realtime_out.drain(..).collect();
-      let _ = self.transport.write_all(&bytes).await;
+    // microsecond of teardown latency. We flush the in-flight remainder first, then the queued tail. We do NOT
+    // flush queued program lines — a teardown must not push more of an aborted job at the controller.
+    //
+    // The flush is bounded by a short timeout (Bug 3): an alive-but-wedged/backpressured port would otherwise
+    // block `write_all` forever, so `Event::Disconnected` would never fire and the serial FD would leak — the
+    // exact leak `has_transport`/Cancel were added to prevent. On timeout we abandon the flush and tear down
+    // anyway, so disconnect ALWAYS completes promptly.
+    let mut pending: Vec<u8> = Vec::new();
+    if let Some((bytes, cursor)) = self.realtime_in_flight.take() {
+      pending.extend_from_slice(&bytes[cursor..]);
+    }
+    pending.extend(self.realtime_out.drain(..));
+    if !pending.is_empty() {
+      let _ = tokio::time::timeout(TEARDOWN_FLUSH_TIMEOUT, self.transport.write_all(&pending)).await;
     }
 
     // Reset the core's view to Disconnected (best-effort: surface any resulting state change) and emit the
@@ -261,37 +284,50 @@ impl<T: Transport> Driver<T> {
   /// loop promptly; any other command queued during the race is fed into the core (it may add more realtime
   /// bytes, which this same flush then drains before returning). Returns the outcome for the loop to act on.
   async fn flush_realtime(&mut self, command_rx: &mut UnboundedReceiver<Command>) -> FlushOutcome {
-    while !self.realtime_out.is_empty() {
-      let bytes: Vec<u8> = self.realtime_out.drain(..).collect();
+    loop {
+      // Adopt a fresh batch into the cursor slot when nothing is mid-write, so a write pre-empted last iteration
+      // resumes from its preserved cursor rather than re-draining the queue. Nothing to write -> done.
+      if self.realtime_in_flight.is_none() && !self.realtime_out.is_empty() {
+        let bytes: Vec<u8> = self.realtime_out.drain(..).collect();
+        self.realtime_in_flight = Some((bytes, 0));
+      }
+      let Some((bytes, cursor)) = &self.realtime_in_flight else {
+        return FlushOutcome::Continue;
+      };
+      // Clone only the unwritten tail to satisfy the borrow checker (the command arm needs `&mut self`); the
+      // real-time batch is a byte or two, so this is negligible. The cursor advances by the count the transport
+      // accepts; a pre-empted write leaves the cursor in place and the next iteration resumes from it.
+      let remaining: Vec<u8> = bytes[*cursor..].to_vec();
       tokio::select! {
         biased;
 
         // A command racing the realtime write: a Disconnect ends the loop even mid-flush; any other command is
-        // handled (it may enqueue more realtime bytes). The bytes we drained are re-queued at the FRONT so they
-        // are not lost when we loop to retry the write — order is preserved.
+        // handled (it may enqueue more realtime bytes). The in-flight cursor is untouched, so the partially-sent
+        // batch resumes from exactly where it was on the next iteration — no byte is re-sent or lost.
         command = command_rx.recv() => {
-          self.requeue_realtime_front(bytes);
           match command {
             None | Some(Command::Disconnect) => return FlushOutcome::Disconnect,
             Some(command) => self.handle_command(command),
           }
         }
 
-        result = self.transport.write_all(&bytes) => {
-          if let Err(err) = result {
-            return FlushOutcome::WriteFailed(err);
+        result = self.transport.write(&remaining) => {
+          match result {
+            Ok(0) => return FlushOutcome::WriteFailed(TransportError::Closed),
+            Ok(n) => {
+              // Advance the cursor; retire the batch once every byte is on the wire. A short write leaves the
+              // remainder in the slot for the next iteration to resume.
+              if let Some((batch, cur)) = &mut self.realtime_in_flight {
+                *cur += n;
+                if *cur >= batch.len() {
+                  self.realtime_in_flight = None;
+                }
+              }
+            }
+            Err(err) => return FlushOutcome::WriteFailed(err),
           }
         }
       }
-    }
-    FlushOutcome::Continue
-  }
-
-  /// Put already-drained real-time bytes back at the front of the queue, preserving their order, so a write
-  /// cancelled by a racing command is retried on the next flush rather than dropped.
-  fn requeue_realtime_front(&mut self, bytes: Vec<u8>) {
-    for byte in bytes.into_iter().rev() {
-      self.realtime_out.push_front(byte);
     }
   }
 
@@ -329,6 +365,13 @@ impl<T: Transport> Driver<T> {
       match effect {
         Effect::WriteRealtime(bytes) => self.realtime_out.extend(bytes),
         Effect::WriteLine(bytes) => self.line_out.push_back(bytes),
+        // A soft reset / controller-reset banner: discard every queued program line AND any line currently
+        // mid-write, so none reaches the wire after the abort and commands the motion the operator just stopped.
+        // Real-time bytes (the 0x18 itself) are deliberately untouched — they must still flush. (Bug 1.)
+        Effect::AbortQueued => {
+          self.line_out.clear();
+          self.line_in_flight = None;
+        }
         Effect::StateChanged(state) => self.emit(Event::StateChanged(state)),
         Effect::Response(response) => self.emit(Event::Response(response)),
         Effect::Progress { sent, acked, total } => self.emit(Event::Progress { sent, acked, total }),
@@ -347,20 +390,31 @@ impl<T: Transport> Driver<T> {
     command_rx: &mut UnboundedReceiver<Command>,
     status_poll: &mut tokio::time::Interval,
   ) -> FlushOutcome {
-    // The caller checked `!line_out.is_empty()`, so a front line is present; treat its absence defensively as a
-    // no-op rather than panicking. Clone the front line to write so the transport borrow does not collide with
-    // the `&mut self` the command/poll arms need; the line is small (one G-code line) so the copy is cheap.
-    let Some(line) = self.line_out.front().cloned() else {
+    // Adopt the front queued line into the cursor slot if nothing is mid-write; otherwise resume the in-flight
+    // line from its preserved cursor (the cancel-safe path). The caller guaranteed one of the two is present;
+    // treat their joint absence defensively as a no-op rather than panicking.
+    if self.line_in_flight.is_none()
+      && let Some(line) = self.line_out.pop_front()
+    {
+      self.line_in_flight = Some((line, 0));
+    }
+    let Some((line, cursor)) = &self.line_in_flight else {
       return FlushOutcome::Continue;
     };
+    // Clone only the unwritten tail so the transport borrow does not collide with the `&mut self` the command/
+    // poll arms need; one G-code line is small, so this is cheap. The cursor persists across pre-emptions, so a
+    // partial write under backpressure resumes exactly where it left off — the line is never torn or re-sent.
+    let remaining: Vec<u8> = line[*cursor..].to_vec();
     tokio::select! {
       biased;
 
       command = command_rx.recv() => {
         match command {
           None | Some(Command::Disconnect) => FlushOutcome::Disconnect,
-          // A command pre-empts the (still-unsent) line: feed it to the core — a real-time Stop now sits in
-          // `realtime_out` and the next loop iteration flushes it ahead of this line, which stays queued.
+          // A command pre-empts the (partially-sent) line: feed it to the core — a real-time Stop now sits in
+          // `realtime_out` and the next loop iteration flushes it ahead of this line. The line's cursor is
+          // untouched, so it resumes from where it was (or is dropped entirely if the command was a Stop, whose
+          // `AbortQueued` effect clears `line_in_flight`).
           Some(command) => {
             self.handle_command(command);
             FlushOutcome::Continue
@@ -374,10 +428,18 @@ impl<T: Transport> Driver<T> {
         FlushOutcome::Continue
       }
 
-      result = self.transport.write_all(&line) => {
+      result = self.transport.write(&remaining) => {
         match result {
-          Ok(()) => {
-            self.line_out.pop_front();
+          Ok(0) => FlushOutcome::WriteFailed(TransportError::Closed),
+          Ok(n) => {
+            // Advance the cursor; retire the line once every byte is on the wire. A short write leaves the
+            // remainder in the slot for the next iteration to resume.
+            if let Some((bytes, cur)) = &mut self.line_in_flight {
+              *cur += n;
+              if *cur >= bytes.len() {
+                self.line_in_flight = None;
+              }
+            }
             FlushOutcome::Continue
           }
           Err(err) => FlushOutcome::WriteFailed(err),
@@ -681,6 +743,88 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn a_soft_reset_discards_queued_program_lines_after_the_0x18() {
+    // Bug 1 (safety): under serial backpressure a program line parks in the driver's outbound queue. A Stop must
+    // put the 0x18 on the wire AND discard the held line, or that line reaches the freshly-aborted board and
+    // commands the motion the operator just stopped. Gate writes so the line parks, queue it, Stop, then release.
+    let (mut handle, mut controller) = connect_idle().await;
+
+    controller.gate_writes();
+    assert!(handle.send(Command::StreamProgram(vec!["G0 X100".to_string()].into())));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
+    wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 1, .. })).await;
+    // Ack the in-flight line so the core's flow accounting stays clean (the firmware echoed an `ok` for it).
+    assert!(controller.inject_line("ok"));
+
+    // Operator hits Stop while the line write parks. Release the gate; the 0x18 must reach the wire and the held
+    // program line must NEVER appear after it.
+    assert!(handle.send(Command::Realtime(RealtimeCommand::SoftReset)));
+    controller.release_writes();
+    let first = wait_for_written(&mut controller).await;
+    assert_eq!(first, vec![0x18], "the soft-reset byte must reach the wire");
+
+    // Drain everything else the engine writes for a moment; no chunk may be the discarded program line.
+    let mut tail: Vec<u8> = Vec::new();
+    for _ in 0..8 {
+      tokio::task::yield_now().await;
+      while let Some(chunk) = controller.try_take_written() {
+        tail.extend_from_slice(&chunk);
+      }
+    }
+    assert!(
+      !tail.windows(b"G0 X100".len()).any(|w| w == b"G0 X100"),
+      "the aborted program line must be discarded, never written after the 0x18; saw tail {tail:?}",
+    );
+  }
+
+  #[tokio::test]
+  async fn a_preempted_line_write_is_resumed_byte_exact_not_re_sent() {
+    // Bug 2/8 (cancel safety): a line write that is split across calls — the transport accepts only a prefix per
+    // `write` — must put each byte on the wire exactly once. We cap the per-write size to 2 bytes so the 6-byte
+    // line `G0 X1\n` is accepted in three short writes, racing the poll between them, and assert the reassembled
+    // wire bytes equal the line once, with no duplicated prefix.
+    let (mut handle, mut controller) = connect_idle().await;
+
+    controller.set_partial_write_limit(Some(2));
+    assert!(handle.send(Command::StreamProgram(vec!["G0 X1".to_string()].into())));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Streaming))).await;
+    wait_for(&mut handle, |e| matches!(e, Event::Progress { sent: 1, .. })).await;
+
+    // Let the engine run; the line is written in 2-byte chunks across several loop iterations (each `write`
+    // returns 2, the cursor advances, the next call resumes). Reassemble all captured chunks.
+    let mut wire: Vec<u8> = Vec::new();
+    for _ in 0..64 {
+      tokio::task::yield_now().await;
+      while let Some(chunk) = controller.try_take_written() {
+        wire.extend_from_slice(&chunk);
+      }
+      if wire.windows(6).any(|w| w == b"G0 X1\n") {
+        break;
+      }
+    }
+    assert_eq!(wire, b"G0 X1\n", "the split line is reassembled exactly once, with no re-sent prefix");
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn disconnect_completes_promptly_even_when_the_write_never_drains() {
+    // Bug 3: teardown must not hang on a wedged port. A pending real-time byte (a Stop the operator issued just
+    // before disconnecting) would otherwise block the unconditional teardown flush forever on a closed gate,
+    // leaking the serial FD. The flush is bounded by a timeout, so Disconnect always emits Disconnected.
+    let (mut handle, controller) = connect_idle().await;
+
+    // Wedge the port: gate writes closed so nothing ever drains, then issue a Stop (queues a 0x18 that the
+    // teardown flush would try to write) and immediately Disconnect.
+    controller.gate_writes();
+    assert!(handle.send(Command::Realtime(RealtimeCommand::SoftReset)));
+    assert!(handle.send(Command::Disconnect));
+
+    // Advance virtual time past the teardown-flush bound; Disconnected must arrive without ever releasing the gate.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    let event = wait_for(&mut handle, |e| matches!(e, Event::Disconnected(_))).await;
+    assert_eq!(event, Event::Disconnected(None), "a wedged port must not block teardown");
+  }
+
+  #[tokio::test]
   async fn disconnect_ends_the_loop_while_a_line_write_is_pending() {
     // The other half of the deadlock: under serial backpressure the driver parks inside a line write, so a queued
     // Disconnect is never serviced and Stop/Disconnect appear dead. Gate the transport so a line write parks,
@@ -851,8 +995,9 @@ mod tests {
       }
     }
 
-    async fn write_all(&mut self, data: &[u8]) -> Result<(), TransportError> {
-      self.writes.send(data.to_vec()).map_err(|_| TransportError::Closed)
+    async fn write(&mut self, data: &[u8]) -> Result<usize, TransportError> {
+      self.writes.send(data.to_vec()).map_err(|_| TransportError::Closed)?;
+      Ok(data.len())
     }
   }
 }
