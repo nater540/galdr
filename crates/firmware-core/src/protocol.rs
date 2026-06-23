@@ -107,6 +107,12 @@ pub enum RealtimeCommand {
   SafetyDoor,
   /// `0x85` — jog cancel: feed-hold plus a planner flush; ignored if not jogging.
   JogCancel,
+  /// `0x86` — Galdr graceful program stop: decelerate the running/held program to a controlled stop at a block
+  /// boundary, flush the planner queue + any in-progress arc, clear the program/modal-run state, and return to
+  /// Idle (NOT alarm) with machine position RETAINED. Distinct from the `0x18` abort (which raises ALARM:3 on a
+  /// mid-cycle reset and loses positional certainty); ignored (benign) when not running or held. This is a Galdr
+  /// extension — grbl has no dedicated graceful-stop real-time byte, modelling it as feed-hold then reset.
+  ProgramStop,
   /// `0x87` — full real-time report (all change-only elements plus the alarm substate). Answered even in
   /// otherwise-locked states so a sender can detect an extended (grblHAL) controller on connect.
   FullStatusReport,
@@ -577,6 +583,29 @@ impl ControlState {
     }
   }
 
+  /// Apply a graceful program stop (`0x86`, Galdr extension): from `Normal` (running or idle) or either `Hold`
+  /// substate, return to [`Normal`](ControlState::Normal) — a motion-capable Idle once motion drains. NEVER an
+  /// alarm: this is the controlled "stop the job" the operator wants, distinct from the `0x18` abort that raises
+  /// `ALARM:3` on a mid-cycle reset and loses positional certainty. From any other mode (alarm, check, sleep, or
+  /// an in-flight jog — which has its own `0x85` cancel) it is a benign no-op (returns `self`). A program stop
+  /// never changes the coordinate model or loses position, so leaving the running/held state needs no alarm and
+  /// the position is retained; the bin clears the modal/program-run state separately (mirroring `M30`).
+  pub fn program_stop(self) -> Self {
+    match self {
+      ControlState::Normal | ControlState::Hold(_) => ControlState::Normal,
+      other => other,
+    }
+  }
+
+  /// Whether a graceful program stop (`0x86`) needs the executor parked at a block boundary and the planner queue
+  /// flushed — i.e. whether the machine is in a state that could have a program running or held. True for `Normal`
+  /// (which may be executing a program) and `Hold`; false for the inert states (alarm, check, sleep) and for `Jog`
+  /// (a jog is not a program — it has its own `0x85` cancel). Pulled out as a pure predicate so the bin gates its
+  /// boundary-quiesce + flush work on it without duplicating the state logic, and so the gate is host-tested here.
+  pub fn program_stop_quiesces(self) -> bool {
+    matches!(self, ControlState::Normal | ControlState::Hold(_))
+  }
+
   /// Whether a `$H` homing cycle may START from this state (DOC-06). grbl runs `$H` from Idle/Normal AND from
   /// the homing-required boot alarm (`$H` is THE way to clear `ALARM:11`), but refuses it from the locked
   /// critical alarms (hard/soft limit, e-stop — those need a soft reset first), from a feed-hold, and from
@@ -814,6 +843,7 @@ pub fn classify_realtime(byte: u8) -> Option<RealtimeCommand> {
     0x83 => Some(RealtimeCommand::ParserStateReport),
     0x84 => Some(RealtimeCommand::SafetyDoor),
     0x85 => Some(RealtimeCommand::JogCancel),
+    0x86 => Some(RealtimeCommand::ProgramStop),
     0x87 => Some(RealtimeCommand::FullStatusReport),
     0x8C => Some(RealtimeCommand::ToggleAutoReport),
     // Feed (0x90-0x94), rapid (0x95-0x97), spindle (0x99-0x9E), coolant (0xA0-0xA1), tool/probe
@@ -1942,6 +1972,12 @@ mod tests {
     assert_eq!(classify_realtime(0x87), Some(RealtimeCommand::FullStatusReport));
     assert_eq!(classify_realtime(0x19), Some(RealtimeCommand::Stop));
     assert_eq!(classify_realtime(0x8C), Some(RealtimeCommand::ToggleAutoReport));
+    // `0x86` is the Galdr graceful program-stop real-time byte (a controlled decelerate-and-flush to Idle, no
+    // alarm), distinct from the `0x18` abort. It must classify even though it carries the top bit, and must NOT
+    // collide with jog-cancel (`0x85`) or the FullStatusReport (`0x87`) on either side of it.
+    assert_eq!(classify_realtime(0x86), Some(RealtimeCommand::ProgramStop));
+    assert_eq!(classify_realtime(0x85), Some(RealtimeCommand::JogCancel));
+    assert_eq!(classify_realtime(0x87), Some(RealtimeCommand::FullStatusReport));
   }
 
   #[test]
@@ -2732,6 +2768,54 @@ mod tests {
       ControlState::Alarm(AlarmCode::HomingRequired).cancel_jog(),
       ControlState::Alarm(AlarmCode::HomingRequired),
     );
+  }
+
+  // ---- Graceful program stop (Galdr `0x86`) ------------------------------------------------------
+
+  #[test]
+  fn program_stop_returns_run_or_hold_to_idle_never_alarm() {
+    // A graceful program stop (`0x86`) decelerates the running/held program to a controlled stop and returns the
+    // machine to a motion-capable Idle (`Normal`) — NEVER an alarm, unlike the `0x18` abort which raises ALARM:3
+    // mid-cycle. From `Normal` (Run or Idle) and from either `Hold` substate it lands in `Normal`.
+    assert_eq!(ControlState::Normal.program_stop(), ControlState::Normal);
+    assert_eq!(ControlState::Hold(false).program_stop(), ControlState::Normal);
+    assert_eq!(ControlState::Hold(true).program_stop(), ControlState::Normal);
+    // The resulting `Normal` reports `Idle` once motion drains (Run/Idle is derived from live execution), so a
+    // host sees the machine come to rest at Idle, not in any alarm or hold.
+    assert_eq!(ControlState::Hold(false).program_stop().machine_state(false), MachineState::Idle);
+  }
+
+  #[test]
+  fn program_stop_is_a_benign_noop_outside_run_or_hold() {
+    // From Idle the machine is already at rest in `Normal`, so a stop is a benign no-op (stays `Normal`). It must
+    // never disturb an alarm, check mode, sleep, or an in-flight jog (jog has its own `0x85` cancel) — a program
+    // stop is for a running PROGRAM, so every non-program state round-trips unchanged and no alarm is raised.
+    for state in [
+      ControlState::Alarm(AlarmCode::HomingRequired),
+      ControlState::Alarm(AlarmCode::HardLimit),
+      ControlState::Alarm(AlarmCode::AbortDuringCycle),
+      ControlState::Check,
+      ControlState::Sleep,
+      ControlState::Jog,
+    ] {
+      assert_eq!(state.program_stop(), state, "{state:?}: program stop must be a no-op outside Run/Hold");
+    }
+  }
+
+  #[test]
+  fn program_stop_quiesces_only_from_run_or_hold() {
+    // The bin gates the heavy boundary-quiesce + planner-flush work on this predicate: only `Normal` (which may be
+    // running a program) and `Hold` need the executor parked and the queue flushed. Idle-`Normal` still answers
+    // true (it is cheaply a no-op there — nothing queued), but the genuinely inert states answer false so a stray
+    // `0x86` while alarmed/checking/sleeping/jogging does nothing.
+    assert!(ControlState::Normal.program_stop_quiesces());
+    assert!(ControlState::Hold(false).program_stop_quiesces());
+    assert!(ControlState::Hold(true).program_stop_quiesces());
+    assert!(!ControlState::Jog.program_stop_quiesces());
+    assert!(!ControlState::Check.program_stop_quiesces());
+    assert!(!ControlState::Sleep.program_stop_quiesces());
+    assert!(!ControlState::Alarm(AlarmCode::HomingRequired).program_stop_quiesces());
+    assert!(!ControlState::Alarm(AlarmCode::AbortDuringCycle).program_stop_quiesces());
   }
 
   #[test]

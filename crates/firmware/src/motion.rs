@@ -361,7 +361,8 @@ impl StepSink for RmtStepSink {
 /// ## Loop shape
 /// 1. Service a pending soft reset (dedicated [`MOTION_RESET`] / [`MOTION_RESET_PENDING`], NOT the shared
 ///    `SOFT_RESET` — an embassy `Signal` wakes one waiter, so the executor needs its own — Finding #3):
-///    zero the live position so MPos returns to the origin in step with the consumer's pipeline reset.
+///    RETAIN the live position (Change A) — a `0x18` abort keeps MPos at the (suspect, mid-move) stop point so
+///    `$X` unlocks there, matching grbl; the consumer's `reset_pipeline` syncs the rebuilt planner to it.
 /// 2. At each block boundary (never mid-burst), honor the hold LEVEL: while [`HOLD_REQUESTED`](crate::comms::
 ///    HOLD_REQUESTED) is set, PARK — acknowledge the park via [`MOTION_PARKED`](crate::comms::MOTION_PARKED) so
 ///    the consumer's quiesce primitive observes a real "parked" fact (Finding #11/#3), then wait on
@@ -381,7 +382,8 @@ impl StepSink for RmtStepSink {
 /// 5. Run the block synchronously through the [`SegmentGenerator`], advancing the live [`StepCounter`] and
 ///    publishing the live step position into the [`LIVE_POSITION`] atomics after EACH burst (so MPos is live
 ///    within a long block, not frozen until the block ends — Finding #5). A reset pending between bursts
-///    aborts the block early via a sink error, then the next loop iteration zeroes the position.
+///    aborts the block early via a sink error; the live position is then RETAINED (Change A) at the last
+///    published step position, not zeroed — the next loop iteration's reset service re-publishes the retained value.
 /// 6. A probe ([`run_probe`]) walks a probe block one tick per burst, sampling the probe input between every
 ///    step and stopping on the expected edge, then publishes the latched stop position + outcome via
 ///    [`PROBE_RESULT`](crate::comms::PROBE_RESULT) for the consumer to turn into `[PRB:]` / position sync / alarm.
@@ -418,13 +420,14 @@ pub async fn run(
   // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
   mtrace!("motion: executor loop entered");
   loop {
-    // Service a pending soft reset at the top of the loop: drop the live position so MPos returns to the
-    // origin in step with the consumer's pipeline reset. `MOTION_RESET_PENDING` is the poll-able flag the
-    // sink also tests mid-block; clearing it AND draining the `MOTION_RESET` signal here keeps the two in
-    // sync so a reset is serviced exactly once.
+    // Service a pending soft reset at the top of the loop: RETAIN the live position (Change A) rather than zero
+    // it, matching grbl — a `0x18` abort keeps MPos so `$X` unlocks at the same coordinates. The consumer's
+    // `reset_pipeline` rebuilds the planner and SYNCS it to this retained position, so the two stay consistent.
+    // `MOTION_RESET_PENDING` is the poll-able flag the sink also tests mid-block; clearing it AND draining the
+    // `MOTION_RESET` signal here keeps the two in sync so a reset is serviced exactly once.
     if MOTION_RESET_PENDING.swap(false, Ordering::AcqRel) {
       MOTION_RESET.try_take();
-      reset_live_position(&mut counter);
+      retain_live_position(&counter);
       // Re-seed the hard-limit arming to the settled levels: a `0x18` after an aborted `$H` leaves a switch
       // parked-engaged, and the warm reset returns to Idle / boot-lock, so that held level is "already known" —
       // re-seeding here means the first post-reset block boundary sees no FRESH edge from it (the principled fix
@@ -525,7 +528,9 @@ pub async fn run(
           Either::First(Either::First(Either::First(Either4::Second(())))) => {
             mtrace!("motion: woke on MOTION_RESET (idle)");
             MOTION_RESET_PENDING.store(false, Ordering::Release);
-            reset_live_position(&mut counter);
+            // RETAIN the live position on the idle reset path too (Change A): a reset from Idle keeps MPos at the
+            // resting position rather than zeroing it, matching the top-of-loop reset service and grbl.
+            retain_live_position(&counter);
             // Re-seed the hard-limit arming on the idle reset path too (same invariant as the top-of-loop reset).
             limit_armed = sample_limit_triggered(limits);
           }
@@ -957,8 +962,9 @@ fn probe_block_to(start: [i32; AXES], target: [i32; AXES]) -> Block {
 /// through to the real RMT sink, so MPos is derived from exactly the events the hardware emits (not
 /// re-derived from the block) and stays live WITHIN a block. It forwards `set_direction`/`emit_burst` to the
 /// inner sink, tallies steps, pushes the running step position into [`LIVE_POSITION`], and — between bursts —
-/// aborts the block early on a pending soft reset (Finding #3) so a reset during a multi-second block zeroes
-/// the position within one burst rather than after the whole block.
+/// aborts the block early on a pending soft reset (Finding #3) so a reset during a multi-second block stops the
+/// motion within one burst rather than after the whole block. The live position is then RETAINED (Change A) at the
+/// last published step position, not zeroed — matching grbl's "reset keeps MPos" behavior.
 struct CountingSink<'a> {
   inner: &'a mut RmtStepSink,
   counter: &'a mut StepCounter,
@@ -995,8 +1001,9 @@ impl StepSink for CountingSink<'_> {
 
   fn emit_burst(&mut self, ticks: &[StepEvent]) -> Result<(), StepError> {
     // Abort BETWEEN bursts on a pending soft reset (never mid-burst — a burst in flight is never split):
-    // returning a sink error stops `run_block` early, and the executor's next iteration zeroes the position.
-    // This bounds reset latency to one burst even inside a long block (Finding #3).
+    // returning a sink error stops `run_block` early, and the executor's next iteration RETAINS the live
+    // position (Change A) at the last published step position rather than zeroing it. This bounds reset latency
+    // to one burst even inside a long block (Finding #3).
     if MOTION_RESET_PENDING.load(Ordering::Acquire) {
       return Err(StepError::Transport);
     }
@@ -1017,11 +1024,18 @@ impl StepSink for CountingSink<'_> {
   }
 }
 
-/// Zero the live step counter and the published [`LIVE_POSITION`] atomics together, so a soft reset returns
-/// MPos to the origin atomically from the reader's view. The executor is the SINGLE owner of the live
-/// position (Finding #3): the consumer's `reset_pipeline` never writes it, so there is no cross-core race.
-fn reset_live_position(counter: &mut StepCounter) {
-  counter.reset();
+/// RETAIN the live step position across a soft reset and re-publish it, matching grbl: a `0x18` abort RETAINS
+/// MPos (it does NOT zero it) so `$X` then unlocks at the SAME coordinates and `$H` re-establishes certainty.
+/// This is the Change A fix — the executor used to zero the counter + atomics here, which lost the operator's
+/// zero on every Stop on a no-homing machine (`$22=0`), diverging from grbl. After an abort DURING motion the
+/// retained value is the last per-burst-published live step position — "suspect" because the steps were
+/// interrupted mid-move (exactly as grbl documents: `$X` unlocks at it, `$H` re-homes to recover) — and after a
+/// reset from Idle it is simply the resting position. The re-publish is a coherent no-op (the atomics already
+/// hold the live value) kept for symmetry with the previous reset-service shape and to pair `Release` stores with
+/// the reader's `Acquire` loads. The executor remains the SINGLE owner of the live position (Finding #3); the
+/// consumer's `reset_pipeline` rebuilds the planner and SYNCS it to this retained position so a subsequent
+/// absolute move resolves relative to the retained MPos, not the origin.
+fn retain_live_position(counter: &StepCounter) {
   publish_live_position(counter);
 }
 

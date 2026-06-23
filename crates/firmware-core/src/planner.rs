@@ -774,6 +774,25 @@ impl Planner {
     flushed
   }
 
+  /// Drain EVERY queued block on a graceful program stop (`0x86`), returning how many were removed. Unlike
+  /// [`flush_jog_blocks`](Planner::flush_jog_blocks) (which spares program blocks and drains only trailing jogs),
+  /// this clears the WHOLE queue — program moves and jogs alike — so the executor has nothing more to pop after it
+  /// decelerates the active block to its boundary. The machine POSITION is deliberately not touched (the executor
+  /// owns the live position; the caller follows this with [`sync_position`](Planner::sync_position) to the actual
+  /// stop point), and the trailing junction state is reset so the next planned move corners from rest, matching the
+  /// executor stopping the active block at its boundary. A no-op on an empty queue, so the caller may invoke it
+  /// unconditionally on the stop path.
+  pub fn flush_queue(&mut self) -> usize {
+    let flushed = self.queue.len();
+    self.queue.clear();
+    // The active block already popped by the executor keeps running to its boundary; dropping the trailing
+    // junction state means a post-stop move corners from rest. `head_busy` is left as-is: an emptied queue clears
+    // it on the next pop anyway, and the executor's committed entry for an in-flight block must not be disturbed.
+    self.prev_unit_vec = [0.0; AXES];
+    self.prev_nominal_speed_sq = 0.0;
+    flushed
+  }
+
   /// Resolve a line's axis words into an absolute machine target in *steps*, applying units, distance mode, and
   /// — for an ABSOLUTE work move — the active Work Coordinate Offset (WCO). A `machine_coords` (G53) move treats
   /// the words as MACHINE positions and skips the offset; an incremental move adds to the current machine
@@ -1663,6 +1682,74 @@ mod tests {
     planner.plan_jog(&jog(Some(2.0), None, None, 600.0, false), None).expect("jog");
     assert_eq!(planner.flush_jog_blocks(), 2);
     assert!(planner.is_empty());
+  }
+
+  // ---- Graceful program stop: flush the whole queue, abort the arc, retain position --------------
+
+  #[test]
+  fn flush_queue_drains_every_queued_block_program_and_jog_alike() {
+    // A graceful program stop (`0x86`) flushes the WHOLE queue, not just jog blocks: program moves and any
+    // trailing jog blocks are all discarded so the executor has nothing more to pop after the active block. This
+    // is the program-stop counterpart to `flush_jog_blocks` (which spares program blocks).
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(1.0), None, None, 600.0, false)).expect("move");
+    planner.plan_command(&mm_move(Some(2.0), None, None, 600.0, false)).expect("move");
+    planner.plan_jog(&jog(Some(3.0), None, None, 600.0, false), None).expect("jog");
+    assert_eq!(planner.queued_len(), 3);
+    let flushed = planner.flush_queue();
+    assert_eq!(flushed, 3, "every queued block is flushed regardless of jog tag");
+    assert!(planner.is_empty(), "the queue is empty after a full flush");
+  }
+
+  #[test]
+  fn flush_queue_resets_trailing_junction_so_next_move_corners_from_rest() {
+    // After flushing the queue at a program stop the executor decelerates the active block to a boundary stop, so
+    // the next planned move must corner from rest (the trailing junction state is dropped, like `flush_jog_blocks`
+    // and `sync_position` do). Position is NOT touched by the flush — that is the executor/`sync_position` job.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("move");
+    planner.plan_command(&mm_move(Some(20.0), None, None, 600.0, false)).expect("move");
+    planner.flush_queue();
+    planner.plan_command(&mm_move(Some(30.0), None, None, 600.0, false)).expect("move");
+    let block = planner.peek_block().expect("a block");
+    assert!(block.entry_speed_sq < 1e-3, "the post-stop move starts at rest");
+  }
+
+  #[test]
+  fn flush_queue_on_an_empty_queue_is_a_noop() {
+    // A program stop issued from Idle (nothing queued) is benign: the flush removes nothing and the planner is
+    // unchanged, so the bin can call it unconditionally on the quiesce path.
+    let mut planner = Planner::new(test_config());
+    assert_eq!(planner.flush_queue(), 0);
+    assert!(planner.is_empty());
+  }
+
+  #[test]
+  fn rebuilt_planner_synced_to_retained_position_resolves_absolute_moves_from_it() {
+    // Change A regression: a soft reset RETAINS the live machine position (it no longer zeroes MPos). The bin
+    // rebuilds the planner (which starts at the step origin) then `sync_position`s it to the RETAINED live step
+    // position, so a subsequent ABSOLUTE move resolves relative to the retained position, not 0. Model that here:
+    // drive to X10 Y5 (1000, 500 steps), then rebuild + sync to the retained position and confirm an absolute
+    // X10 Y5 is now a no-op move (same target) rather than a fresh 10 mm move from the origin.
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(10.0), Some(5.0), None, 600.0, false)).expect("queued");
+    let retained = planner.position_steps();
+    assert_eq!(retained, [1000, 500, 0, 0]);
+    // The reset rebuilds the planner from defaults, which starts at the origin...
+    let mut rebuilt = Planner::new(test_config());
+    assert_eq!(rebuilt.position_steps(), [0, 0, 0, 0]);
+    // ...then the consumer syncs it to the RETAINED position so commanded position matches the retained MPos.
+    rebuilt.sync_position(retained);
+    assert_eq!(rebuilt.position_steps(), retained);
+    // An absolute move back to the same coordinates now resolves to the SAME target (a no-op), proving the move
+    // is relative to the retained position. Were the position zeroed, this would resolve to a fresh 1000/500 move.
+    let target = rebuilt.resolve_target(
+      &AxisWords { x: Some(10.0), y: Some(5.0), z: None, a: None },
+      Units::Millimeter,
+      DistanceMode::Absolute,
+      false,
+    );
+    assert_eq!(target, retained, "absolute move resolves from the retained position, not the origin");
   }
 
   #[test]
