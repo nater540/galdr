@@ -28,16 +28,28 @@ use crate::protocol::realtime::RealtimeCommand;
 use crate::protocol::response::{Response, is_grbl_evidence, rx_buffer_from_opt};
 use crate::protocol::status::{RunState, parse_status};
 
-/// One side effect the core wants the driver to perform or surface. The driver writes [`Effect::Write`]
-/// bytes to the transport and forwards every other variant to the UI event channel.
+/// One side effect the core wants the driver to perform or surface. The driver writes the two byte-write
+/// variants to the transport (with different priority — see below) and forwards every other variant to the UI
+/// event channel.
+///
+/// Writes are split by provenance so the driver can honour the grbl real-time contract: a [`Effect::WriteLine`]
+/// is a counted program/manual line that must wait for window room and may park under serial backpressure,
+/// while a [`Effect::WriteRealtime`] is an out-of-band single-byte command that must reach the wire ahead of any
+/// queued line bytes and must never be blocked behind a pending line write. Keeping the distinction in the pure
+/// core makes the priority contract directly testable rather than re-derived from call-site at the driver.
 ///
 /// `Eq` is not derived: [`Effect::Response`] can carry a [`Response::ProbeResult`] whose `Vec<f64>` is not `Eq`.
 /// `PartialEq` is retained for tests; nothing keys an `Effect` in a hash/tree set.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-  /// Raw bytes to write to the transport, in order. Used for both program/manual lines (which were already
-  /// counted against the window) and real-time bytes (which were not).
-  Write(Vec<u8>),
+  /// A counted program/manual line to write, already accounted against the character-count window. The driver
+  /// releases it through the prioritised write path: it waits its turn behind real-time bytes and may park under
+  /// serial backpressure without blocking the rest of the loop.
+  WriteLine(Vec<u8>),
+  /// An out-of-band real-time byte sequence (status `?`, soft-reset `0x18`, feed-hold `!`, overrides, ...), never
+  /// counted against the window. The driver must emit it ahead of any queued line bytes and must never let a
+  /// pending line write block it — that is what keeps Stop/feed-hold/poll responsive mid-stream.
+  WriteRealtime(Vec<u8>),
   /// The lifecycle moved to a new state; the driver should surface this to the UI.
   StateChanged(ConnectionState),
   /// A parsed firmware response worth surfacing (status, message, banner, error, alarm, ...).
@@ -157,7 +169,7 @@ impl ProtocolCore {
   pub fn begin_handshake(&mut self) -> Vec<Effect> {
     let mut out = Vec::new();
     // Uncounted real-time probes first: a status request and a full-report request, emitted out-of-band.
-    out.push(Effect::Write(vec![RealtimeCommand::StatusReport.byte(), RealtimeCommand::FullReport.byte()]));
+    out.push(Effect::WriteRealtime(vec![RealtimeCommand::StatusReport.byte(), RealtimeCommand::FullReport.byte()]));
     // Then the counted build-info query, so its `ok` lands against a line we actually tracked.
     out.extend(self.on_send_line("$I"));
     out
@@ -226,7 +238,7 @@ impl ProtocolCore {
         // Manual/jog lines occupy the window but are not program progress; record their kind so their ack is
         // routed away from program accounting and the error-hold.
         self.inflight_kinds.push_back(InflightKind::Other);
-        out.push(Effect::Write(encoded));
+        out.push(Effect::WriteLine(encoded));
       }
       Ok(false) => out.push(Effect::Fault(EngineError::LineTooLong {
         len: encoded.len(),
@@ -240,7 +252,7 @@ impl ProtocolCore {
   /// window. Also reflects the obvious lifecycle effects of feed-hold / resume / soft-reset locally so the
   /// UI sees them without waiting for a status poll.
   pub fn on_realtime(&mut self, cmd: RealtimeCommand) -> Vec<Effect> {
-    let mut out = vec![Effect::Write(vec![cmd.byte()])];
+    let mut out = vec![Effect::WriteRealtime(vec![cmd.byte()])];
     match cmd {
       RealtimeCommand::FeedHold if self.state == ConnectionState::Streaming => {
         self.transition(ConnectionState::Hold, &mut out);
@@ -395,7 +407,7 @@ impl ProtocolCore {
   }
 
   /// Release as many queued program lines as currently fit the window, in order. Each released line is
-  /// counted against the window and emitted as a single [`Effect::Write`].
+  /// counted against the window and emitted as a single [`Effect::WriteLine`].
   fn release_ready_lines(&mut self, out: &mut Vec<Effect>) {
     while let Some(next) = self.program.front() {
       // `fits` only errors on an impossibly-long line, which load-time validation already excluded; treat
@@ -410,7 +422,7 @@ impl ProtocolCore {
       self.flow.on_line_sent(line.len());
       self.inflight_kinds.push_back(InflightKind::Program);
       self.program_sent += 1;
-      out.push(Effect::Write(line));
+      out.push(Effect::WriteLine(line));
     }
   }
 
@@ -495,10 +507,12 @@ fn encode_line(line: &str) -> Vec<u8> {
 mod tests {
   use super::*;
 
-  /// Collect just the `Write` payloads from a slice of effects, in order.
+  /// Collect every write payload (line or real-time) from a slice of effects, in order. The split into
+  /// [`Effect::WriteLine`] / [`Effect::WriteRealtime`] is a driver-priority concern; the core tests assert on the
+  /// byte stream regardless of which path carries it, so both variants are flattened here.
   fn writes(effects: &[Effect]) -> Vec<Vec<u8>> {
     effects.iter().filter_map(|e| match e {
-      Effect::Write(bytes) => Some(bytes.clone()),
+      Effect::WriteLine(bytes) | Effect::WriteRealtime(bytes) => Some(bytes.clone()),
       _ => None,
     }).collect()
   }
