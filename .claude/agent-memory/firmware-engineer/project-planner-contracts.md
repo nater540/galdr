@@ -1,6 +1,6 @@
 ---
 name: project-planner-contracts
-description: Galdr motion planner (DOC-05) design decisions — RESUMABLE arc back-pressure (2026-06-23 deadlock fix), squared speeds, entry-speed semantics, planner-owns-geometry.
+description: Galdr motion planner (DOC-05) decisions — RESUMABLE arc (2026-06-23 deadlock fix + Bugs 4/9/10: SLOT_FREED proactive refill, genuine-error propagation, no expect), squared speeds, planner-owns-geometry.
 metadata:
   type: project
 ---
@@ -52,5 +52,31 @@ immediate look-ahead). Equivalence is exact because reverse/forward passes alway
 final queue state matters (host test `recalculate_once_equals_recalculate_per_segment` proves it). The
 `queue.len() < BLOCK_QUEUE_LEN` free-slot guard in the chunk loop is the termination backstop — a full queue
 enqueues nothing and returns `ArcPending{enqueued:0}` rather than ever hitting QueueFull mid-chunk.
+
+**Resumable-arc review fixes (2026-06-23, Bugs 4/9/10):**
+- **Bug 10 (no expect in lib):** `enqueue_arc_chunk` no longer `expect`s `arc_in_progress`. It now takes the arc
+  BY VALUE — `fn enqueue_arc_chunk(&mut self, mut arc: ArcInProgress) -> Result<PlannerOutcome, PlannerError>`.
+  Callers resolve the `Option` (`plan_arc` constructs it, `resume_arc` matches `Some(arc) => …`), so the missing
+  case is unrepresentable. No panic path.
+- **Bug 9 (no infinite loop on a genuine error):** the chunk loop now MATCHES `enqueue_move`'s error:
+  `Err(QueueFull) => break` (legit back-pressure → `ArcPending`, segment NOT advanced so retried), but
+  `Err(other) => { self.arc_in_progress=None; self.recalculate(); return Err(other) }` — a genuine per-segment
+  error CLEARS the arc and PROPAGATES. `resume_arc` returns the `Err`; comms `drive_pending_arc`'s `Err(other)`
+  arm surfaces `error:N` and exits the loop. Test seam: `#[cfg(test)] inject_seg_error: Option<PlannerError>` on
+  `Planner` (compiled out of the binary) forces the next segment enqueue to fail (today `enqueue_move` can only
+  fail QueueFull, so the genuine-error branch is otherwise untestable). Host test
+  `arc_chunk_surfaces_a_genuine_segment_error_and_clears_the_arc`.
+- **Bug 4 (no chunk-boundary decelerate-to-stop on large arcs):** mechanism is PROACTIVE refill, NOT a planner
+  change. New `SLOT_FREED: Signal` in comms.rs raised by the core-1 executor on EVERY block pop (motion.rs, in
+  the `Some((block,…))` arm before run_block). `drive_pending_arc` now races
+  `select(select(SLOT_FREED.wait(), Timer::after(QUEUE_FULL_RETRY)), SOFT_RESET.wait())` — it refills the instant
+  a slot frees instead of only after the 2ms poll, keeping the buffer topped up so the executor never drains to
+  the reverse-pass's forced-stop chunk tail. RESIDUAL (documented in `drive_pending_arc` doc): the GENUINE last
+  available block always decelerates to a stop (safety invariant); at an extreme feed where the executor could
+  empty the queue between pop and refill, motion momentarily stops (safe, no step loss). Host VELOCITY-equivalence
+  test `over_subdivided_arc_carries_velocity_across_chunk_boundaries`: drives the arc pop-one/refill-one and
+  asserts ZERO interior zero-EXIT speeds (the metric is the next block's planned entry = what the executor decels
+  to), vs the OLD drain-all-then-refill cadence which stamps ≥1 (one per ~32-seg boundary). Geometry-equivalence
+  was already tested; this fills the missing velocity gap.
 
 See [[project-galdr-overview]], [[project-build-constraints]], [[project-motion-contracts]].

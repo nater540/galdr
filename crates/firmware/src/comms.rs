@@ -214,6 +214,19 @@ pub fn limit_levels() -> [bool; AXES] {
 /// lock after each wake and loops until it is drained, so a coalesced multi-block signal loses no block.
 pub static BLOCK_AVAILABLE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Motion-executor → consumer "a queue slot just freed" wake (Bug 4: chunk-boundary decelerate-to-stop on large
+/// arcs). Raised by the core-1 executor the instant it pops a block, so [`drive_pending_arc`] refills an
+/// in-progress over-subdivided arc PROACTIVELY — the moment a slot opens — rather than only after the fixed
+/// [`QUEUE_FULL_RETRY`] poll interval. Keeping the planner buffer topped up while an arc is pending stops the
+/// executor from draining down to the look-ahead's forced-stop chunk tail before the next chunk arrives, which
+/// otherwise stamps a dwell mark (a physical decelerate-to-stop and re-accelerate) at every ~`BLOCK_QUEUE_LEN`
+/// segment boundary of the milled curve. A `Signal` (not a counter) suffices: `drive_pending_arc` re-checks the
+/// queue under the lock after each wake and resumes until the arc completes, so a coalesced multi-pop wake is
+/// fine. It is ONLY consumed by the arc-drive loop, so a slot-freed wake raised while no arc is pending is simply
+/// overwritten by the next pop and costs nothing. The timer race remains as a backstop so a missed/foregone
+/// signal (e.g. the executor parked on a hold) can never wedge the drive loop.
+pub static SLOT_FREED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// Limit-switch rising-edge trip → executor idle-trip seam (DOC-06). The core-1 executor's idle loop awaits a
 /// rising edge on the X/Y/Z limit pins via the interrupt-driven `Input::wait_for_rising_edge`, runs the `$26`
 /// debounce resample, and on a CONFIRMED trip signals this static (`wait_for_limit_trip` in [`crate::motion`]) —
@@ -1673,16 +1686,33 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
 /// than the queue. The resume wait is raced against [`SOFT_RESET`] so a `0x18` aborts a stuck arc at once — the
 /// executor's reset clears the queue and the planner rebuild drops the in-progress arc, so the abort is clean.
 ///
-/// Defensive backstop against an infinite spin: a `resume_arc` that enqueues zero (the queue is still full of the
-/// chunk we just fed) is fine — it simply yields again — but the loop only ever PROGRESSES because each yield lets
-/// the executor pop blocks, and `resume_arc` enqueues at least one segment the moment a slot frees. The
-/// short-relative-to-block-time `QUEUE_FULL_RETRY` delay keeps the yield from busy-spinning the CPU.
+/// ## Proactive (event-driven) refill — Bug 4
+/// The refill is woken by [`SLOT_FREED`] (raised the instant the executor pops a block) raced against a short
+/// [`QUEUE_FULL_RETRY`] timer backstop and [`SOFT_RESET`]. Refilling the moment a slot opens — rather than only
+/// after the full poll interval — keeps the planner buffer topped up while the arc is pending, so the executor
+/// never drains down to the look-ahead's forced-stop chunk tail before the next chunk lands. That is what makes a
+/// large arc execute as CONTINUOUS motion across chunk boundaries (proven host-side in
+/// `over_subdivided_arc_carries_velocity_across_chunk_boundaries`) instead of stamping a decelerate-to-stop dwell
+/// mark at each ~`BLOCK_QUEUE_LEN` boundary. RESIDUAL: the genuine last available block always decelerates to a
+/// stop (the executor must be able to halt there — a hard safety invariant); at an extreme feed where the
+/// executor could empty the queue between a pop and the refill completing, motion would still momentarily stop —
+/// safe, never a step loss — but at realistic PCB-milling feeds/segment timing the producer stays ahead and the
+/// curve is smooth.
+///
+/// ## Termination — Bug 9
+/// The loop exits ONLY on `Queued` (the arc completed), `SOFT_RESET`, or an `Err` from `resume_arc`. A genuine
+/// (non-`QueueFull`) per-segment error now PROPAGATES out of `resume_arc` with the in-progress arc cleared, so the
+/// `Err(other)` arm returns `error:N` and the loop ends — a deterministic segment error can no longer spin here
+/// forever. A `resume_arc` that enqueues zero (the queue is still full) is benign: it simply waits for the next
+/// `SLOT_FREED`/timer wake, and the loop PROGRESSES because each executor pop frees a slot the next resume claims.
 async fn drive_pending_arc() -> PlanResult {
   loop {
-    // Yield so the core-1 executor drains the chunk we just queued, racing a soft reset so `0x18` aborts at once.
-    // The delay is short relative to a block's execution time, so a freed slot is claimed promptly.
-    match select(Timer::after(QUEUE_FULL_RETRY), SOFT_RESET.wait()).await {
-      Either::First(()) => {}
+    // Refill on the executor's "slot freed" wake the instant it pops a block (proactive refill, Bug 4), with a
+    // short timer backstop so a foregone signal (e.g. the executor parked on a hold) cannot wedge the loop, and a
+    // soft reset so `0x18` aborts at once. The timer is short relative to a block's execution time, so even on the
+    // backstop path a freed slot is claimed promptly.
+    match select(select(SLOT_FREED.wait(), Timer::after(QUEUE_FULL_RETRY)), SOFT_RESET.wait()).await {
+      Either::First(_) => {}
       Either::Second(()) => return PlanResult::Aborted,
     }
     // Feed the next chunk under the planner lock (scoped so it is dropped before any await). A missing planner is
@@ -1708,9 +1738,11 @@ async fn drive_pending_arc() -> PlanResult {
           BLOCK_AVAILABLE.signal(());
         }
       }
-      // `resume_arc` only ever returns an arc outcome and never errors; any other result is an invariant break,
+      // `resume_arc` only ever returns an arc outcome on success; any other Ok variant is an invariant break,
       // surfaced loudly rather than silently acking a half-fed arc.
       Ok(_) => return PlanResult::Error(ERROR_PLANNER_UNINITIALIZED),
+      // A genuine per-segment planner error (Bug 9): `resume_arc` has already cleared the in-progress arc, so we
+      // surface `error:N` and STOP driving — the deterministic error can never spin this loop forever.
       Err(other) => return PlanResult::Error(other.code()),
     }
   }

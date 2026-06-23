@@ -67,7 +67,7 @@ use crate::comms::{
   overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HARD_LIMITS_ENABLED,
   HARD_LIMIT_TRIPPED, HOLD_REQUESTED, HOLD_WAKE, HOMING_ACTIVE, HOME_REQUEST, HOME_RESULT, LIMIT_LEVELS,
   LIMIT_TRIGGERED, LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
-  MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT,
+  MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT, SLOT_FREED,
 };
 
 /// Core-1 motion-executor trace point. Expands to a `defmt::trace!` only under the `defmt` feature and to
@@ -463,6 +463,12 @@ pub async fn run(
 
     match popped {
       Some((block, exit_speed_sq)) => {
+        // A queue slot just freed: wake the consumer's arc-drive loop so an in-progress over-subdivided arc
+        // refills PROACTIVELY (Bug 4) — the instant a slot opens, while THIS block executes — instead of only
+        // after the consumer's poll interval. Keeping the buffer topped up stops the executor draining to the
+        // look-ahead's forced-stop chunk tail, so a large arc stays continuous across chunk boundaries. Raised
+        // unconditionally on every pop; it is consumed only while an arc is pending and is otherwise a no-op.
+        SLOT_FREED.signal(());
         // A block was popped: trace its dominant-axis event count and rapid flag so the log shows the block
         // actually reached the executor. If this prints but "run_block returned" never does, the stall is
         // INSIDE run_block (the generator + RMT emit path).
