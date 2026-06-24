@@ -121,13 +121,47 @@ works in the DEFAULT (no-defmt) build.
   but the transmit/wait loops iterate `0..AXES`=0..4, so axis 3 (A) transmits STALE `scratch[3]` (all-end-marker from
   init → completes instantly, harmless for T1_Test which has no A motion, but A never steps correctly). Fix later.
 
+**IMPLEMENTED 2026-06-24 (TASK-WATCHDOG fix — REAL-BOARD WEDGE exposed a hole; compiled both configs, -D warnings + clippy
+clean, 522 host tests green):** HARDWARE EVIDENCE: user flashed the watchdog/crash fw, streamed a large file, wedged at
+line ~1387; RWDT did NOT auto-reset, needed a physical EN-reset (wiped the RTC crumb → no crumb). Host side: skirnir
+WRITES kept succeeding (usb_rx alive, draining FIFO) but got NO responses (DRO frozen) → the comms PROCESSING/RESPONSE
+path died while the Embassy executor stayed ALIVE. ROOT CAUSE: the old `watchdog_feed` fed UNCONDITIONALLY (except the
+core-1 check) AND self-bumped CORE0_LIVENESS, so a core-0 task stuck on a never-resolving `.await` (executor still
+scheduling the feed task) kept the dog fed → never fired. The executor-death case and core-1 case were covered; the
+CORE-0 STUCK-AWAIT case was NOT.
+FIX = proper task-watchdog (feed only on REAL forward progress, gated by host activity):
+- Renamed `CORE0_LIVENESS` → `COMMS_PROGRESS` and REMOVED the feed-task self-bump. Bumped ONLY on genuine host-facing
+  work: `status_responder` serving a `?` (top of loop), `usb_tx` writing a response, `comms_consumer` finishing a line.
+  Three independent bumpers — legitimate back-pressure (consumer blocked in QueueFull) still leaves `?` answered, so a
+  stall needs ALL THREE frozen = the genuine wedge.
+- Added `pub static RX_ACTIVITY: AtomicU32` bumped per non-empty `usb_rx` read (host-present signal; usb_rx keeps
+  draining even when comms is wedged, which is WHY RX is the right "host driving" gate).
+- `watchdog_feed` now withholds the feed in THREE classes: (1) core-0 executor death (task never runs); (2) core-1
+  motion wedge (`EXECUTOR_RUNNING && MOTION_LIVENESS frozen CORE1_STALL_TICKS=8 ≈4s`); (3) NEW core-0 comms stall
+  (`COMMS_PROGRESS frozen COMMS_STALL_TICKS=6 ≈3s WHILE host_active`). Records `crash::WithholdReason` (Core1Motion /
+  Core0Comms) into a new breadcrumb WITHHOLD word (idx 4, RING_BASE→5; tagged 0x5748).
+- RESET-LOOP / FALSE-TRIP GUARDS (load-bearing): `host_active = rx_idle_ticks < RX_ACTIVE_TICKS=12` (~6 s sticky window
+  since last RX). Seeded `rx_idle_ticks = RX_ACTIVE_TICKS` so the host starts INACTIVE → a board booting with NO host
+  never counts as active before the first real RX byte (prevents a boot→reset→boot loop). The 6 s sticky window BRIDGES
+  the host's flow-control quiet gap: when comms wedges, skirnir streams only until its char-count window fills (~1-2 s,
+  the observed ~30 lines) then goes quiet — 6 s keeps host_active=true so the ~3 s comms trip still fires; a truly
+  disconnected board (RX never advances) goes inactive after 6 s and FEEDS FOREVER. Core-1 check unchanged
+  (block-in-flight gated). NOT feature-gated (judged safe given the gating); raise the *_TICKS consts if a bench
+  false-trip ever appears.
+- Boot dump now leads with the withhold class: `[MSG:CRASH core0-comms-wedge stage=... comms-froze-first beats
+  comms=N motion=M (RWDT-reset; not power-cycle)]` (or `core1-motion-wedge` + `axisN:wait_begin`). froze_first verdict
+  relabeled `comms-froze-first`/`motion-froze-first`/`both-froze`/`no-stall`. Snapshot beats now = (comms_progress,
+  motion_liveness). The earlier "GOAL B note above" (core-1-only) is SUBSUMED — both conditional withholds now coexist.
+
 CAPTURE PROCEDURE (no defmt needed): `just flash` (plain), connect skirnir, stream T1_Test NORMALLY. When it wedges, WAIT
-~8-12 s — do NOT power-cycle — for the RWDT auto-reset. After reboot, skirnir's console shows the banner then a
-`[MSG:CRASH stage=... <which-core>-froze-first beats c0=.. c1=..]` line (also replayed on the first `$I`/`?`). A frozen
-`stage=axisN:wait_begin` pins the wedge to RMT channel N's TX-END never firing — the prime suspect. `core1-froze-first`
-confirms core 1 died before core 0. The `[boot] reset reason: PRO_CPU=...` (esp-println) line shows `cpu-rtc-WDT` (dog
-fired) vs `cpu-sw-reset` (panic into esp-backtrace = fault-handler hang). `--features defmt` still adds the live mtrace
-chain if streaming over a SECOND path is ever possible, but is no longer required.
+~11-12 s — do NOT power-cycle/EN-reset — for the comms-stall (or core-1) feed-withhold (~3-4 s) + the 8 s RWDT. After
+reboot, skirnir's console shows the banner then a `[MSG:CRASH <class> stage=... <side>-froze-first beats comms=..
+motion=..]` line (also replayed on the first `$I`/`?`). `core0-comms-wedge` + `comms-froze-first` = the comms-pipeline
+wedge (the real-board case); `core1-motion-wedge` + `stage=axisN:wait_begin` pins an RMT channel-N TX-END wedge. The
+`[boot] reset reason: PRO_CPU=...` (esp-println) shows `cpu-rtc-WDT` (dog fired) vs `cpu-sw-reset` (panic into
+esp-backtrace = fault-handler hang). `--features defmt` adds live `watchdog:` warn/error lines but is NOT required.
+THRESHOLDS: WATCHDOG_TIMEOUT=8s, WATCHDOG_FEED_INTERVAL=500ms, CORE1_STALL_TICKS=8(~4s), COMMS_STALL_TICKS=6(~3s),
+RX_ACTIVE_TICKS=12(~6s sticky).
 
 **BEST NEXT STEP = BENCH INSTRUMENTATION (source review cannot pin it):** (1) add the watchdog (defect #1) and read the
 reset reason on the next lockup — distinguishes panic/fault (backtrace handler hang) from a pure spin. (2) Build

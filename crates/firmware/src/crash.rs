@@ -57,9 +57,14 @@ mod idx {
   /// Ring head: index (mod [`super::RING_LEN`]) of the NEXT snapshot slot to write. The newest snapshot is at
   /// `(head + RING_LEN - 1) % RING_LEN`.
   pub const HEAD: usize = 3;
+  /// Why the watchdog WITHHELD the feed to force this reset (a [`super::WithholdReason`], tagged). `0`/untagged
+  /// means the dog fired some other way (the feed task itself stopped, or a non-watchdog reset). Written by the
+  /// core-0 watchdog task just before it stops feeding, so the boot dump can name the wedge CLASS (core-1 RMT axis
+  /// vs core-0 comms stall) independently of the core-1 executor's [`LAST_STAGE`] marker.
+  pub const WITHHOLD: usize = 4;
   /// First word of the snapshot ring. Each snapshot is [`super::SNAP_WORDS`] words: `[seq, core0_beat,
   /// core1_beat]`. The current stage is carried by the always-updated [`LAST_STAGE`] word, not per snapshot.
-  pub const RING_BASE: usize = 4;
+  pub const RING_BASE: usize = 5;
 }
 
 /// Words per snapshot in the ring: `[seq, core0_beat, core1_beat]`. The per-snapshot stage is omitted — the
@@ -130,6 +135,44 @@ pub fn record_stage(stage: Stage, axis: u8) {
   BREADCRUMB[idx::LAST_STAGE].store(pack_stage(stage, axis), Ordering::Relaxed);
 }
 
+/// Why the core-0 watchdog task WITHHELD the feed to deliberately force a reset. Recorded in the breadcrumb so the
+/// boot dump can name the wedge CLASS, distinct from the core-1 executor's last [`Stage`]. Stable on-wire values
+/// (a reboot decodes them) — APPEND, never renumber.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WithholdReason {
+  /// The core-1 motion executor's beat froze WHILE a block was in flight — a core-1 / RMT wedge (the [`Stage`]
+  /// marker pins the exact axis/channel).
+  Core1Motion = 1,
+  /// The host was actively driving the firmware (RX bytes flowing) but the core-0 comms path stopped making
+  /// forward progress (no `?` served / no response emitted) — a core-0 stuck-await wedge, with the Embassy
+  /// executor still alive. This is the case the original unconditional feed could not catch.
+  Core0Comms = 2,
+}
+
+/// Tag in the high half of the [`idx::WITHHOLD`] word, distinct from the [`pack_stage`] tag, so a garbage/zeroed
+/// word never decodes as a plausible reason.
+const WITHHOLD_TAG: u32 = 0x5748_0000; // "WH".
+
+/// Record why the watchdog is about to withhold the feed (force a reset). A single relaxed store from the core-0
+/// watchdog task; read only after the reset, so no ordering is needed.
+pub fn record_withhold(reason: WithholdReason) {
+  BREADCRUMB[idx::WITHHOLD].store(WITHHOLD_TAG | (reason as u8 as u32), Ordering::Relaxed);
+}
+
+/// Decode the withhold word into a short label for the boot report, or `None` if the dog fired some other way
+/// (untagged / zero — e.g. the feed task itself stopped, which leaves no withhold marker).
+pub fn withhold_label(packed: u32) -> Option<&'static str> {
+  if packed & 0xFFFF_0000 != WITHHOLD_TAG {
+    return None;
+  }
+  match (packed & 0xFF) as u8 {
+    1 => Some("core1-motion-wedge"),
+    2 => Some("core0-comms-wedge"),
+    _ => None,
+  }
+}
+
 /// Stamp the validity [`MAGIC`] into the breadcrumb. Called once at boot AFTER the previous run's breadcrumb has
 /// been read back, so this run's markers/snapshots are recognized as valid on the NEXT boot. Idempotent.
 pub fn init_magic() {
@@ -137,9 +180,11 @@ pub fn init_magic() {
 }
 
 /// Append a liveness snapshot to the ring (called by the core-0 watchdog-feed task every ~500 ms, OFF the
-/// real-time path). Records the monotonic sequence number, both cores' liveness beats, and the current last-stage
-/// marker, then advances the ring head — so the ring holds the last [`RING_LEN`] snapshots before a reset and the
-/// boot dump can see which core's beat stopped advancing first. All relaxed stores (best-effort post-mortem).
+/// real-time path). Records the monotonic sequence number and the two side-of-the-board liveness beats
+/// (`core0_beat` = the core-0 host-facing [`COMMS_PROGRESS`](crate::comms::COMMS_PROGRESS), `core1_beat` = the core-1
+/// [`MOTION_LIVENESS`](crate::comms::MOTION_LIVENESS)), then advances the ring head — so the ring holds the last
+/// [`RING_LEN`] snapshots before a reset and the boot dump can see which side's beat stopped advancing first. All
+/// relaxed stores (best-effort post-mortem).
 pub fn push_snapshot(core0_beat: u32, core1_beat: u32) {
   let seq = BREADCRUMB[idx::SEQ].load(Ordering::Relaxed).wrapping_add(1);
   BREADCRUMB[idx::SEQ].store(seq, Ordering::Relaxed);
@@ -156,9 +201,9 @@ pub fn push_snapshot(core0_beat: u32, core1_beat: u32) {
 pub struct Snapshot {
   /// Monotonic sequence number when this snapshot was taken (0 = an empty/never-written ring slot).
   pub seq: u32,
-  /// The core-0 heartbeat at that snapshot.
+  /// The core-0 side beat at that snapshot — the host-facing [`COMMS_PROGRESS`](crate::comms::COMMS_PROGRESS).
   pub core0_beat: u32,
-  /// The core-1 (motion-executor) heartbeat at that snapshot.
+  /// The core-1 side beat at that snapshot — the [`MOTION_LIVENESS`](crate::comms::MOTION_LIVENESS) executor beat.
   pub core1_beat: u32,
 }
 
@@ -170,6 +215,9 @@ pub struct Breadcrumb {
   valid: bool,
   /// The most-recent stage marker (packed) — the LAST place the executor was before the reset.
   pub last_stage: u32,
+  /// The watchdog withhold reason (packed) — why the dog was deliberately starved to force this reset, if it was
+  /// (a [`WithholdReason`], or untagged when the feed task simply stopped). Decoded via [`withhold_label`].
+  pub withhold: u32,
   /// The snapshots, NEWEST first (index 0 is the most recent). Empty-seq entries are filtered by the formatter.
   pub snapshots: [Snapshot; RING_LEN],
 }
@@ -189,6 +237,7 @@ impl Breadcrumb {
 pub fn take_breadcrumb() -> Breadcrumb {
   let valid = BREADCRUMB[idx::MAGIC].load(Ordering::Relaxed) == MAGIC;
   let last_stage = BREADCRUMB[idx::LAST_STAGE].load(Ordering::Relaxed);
+  let withhold = BREADCRUMB[idx::WITHHOLD].load(Ordering::Relaxed);
   // The newest snapshot is at `(head + RING_LEN - 1) % RING_LEN`; walk backwards so index 0 is the most recent.
   let head = (BREADCRUMB[idx::HEAD].load(Ordering::Relaxed) as usize) % RING_LEN;
   let snapshots = core::array::from_fn(|i| {
@@ -200,9 +249,11 @@ pub fn take_breadcrumb() -> Breadcrumb {
       core1_beat: BREADCRUMB[base + 2].load(Ordering::Relaxed),
     }
   });
-  // Consume: clear the magic so this crumb is reported exactly once. `init_magic` re-stamps it for the new run.
+  // Consume: clear the magic AND the withhold word so this crumb is reported exactly once and a stale withhold
+  // reason cannot bleed into a later, unrelated reset. `init_magic` re-stamps the magic for the new run.
   BREADCRUMB[idx::MAGIC].store(0, Ordering::Relaxed);
-  Breadcrumb { valid, last_stage, snapshots }
+  BREADCRUMB[idx::WITHHOLD].store(0, Ordering::Relaxed);
+  Breadcrumb { valid, last_stage, withhold, snapshots }
 }
 
 /// Decode a packed last-stage marker into a short, stable label (e.g. `"axis1:wait_begin"`). Returns `"?"` for a
@@ -244,11 +295,12 @@ pub fn stage_axis(packed: u32) -> u8 {
   ((packed >> 8) & 0xFF) as u8
 }
 
-/// Determine which core (if either) stopped advancing FIRST, by scanning the NEWEST-first snapshot ring for the
-/// longest trailing run over which each core's beat did NOT change. Returns a short verdict label for the report:
-/// `"core1-froze-first"`, `"core0-froze-first"`, `"both-froze"`, or `"no-stall"` (or `"insufficient-data"` when
-/// fewer than two valid snapshots exist). "Froze first" = its beat was unchanged across MORE of the most-recent
-/// snapshots than the other core's — i.e. it stopped advancing earlier in the run-up to the reset.
+/// Determine which SIDE (if either) stopped advancing FIRST, by scanning the NEWEST-first snapshot ring for the
+/// longest trailing run over which each side's beat did NOT change. `core0_beat` is the core-0 host-facing comms
+/// progress, `core1_beat` the core-1 motion beat. Returns a short verdict label: `"motion-froze-first"`,
+/// `"comms-froze-first"`, `"both-froze"`, `"no-stall"`, or `"insufficient-data"` (fewer than two valid snapshots).
+/// "Froze first" = its beat was unchanged across MORE of the most-recent snapshots than the other side's — i.e. it
+/// stopped advancing earlier in the run-up to the reset.
 pub fn froze_first(snapshots: &[Snapshot; RING_LEN]) -> &'static str {
   // Count valid (seq != 0) snapshots, newest-first. Fewer than two means we cannot compare a delta.
   let valid: heapless::Vec<&Snapshot, RING_LEN> = snapshots.iter().filter(|s| s.seq != 0).collect();
@@ -282,14 +334,14 @@ pub fn froze_first(snapshots: &[Snapshot; RING_LEN]) -> &'static str {
     (true, true) => {
       // Both stalled; the one with the LONGER frozen run stopped first. A tie = both froze together.
       if core1_frozen_run > core0_frozen_run {
-        "core1-froze-first"
+        "motion-froze-first"
       } else if core0_frozen_run > core1_frozen_run {
-        "core0-froze-first"
+        "comms-froze-first"
       } else {
         "both-froze"
       }
     }
-    (false, true) => "core1-froze-first",
-    (true, false) => "core0-froze-first",
+    (false, true) => "motion-froze-first",
+    (true, false) => "comms-froze-first",
   }
 }

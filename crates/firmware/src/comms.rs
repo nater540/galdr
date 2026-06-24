@@ -378,12 +378,25 @@ pub static EXECUTOR_RUNNING: AtomicBool = AtomicBool::new(false);
 /// `u32::MAX` (harmless: the sampler compares for INEQUALITY, not magnitude, so a wrap still reads as "advanced").
 pub static MOTION_LIVENESS: AtomicU32 = AtomicU32::new(0);
 
-/// Core-0 (PRO_CPU) heartbeat counter, the companion to [`MOTION_LIVENESS`] for the crash-breadcrumb snapshot. It
-/// is bumped by [`watchdog_feed`] each tick (and by [`status_responder`] on every report) so the breadcrumb's
-/// per-core liveness snapshot can show whether CORE 0 stopped advancing before core 1, or vice-versa — the
-/// "which core died first" determination ([`crate::crash::froze_first`]). `Relaxed` lock-free, exactly like
-/// [`MOTION_LIVENESS`]; advancement (not magnitude) is all the boot dump reads.
-pub static CORE0_LIVENESS: AtomicU32 = AtomicU32::new(0);
+/// Core-0 (PRO_CPU) COMMS-PROGRESS counter — the heart of the task-watchdog (revised after a real-board wedge where
+/// the Embassy executor stayed alive but the comms PROCESSING/RESPONSE path was stuck on a never-resolving `.await`,
+/// so the old unconditional feed kept the dog quiet). It counts GENUINE host-facing forward progress, NOT the feed
+/// task running: it is bumped where the firmware actually serves the host — a `?` answered ([`status_responder`]),
+/// a response/ack written out ([`usb_tx`]), and a line consumed by the parser pipeline ([`comms_consumer`]). The
+/// watchdog withholds the feed (forcing a recoverable RWDT reset) when this counter STOPS advancing WHILE the host
+/// is actively driving the board ([`RX_ACTIVITY`] live) — exactly the stuck-comms wedge the executor-alive feed
+/// could not catch. It also feeds the breadcrumb's per-core "which froze first" compare, now untainted by a
+/// feed-task self-bump (removed). `Relaxed` lock-free; only advancement (not magnitude) is read.
+pub static COMMS_PROGRESS: AtomicU32 = AtomicU32::new(0);
+
+/// Host RX-activity counter: bumped by [`usb_rx`] on every received byte, so the watchdog can tell whether a HOST is
+/// actively driving the firmware (skirnir polls `?` ~5 Hz whenever connected, so bytes flow continuously while
+/// connected). This is the CRITICAL guard against a reset-loop on a quiescent or disconnected board: the comms-stall
+/// feed-withhold fires ONLY when RX is live (a host is present and expecting answers). With no recent RX — idle or
+/// disconnected — the watchdog feeds normally and never resets, no matter how long the comms counter sits still
+/// (there is simply no host to serve). `Relaxed` lock-free; the watchdog ages it across its ticks, reading only
+/// whether it advanced, never the absolute value.
+pub static RX_ACTIVITY: AtomicU32 = AtomicU32::new(0);
 
 /// "A `$H` homing cycle is currently running" (DOC-06). Set by [`handle_home`] for the duration of the cycle and
 /// cleared when it ends, so two things happen: the status reporter overrides the wire State to `Home` (grbl
@@ -875,28 +888,36 @@ fn take_pending_crash_report() -> Option<Response> {
   CRASH_REPORT.lock(|c| c.take())
 }
 
-/// Build the `[MSG:CRASH ...]` line from a decoded breadcrumb. Renders: the last executor stage (with axis for the
-/// per-axis RMT stages, e.g. `axis1:wait_begin`), the "which core froze first" verdict, and the newest core-0 /
-/// core-1 beats. Returns `None` only if the text could not be wrapped (never in practice — the line is far under
-/// [`RESPONSE_CAPACITY`]). Pure formatting; no I/O.
+/// Build the `[MSG:CRASH ...]` line from a decoded breadcrumb. Renders, in order: the WATCHDOG WITHHOLD CLASS when
+/// present (`core1-motion-wedge` / `core0-comms-wedge` — the most decisive datum, naming WHY the dog was forced to
+/// fire), the last executor stage (with axis for the per-axis RMT stages, e.g. `axis1:wait_begin`), the snapshot
+/// "which side froze first" verdict, and the newest comms/motion beats. Returns `None` only if the text could not be
+/// wrapped (never in practice — the line is far under [`RESPONSE_CAPACITY`]). Pure formatting; no I/O.
 fn format_crash_report(breadcrumb: &crate::crash::Breadcrumb) -> Option<Response> {
   use core::fmt::Write as _;
   // Build the inner text (without the `[MSG:...]` envelope), then wrap it. Sized well under RESPONSE_CAPACITY.
   let mut inner: heapless::String<128> = heapless::String::new();
+  let _ = write!(inner, "CRASH");
+  // Withhold class first when the watchdog deliberately forced the reset — the single most useful datum (an executor
+  // death that just stopped feeding leaves no withhold marker, so this is absent then).
+  if let Some(reason) = crate::crash::withhold_label(breadcrumb.withhold) {
+    let _ = write!(inner, " {}", reason);
+  }
   // Stage: name plus axis for the per-axis RMT stages. `write!` into a fixed string cannot panic; ignore the
   // `Result` (a full buffer just truncates, which still yields a usable, if clipped, report).
   let stage = breadcrumb.last_stage;
   if crate::crash::stage_has_axis(stage) {
-    let _ = write!(inner, "CRASH stage=axis{}:{}", crate::crash::stage_axis(stage), crate::crash::stage_label(stage));
+    let _ = write!(inner, " stage=axis{}:{}", crate::crash::stage_axis(stage), crate::crash::stage_label(stage));
   } else {
-    let _ = write!(inner, "CRASH stage={}", crate::crash::stage_label(stage));
+    let _ = write!(inner, " stage={}", crate::crash::stage_label(stage));
   }
-  // Which core stopped advancing first, from the snapshot ring.
+  // Which side stopped advancing first, from the snapshot ring (comms = core-0 side, motion = core-1 side).
   let verdict = crate::crash::froze_first(&breadcrumb.snapshots);
   let _ = write!(inner, " {}", verdict);
-  // Newest beats (index 0 of the newest-first ring) so the operator sees the absolute counters too.
+  // Newest beats (index 0 of the newest-first ring): `comms` is the core-0 host-facing progress counter, `motion`
+  // the core-1 executor beat — so the operator sees the absolute counters too.
   let newest = breadcrumb.snapshots[0];
-  let _ = write!(inner, " beats c0={} c1={}", newest.core0_beat, newest.core1_beat);
+  let _ = write!(inner, " beats comms={} motion={}", newest.core0_beat, newest.core1_beat);
   // Remind that the breadcrumb is watchdog-survival only (so a power-cycle would have lost it — useful context).
   let _ = write!(inner, " (RWDT-reset; not power-cycle)");
   let mut out = Response::new();
@@ -948,6 +969,14 @@ pub async fn usb_rx(mut rx: UsbSerialJtagRx<'static, Async>) -> ! {
         continue;
       }
     };
+    // Host-activity heartbeat: advance once per non-empty read (by the byte count, harmlessly) so the watchdog can
+    // tell a host is actively driving the firmware. Bumping per read rather than per byte is enough for the "did it
+    // advance since the last tick" check and stays off the per-byte path. `usb_rx` keeps draining the FIFO even when
+    // the comms PROCESSING path is wedged (the real-board failure mode), which is EXACTLY why RX activity is the
+    // right "host present" signal to gate the comms-stall feed-withhold on.
+    if n > 0 {
+      RX_ACTIVITY.fetch_add(n as u32, Ordering::Relaxed);
+    }
     for &byte in &buf[..n] {
       match classify_realtime(byte) {
         // A real-time byte: dispatch its action and do NOT let it enter a line or the byte buffer.
@@ -1175,6 +1204,12 @@ pub static AUTO_REPORT_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new()
 pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
   loop {
     let resp = RESPONSE.receive().await;
+    // Comms-progress heartbeat: a response/ack/status line is leaving the firmware, which is the most direct
+    // evidence the core-0 comms path is making host-facing forward progress. Bumped here (the single writer) so the
+    // task-watchdog sees real output flow; a stuck pipeline produces no responses, so this counter freezes — the
+    // signal the watchdog needs. Bumped BEFORE the write so even a write that the host-closed-port path drops still
+    // counts as "the firmware produced a response" (the wedge is upstream of the writer, not in the USB write).
+    COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
     // A write error on native USB means the host closed the port; drop the byte and continue, since the
     // connection re-establishes on host reopen without a controller reset.
     let _ = tx.write_all(resp.as_bytes()).await;
@@ -1251,7 +1286,14 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // Also race a graceful program stop (`0x86`): a controlled decelerate-to-Idle + full flush that, unlike the
     // hard-limit trip and the `0x18` reset, raises no alarm and retains position. Nested `select`s keep each arm typed.
     match select(select(events, HARD_LIMIT_TRIPPED.wait()), PROGRAM_STOP.wait()).await {
-      Either::First(Either::First(Either4::First(line))) => handle_line(line.as_slice(), &mut parser, &mut state, flash).await,
+      Either::First(Either::First(Either4::First(line))) => {
+        // Comms-progress heartbeat: a line was fully processed (parsed, planned/queued, acked). This is the
+        // consumer-side companion to the `usb_tx`/`status_responder` bumps — together they prove the WHOLE
+        // host-facing pipeline (parse -> plan -> respond) is advancing. A consumer stuck on a never-resolving
+        // back-pressure / probe / home await stops bumping this, which (with RX live) trips the comms-stall reset.
+        handle_line(line.as_slice(), &mut parser, &mut state, flash).await;
+        COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
+      }
       // A soft reset must not lose a pending settings change: persist before rebuilding the pipeline (grbl
       // applies most settings on the next reset, so they MUST be on flash by the time the reset takes them).
       Either::First(Either::First(Either4::Second(()))) => {
@@ -2567,76 +2609,144 @@ const WATCHDOG_FEED_INTERVAL: Duration = Duration::from_millis(500);
 /// otherwise-silent core-1-only stall into a recoverable reset + a captured breadcrumb.
 const CORE1_STALL_TICKS: u32 = 8;
 
-/// The RTC watchdog feed task (core 0 / PRO_CPU, a plain thread-mode task). It pets the RWDT every
-/// [`WATCHDOG_FEED_INTERVAL`] so the dog never resets a HEALTHY board, but stops feeding — letting the dog fire an
-/// auto-reset — in two wedge cases: (1) the core-0 thread-mode executor stops scheduling tasks at all (a hang /
-/// deadlock / fault that wedged core 0), so this task simply never runs; and (2, Goal B) a CORE-1-ONLY wedge that
-/// core 0 would otherwise paper over by continuing to feed — detected by [`MOTION_LIVENESS`] staying frozen for
-/// [`CORE1_STALL_TICKS`] while a block is actively in flight. Either way the RWDT reset is recorded, so the next
-/// boot reads the [`crate::crash`] breadcrumb and logs WHY it reset.
+/// Number of consecutive [`WATCHDOG_FEED_INTERVAL`] ticks the [`COMMS_PROGRESS`] counter may stay frozen WHILE the
+/// host is active before [`watchdog_feed`] declares a CORE-0 COMMS wedge and withholds the feed. At 500 ms/tick this
+/// is ~3 s. skirnir polls `?` every ~200 ms whenever connected and the firmware answers in EVERY state, so a
+/// connected-and-active board advances `COMMS_PROGRESS` ~5 Hz (every tick) via three independent tasks
+/// (`status_responder`, `usb_tx`, `comms_consumer`); if ALL THREE freeze for 3 s while the host is still present, the
+/// comms path is genuinely wedged — the real-board failure (writes succeed, no responses, DRO frozen) — with no
+/// legitimate counterexample (back-pressure still leaves `?` answered). ~3 s is short enough that the trip fires
+/// WHILE the host is still flowing or recently-flowing RX (see [`RX_ACTIVE_TICKS`]); three independent bumpers + the
+/// host-active gate keep it from false-tripping.
+const COMMS_STALL_TICKS: u32 = 6;
+
+/// The "host is present" sticky window, in [`WATCHDOG_FEED_INTERVAL`] ticks since [`RX_ACTIVITY`] last advanced. The
+/// host counts as active for ~6 s after its last received byte. This is BOTH the reset-loop guard AND the bridge
+/// across the host's flow-control quiet gap: when the comms path wedges, the host keeps streaming only until its
+/// character-counting window fills (it got no `ok`s) — on the real board skirnir sent ~30 more lines (~1-2 s) then
+/// went quiet. A 6 s sticky window keeps the host "active" across that quiet gap so the ~3 s [`COMMS_STALL_TICKS`]
+/// trip still fires, while a board with NO host (RX never advances) goes inactive after 6 s and FEEDS NORMALLY
+/// forever — never a reset-loop. The counter is SEEDED idle (host inactive) at task start, so a board that boots
+/// with no host present never spuriously counts as active before the first real RX byte.
+const RX_ACTIVE_TICKS: u32 = 12;
+
+/// The RTC watchdog feed task (core 0 / PRO_CPU, a plain thread-mode task) — a proper TASK-watchdog (revised after a
+/// real-board wedge where the Embassy executor stayed alive but the comms path was stuck on a never-resolving
+/// `.await`, so the original unconditional feed kept the dog quiet and a physical EN-reset was needed). It feeds the
+/// RWDT only while the firmware is making real forward progress, and WITHHOLDS the feed — letting the already-armed
+/// 8 s RWDT auto-reset the board — in three wedge classes:
+/// 1. **Core-0 executor death** (a hang/deadlock/fault that wedged the whole thread-mode executor): this task simply
+///    never runs, so the dog is never fed. Caught implicitly, no logic needed.
+/// 2. **Core-1 motion wedge** (the suspected RMT `wait()` spin): [`MOTION_LIVENESS`] frozen for [`CORE1_STALL_TICKS`]
+///    WHILE `EXECUTOR_RUNNING` (a block in flight). Idle/parked/dwell clear `EXECUTOR_RUNNING`, so they never trip.
+/// 3. **Core-0 comms stall** (the NEW case — executor alive but the comms pipeline stuck): [`COMMS_PROGRESS`] frozen
+///    for [`COMMS_STALL_TICKS`] WHILE the host is active ([`RX_ACTIVITY`] advanced within [`RX_ACTIVE_TICKS`]).
+/// Either withhold records its reason in the [`crate::crash`] breadcrumb, so the boot `[MSG:CRASH ...]` names the
+/// wedge class (`core1-motion-wedge` vs `core0-comms-wedge`).
 ///
-/// ## Goal B — conditional feed for a core-1-only stall (conservative)
-/// Case 2 is gated tightly so it can NEVER false-trip on legitimate operation: the feed is withheld ONLY when
-/// `EXECUTOR_RUNNING` is set (a block is genuinely executing — not idle, not parked on a feed-hold, which both
-/// clear it at the block boundary) AND the core-1 beat has not advanced for [`CORE1_STALL_TICKS`] (~4 s, well above
-/// the ~1.5 s worst-case single burst). An idle, parked, or dwelling executor (whose beat naturally is not
-/// advancing) keeps `EXECUTOR_RUNNING` false, so it is never mistaken for a wedge. A `G4` dwell runs in the
-/// consumer, not the executor, so `EXECUTOR_RUNNING` is false then too. The conservatism is deliberate: a spurious
-/// reset mid-cut is worse than missing one stall, so the bar for forcing a reset is "provably should be moving but
-/// has emitted nothing for 4 s".
+/// ## Reset-loop / false-trip safety (the load-bearing guards)
+/// - The comms-stall withhold is gated on RX activity, so a QUIESCENT or DISCONNECTED board (no host polling, so
+///   `COMMS_PROGRESS` naturally sits still) is NEVER reset — there is no host to serve, so a still counter is
+///   correct, not a wedge. This is what prevents a boot→reset→boot loop on a board left sitting at a prompt.
+/// - `COMMS_PROGRESS` is bumped by THREE independent tasks; legitimate back-pressure (the consumer blocked in a
+///   `QueueFull` retry) still leaves `status_responder`/`usb_tx` answering `?`, so the counter keeps advancing — a
+///   stall requires ALL host-facing work to stop, which is the genuine wedge.
+/// - The core-1 check is unchanged (block-in-flight gated), so it cannot false-trip on idle/hold/dwell.
 ///
 /// ## Breadcrumb snapshots
-/// Each tick also bumps the [`CORE0_LIVENESS`] heartbeat and pushes a `(seq, core0_beat, core1_beat)` snapshot into
-/// the RTC_FAST crash ring ([`crate::crash::push_snapshot`]) — OFF the real-time path — so after a reset the boot
-/// dump can show which core's beat stopped advancing FIRST. The current executor stage rides the always-updated
-/// last-stage breadcrumb word, not per snapshot.
+/// Each tick pushes a `(seq, comms_progress, motion_liveness)` snapshot into the RTC_FAST crash ring
+/// ([`crate::crash::push_snapshot`]) — OFF the real-time path — so after a reset the boot dump can show which side
+/// stopped advancing FIRST. The feed task NO LONGER self-bumps `COMMS_PROGRESS` (that polluted the verdict and
+/// masked the comms wedge); the snapshot reads the genuine, work-driven counters.
 ///
 /// `Rtc::rwdt::feed` takes `&mut self`, so the task owns the `Rtc` by `&'static mut` (parked in a `StaticCell` in
 /// `main`); it is the SOLE feeder, so no lock is needed.
 #[embassy_executor::task]
 pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) -> ! {
-  // The previous core-1 beat and how many consecutive ticks it has stayed frozen WHILE a block was executing. Seeded
-  // from the first read so the first delta is meaningful rather than a spurious "moved from 0".
+  // Previous samples + frozen-tick counts for the two conditional withholds. Seeded from the first read so the first
+  // delta is meaningful rather than a spurious "moved from 0".
   let mut last_core1 = MOTION_LIVENESS.load(Ordering::Relaxed);
+  let mut last_comms = COMMS_PROGRESS.load(Ordering::Relaxed);
+  let mut last_rx = RX_ACTIVITY.load(Ordering::Relaxed);
   let mut core1_frozen_ticks: u32 = 0;
+  let mut comms_frozen_ticks: u32 = 0;
+  // Seed the RX-idle counter at the threshold so the host starts INACTIVE: a board that boots with no host present
+  // must not count as "host active" before the first real RX byte arrives (else the comms-stall check could trip on
+  // a host-less board in the first few seconds — a reset loop). The first RX advance resets this to 0.
+  let mut rx_idle_ticks: u32 = RX_ACTIVE_TICKS;
   loop {
-    // Bump the core-0 heartbeat first (proves THIS task is still running for the breadcrumb's per-core compare).
-    let core0 = CORE0_LIVENESS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     let core1 = MOTION_LIVENESS.load(Ordering::Relaxed);
+    let comms = COMMS_PROGRESS.load(Ordering::Relaxed);
+    let rx = RX_ACTIVITY.load(Ordering::Relaxed);
 
-    // Goal B core-1-stall detection: count consecutive ticks where the beat is frozen AND a block is in flight.
-    // `EXECUTOR_RUNNING` false (idle / parked / dwell) resets the count, so a legitimately non-advancing beat is
-    // never a stall. The reset condition is "executing but no burst for CORE1_STALL_TICKS".
+    // Core-1 motion-stall detection: beat frozen WHILE a block is in flight. `EXECUTOR_RUNNING` false (idle / parked
+    // / dwell) resets the count, so a legitimately non-advancing beat is never a stall.
     let block_in_flight = EXECUTOR_RUNNING.load(Ordering::Acquire);
     if block_in_flight && core1 == last_core1 {
       core1_frozen_ticks = core1_frozen_ticks.saturating_add(1);
     } else {
       core1_frozen_ticks = 0;
     }
+
+    // Host-activity ageing: how many consecutive ticks since RX last advanced. Resets to 0 on any RX advance.
+    if rx == last_rx {
+      rx_idle_ticks = rx_idle_ticks.saturating_add(1);
+    } else {
+      rx_idle_ticks = 0;
+    }
+    let host_active = rx_idle_ticks < RX_ACTIVE_TICKS;
+
+    // Core-0 comms-stall detection: `COMMS_PROGRESS` frozen WHILE the host is active. When the host is NOT active
+    // (no recent RX → idle/disconnected) the count is held at 0 — a still counter with no host is correct, never a
+    // wedge — which is the reset-loop guard. Only "host driving + no comms forward progress" accrues toward a reset.
+    if host_active && comms == last_comms {
+      comms_frozen_ticks = comms_frozen_ticks.saturating_add(1);
+    } else {
+      comms_frozen_ticks = 0;
+    }
+
     last_core1 = core1;
+    last_comms = comms;
+    last_rx = rx;
+
+    // Push a liveness snapshot (genuine work-driven counters) into the RTC_FAST crash ring so a reset's boot dump
+    // can determine which side stopped advancing first.
+    crate::crash::push_snapshot(comms, core1);
+
     let core1_wedged = core1_frozen_ticks >= CORE1_STALL_TICKS;
+    let comms_wedged = comms_frozen_ticks >= COMMS_STALL_TICKS;
 
-    // Push a liveness snapshot into the RTC_FAST crash ring (off the real-time path) so a reset's boot dump can
-    // determine which core froze first.
-    crate::crash::push_snapshot(core0, core1);
-
-    if core1_wedged {
-      // A block is in flight but core 1 has emitted nothing for ~4 s: a genuine core-1 wedge. WITHHOLD the feed and
-      // let the already-armed 8 s RWDT reset the board — the breadcrumb (last stage = the wedged RMT axis) survives
-      // the reset and is dumped on the next boot. Record the verdict for the breadcrumb's stage view, then spin out
-      // the remaining time WITHOUT feeding (we still await so we never busy-spin core 0).
+    if core1_wedged || comms_wedged {
+      // A genuine wedge: record the class in the breadcrumb, then WITHHOLD the feed and let the 8 s RWDT reset the
+      // board. The core-1 check takes precedence in the (impossible-in-practice) both-true case since its breadcrumb
+      // stage marker is the more specific datum. We still await so we never busy-spin core 0 while the dog runs out.
+      let reason = if core1_wedged {
+        crate::crash::WithholdReason::Core1Motion
+      } else {
+        crate::crash::WithholdReason::Core0Comms
+      };
+      crate::crash::record_withhold(reason);
       #[cfg(feature = "defmt")]
-      defmt::error!("watchdog: core-1 wedged mid-motion ({=u32} frozen ticks) — withholding feed to force reset", core1_frozen_ticks);
+      if core1_wedged {
+        defmt::error!("watchdog: core-1 wedged mid-motion ({=u32} ticks) — withholding feed to force reset", core1_frozen_ticks);
+      } else {
+        defmt::error!("watchdog: core-0 comms stalled ({=u32} ticks, host active) — withholding feed to force reset", comms_frozen_ticks);
+      }
       Timer::after(WATCHDOG_FEED_INTERVAL).await;
       continue;
     }
 
-    // Healthy (or legitimately idle): pet the dog. A slow path above can never delay this past the 8 s timeout (the
-    // whole loop body is a handful of atomic ops + one await).
+    // Healthy, idle, or host-absent: pet the dog. The whole loop body is a handful of atomic ops + one await, so it
+    // can never delay the feed past the 8 s timeout.
     rtc.rwdt.feed();
     #[cfg(feature = "defmt")]
-    if core1_frozen_ticks > 0 {
-      defmt::warn!("watchdog: core-1 beat frozen ({=u32}/{=u32} ticks) while executing", core1_frozen_ticks, CORE1_STALL_TICKS);
+    {
+      if core1_frozen_ticks > 0 {
+        defmt::warn!("watchdog: core-1 beat frozen ({=u32}/{=u32} ticks) while executing", core1_frozen_ticks, CORE1_STALL_TICKS);
+      }
+      if comms_frozen_ticks > 0 {
+        defmt::warn!("watchdog: comms frozen ({=u32}/{=u32} ticks) while host active", comms_frozen_ticks, COMMS_STALL_TICKS);
+      }
     }
     Timer::after(WATCHDOG_FEED_INTERVAL).await;
   }
@@ -4052,9 +4162,12 @@ async fn error_bare(code: u8) {
 pub async fn status_responder() -> ! {
   loop {
     STATUS_REQUEST.wait().await;
-    // Bump the core-0 heartbeat (crash breadcrumb): every served report is proof the core-0 executor is alive, a
-    // finer-grained companion to the watchdog task's own bump for the "which core froze first" determination.
-    CORE0_LIVENESS.fetch_add(1, Ordering::Relaxed);
+    // Comms-progress heartbeat: serving a `?` is the most frequent host-facing work (skirnir polls ~5 Hz), so this
+    // is the watchdog's primary "the comms path is alive" signal. A wedge that stops answering `?` (the real-board
+    // failure: writes succeed, DRO frozen) freezes this counter, which — with the host still sending RX — is what
+    // trips the comms-stall feed-withhold. NOTE: this bump is BEFORE the report is built, so it advances on the
+    // INTENT to serve; the `usb_tx` bump covers actual output, so the two together bracket the response path.
+    COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
     // Read the cached, pre-derived status config (steps/mm, the `$10` MPos/WPos choice, and the feed ceiling)
     // from a synchronous `Cell` — NO `SETTINGS` lock, no ~30-field `Settings` copy on the hot path (Finding
     // #14). The cache is refreshed at every settings-commit site (see `refresh_status_cfg`), so a `$100`/`$10`/
