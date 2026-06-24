@@ -12,38 +12,36 @@ edition = "2024"
 # and its mere presence fails manifest parsing on the stable host toolchain — so we use the
 # `.cargo/config.toml` + `default-members` exclusion mechanism instead, which works on stable.
 
-# esp-hal is exact-pinned and esp-rtos is exact-pinned: esp-rtos 0.2 is tightly coupled to a specific
-# esp-hal API surface, and esp-hal must stay at 1.0.0 (1.1.x needs esp-rtos 0.3.x). Pinning both keeps
-# the runtime family from floating apart on `cargo update`. Reproducibility also relies on committing
+# esp-hal is exact-pinned and esp-rtos is exact-pinned: esp-rtos 0.3 is tightly coupled to a specific
+# esp-hal API surface, and esp-hal must stay at 1.1.x (esp-rtos 0.3 requires esp-hal `~1.1`). Pinning both
+# keeps the runtime family from floating apart on `cargo update`. Reproducibility also relies on committing
 # Cargo.lock, which carries the exact embassy-* minors esp-rtos was resolved against.
 [dependencies]
 firmware-core     = { path = "../firmware-core", default-features = false }
 galdr-proto       = { path = "../galdr-proto", default-features = false }
-esp-hal           = { version = "=1.0.0", features = ["esp32s3", "unstable"] }
-esp-rtos          = { version = "=0.2.0", features = ["esp32s3", "embassy"] }
-embassy-executor  = { version = "0.9.1",  features = ["executor-interrupt", "executor-thread"] }
+esp-hal           = { version = "=1.1.1", features = ["esp32s3", "unstable"] }
+esp-rtos          = { version = "=0.3.0", features = ["esp32s3", "embassy"] }
+embassy-executor  = { version = "0.10.0", features = ["executor-interrupt", "executor-thread"] }
 embassy-time      = "0.5.0"
-embassy-sync      = "0.7"
+embassy-sync      = "0.8"
 embassy-futures   = "0.1"
-esp-backtrace     = { version = "0.18.1", features = ["esp32s3", "panic-handler", "println"] }
-esp-println       = { version = "0.16.1", features = ["esp32s3"] }
-esp-storage       = { version = "0.8.1",  features = ["esp32s3"] }
+esp-backtrace     = { version = "0.19.0", features = ["esp32s3", "panic-handler", "println"] }
+esp-println       = { version = "0.17.0", features = ["esp32s3"] }
+esp-storage       = { version = "0.9.0",  features = ["esp32s3"] }
 embedded-storage  = "0.3"
 embedded-io-async = "0.7"
 # `sequential-storage` is the wear-leveled key/value flash store for the settings record (DOC-04). It is
-# async-only, so esp-storage's blocking flash is bridged with `embassy-embedded-hal`'s `BlockingAsync`
-# (pinned exactly to 0.5.0 — already in the graph via esp-hal — to avoid the 0.6 bump that pulls
-# embassy-hal-internal). `heapless-09` matches the workspace heapless.
+# async-only, so esp-storage's blocking flash is bridged with `embassy-embedded-hal`'s `BlockingAsync`.
+# `heapless-09` matches the workspace heapless.
 sequential-storage   = { version = "7.2.0", default-features = false, features = ["heapless-09"] }
-embassy-embedded-hal = { version = "=0.5.0", default-features = false }
-# Pinned to =0.4.0 to match esp-hal 1.0.0's linker convention. esp-hal 1.0.0's `ld/sections/rodata.x`
-# reserves and KEEPs the app descriptor at the front of DROM under the section name `.rodata_desc`
-# (`esp32s3.x`: `. = . + SIZEOF(.rodata_desc);`). esp-bootloader-esp-idf 0.5.0 renamed that section to
-# `.flash.appdesc` (#4745), so the descriptor falls to the END of `.rodata` instead of the front; the
-# bootloader then reads `.rodata` as the descriptor and rejects the image with a bogus
-# "efuse blk rev >= v116.31", boot-looping. 0.4.0 still emits `.rodata_desc`. Revisit when esp-hal moves
-# to a linker script that uses `.flash.appdesc` (needs the esp-rtos 0.3 / esp-hal 1.1+ bump).
-esp-bootloader-esp-idf = { version = "=0.4.0", features = ["esp32s3"] }
+embassy-embedded-hal = { version = "0.6.0", default-features = false }
+# Pinned to =0.5.0 to match esp-hal 1.1.x's linker convention. esp-hal 1.1.0's `ld/sections/rodata.x`
+# renamed the app-descriptor section to `.flash.appdesc` (to align with esptool), and esp-bootloader-esp-idf
+# 0.5.0 (#4745, 2026-04-16) made the matching change to where it emits `ESP_APP_DESC`. The two MUST move
+# together: pairing esp-hal 1.1 with bootloader 0.4.0 (or 1.0 with 0.5.0) misplaces the descriptor and the
+# board boot-loops with a bogus "efuse blk rev >= v116.31". This pairing finally retires the old 0.4.0 pin
+# that the esp-hal 1.0 linker required.
+esp-bootloader-esp-idf = { version = "=0.5.0", features = ["esp32s3"] }
 heapless          = "0.9"
 libm              = "0.2"
 defmt             = { version = "1", optional = true }

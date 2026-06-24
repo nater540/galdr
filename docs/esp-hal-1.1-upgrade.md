@@ -1,9 +1,33 @@
 # esp-hal 1.0 → 1.1 Upgrade Plan (Galdr firmware)
 
-Status: **planned, not executed.** This is a staged upgrade plan for moving the ESP32-S3 firmware
-(`crates/firmware`) from esp-hal 1.0 to 1.1. It is grounded in the actual tagged linker scripts and
-CHANGELOGs (sources at the bottom). Items marked *(inferred)* were not confirmed by an actual compile and
-must be nailed down when the upgrade is attempted.
+Status: **executed & boot-verified on hardware.** On 2026-06-24 the bump was applied on branch
+`feat/esp-hal-1.1-upgrade`, **targeting esp-hal 1.1.1** (the latest 1.x — 1.1.0 in the original plan was
+superseded by 1.1.1, released 2026-05-07; esp-rtos 0.3.0's `~1.1.0-rc.0` requirement is satisfied by it). The
+firmware **compiles** under the esp toolchain, **passes the offline app-descriptor gate** (§5), and was
+**flashed to the live board: it boots clean (no boot loop), emits the `Grbl 1.1f` banner, and answers `?`
+status queries over USB CDC** (see §5 "On-hardware results"). The remaining peripheral-boundary items (RMT
+pulse shape, spindle 0–10 V, TMC UART, homing/limit timing, flash round-trip) stay **bench-gated** as before.
+
+> **Execution notes / corrections to the plan below.**
+> - **`embassy-executor` 0.10 was more breaking than item D claimed.** Beyond the `arch-*`→`platform-*`
+>   feature rename (which did not affect us), 0.10 **removed `Spawner::must_spawn`** and moved the pool
+>   check from spawn-time to **token creation**: the `#[embassy_executor::task]` macro now returns
+>   `Result<SpawnToken, SpawnError>` and `Spawner::spawn` is infallible (returns `()`). All 10 spawn sites
+>   in `main.rs` became `spawner.spawn(task(..).expect("spawn <name>"))` (init-path `expect`, allowed by
+>   CLAUDE.md). This was the only source change not anticipated by the plan.
+> - **RMT (items B/C) needed only the `init` API change**, exactly as item C predicted:
+>   `configure_tx(pin, cfg)` → `configure_tx(&cfg).with_pin(pin)` (esp-hal 1.1 #4302, config by reference,
+>   pin attached via `Channel::with_pin`). `emit_burst` (item B) needed **no change** to compile; the
+>   channel-loss TODO it flags is still open (revisit on a bench when the alarm path lands).
+> - **LEDC (item E) and GPIO/TMC (items F) needed no change** — the LEDC pin-param removal was a pre-1.0
+>   change (#2388, v0.13.0) misattributed to 1.1, and `spindle.rs` already uses `DriveMode::PushPull`. The
+>   `unsafe { tx_line.clone_unchecked() }` in `tmc.rs` still compiles as-is.
+> - **`esp-storage` 0.9 (item G) and `embassy-embedded-hal` 0.6 (item H) were drop-in** —
+>   `multicore_auto_park()` and `BlockingAsync` survived; the `=0.5.0` pin was dropped.
+
+This is the original staged upgrade plan, grounded in the actual tagged linker scripts and CHANGELOGs
+(sources at the bottom). Items marked *(inferred)* were not confirmed by an actual compile when the plan was
+written; the execution notes above record how each resolved.
 
 > **Recommendation up front.** Worth doing, but **time it to land the same sitting the board is back**, not
 > blind. The two highest-risk changes (the esp-rtos `start`/`start_second_core` software-interrupt reshuffle
@@ -134,6 +158,24 @@ longer need `unsafe` / may have a changed signature.
 RMT step pulse shape/jitter (scope), USB CDC enumeration + banner, LEDC 0–10 V ramp on GPIO13, UART1 TMC2209
 exchanges, limit-switch GPIO IRQs + homing timing, flash persistence round-trip, and the core-1 ABI canary
 check in `main.rs`.
+
+### On-hardware results (2026-06-24, board on `/dev/cu.usbmodem31101`)
+First live flash of the 1.1.1 stack — **boots clean, no boot loop:**
+- Offline gate passed: descriptor at flash `0x10020` = magic `32 54 cd ab`, `min_efuse_rev = 00 00`.
+- 2nd-stage bootloader **accepted the image** (`efuse block revision: v1.4`, `Loaded app from partition at
+  offset 0x10000`) — the old `efuse blk rev >= v116.31` rejection is gone. **Confirms the esp-hal 1.1.1 ↔
+  esp-bootloader-esp-idf 0.5.0 `.flash.appdesc` pairing on real silicon.**
+- Welcome banner emitted: `Grbl 1.1f ['$' for help]` (USB CDC enumeration + banner ✓).
+- `skirnir --cli` status smoke (no motion): firmware answers `?` with well-formed reports,
+  `Idle|WPos:0,0,0,0|FS:0,0|Bf:32,1024|Pn:XYZ|Ov:100,100,100`, `had_error=false`. Confirms bidirectional USB
+  CDC + the core-0 status reporter, and — by reaching steady state without panic — a **successful core-1
+  bring-up through the new esp-rtos 0.3 `start_second_core` signature**.
+- (`Pn:XYZ` = all limit inputs read asserted: a bench wiring / `$5`-invert matter, unrelated to this bump.)
+
+**Still bench-gated** (need scope / physical rig / risk motion, not run here): RMT step pulse shape & jitter,
+LEDC 0–10 V spindle ramp, UART1 TMC2209 exchanges, limit IRQ + homing timing, flash persistence round-trip,
+and the defmt-only core-1 ABI canary readout. See `docs/homing-bench-checklist.md` /
+`docs/4th-axis-bench-checklist.md`.
 
 ## 6. What 1.1 actually buys Galdr
 

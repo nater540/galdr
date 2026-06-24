@@ -95,20 +95,24 @@ just flash        # build + flash + serial monitor (espflash)
 just monitor      # attach the serial monitor only (e.g. `just monitor --port /dev/ttyACM0`)
 ```
 
-> **Pin `esp-bootloader-esp-idf = "=0.4.0"` — do NOT use 0.5.0 with esp-hal 1.0.** esp-hal 1.0.0's linker
-> scripts reserve and KEEP the app descriptor at the FRONT of the DROM segment under the section name
-> `.rodata_desc` (`ld/sections/rodata.x`; `ld/esp32s3/esp32s3.x`: `. = . + SIZEOF(.rodata_desc);`).
-> esp-bootloader-esp-idf 0.5.0 renamed that section to `.flash.appdesc` (CHANGELOG #4745), so the descriptor
-> falls to the END of `.rodata`; the bootloader reads the first 256 bytes of `.rodata` at flash `0x10020` as
-> the descriptor and rejects the image with `Image requires efuse blk rev >= v116.31` → boot loop. 0.4.0 still
-> emits `.rodata_desc`. (esp-hal 1.0.0 does NOT depend on esp-bootloader-esp-idf — the firmware pulls it
-> directly.) Verify without hardware via `espflash save-image --merge` + checking magic `0xabcd5432` /
-> `min_efuse=0` at flash `0x10020`. Revisit (allow 0.5.0+) only when esp-hal moves to a `.flash.appdesc`
-> linker script (the esp-rtos 0.3 / esp-hal 1.1+ bump).
+> **`esp-bootloader-esp-idf` MUST track the esp-hal linker script — they move atomically.** The app
+> descriptor lives at the FRONT of the DROM segment, and esp-hal's linker script and the bootloader crate
+> must agree on its section name or the descriptor is misplaced and the board boot-loops with a bogus
+> `Image requires efuse blk rev >= v116.31`. The pairing depends on the esp-hal major:
+> - **esp-hal `=1.1.x` ⇒ `esp-bootloader-esp-idf = "=0.5.0"`** (current). 1.1's `ld/sections/rodata.x` emits
+>   the descriptor under `.flash.appdesc`, matching bootloader 0.5.0 (#4745, aligns with esptool).
+> - **esp-hal `=1.0.0` ⇒ `esp-bootloader-esp-idf = "=0.4.0"`** (pre-upgrade). 1.0's linker used
+>   `.rodata_desc`; 0.5.0's `.flash.appdesc` rename would drop the descriptor to the END of `.rodata`.
 >
-> **NOTE:** the espflash version was a red herring. The `v116.31` value is a *constant* across flashes and
-> across espflash 4.3.0/4.4.0 — SHA-256 bleed would vary, so it was always fixed `.rodata` bytes, never
-> espflash. The `_espflash-ok` guard in the justfile is now harmless but no longer the real fix.
+> Mismatching either direction boot-loops. (esp-hal does NOT depend on esp-bootloader-esp-idf — the firmware
+> pulls it directly, so the two are pinned independently and must be bumped together.) Verify without hardware
+> via `espflash save-image --merge` + checking magic `0xabcd5432` / `min_efuse=0` at flash `0x10020` (see
+> `docs/esp-hal-1.1-upgrade.md` §5). The 1.0→1.1 bump is **done** on `feat/esp-hal-1.1-upgrade` (esp-hal
+> 1.1.1, esp-rtos 0.3.0, embassy-executor 0.10, embassy-sync 0.8); see that doc for the full set.
+>
+> **NOTE:** the espflash version was a red herring for the original boot loop. The `v116.31` value is a
+> *constant* across flashes and across espflash 4.3.0/4.4.0 — SHA-256 bleed would vary, so it was always
+> fixed `.rodata` bytes, never espflash. The `_espflash-ok` guard in the justfile is harmless but not the fix.
 
 Pure-logic library code is `no_std` but has **no esp-hal dependency**, so it compiles and unit-tests on the host with
 stock Rust — keep it that way (see "Hardware abstraction" below).
@@ -125,7 +129,7 @@ stock Rust — keep it that way (see "Hardware abstraction" below).
   via a `LIMIT_LEVELS` atomic that sources the `Pn:` field.
 - **Step generation via RMT.** Each axis (X/Y/Z) gets its own dedicated RMT TX channel (ch0/1/2); ch3 is spare. Keep
   `mem_block_symbols ≤ 48` (one memory block) per channel or the driver borrows the adjacent channel's block. esp-hal
-  1.0 exposes no RMT DMA backend yet — use the interrupt path.
+  1.1 still exposes no RMT DMA backend — use the interrupt path. (1.1 #4302: `configure_tx(&cfg).with_pin(pin)`.)
 - **Inter-task comms** use `embassy-sync` primitives with `CriticalSectionRawMutex`. Planner → motion executor goes
   through a `BlockQueue` ring buffer behind a `Mutex` plus a `BLOCK_AVAILABLE` signal; real-time bytes
   (`?`/`!`/`~`/`0x18`) are intercepted in `usb_rx` and dispatched via `Signal`s, never line-buffered.

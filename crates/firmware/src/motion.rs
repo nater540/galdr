@@ -1115,11 +1115,13 @@ pub fn init(
     .with_idle_output(true);
 
   // Each axis owns one TX channel on its step GPIO; the channels are independent (no shared memory block).
-  let ch_x = rmt.channel0.configure_tx(step_pins.0, tx_config).expect("RMT ch0 (X step)");
-  let ch_y = rmt.channel1.configure_tx(step_pins.1, tx_config).expect("RMT ch1 (Y step)");
-  let ch_z = rmt.channel2.configure_tx(step_pins.2, tx_config).expect("RMT ch2 (Z step)");
+  // As of esp-hal 1.1 (#4302) `configure_tx` takes the config by reference and no longer binds the pin —
+  // the step GPIO is attached afterwards with `Channel::with_pin`.
+  let ch_x = rmt.channel0.configure_tx(&tx_config).expect("RMT ch0 (X step)").with_pin(step_pins.0);
+  let ch_y = rmt.channel1.configure_tx(&tx_config).expect("RMT ch1 (Y step)").with_pin(step_pins.1);
+  let ch_z = rmt.channel2.configure_tx(&tx_config).expect("RMT ch2 (Z step)").with_pin(step_pins.2);
   // A-STEP on the previously-spare ch3 (DOC-10). Compile-verified only; not driven on the bench yet (Phase 5).
-  let ch_a = rmt.channel3.configure_tx(step_pins.3, tx_config).expect("RMT ch3 (A step)");
+  let ch_a = rmt.channel3.configure_tx(&tx_config).expect("RMT ch3 (A step)").with_pin(step_pins.3);
 
   // DIR outputs start low (positive direction); the first block latches the real direction before stepping.
   let out_cfg = OutputConfig::default();
