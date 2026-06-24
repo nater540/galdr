@@ -83,6 +83,15 @@ const TEARDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
 /// a wedged firmware made Stop do nothing and the UI go stale). Generous, so normal backpressure never trips it.
 const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the controller may produce NO inbound bytes at all before it is declared unresponsive. This catches
+/// the OTHER wedge mode the write-stall timeout cannot: the firmware keeps draining its USB RX (writes still
+/// succeed) but its processing/response path has died, so the DRO freezes and not a single byte comes back. Since
+/// the engine polls `?` continuously and a healthy controller answers in EVERY state (Idle/Run/Hold/…) within a
+/// poll period, total inbound silence this long means a wedge. Armed from connect, so it also surfaces a fresh
+/// connect to an already-wedged board (which otherwise hangs forever in Connecting) as a clean unresponsive
+/// disconnect. Reset on every inbound chunk.
+const RESPONSE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A host intent sent from the UI to the engine. Each is fed straight into the [`ProtocolCore`]; the engine
 /// adds no policy of its own beyond carrying out the resulting effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,11 +254,21 @@ impl<T: Transport> Driver<T> {
     );
 
     let mut read_buf = [0u8; READ_CHUNK];
+    // Last time any inbound byte arrived; armed from connect so an already-wedged board surfaces rather than
+    // hanging in Connecting. The `?` poll guarantees a loop iteration every poll period, so the silence check
+    // below runs regularly even when the controller has gone completely quiet.
+    let mut last_inbound = tokio::time::Instant::now();
     let disconnect_reason = loop {
       // Adapt the poll rate to the latest run state (10 Hz while `Run`, else 5 Hz). A no-op unless the desired
       // rate changed, so a steady run never rebuilds the timer; on a change the first tick is bounded to the
       // shorter of the two periods so rapid flapping cannot indefinitely postpone the next poll (finding #8).
       self.refresh_poll_interval(&mut status_poll);
+
+      // The OTHER wedge mode: the controller still accepts writes (so the write-stall arms below never trip) but
+      // has stopped responding entirely. Total inbound silence past the timeout is a wedge — surface it.
+      if last_inbound.elapsed() >= RESPONSE_STALL_TIMEOUT {
+        break Some(TransportError::Unresponsive);
+      }
 
       // Priority 1: flush every pending real-time byte first, out-of-band, before any line write or read. These
       // are tiny; we write the whole buffer at once. The flush itself races a Disconnect/Stop so it can never
@@ -297,7 +316,10 @@ impl<T: Transport> Driver<T> {
           match read {
             // Ok(0) is end-of-stream — the device disappeared. A clean disconnect, not an error.
             Ok(0) => break None,
-            Ok(n) => self.handle_inbound(&read_buf[..n]),
+            Ok(n) => {
+              last_inbound = tokio::time::Instant::now(); // The controller spoke: reset the silence watchdog.
+              self.handle_inbound(&read_buf[..n]);
+            }
             Err(err) => break Some(err),
           }
         }
@@ -822,6 +844,20 @@ mod tests {
     assert!(
       matches!(evt, Event::Disconnected(Some(crate::error::TransportError::Unresponsive))),
       "a wedged controller must disconnect as unresponsive, got {evt:?}"
+    );
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_silent_controller_that_stops_responding_disconnects_as_unresponsive() {
+    let (mut handle, _controller) = connect();
+    // The board still ACCEPTS writes (default loopback gate is open, so the write-stall arms never trip) but never
+    // answers — usb_rx alive, processing/response wedged. Advancing past the response-stall timeout must surface
+    // it as an unresponsive disconnect rather than the host waiting on silence forever.
+    tokio::time::advance(RESPONSE_STALL_TIMEOUT + Duration::from_secs(1)).await;
+    let evt = wait_for(&mut handle, |e| matches!(e, Event::Disconnected(_))).await;
+    assert!(
+      matches!(evt, Event::Disconnected(Some(crate::error::TransportError::Unresponsive))),
+      "a controller that stops responding must disconnect as unresponsive, got {evt:?}"
     );
   }
 
