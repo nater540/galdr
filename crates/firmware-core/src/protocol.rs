@@ -118,6 +118,9 @@ pub enum RealtimeCommand {
   FullStatusReport,
   /// `0x8C` — toggle the auto real-time report mode (`$481`). Carried for Stage 3; no Stage-1 action.
   ToggleAutoReport,
+  /// `0x88` — toggle the optional-stop switch that gates `M1`. grblHAL leaves this OFF by default, so an `M1` is a
+  /// no-op until the operator enables it; the firmware holds the toggle and consults it when an `M1` pause runs.
+  ToggleOptionalStop,
   /// A feed / rapid / spindle / coolant override byte (`0x90`–`0x9E`, `0xA0`–`0xA4`). The raw byte is
   /// preserved so the override handler can decode the specific adjustment without a second classify pass.
   Override(u8),
@@ -145,7 +148,7 @@ pub struct ErrorCode {
 /// ([`ERROR_LINE_OVERFLOW`], [`ERROR_UNSUPPORTED_COMMAND`], [`ERROR_HOMING_DISABLED`]) all surface codes drawn
 /// from this set. The names/descriptions mirror grblHAL's published `error_codes.csv` so a sender's display
 /// matches the reference controller. Codes are listed once even when several internal variants share them (e.g.
-/// the parser's probe/jog "requires axis words" both map to `error:23`).
+/// the parser's probe/jog "requires axis words" both map to `error:26`).
 pub const ERROR_CODES: &[ErrorCode] = &[
   ErrorCode {
     id: 1,
@@ -193,6 +196,11 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     description: "Feed rate has not yet been set or is undefined.",
   },
   ErrorCode {
+    id: 23,
+    name: "Invalid g-code ID:23",
+    description: "A G-code command value, such as a tool number (T), must be a non-negative integer within range.",
+  },
+  ErrorCode {
     id: 26,
     name: "No axis words in block",
     description: "A G-code command (or the current modal state) requires axis words, but none were found in the block.",
@@ -234,6 +242,9 @@ pub enum MachineState {
   Home,
   /// `$SLP` sleep: spindle/coolant off, drivers parked, held until a soft reset wakes the machine.
   Sleep,
+  /// grblHAL `STATE_TOOLCHANGE`: an `M6` manual tool change is held, awaiting a cycle-start (`~`) resume. A bare
+  /// state token with no substate — distinct from a feed-hold's `Hold:0` (M0/M1 still report `Hold:0`).
+  Tool,
 }
 
 impl MachineState {
@@ -250,6 +261,7 @@ impl MachineState {
       MachineState::Check => "Check",
       MachineState::Home => "Home",
       MachineState::Sleep => "Sleep",
+      MachineState::Tool => "Tool",
     }
   }
 }
@@ -396,6 +408,11 @@ pub enum ControlState {
   /// `$SLP` sleep: spindle/coolant off, drivers parked; held until a soft reset wakes the machine (DOC-07/
   /// DOC-03 own the actual peripheral shutdown — the state machine only latches the mode).
   Sleep,
+  /// An `M6` manual tool change is held, awaiting a cycle-start (`~`) resume (grblHAL `STATE_TOOLCHANGE`). Reports
+  /// the dedicated `Tool` wire state rather than `Hold:0` (M0/M1 still latch `Hold(false)`). Like a hold it is
+  /// cycle-start-resumable (back to `Normal`) and motion-allowed (so the resumed program continues), but it is a
+  /// DISTINCT wire state so a sender shows a tool-change prompt rather than a generic pause.
+  Tool,
 }
 
 impl ControlState {
@@ -437,7 +454,16 @@ impl ControlState {
       ControlState::Alarm(code) => MachineState::Alarm(code.code()),
       ControlState::Check => MachineState::Check,
       ControlState::Sleep => MachineState::Sleep,
+      // An M6 manual tool change reports the dedicated `Tool` state (latched, independent of live execution).
+      ControlState::Tool => MachineState::Tool,
     }
+  }
+
+  /// Enter the `M6` manual-tool-change hold (`Tool` state). A constructor (not a transition from another mode) so
+  /// the consumer's M6 pause sets it explicitly; `~` (cycle-start) resumes it back to `Normal` via
+  /// [`cycle_start`](ControlState::cycle_start), and motion stays allowed so the resumed program continues.
+  pub fn tool_change() -> Self {
+    ControlState::Tool
   }
 
   /// Whether GCode motion is currently allowed. False in any alarm, in sleep, and in check mode (check parses
@@ -445,7 +471,7 @@ impl ControlState {
   /// enqueues a move. (Hold does not block *planning* — blocks may queue while held; the executor pauses at
   /// the boundary — so `Hold` is motion-allowed here.)
   pub fn motion_allowed(self) -> bool {
-    matches!(self, ControlState::Normal | ControlState::Hold(_))
+    matches!(self, ControlState::Normal | ControlState::Hold(_) | ControlState::Tool)
   }
 
   /// Apply a feed-hold (`!`/`0x82`): from `Normal` (or an existing hold) latch `Hold:0`. A hold requested in
@@ -463,7 +489,8 @@ impl ControlState {
   /// alarm or wake from sleep — only a soft reset / `$X` does).
   pub fn cycle_start(self) -> Self {
     match self {
-      ControlState::Hold(_) => ControlState::Normal,
+      // Both a feed-hold and an M6 tool-change hold resume to `Normal` on `~` (Run/Idle re-derived from execution).
+      ControlState::Hold(_) | ControlState::Tool => ControlState::Normal,
       other => other,
     }
   }
@@ -475,7 +502,9 @@ impl ControlState {
   /// as a pure predicate so the bin's real-time `~` dispatch can gate the executor-hold release on it without
   /// duplicating the state logic, and so the gate is host-tested here rather than in the untestable wiring.
   pub fn resumes_on_cycle_start(self) -> bool {
-    matches!(self, ControlState::Hold(_))
+    // A feed-hold (M0/M1) AND an M6 tool-change hold both resume on `~`; every other mode is inert (an alarm/sleep
+    // only clears via `$X`/soft reset).
+    matches!(self, ControlState::Hold(_) | ControlState::Tool)
   }
 
   /// Whether a hard-limit trip from the core-1 executor should raise a fresh `ALARM:1` from THIS control state.
@@ -846,6 +875,7 @@ pub fn classify_realtime(byte: u8) -> Option<RealtimeCommand> {
     0x86 => Some(RealtimeCommand::ProgramStop),
     0x87 => Some(RealtimeCommand::FullStatusReport),
     0x8C => Some(RealtimeCommand::ToggleAutoReport),
+    0x88 => Some(RealtimeCommand::ToggleOptionalStop),
     // Feed (0x90-0x94), rapid (0x95-0x97), spindle (0x99-0x9E), coolant (0xA0-0xA1), tool/probe
     // (0xA3-0xA4) overrides. Preserve the raw byte for the override decoder.
     0x90..=0x9E | 0xA0..=0xA4 => Some(RealtimeCommand::Override(byte)),
@@ -1091,6 +1121,42 @@ impl ParserSpindle {
   }
 }
 
+/// The active plane (modal group 2) reported in a `$G` line: G17 XY / G18 ZX / G19 YZ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ParserPlane {
+  /// G17 — the XY plane (the power-on default).
+  #[default]
+  XY,
+  /// G18 — the ZX plane.
+  ZX,
+  /// G19 — the YZ plane.
+  YZ,
+}
+
+impl ParserPlane {
+  /// The `G<n>` word for this plane.
+  fn word(self) -> &'static str {
+    match self {
+      ParserPlane::XY => "G17",
+      ParserPlane::ZX => "G18",
+      ParserPlane::YZ => "G19",
+    }
+  }
+}
+
+/// The active coolant state (modal group 8) reported in a `$G` line. Mist (M7) and flood (M8) are independent and
+/// can both be active; M9 (all off) is the default. The formatter renders the active word(s): `M9` when both are
+/// off, `M7` / `M8` for a single circuit, or `M7 M8` for both — matching grbl's `$G` group-8 output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ParserCoolant {
+  /// Mist coolant (M7) active.
+  pub mist: bool,
+  /// Flood coolant (M8) active.
+  pub flood: bool,
+}
+
 /// The active units mode reported in a `$G` line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -1178,6 +1244,13 @@ pub struct ParserSnapshot {
   pub spindle: ParserSpindle,
   /// Programmed spindle speed (modal S), in RPM.
   pub spindle_rpm: u16,
+  /// Active plane (modal group 2): reported as `G17`/`G18`/`G19`.
+  pub plane: ParserPlane,
+  /// Active coolant state (modal group 8): reported as `M9` / `M7` / `M8` / `M7 M8`.
+  pub coolant: ParserCoolant,
+  /// The CURRENT (active) tool number, reported as `T<n>` (`T0` = no tool selected). Committed by `M6` from the
+  /// pending `T` word; persists across program end / soft reset (grbl keeps the physically-loaded tool).
+  pub tool: u16,
 }
 
 impl ParserSnapshot {
@@ -1194,6 +1267,9 @@ impl ParserSnapshot {
       feed: 0.0,
       spindle: ParserSpindle::Stop,
       spindle_rpm: 0,
+      plane: ParserPlane::XY,
+      coolant: ParserCoolant { mist: false, flood: false },
+      tool: 0,
     }
   }
 }
@@ -1277,6 +1353,26 @@ impl ResponseWriter {
   /// `[MSG:Enabled]`). The caller supplies the inner text; this wraps it in the grbl `[MSG:...]` envelope.
   pub fn message<const N: usize>(out: &mut String<N>, text: &str) -> Result<(), FmtError> {
     write!(out, "[MSG:{text}]\r\n").map_err(|_| FmtError)
+  }
+
+  /// The human-readable INNER text of the `[MSG:..]` an `M6` manual tool change pushes when it holds (the firmware
+  /// wraps this with [`message`](ResponseWriter::message)). It NAMES the committed tool so a bare-terminal operator
+  /// knows which tool to insert: `Manual tool change to T<n> — swap tool, then cycle-start (~) to resume` for a
+  /// selected tool, or `Manual tool change (no tool selected) — …` for `T0` (a bare `M6` with no pending `T`).
+  ///
+  /// This is a human-readable PUSH only — NOT a wire-format contract. `skirnir` sources the tool number from the
+  /// streamed program independently and does NOT parse this text, so the exact wording is free to change; the test
+  /// pins it only so the tool number is provably present. Kept pure (a `no_std` buffer write) so it is host-tested
+  /// byte-for-byte rather than living in the untestable async `send_message` wiring.
+  pub fn tool_change_message<const N: usize>(out: &mut String<N>, tool: u16) -> Result<(), FmtError> {
+    if tool == 0 {
+      out
+        .push_str("Manual tool change (no tool selected) \u{2014} swap tool, then cycle-start (~) to resume")
+        .map_err(|_| FmtError)
+    } else {
+      write!(out, "Manual tool change to T{tool} \u{2014} swap tool, then cycle-start (~) to resume")
+        .map_err(|_| FmtError)
+    }
   }
 
   /// A `[MSG:error:N <name>]` context push line, emitted just BEFORE an `error:N` response so a plain terminal
@@ -1406,24 +1502,36 @@ impl ResponseWriter {
   /// The `$G` parser-state report: `[GC:<modal words>]`, rendered from a live [`ParserSnapshot`]. The
   /// motion (`G0`–`G3`), units (`G20`/`G21`), distance (`G90`/`G91`), feed mode (`G93`/`G94`), work coordinate
   /// (`G54`–`G59`), tool-offset mode (`G43.1`/`G49`), spindle state (`M3`/`M4`/`M5`), feed (`F`), and spindle speed
-  /// (`S`) words reflect the snapshot; the remaining modal groups (`G17` plane, `M9` coolant off, `T0` tool) are
-  /// fixed where they are not yet commandable, but are emitted so the line is a complete grbl-faithful report.
-  /// Feed is written with a minimal decimal (no trailing `.0` for whole values) to match grbl's compact form.
+  /// (`S`), plane (`G17`/`G18`/`G19`), and coolant (`M7`/`M8`/`M9`) words reflect the snapshot; only `T0` (tool) is
+  /// fixed where it is not yet commandable, but it is emitted so the line is a complete grbl-faithful report. Feed
+  /// is written with a minimal decimal (no trailing `.0` for whole values) to match grbl's compact form.
   pub fn parser_state<const N: usize>(out: &mut String<N>, snap: &ParserSnapshot) -> Result<(), FmtError> {
     // The active work-coordinate word: G54..G59 from the modal WCS index (clamped defensively to G54 for an
     // out-of-range index, which the parser never produces).
     let wcs_word = WCS_TAGS.get(snap.wcs).copied().unwrap_or("G54");
     // The tool-offset-mode word: G43.1 when a dynamic TLO is active, else G49.
     let tlo_word = if snap.tlo_active { "G43.1" } else { "G49" };
+    // The coolant word(s) (modal group 8): M9 when both off, else the active circuit word(s) — `M7`, `M8`, or
+    // `M7 M8` (both active at once, grbl's group-8 output). A small fixed buffer holds the longest form (`M7 M8`).
+    let mut coolant_word = String::<8>::new();
+    match (snap.coolant.mist, snap.coolant.flood) {
+      (false, false) => coolant_word.push_str("M9").map_err(|_| FmtError)?,
+      (true, false) => coolant_word.push_str("M7").map_err(|_| FmtError)?,
+      (false, true) => coolant_word.push_str("M8").map_err(|_| FmtError)?,
+      (true, true) => coolant_word.push_str("M7 M8").map_err(|_| FmtError)?,
+    }
     write!(
       out,
-      "[GC:{} {} G17 {} {} {} {} M9 T0 {} F",
+      "[GC:{} {} {} {} {} {} {} {} T{} {} F",
       snap.motion.word(),
       wcs_word,
+      snap.plane.word(),
       snap.units.word(),
       snap.distance.word(),
       snap.feed_mode.word(),
       snap.spindle.word(),
+      coolant_word.as_str(),
+      snap.tool,
       tlo_word,
     )
     .map_err(|_| FmtError)?;
@@ -1730,6 +1838,31 @@ impl<'a> SystemCommand<'a> {
     }
     SystemCommand::Unknown
   }
+
+  /// Whether this is a pure READ-ONLY query — a reporting command with NO side effect on modal, planner, settings,
+  /// or coordinate state — and so can be safely serviced WHILE A PAUSE HOLD IS ACTIVE (M0/M1/M6) without releasing
+  /// the hold. grbl answers `$G`/`$#`/`$$`/`$I` etc. during a hold (motion is held, the protocol loop is not), so
+  /// the firmware's pause loop services these in-place and emits their report + `ok`. Everything that WRITES or
+  /// changes state — `$<n>=val`, `$RST=*`, `$N0=`, `$PBX=`, `$X`, `$C`, `$SLP`, `$H`, and an `Unknown` rejection —
+  /// is NOT a read-only query: it must be deferred (left queued) until the hold resumes, so a held machine never
+  /// mutates state or runs an action behind the operator's back. Used by [`run_program_pause`](crate) in the bin.
+  pub fn is_readonly_query(&self) -> bool {
+    matches!(
+      self,
+      SystemCommand::Help
+        | SystemCommand::SettingsDump
+        | SystemCommand::BuildInfo { .. }
+        | SystemCommand::ParserState
+        | SystemCommand::NgcParams
+        | SystemCommand::StartupQuery
+        | SystemCommand::EnumSettings
+        | SystemCommand::EnumSettingGroups
+        | SystemCommand::EnumErrorCodes
+        | SystemCommand::EnumAlarmCodes
+        | SystemCommand::SettingDescription { .. }
+        | SystemCommand::PbExport
+    )
+  }
 }
 
 /// The grbl override bounds (DOC-08 §3, `docs/gcode-streaming.md`). Feed and spindle overrides clamp to
@@ -1972,6 +2105,9 @@ mod tests {
     assert_eq!(classify_realtime(0x87), Some(RealtimeCommand::FullStatusReport));
     assert_eq!(classify_realtime(0x19), Some(RealtimeCommand::Stop));
     assert_eq!(classify_realtime(0x8C), Some(RealtimeCommand::ToggleAutoReport));
+    // `0x88` toggles the optional-stop switch (gates M1). It must classify so it is diverted from the line buffer
+    // rather than corrupting a line, even though grblHAL leaves it inert by default.
+    assert_eq!(classify_realtime(0x88), Some(RealtimeCommand::ToggleOptionalStop));
     // `0x86` is the Galdr graceful program-stop real-time byte (a controlled decelerate-and-flush to Idle, no
     // alarm), distinct from the `0x18` abort. It must classify even though it carries the top bit, and must NOT
     // collide with jog-cancel (`0x85`) or the FullStatusReport (`0x87`) on either side of it.
@@ -2490,10 +2626,41 @@ mod tests {
       // S8000 alone (no M3) sets the speed but leaves the spindle stopped — grbl reports M5 with the S word.
       spindle: ParserSpindle::Stop,
       spindle_rpm: 8000,
+      plane: ParserPlane::XY,
+      coolant: ParserCoolant { mist: false, flood: false },
+      tool: 0,
     };
     let mut s = String::<RESPONSE_CAPACITY>::new();
     ResponseWriter::parser_state(&mut s, &snap).unwrap();
     assert_eq!(s.as_str(), "[GC:G1 G55 G17 G20 G91 G94 M5 M9 T0 G43.1 F12.5 S8000]\r\n");
+  }
+
+  #[test]
+  fn parser_state_renders_live_plane_and_coolant() {
+    // G18/G19 and M7/M8 are now live modal state: the `$G` line must reflect them, not the old hardcoded G17/M9,
+    // so a host re-establishing modal state after a reset reads the real plane and coolant. G18 ZX + flood (M8).
+    let snap = ParserSnapshot {
+      plane: ParserPlane::ZX,
+      coolant: ParserCoolant { mist: false, flood: true },
+      ..ParserSnapshot::power_on()
+    };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &snap).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G18 G21 G90 G94 M5 M8 T0 G49 F0 S0]\r\n");
+    // Mist alone renders M7; both mist and flood render `M7 M8` (grbl reports both active group-8 words).
+    let mist = ParserSnapshot { coolant: ParserCoolant { mist: true, flood: false }, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &mist).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G94 M5 M7 T0 G49 F0 S0]\r\n");
+    let both = ParserSnapshot { coolant: ParserCoolant { mist: true, flood: true }, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &both).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G94 M5 M7 M8 T0 G49 F0 S0]\r\n");
+    // G19 renders YZ.
+    let yz = ParserSnapshot { plane: ParserPlane::YZ, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &yz).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G19 G21 G90 G94 M5 M9 T0 G49 F0 S0]\r\n");
   }
 
   #[test]
@@ -2729,6 +2896,90 @@ mod tests {
     assert!(!ControlState::Sleep.resumes_on_cycle_start());
     assert!(!ControlState::Alarm(AlarmCode::HomingRequired).resumes_on_cycle_start());
     assert!(!ControlState::Alarm(AlarmCode::AbortDuringCycle).resumes_on_cycle_start());
+  }
+
+  // ---- M6 manual tool-change state (grblHAL `Tool`) ---------------------------------------------
+
+  #[test]
+  fn tool_change_state_reports_the_tool_token() {
+    // An M6 manual tool change reports the dedicated grblHAL `Tool` state (no substate), distinct from a feed-hold's
+    // `Hold:0`. The token has no colon-substate, so the formatter renders a bare `<Tool|...>`.
+    assert_eq!(ControlState::Tool.machine_state(true), MachineState::Tool);
+    assert_eq!(ControlState::Tool.machine_state(false), MachineState::Tool, "Tool is latched, ignores running");
+    assert_eq!(MachineState::Tool.token(), "Tool");
+  }
+
+  #[test]
+  fn tool_change_resumes_on_cycle_start_back_to_normal() {
+    // Like a hold, the M6 tool-change state resumes on cycle-start (`~`) — but it returns to `Normal` (Run/Idle
+    // re-derived), NOT to another hold. `resumes_on_cycle_start` includes it so the bin's `~` dispatch releases it.
+    let tool = ControlState::tool_change();
+    assert_eq!(tool, ControlState::Tool);
+    assert!(tool.resumes_on_cycle_start(), "`~` resumes a tool-change hold");
+    assert_eq!(tool.cycle_start(), ControlState::Normal, "resume returns to Normal (prior run state re-derived)");
+    // Motion is allowed in the tool-change state so the resumed program can continue cutting (like Hold).
+    assert!(tool.motion_allowed());
+  }
+
+  #[test]
+  fn tool_change_is_distinct_from_feed_hold() {
+    // The load-bearing distinction the wire contract requires: M0/M1 use `Hold(false)` → `Hold:0`; ONLY M6 enters
+    // `Tool`. `feed_hold` never produces `Tool`, and `tool_change` never produces `Hold` — the two are separate.
+    assert_eq!(ControlState::Normal.feed_hold(), ControlState::Hold(false));
+    assert_eq!(ControlState::tool_change(), ControlState::Tool);
+    assert_ne!(ControlState::tool_change(), ControlState::Hold(false));
+    // A `~` from the tool state resumes (returns Normal); from a hold it also resumes — both are cycle-start-able,
+    // but they are DIFFERENT wire states while held.
+    assert_eq!(ControlState::Tool.machine_state(false), MachineState::Tool);
+    assert_eq!(ControlState::Hold(false).machine_state(false), MachineState::Hold(false));
+  }
+
+  #[test]
+  fn status_report_renders_bare_tool_state() {
+    // The `?` wire string for an active M6 hold leads with a BARE `Tool` state token — no `:substate` (unlike
+    // `Hold:0`). The remaining elements follow the idle defaults; the load-bearing assertion is the leading token.
+    let snap = MachineSnapshot { state: MachineState::Tool, ..MachineSnapshot::idle() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::status_report(&mut s, &snap).unwrap();
+    assert!(s.as_str().starts_with("<Tool|MPos:0.000,0.000,0.000,0.000"), "leads with a bare Tool state: {}", s);
+    assert!(!s.as_str().contains("Tool:"), "the Tool state carries no `:substate`");
+  }
+
+  #[test]
+  fn parser_state_reports_the_active_tool_number() {
+    // `$G` must carry the current/active tool as `T<n>` (T0 = none). The power-on default is T0; a committed tool
+    // (after M6) shows its number. This replaces the previously hardcoded `T0`.
+    let none = ParserSnapshot::power_on();
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &none).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 G49 F0 S0]\r\n");
+    let with_tool = ParserSnapshot { tool: 5, ..ParserSnapshot::power_on() };
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::parser_state(&mut s, &with_tool).unwrap();
+    assert_eq!(s.as_str(), "[GC:G0 G54 G17 G21 G90 G94 M5 M9 T5 G49 F0 S0]\r\n");
+  }
+
+  #[test]
+  fn tool_change_message_names_the_committed_tool() {
+    // The M6 hold prompt NAMES the committed tool so a bare-terminal operator knows which tool to insert. A
+    // selected tool reads `... to T<n> ...`; T0 (a bare M6) reads `(no tool selected)`. Not a wire contract —
+    // skirnir does not parse it — but the tool number must be present and the phrasing legible.
+    let mut s = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::tool_change_message(&mut s, 5).unwrap();
+    assert_eq!(s.as_str(), "Manual tool change to T5 \u{2014} swap tool, then cycle-start (~) to resume");
+    assert!(s.as_str().contains("T5"), "the prompt names the committed tool");
+    // T0 (no tool selected) phrases sensibly rather than printing a bare `T0`.
+    let mut z = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::tool_change_message(&mut z, 0).unwrap();
+    assert_eq!(z.as_str(), "Manual tool change (no tool selected) \u{2014} swap tool, then cycle-start (~) to resume");
+    assert!(!z.as_str().contains("T0"), "T0 reads as `(no tool selected)`, not a bare `T0`");
+    // Wrapped by `message`, it is a well-formed `[MSG:..]` push (the form `send_message` emits on the wire).
+    let mut m = String::<RESPONSE_CAPACITY>::new();
+    ResponseWriter::message(&mut m, s.as_str()).unwrap();
+    assert_eq!(
+      m.as_str(),
+      "[MSG:Manual tool change to T5 \u{2014} swap tool, then cycle-start (~) to resume]\r\n",
+    );
   }
 
   // ---- Phase D: jog control-state transitions ----------------------------------------------------
@@ -3028,6 +3279,49 @@ mod tests {
     assert_eq!(SystemCommand::classify(b"RST=#"), SystemCommand::RestoreParams);
     assert_eq!(SystemCommand::classify(b"RST=*"), SystemCommand::RestoreAll);
     assert_eq!(SystemCommand::classify(b"PBX"), SystemCommand::PbExport);
+  }
+
+  #[test]
+  fn readonly_queries_are_classified_so_they_can_be_serviced_during_a_hold() {
+    // A pause (M0/M1/M6) holds the consumer, but read-only `$`-QUERIES must still be answered during the hold
+    // (grbl answers them while held). `is_readonly_query` is the gate: it is TRUE for the pure reporting commands
+    // (no modal/planner/settings/coordinate side effect) and FALSE for every write / state-change / action, so the
+    // hold loop services only the safe ones and leaves the rest queued for after resume.
+    let readonly = [
+      SystemCommand::Help,
+      SystemCommand::SettingsDump,
+      SystemCommand::BuildInfo { extended: false },
+      SystemCommand::BuildInfo { extended: true },
+      SystemCommand::ParserState,
+      SystemCommand::NgcParams,
+      SystemCommand::StartupQuery,
+      SystemCommand::EnumSettings,
+      SystemCommand::EnumSettingGroups,
+      SystemCommand::EnumErrorCodes,
+      SystemCommand::EnumAlarmCodes,
+      SystemCommand::SettingDescription { id: 0 },
+      SystemCommand::PbExport,
+    ];
+    for cmd in readonly {
+      assert!(cmd.is_readonly_query(), "{cmd:?} must be a read-only query serviceable during a hold");
+    }
+    // Every write / state-change / action is NOT a read-only query: it must be held (deferred) during a pause.
+    let not_readonly = [
+      SystemCommand::Unlock,
+      SystemCommand::ToggleCheck,
+      SystemCommand::Sleep,
+      SystemCommand::Home,
+      SystemCommand::StartupSet { index: 0, gcode: b"G54" },
+      SystemCommand::RestoreSettings,
+      SystemCommand::RestoreParams,
+      SystemCommand::RestoreAll,
+      SystemCommand::SetSetting { body: b"100=250" },
+      SystemCommand::PbImport { hex: b"DEAD" },
+      SystemCommand::Unknown,
+    ];
+    for cmd in not_readonly {
+      assert!(!cmd.is_readonly_query(), "{cmd:?} must NOT be serviced during a hold (it writes / changes state)");
+    }
   }
 
   #[test]

@@ -62,6 +62,7 @@ use static_cell::StaticCell;
 use firmware_core::motion::MotionConfig;
 
 mod comms;
+mod coolant;
 mod motion;
 mod spindle;
 mod storage;
@@ -235,6 +236,12 @@ static SPINDLE_CHANNEL: StaticCell<esp_hal::ledc::channel::Channel<'static, esp_
 /// the single driver of the spindle outputs.
 static SPINDLE: StaticCell<spindle::Spindle> = StaticCell::new();
 
+/// The coolant controller (M7/M8/M9 over two — currently stubbed — coolant outputs), parked for the program's
+/// lifetime and borrowed mutably by the long-running `coolant` task, which owns it as the single driver of the
+/// coolant outputs. No coolant GPIO is budgeted yet (CLAUDE.md), so the underlying pins are stubs — see
+/// [`coolant`](crate::coolant); the task topology and the all-off safety path are real now.
+static COOLANT: StaticCell<coolant::Coolant> = StaticCell::new();
+
 /// The single flash instance plus its persistent pointer cache ([`storage::FlashState`]) behind its
 /// cross-core mutex, parked in a `StaticCell` so it lives for the program and can be shared as `&'static` with
 /// the settings store at boot and the coalesced persist path. `esp_storage::FlashStorage::new` panics if
@@ -383,6 +390,12 @@ async fn main(spawner: Spawner) {
   );
   let spindle: &'static mut spindle::Spindle = SPINDLE.init(spindle);
 
+  // 4f. Bring up COOLANT (M7/M8/M9, DOC-07 follow-up). No coolant GPIO is budgeted on this board, so this claims no
+  //     pins and cannot fail: the controller drives stubbed outputs (it traces the logical level under defmt but
+  //     touches no hardware). Parked `'static` so the `coolant` task is the sole driver, exactly like the spindle.
+  let coolant = coolant::init();
+  let coolant: &'static mut coolant::Coolant = COOLANT.init(coolant);
+
   // 5. Install the motion planner (built from the loaded settings) before spawning the tasks that share it
   //    (the consumer enqueues, the core-1 executor pops). `Planner::new` is not `const`, so the static holds
   //    an `Option` filled here.
@@ -480,6 +493,7 @@ async fn main(spawner: Spawner) {
   // the consumer's spindle-update wake (an M3/M4/M5 or a spindle override/stop change) and the emergency-stop
   // signal (ALARM / soft-reset / sleep), drives the `SpindleController`, and runs the `$393` reverse dwell.
   spawner.must_spawn(comms::spindle(spindle));
+  spawner.must_spawn(comms::coolant(coolant));
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
