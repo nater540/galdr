@@ -367,6 +367,17 @@ pub static CONTROL: BlockingMutex<CriticalSectionRawMutex, Cell<ControlState>> =
 /// after the queue drains but a burst is still emitting. `AcqRel`/`Acquire` publishes it across cores.
 pub static EXECUTOR_RUNNING: AtomicBool = AtomicBool::new(false);
 
+/// Core-1 motion-executor LIVENESS counter (diagnostic): the executor bumps this once per drain-loop turn in
+/// [`motion::run`](crate::motion::run), so a monotonically increasing value proves core 1 is still scheduling its
+/// loop and a frozen value proves it has stopped advancing. The watchdog-feed task ([`watchdog_feed`]) samples it
+/// each tick and, under `defmt`, logs whether it moved since the previous sample — so a lockup capture shows which
+/// core died FIRST (core 1 frozen while core 0 still feeds the dog, vs. both frozen). It is a pure progress beat,
+/// NOT a liveness gate on the watchdog: the dog is fed unconditionally so an instrumentation bug can never starve
+/// it. `Relaxed` is correct — this is a cross-core diagnostic where exact ordering against other state does not
+/// matter, only that the value advances; a single `AtomicU32` is a native lock-free store on the S3. Wraps at
+/// `u32::MAX` (harmless: the sampler compares for INEQUALITY, not magnitude, so a wrap still reads as "advanced").
+pub static MOTION_LIVENESS: AtomicU32 = AtomicU32::new(0);
+
 /// "A `$H` homing cycle is currently running" (DOC-06). Set by [`handle_home`] for the duration of the cycle and
 /// cleared when it ends, so two things happen: the status reporter overrides the wire State to `Home` (grbl
 /// reports `Home` during `$H` and queues live DRO motion — research finding #1), and the hard-limit monitor
@@ -2463,6 +2474,59 @@ pub async fn coolant(controller: &'static mut crate::coolant::Coolant) {
         }
       }
     }
+  }
+}
+
+/// How often the [`watchdog_feed`] task pets the RTC watchdog, in milliseconds. Must be COMFORTABLY shorter than the
+/// RWDT stage-0 timeout (`WATCHDOG_TIMEOUT` in `main`, 8 s) so several feeds fall inside one timeout window and a
+/// single late wake (e.g. a brief flash-write quiesce that parks core 0 for tens of ms) cannot trip the dog. 500 ms
+/// gives a 16x margin: the timeout only expires after ~8 s of the core-0 thread-mode executor never running this
+/// task at all — i.e. a genuine core-0 wedge, exactly the condition we want a reset for, never a normal stall.
+const WATCHDOG_FEED_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The RTC watchdog feed task (core 0 / PRO_CPU, lowest practical priority — a plain thread-mode task). It pets the
+/// RWDT every [`WATCHDOG_FEED_INTERVAL`] so the dog never resets a HEALTHY board, but stops feeding — and thus lets
+/// the dog fire an auto-reset — the moment the core-0 thread-mode executor stops scheduling tasks (a hang, a
+/// deadlock, or a fault that wedged core 0). This converts the previously-required hard power-cycle into an
+/// automatic recovery AND, because the RWDT reset is recorded, lets the next boot log WHY it reset (see
+/// `log_reset_reason` in `main`).
+///
+/// ## Why feeding from a normal task is the right liveness test
+/// The feed is UNCONDITIONAL — it does not gate on [`MOTION_LIVENESS`] or any other progress signal — so an
+/// instrumentation bug can never starve the dog and cause a spurious reset. The watchdog's job here is narrow: catch
+/// a CORE-0 wedge (the reporter/consumer/USB tasks all stop, which is the reported lockup's core-0 symptom). It
+/// CANNOT directly catch a core-1-only wedge (core 1 runs its own interrupt executor and never feeds this dog), but
+/// [`MOTION_LIVENESS`] is sampled here so a `defmt` capture still shows whether core 1 froze first.
+///
+/// `Rtc::rwdt::feed` takes `&mut self`, so the task owns the `Rtc` by `&'static mut` (parked in a `StaticCell` in
+/// `main`); it is the SOLE feeder, so no lock is needed. The `MOTION_LIVENESS` sample + delta log is `defmt`-gated so
+/// the default release build pays only the feed + one atomic load per 500 ms.
+#[embassy_executor::task]
+pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) -> ! {
+  // The previous core-1 liveness sample, so each tick can report whether core 1 advanced since the last feed. Only
+  // needed for the `defmt` delta log — the default build does not sample (the bump in `motion.rs` is the cost; the
+  // read here would be a dead store under `#![deny(warnings)]`). Seeded from the first read so the first delta is
+  // meaningful rather than a spurious "moved from 0".
+  #[cfg(feature = "defmt")]
+  let mut last_liveness = MOTION_LIVENESS.load(Ordering::Relaxed);
+  loop {
+    // Pet the dog FIRST, unconditionally, so a slow `defmt` sink or the sampling below can never delay the feed past
+    // the timeout. A healthy core 0 reaches this line every 500 ms; a wedged core 0 never does, and the dog fires.
+    rtc.rwdt.feed();
+    // Diagnostic-only (defmt): sample the core-1 liveness counter and log whether it advanced. A frozen `current`
+    // while this task keeps running localizes the lockup to core 1 (it stopped scheduling its drain loop) BEFORE
+    // core 0 — the key "which core died first" signal for the lockup capture. Compiled out of the default build.
+    #[cfg(feature = "defmt")]
+    {
+      let current = MOTION_LIVENESS.load(Ordering::Relaxed);
+      if current == last_liveness {
+        defmt::warn!("watchdog: core-1 liveness STALLED at {=u32} (core 1 may have wedged; core 0 still feeding)", current);
+      } else {
+        defmt::trace!("watchdog: core-1 liveness {=u32} -> {=u32} (advancing)", last_liveness, current);
+      }
+      last_liveness = current;
+    }
+    Timer::after(WATCHDOG_FEED_INTERVAL).await;
   }
 }
 

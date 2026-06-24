@@ -66,8 +66,8 @@ use firmware_core::planner::{Block, Planner, A_AXIS, AXES};
 use crate::comms::{
   overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HARD_LIMITS_ENABLED,
   HARD_LIMIT_TRIPPED, HOLD_REQUESTED, HOLD_WAKE, HOMING_ACTIVE, HOME_REQUEST, HOME_RESULT, LIMIT_LEVELS,
-  LIMIT_TRIGGERED, LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
-  MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT, SLOT_FREED,
+  LIMIT_TRIGGERED, LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_LIVENESS, MOTION_PARKED,
+  MOTION_RESET, MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT, SLOT_FREED,
 };
 
 /// Core-1 motion-executor trace point. Expands to a `defmt::trace!` only under the `defmt` feature and to
@@ -285,6 +285,12 @@ impl StepSink for RmtStepSink {
     if ticks.is_empty() {
       return Ok(());
     }
+    // Liveness beat (diagnostic): advance the core-1 progress counter per BURST as well as per loop turn, so a long
+    // single block (seconds of bursts without returning to the drain loop) still shows core 1 as ADVANCING to the
+    // core-0 watchdog sampler — otherwise a legitimate long move would read as a false "stall". `Relaxed` single
+    // store; see [`MOTION_LIVENESS`](crate::comms::MOTION_LIVENESS). A frozen counter mid-burst now unambiguously
+    // means core 1 wedged inside the RMT transmit/wait below — exactly the suspected lockup site.
+    MOTION_LIVENESS.store(MOTION_LIVENESS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
     // Encode all three channels into their scratch buffers up front; `len` is the same for every channel
     // (events + end marker), keeping the three transmits identical in length.
     let len = self.encode_channel(0, ticks);
@@ -420,6 +426,14 @@ pub async fn run(
   // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
   mtrace!("motion: executor loop entered");
   loop {
+    // Liveness beat (diagnostic), per drain-loop turn: bump the cross-core progress counter so the core-0
+    // watchdog-feed task can tell whether core 1 is still scheduling at the block level (this site covers the
+    // empty-queue idle wait + block-pop cadence; `emit_burst` bumps it again per burst so a long single block also
+    // reads as advancing). `Relaxed` + `wrapping_add` is a single native store with no synchronization cost; a wrap
+    // is harmless (the sampler tests for inequality, not magnitude). It NEVER gates the watchdog feed, so it cannot
+    // starve the dog if it misbehaves.
+    MOTION_LIVENESS.store(MOTION_LIVENESS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+
     // Service a pending soft reset at the top of the loop: RETAIN the live position (Change A) rather than zero
     // it, matching grbl — a `0x18` abort keeps MPos so `$X` unlocks at the same coordinates. The consumer's
     // `reset_pipeline` rebuilds the planner and SYNCS it to this retained position, so the two stay consistent.
