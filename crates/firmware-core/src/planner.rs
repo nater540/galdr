@@ -31,7 +31,7 @@
 //! [`BLOCK_QUEUE_LEN`]; an over-full queue is a recoverable [`PlannerError::QueueFull`], never a
 //! panic. All arithmetic is `f32`; `libm` supplies `sqrtf`, `acosf`, `sinf`, `cosf`.
 
-use crate::gcode::{AxisWords, CoordinateOp, DistanceMode, FeedMode, JogCommand, PlannerCommand, ProbeKind, Units};
+use crate::gcode::{AxisWords, CoordinateOp, DistanceMode, FeedMode, JogCommand, Plane, PlannerCommand, ProbeKind, Units};
 use heapless::Deque;
 
 /// Number of axes the planner coordinates: X, Y, Z (linear, mm) and A (rotary about X, degrees) per DOC-10.
@@ -40,6 +40,13 @@ pub const AXES: usize = 4;
 
 /// Axis index of the rotary A axis (rotation about machine X). The linear axes are indices 0..3 (X, Y, Z).
 pub const A_AXIS: usize = 3;
+
+/// Axis index of the linear X axis.
+pub const X_AXIS: usize = 0;
+/// Axis index of the linear Y axis.
+pub const Y_AXIS: usize = 1;
+/// Axis index of the linear Z axis.
+pub const Z_AXIS: usize = 2;
 
 /// DEFAULT `$376` rotary-axes bitmask — the fresh power-on value before flash loads (DOC-10.7). Bit N set ⇒
 /// axis N is angular (degrees). The authoritative value is the runtime `$376` setting in
@@ -270,6 +277,19 @@ pub enum PlannerOutcome {
   GoToPredefined { is_g28: bool },
   /// M30 program end. The look-ahead is flushed to a stop; the caller resets modal/program state.
   ProgramEnd,
+  /// A program-flow PAUSE (M0/M1/M6). The look-ahead is flushed to a stop (the pause is a synchronized boundary,
+  /// like a dwell); the caller drains motion and holds until cycle-start. `optional` flags M1 (the caller's
+  /// optional-stop gate decides whether to halt); `tool_change` flags M6 (the caller prompts the tool swap).
+  ProgramPause {
+    /// True for M1 (optional stop): the caller's optional-stop gate decides whether this actually halts.
+    optional: bool,
+    /// True for M6 (manual tool change): the caller prompts the operator for the swap before resuming.
+    tool_change: bool,
+  },
+  /// An M7/M8/M9 coolant command. The caller drives the (hardware-gated) coolant outputs from the carried
+  /// [`CoolantState`]; the planner does not. No motion is produced and look-ahead is preserved (M7/M8/M9 do not
+  /// move the machine), matching grbl — exactly like the spindle command.
+  Coolant(crate::gcode::CoolantState),
   /// A coordinate-system / offset op (G10, G54-G59, G92, G28.1/G30.1, G43.1/G49) passed through for the caller
   /// to apply to the shared [`crate::coords::CoordinateSystems`]. No motion is produced and look-ahead is
   /// preserved (these do not move the machine), matching grbl; the caller then pushes the recomputed WCO back
@@ -360,6 +380,10 @@ struct ArcRequest<'a> {
   i: Option<f32>,
   /// J center offset (Y) relative to the start point, in the active units, if present.
   j: Option<f32>,
+  /// K center offset (Z) relative to the start point, in the active units, if present (G18/G19 arcs).
+  k: Option<f32>,
+  /// The active plane (G17/G18/G19): selects the two in-plane axes and which I/J/K offsets map to them.
+  plane: Plane,
   /// Active units for the endpoint/offset/feed words.
   units: Units,
   /// Active distance mode for the endpoint words.
@@ -373,15 +397,72 @@ struct ArcRequest<'a> {
   machine_coords: bool,
 }
 
+/// The axis mapping for a G2/G3 plane (G17/G18/G19): the two axis indices the arc is circularly interpolated in,
+/// plus which arc-center offset word feeds each. grbl orders the in-plane axes per plane so the CW/CCW sense and
+/// the helix axis come out right: G17 = (X, Y) linear Z with offsets I/J; G18 = (Z, X) linear Y with offsets K/I;
+/// G19 = (Y, Z) linear X with offsets J/K. The remaining (third) linear axis and the rotary A are slaved as a
+/// helix across the arc. Holding the mapping as data keeps the arc geometry plane-agnostic — one code path serves
+/// all three planes — and makes a wrong-plane arc impossible to cut silently (the plane is threaded end to end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlaneAxes {
+  /// The first in-plane axis index (the arc's local `cos θ` axis).
+  p0: usize,
+  /// The second in-plane axis index (the arc's local `sin θ` axis).
+  p1: usize,
+  /// The out-of-plane LINEAR axis index, slaved linearly across the arc as a helix.
+  normal: usize,
+}
+
+impl PlaneAxes {
+  /// The axis mapping for `plane`. `offsets(req)` then selects the matching center-offset words.
+  fn for_plane(plane: Plane) -> Self {
+    match plane {
+      Plane::XY => PlaneAxes { p0: X_AXIS, p1: Y_AXIS, normal: Z_AXIS },
+      Plane::ZX => PlaneAxes { p0: Z_AXIS, p1: X_AXIS, normal: Y_AXIS },
+      Plane::YZ => PlaneAxes { p0: Y_AXIS, p1: Z_AXIS, normal: X_AXIS },
+    }
+  }
+
+  /// The `(p0, p1)` center-offset words for this plane, picked from the request's I/J/K. grbl maps I→X, J→Y, K→Z
+  /// regardless of plane, so each plane's two in-plane axes select two of the three offset words: G17 → (I, J),
+  /// G18 → (K, I), G19 → (J, K). A missing offset defaults to 0 (a flat center on that axis), matching grbl.
+  fn offsets(self, i: Option<f32>, j: Option<f32>, k: Option<f32>) -> (f32, f32) {
+    (
+      offset_for_axis(self.p0, i, j, k).unwrap_or(0.0),
+      offset_for_axis(self.p1, i, j, k).unwrap_or(0.0),
+    )
+  }
+
+  /// True when at least one of the two in-plane center offsets was present on the line (grbl's IJK arc form
+  /// requires at least one). Checked against the SAME I/J/K mapping `offsets` uses, so a G18 arc needs an I or K.
+  fn has_offset(self, i: Option<f32>, j: Option<f32>, k: Option<f32>) -> bool {
+    offset_for_axis(self.p0, i, j, k).is_some() || offset_for_axis(self.p1, i, j, k).is_some()
+  }
+}
+
+/// The center-offset word that maps to `axis` under grbl's fixed I→X, J→Y, K→Z convention. Shared by
+/// [`PlaneAxes::offsets`] (which uses the value) and [`PlaneAxes::has_offset`] (which checks presence) so the
+/// I/J/K→axis mapping has ONE definition and cannot desync between arc-center validation and computation.
+fn offset_for_axis(axis: usize, i: Option<f32>, j: Option<f32>, k: Option<f32>) -> Option<f32> {
+  match axis {
+    X_AXIS => i,
+    Y_AXIS => j,
+    _ => k,
+  }
+}
+
 /// The saved state of an arc that could not enqueue all its segments at once, so the planner feeds it into the
 /// block buffer INCREMENTALLY as the executor frees slots (grbl's resumable-arc model, DOC-05). It is pure,
-/// `Copy` geometry — center, radius, the per-segment angular step, the Z/A helix interpolation params, the
-/// per-segment feed, and the index of the NEXT segment to emit — so [`Planner::resume_arc`] can recompute each
-/// remaining chord deterministically. An arc whose segments all fit in one [`plan_arc`](Planner::plan_arc) call
-/// never creates one of these; only an over-subdivided arc (more segments than free queue space) does.
+/// `Copy` geometry — the plane axis mapping, center, radius, the per-segment angular step, the helix/rotary
+/// interpolation params, the per-segment feed, and the index of the NEXT segment to emit — so
+/// [`Planner::resume_arc`] can recompute each remaining chord deterministically. An arc whose segments all fit in
+/// one [`plan_arc`](Planner::plan_arc) call never creates one of these; only an over-subdivided arc does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ArcInProgress {
-  /// Arc center in machine mm (XY plane). The chord vertices are `center + radius·(cos θ, sin θ)`.
+  /// The plane axis mapping (in-plane pair + out-of-plane linear axis).
+  plane: PlaneAxes,
+  /// Arc center in machine mm, in the `(p0, p1)` in-plane subspace. A chord vertex's in-plane coordinates are
+  /// `center + radius·(cos θ, sin θ)` mapped back onto axes `p0`/`p1`.
   center: [f32; 2],
   /// Arc radius in mm.
   radius: f32,
@@ -394,11 +475,13 @@ struct ArcInProgress {
   /// 1-based index of the NEXT segment to emit. Starts at 1 and advances by one per enqueued segment; the arc is
   /// complete when this exceeds [`segments`](ArcInProgress::segments).
   next_seg: u32,
-  /// Z at the arc start (mm); the helix linearly interpolates Z from here to `z_start + z_delta` across segments.
-  z_start: f32,
-  /// Total Z travel across the whole arc (mm); segment `k` ends at `z_start + z_delta·(k/segments)`.
-  z_delta: f32,
-  /// A (rotary, degrees) at the arc start; the A axis is slaved linearly across the arc exactly like the Z helix.
+  /// The out-of-plane LINEAR axis position (mm) at the arc start; the helix interpolates it linearly to
+  /// `normal_start + normal_delta` across the segments.
+  normal_start: f32,
+  /// Total out-of-plane LINEAR travel across the whole arc (mm); segment `k` ends at
+  /// `normal_start + normal_delta·(k/segments)`.
+  normal_delta: f32,
+  /// A (rotary, degrees) at the arc start; the A axis is slaved linearly across the arc exactly like the helix.
   a_start: f32,
   /// Total A travel across the whole arc (degrees); segment `k` ends at `a_start + a_delta·(k/segments)`.
   a_delta: f32,
@@ -581,7 +664,7 @@ impl Planner {
         let queued = self.plan_line(target, *feed, *units, *feed_mode, *rapid)?;
         Ok(PlannerOutcome::Queued { blocks: queued })
       }
-      PlannerCommand::Arc { cw, axes, i, j, units, distance, feed, feed_mode, machine_coords } => {
+      PlannerCommand::Arc { cw, axes, i, j, k, plane, units, distance, feed, feed_mode, machine_coords } => {
         // Check the arc ENDPOINT against the envelope (the start is wherever the machine already is, already
         // inside the envelope by induction). A degenerate arc still surfaces its `InvalidArc` below.
         if let Some(limits) = limits
@@ -599,6 +682,8 @@ impl Planner {
           axes,
           i: *i,
           j: *j,
+          k: *k,
+          plane: *plane,
           units: *units,
           distance: *distance,
           feed: *feed,
@@ -635,6 +720,17 @@ impl Planner {
       PlannerCommand::ProgramEnd => {
         self.flush_lookahead();
         Ok(PlannerOutcome::ProgramEnd)
+      }
+      PlannerCommand::ProgramPause { optional, tool_change } => {
+        // A program-flow pause (M0/M1/M6) is a synchronized motion boundary like a dwell: flush look-ahead so the
+        // preceding block decelerates to a full stop before the machine holds. The caller realizes the hold.
+        self.flush_lookahead();
+        Ok(PlannerOutcome::ProgramPause { optional: *optional, tool_change: *tool_change })
+      }
+      PlannerCommand::Coolant(state) => {
+        // A coolant change moves nothing; pass it through for the caller to drive the outputs. Look-ahead is
+        // preserved (grbl does not flush on M7/M8/M9), so coolant can change mid-program without stalling motion.
+        Ok(PlannerOutcome::Coolant(*state))
       }
     }
   }
@@ -1155,14 +1251,18 @@ impl Planner {
     let start = self.position_mm();
     let target = self.arc_endpoint_mm(request.axes, scale, request.distance, request.machine_coords, &start);
 
-    // Center offsets I/J are relative to the start point. At least one must be present (grbl IJ form).
-    if request.i.is_none() && request.j.is_none() {
+    // The plane (G17/G18/G19) selects the two in-plane axes the arc is circularly interpolated in and the
+    // out-of-plane LINEAR axis slaved as a helix. The center offsets map to the in-plane axes per grbl's I/J/K
+    // convention (I→X, J→Y, K→Z); at least one of the two in-plane offsets must be present (grbl IJK form).
+    let plane = PlaneAxes::for_plane(request.plane);
+    if !plane.has_offset(request.i, request.j, request.k) {
       return Err(PlannerError::InvalidArc);
     }
-    let center = [start[0] + request.i.unwrap_or(0.0) * scale, start[1] + request.j.unwrap_or(0.0) * scale];
+    let (off0, off1) = plane.offsets(request.i, request.j, request.k);
+    let center = [start[plane.p0] + off0 * scale, start[plane.p1] + off1 * scale];
 
-    let r0 = [start[0] - center[0], start[1] - center[1]];
-    let r1 = [target[0] - center[0], target[1] - center[1]];
+    let r0 = [start[plane.p0] - center[0], start[plane.p1] - center[1]];
+    let r1 = [target[plane.p0] - center[0], target[plane.p1] - center[1]];
     let radius = libm::sqrtf(r0[0] * r0[0] + r0[1] * r0[1]);
     if radius < LENGTH_EPSILON_MM {
       return Err(PlannerError::InvalidArc);
@@ -1171,11 +1271,14 @@ impl Planner {
     let sweep = arc_sweep_angle(r0, r1, request.cw);
     let segments = arc_segment_count(radius, sweep, self.config.arc_tolerance_mm);
 
-    let z_start = start[2];
-    let z_delta = target[2] - z_start;
-    // The rotary A axis is slaved linearly across the arc exactly like the Z helix (DOC-10.5): it advances
-    // `a_delta / segments` per chord, in lockstep with the XY interpolation. A is never circularly interpolated;
-    // a G2/G3 with an `A` word produces an A-slaved helical arc, not a rotary-plane arc (that is out of scope).
+    // The out-of-plane LINEAR axis is slaved linearly across the arc (the helix), e.g. Z for a G17 XY arc, Y for a
+    // G18 ZX arc. Both in-plane axes are always linear (a rotary axis is never an arc plane axis here), so the
+    // helix axis carries the third linear travel.
+    let normal_start = start[plane.normal];
+    let normal_delta = target[plane.normal] - normal_start;
+    // The rotary A axis is slaved linearly across the arc exactly like the helix (DOC-10.5): it advances
+    // `a_delta / segments` per chord, in lockstep with the in-plane interpolation. A is never circularly
+    // interpolated; a G2/G3 with an `A` word produces an A-slaved helical arc, not a rotary-plane arc.
     let a_start = start[A_AXIS];
     let a_delta = target[A_AXIS] - a_start;
     let theta_start = libm::atan2f(r0[1], r0[0]);
@@ -1183,7 +1286,7 @@ impl Planner {
 
     // The per-segment feed. Under G94 every segment carries the same units/min feed. Under G93 the inverse-time
     // F describes the WHOLE arc's duration; since a circular arc with a constant angular step subdivides into
-    // EQUAL-length segments (identical chord, identical Z/A step), each segment must take `1/(feed × segments)`
+    // EQUAL-length segments (identical chord, identical helix/A step), each segment must take `1/(feed × segments)`
     // minutes, i.e. its inverse-time feed is `feed × segments`. This keeps the arc's total duration at `1/feed`
     // minutes while reusing the same per-block inverse-time math (DOC-10.2).
     let seg_feed = match request.feed_mode {
@@ -1195,14 +1298,15 @@ impl Planner {
     // arc is passed BY VALUE (the `Option` is resolved here, where it is provably `Some`), so the chunk method has
     // no panic path; it stores the advanced arc back into `arc_in_progress` itself when segments remain.
     let arc = ArcInProgress {
+      plane,
       center,
       radius,
       theta_start,
       theta_step,
       segments,
       next_seg: 1,
-      z_start,
-      z_delta,
+      normal_start,
+      normal_delta,
       a_start,
       a_delta,
       seg_feed,
@@ -1263,12 +1367,16 @@ impl Planner {
     while arc.next_seg <= arc.segments && self.queue.len() < BLOCK_QUEUE_LEN {
       let seg = arc.next_seg;
       let theta = arc.theta_start + arc.theta_step * seg as f32;
-      let x = arc.center[0] + arc.radius * libm::cosf(theta);
-      let y = arc.center[1] + arc.radius * libm::sinf(theta);
       let frac = seg as f32 / arc.segments as f32;
-      let z = arc.z_start + arc.z_delta * frac;
-      let a = arc.a_start + arc.a_delta * frac;
-      let seg_target = self.mm_target_to_steps(&[x, y, z, a]);
+      // Build the chord-endpoint mm target by axis: the two in-plane axes follow the circle, the out-of-plane
+      // linear axis and the rotary A are slaved linearly (the helix). Start from the arc's machine origin so any
+      // axis the arc never touches keeps its start value; here every relevant axis is overwritten explicitly.
+      let mut target_mm = [0.0f32; AXES];
+      target_mm[arc.plane.p0] = arc.center[0] + arc.radius * libm::cosf(theta);
+      target_mm[arc.plane.p1] = arc.center[1] + arc.radius * libm::sinf(theta);
+      target_mm[arc.plane.normal] = arc.normal_start + arc.normal_delta * frac;
+      target_mm[A_AXIS] = arc.a_start + arc.a_delta * frac;
+      let seg_target = self.mm_target_to_steps(&target_mm);
       // The fault-injection seam (tests only): force the next enqueue to fail with a genuine, non-`QueueFull`
       // error so the abort/propagate path below is exercised. No-op in production (the field is `None`/absent).
       #[cfg(test)]
@@ -2194,6 +2302,8 @@ mod tests {
       axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None, a: None },
       i: Some(0.0),
       j: Some(10.0),
+      k: None,
+      plane: Plane::XY,
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
@@ -2236,6 +2346,101 @@ mod tests {
       // Chord tolerance is 0.05 mm; allow a small extra margin for step-rounding at 100 steps/mm.
       assert!((dist - radius).abs() < 0.07, "vertex ({x}, {y}) off circle by {}", (dist - radius).abs());
     }
+  }
+
+  #[test]
+  fn g18_zx_arc_interpolates_in_the_zx_plane_with_y_helix() {
+    // A G18 (ZX) quarter arc: start at origin, center at (X10, Z0) — for G18 the offsets are I (→X) and K (→Z),
+    // so I10 K0 puts the center 10 mm along +X. Endpoint X10 Z10 with a Y helix of 5 mm. Every queued vertex must
+    // lie on the radius-10 circle in the XZ plane, and the Y (out-of-plane) axis must advance monotonically to 5.
+    let mut planner = Planner::new(coarse_arc_config());
+    let arc = PlannerCommand::Arc {
+      cw: false,
+      axes: AxisWords { x: Some(10.0), y: Some(5.0), z: Some(10.0), a: None },
+      i: Some(10.0),
+      j: None,
+      k: Some(0.0),
+      plane: Plane::ZX,
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
+      machine_coords: false,
+    };
+    planner.plan_command(&arc).expect("queued");
+    // The endpoint must be exactly X10 Y5 Z10 (1000, 500, 1000 steps at 100 steps/mm).
+    assert_eq!(planner.position_steps(), [1000, 500, 1000, 0]);
+    // Walk the vertices: each must lie on the XZ circle centered at (X10, Z0); Y advances toward 5 but does not
+    // disturb the in-plane geometry (a wrong-plane arc would put the circle on XY and fail this).
+    let center_x = 10.0_f32;
+    let center_z = 0.0_f32;
+    let radius = 10.0_f32;
+    let mut pos = [0i32; AXES];
+    let mut last_y = 0i32;
+    while let Some(block) = planner.pop_block() {
+      for (axis, p) in pos.iter_mut().enumerate() {
+        *p += block.steps[axis];
+      }
+      let x = pos[X_AXIS] as f32 / 100.0;
+      let z = pos[Z_AXIS] as f32 / 100.0;
+      let dist = libm::sqrtf((x - center_x) * (x - center_x) + (z - center_z) * (z - center_z));
+      assert!((dist - radius).abs() < 0.07, "ZX vertex (x{x}, z{z}) off circle by {}", (dist - radius).abs());
+      assert!(pos[Y_AXIS] >= last_y, "the Y helix must advance monotonically");
+      last_y = pos[Y_AXIS];
+    }
+    assert_eq!(last_y, 500, "the Y helix reaches the commanded 5 mm");
+  }
+
+  #[test]
+  fn g19_yz_arc_requires_a_jk_offset_not_an_i_offset() {
+    // For G19 (YZ) the in-plane offsets are J (→Y) and K (→Z); an I (→X) offset is OUT of the YZ plane, so an arc
+    // with only `I` and no J/K is a degenerate (centerless) arc and must be rejected, exactly as a G17 arc with
+    // only a K offset would be. This guards the plane→offset mapping against an axis-confusion regression.
+    let mut planner = Planner::new(coarse_arc_config());
+    let only_i = PlannerCommand::Arc {
+      cw: false,
+      axes: AxisWords { x: None, y: Some(10.0), z: Some(10.0), a: None },
+      i: Some(5.0),
+      j: None,
+      k: None,
+      plane: Plane::YZ,
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
+      machine_coords: false,
+    };
+    assert_eq!(planner.plan_command(&only_i), Err(PlannerError::InvalidArc));
+    // A J/K offset in the YZ plane is accepted.
+    let with_jk = PlannerCommand::Arc {
+      cw: false,
+      axes: AxisWords { x: None, y: Some(10.0), z: Some(10.0), a: None },
+      i: None,
+      j: Some(0.0),
+      k: Some(10.0),
+      plane: Plane::YZ,
+      units: Units::Millimeter,
+      distance: DistanceMode::Absolute,
+      feed: 600.0,
+      feed_mode: FeedMode::UnitsPerMin,
+      machine_coords: false,
+    };
+    assert!(planner.plan_command(&with_jk).is_ok(), "a J/K offset is a valid YZ-plane center");
+  }
+
+  #[test]
+  fn program_pause_and_coolant_pass_through_the_planner() {
+    // M0/M1/M6 flush look-ahead (a synchronized boundary) and surface as ProgramPause; M7/M8/M9 pass through with
+    // no flush as Coolant. Both carry no motion. This is the planner half of the program-flow/coolant wiring.
+    let mut planner = Planner::new(test_config());
+    let pause = planner
+      .plan_command(&PlannerCommand::ProgramPause { optional: true, tool_change: false })
+      .expect("pause");
+    assert_eq!(pause, PlannerOutcome::ProgramPause { optional: true, tool_change: false });
+    let coolant = planner
+      .plan_command(&PlannerCommand::Coolant(crate::gcode::CoolantState { mist: false, flood: true }))
+      .expect("coolant");
+    assert_eq!(coolant, PlannerOutcome::Coolant(crate::gcode::CoolantState { mist: false, flood: true }));
   }
 
   /// Drive an in-progress arc to completion the way the consumer does on hardware: enqueue a chunk, drain the
@@ -2428,6 +2633,8 @@ mod tests {
       axes: AxisWords { x: Some((pre as f32) + 10.0), y: Some(10.0), z: None, a: None },
       i: Some(0.0),
       j: Some(10.0),
+      k: None,
+      plane: Plane::XY,
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
@@ -2470,6 +2677,8 @@ mod tests {
       axes: AxisWords { x: Some(-10.0), y: Some(10.0), z: None, a: None },
       i: Some(0.0),
       j: Some(10.0),
+      k: None,
+      plane: Plane::XY,
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
@@ -2539,6 +2748,8 @@ mod tests {
       axes: AxisWords { x: Some(10.0), y: Some(0.0), z: None, a: None },
       i: None,
       j: None,
+      k: None,
+      plane: Plane::XY,
       units: Units::Millimeter,
       distance: DistanceMode::Absolute,
       feed: 600.0,
@@ -2855,6 +3066,8 @@ mod tests {
         axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None, a: None },
         i: Some(0.0),
         j: Some(10.0),
+        k: None,
+        plane: Plane::XY,
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 1.0,
@@ -2944,6 +3157,8 @@ mod tests {
         axes: AxisWords { x: Some(10.0), y: Some(10.0), z: None, a: Some(90.0) },
         i: Some(0.0),
         j: Some(10.0),
+        k: None,
+        plane: Plane::XY,
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 600.0,

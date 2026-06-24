@@ -233,6 +233,52 @@ mod tests {
     view
   }
 
+  /// The exact label the Program listing renders for `index` of `program` — `{:>5}  {line}` (1-based number,
+  /// two spaces, the source line). Mirrors `program_body`'s row format so a test can look the row up by label.
+  fn program_row_label(program: &[String], index: usize) -> String {
+    format!("{:>5}  {}", index + 1, program[index])
+  }
+
+  /// The Program tab auto-scrolls to keep the executing line in view as the stream advances. This drives the real
+  /// [`views::dock`] Program body — whose rows are virtualised via `show_rows`, so only on-screen rows exist as
+  /// widgets — and asserts the *executing* row is laid out (hence visible) after the cursor jumps deep into a
+  /// long file while already scrolled. That is exactly the path the pure `program_follow_target` test cannot
+  /// reach: it exercises the `scroll_to_rect` coordinate math, which must recover row 0's origin from the visible
+  /// slice (`range.start`) and step by the full row pitch (`row_height + item_spacing.y`). With the earlier
+  /// row-0-assuming math the target landed hundreds of pixels off once scrolled, leaving the executing row off
+  /// screen — so this regresses that bug.
+  #[test]
+  fn the_program_tab_keeps_the_executing_line_in_view_after_a_scrolled_advance() {
+    let program: Vec<String> = (0..500).map(|n| format!("G1 X{n}")).collect();
+    let total = program.len();
+    let mut ui = UiState::default();
+    ui.active_tab = views::DockTab::Program;
+    ui.set_program(program.clone(), None);
+    // The dock body virtualises (only a slice of the 500 rows is ever laid out) yet is small relative to the file,
+    // so the executing line genuinely scrolls — `build_dock_harness` uses a 900×260 window.
+    let time = TimeEstimate { elapsed: Duration::from_secs(0), remaining: None, total: None };
+
+    // First settle the view on a line a few hundred rows down, so the listing is scrolled well away from the top
+    // (`range.start > 0`) — the state in which the old row-0-assuming math went wrong.
+    let state = HarnessState::new(view_streaming(250, total), ui);
+    let mut harness = build_dock_harness(state, time);
+    harness.run();
+    // Sanity: it actually scrolled — row 0 is virtualised away, not laid out, so its label is absent.
+    assert!(
+      harness.query_by_label(&program_row_label(&program, 0)).is_none(),
+      "the listing must have scrolled away from the top, virtualising row 0 out of the widget tree"
+    );
+
+    // Advance the cursor deeper into the file while already scrolled, then re-render. The follow must re-target
+    // the new executing row and bring it into view.
+    harness.state_mut().view = view_streaming(460, total);
+    harness.run();
+    assert!(
+      harness.query_by_label(&program_row_label(&program, 460)).is_some(),
+      "after a scrolled advance the executing row (461: `G1 X460`) must be scrolled into view, not left off screen"
+    );
+  }
+
   /// Regression for the crammed dock progress readout: render the real [`views::dock`] with a loaded, mid-stream
   /// program and a projectable estimate, and assert the readout's fields are present as distinct, separated labels
   /// — the percent (`9%`) and the clock (`0:51 / 9:36`) are separate nodes with a `·` separator between them, not

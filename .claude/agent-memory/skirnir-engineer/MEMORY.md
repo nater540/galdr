@@ -13,3 +13,5 @@
 - [Engine write cancel-safety](engine-write-cancel-safety.md) — cursor-based write path, Transport::write primitive, Effect::AbortQueued on soft-reset/banner, timeout-bounded teardown, loopback partial-write seam
 - [header_bar item_spacing leak](header-bar-itemspacing-leak.md) — tab_strip's left-closure item_spacing.x=0 leaks into the shared right closure; header-strip right content must set its own spacing
 - [Graceful program-stop](graceful-program-stop.md) — 0x86 ProgramStop (clean Stop) vs 0x18 SoftReset (Abort/E-stop); two-control split, abort_enabled gating, re-Run
+- [Program panel auto-scroll](program-panel-autoscroll.md) — follow executing line in virtualized show_rows via scroll_to_rect (not stick-to-bottom); pure program_follow_target + program_followed_line gate
+- [Tool-change state](tool-change-state.md) — grblHAL Tool machine-state + active tool: parser_state.rs [GC:] T<n>, ViewState.current_tool, BadgeState::Tool resume-via-~, $G requested on Tool transition

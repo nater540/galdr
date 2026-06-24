@@ -9,6 +9,7 @@ pub mod codes;
 pub mod core;
 pub mod flow;
 pub mod lifecycle;
+pub mod parser_state;
 pub mod probe;
 pub mod realtime;
 pub mod response;
@@ -22,6 +23,7 @@ pub use codes::{
 pub use core::{Effect, ProtocolCore};
 pub use flow::{DEFAULT_RX_BUFFER, FlowWindow};
 pub use lifecycle::ConnectionState;
+pub use parser_state::{ParserState, parse_gc_body};
 pub use probe::parse_prb_body;
 pub use realtime::RealtimeCommand;
 pub use response::{Response, is_grbl_evidence, parse_line};

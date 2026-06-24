@@ -12,6 +12,7 @@
 //! and host-tested. The remaining subsystems are documented stubs awaiting their DOC-referenced
 //! implementations.
 
+pub mod coolant;
 pub mod coords;
 pub mod drivers;
 pub mod gcode;

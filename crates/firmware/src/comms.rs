@@ -24,7 +24,11 @@
 //! - [`comms_consumer`] is the real gcode parser → planner pipeline. It parses each accepted line through a
 //!   persistent [`Parser`], feeds the resulting command to a persistent [`Planner`], answers the `$` system
 //!   queries (`$$`/`$I`/`$I+`/`$G`/`$#`), and emits exactly one `ok`/`error:N` per line. It owns the
-//!   grblHAL gcode error-hold and back-pressures the host when the planner buffer is full.
+//!   grblHAL gcode error-hold and back-pressures the host when the planner buffer is full. While this single task
+//!   is held in an M0/M1/M6 pause ([`run_program_pause`]), it STILL services read-only `$`-queries (`$G`/`$#`/`$$`/
+//!   `$I`…) in place via [`hold_until_resume`] — answering report + `ok` without releasing the hold, so a
+//!   character-counting host is never stalled — while DEFERRING every motion / write / action line until resume.
+//!   `?` is served by the separate [`status_responder`] task and is answered throughout regardless.
 //! - The DOC-02 `motion_executor` (in [`crate::motion`], on core 1) is the consumer end of the planner
 //!   queue: it pops blocks, realizes them as RMT step pulses, and publishes the *live* position into
 //!   [`MACHINE`]. The consumer raises [`BLOCK_AVAILABLE`] after enqueuing a motion block so the executor
@@ -61,8 +65,8 @@ use firmware_core::planner::{Planner, PlannerConfig, PlannerError, PlannerOutcom
 use firmware_core::spindle::SpindleAction;
 use firmware_core::protocol::{
   classify_realtime, probe_response, AlarmCode, CheckToggle, ControlState, CoordinateReport, EngineEvent,
-  LastProbe, MachineSnapshot, MachineState, Overrides, ParserDistance, ParserFeedMode, ParserMotion, ParserSnapshot,
-  ParserSpindle, ParserUnits,
+  LastProbe, MachineSnapshot, MachineState, Overrides, ParserCoolant, ParserDistance, ParserFeedMode, ParserMotion,
+  ParserPlane, ParserSnapshot, ParserSpindle, ParserUnits,
   PinReport, PositionReport, ProbeResponse, RealtimeCommand, RefreshReporter, ResponseWriter, StreamEngine,
   SystemCommand, UnlockOutcome, ERROR_CODES, ERROR_HOMING_DISABLED, ERROR_UNSUPPORTED_COMMAND, MAX_LINE_LEN,
   NGC_PARAMETER_LINES, RX_BUFFER_SIZE, RESPONSE_CAPACITY,
@@ -470,6 +474,46 @@ pub static SPINDLE_UPDATE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// does NOT set this — a held program keeps the spindle running, matching grblHAL. The task races this against
 /// the update wake AND against the reverse-dwell timer, so an e-stop during a spin-down still parks the spindle.
 pub static SPINDLE_ESTOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// The commanded modal COOLANT state (M7/M8/M9), packed into a `u8` bitmask (`bit0 = mist`, `bit1 = flood`).
+/// Published by the consumer from the parser's modal coolant state and read by the [`coolant`] task, which drives
+/// the (hardware-gated) coolant outputs. `Release`/`Acquire` orders it ahead of the [`COOLANT_UPDATE`] wake that
+/// always follows a store. Mirrors [`SPINDLE_DIRECTION`].
+pub static COOLANT_STATE: AtomicU8 = AtomicU8::new(0);
+/// [`COOLANT_STATE`] bit for mist (M7).
+pub const COOLANT_BIT_MIST: u8 = 0b01;
+/// [`COOLANT_STATE`] bit for flood (M8).
+pub const COOLANT_BIT_FLOOD: u8 = 0b10;
+
+/// Wakes the [`coolant`] task to RE-APPLY the coolant outputs from the current [`COOLANT_STATE`]. Coalesced (a
+/// `Signal`): the task always re-reads the live state after a wake, so a missed-and-coalesced wake loses nothing.
+/// Set by the consumer on an M7/M8/M9. Mirrors [`SPINDLE_UPDATE`].
+pub static COOLANT_UPDATE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Forces the [`coolant`] task to turn BOTH circuits off immediately, independent of modal state, for any ALARM,
+/// soft reset (`0x18`), hard-limit trip, `$SLP` sleep, or program end (M2/M30) — mirroring [`SPINDLE_ESTOP`] and
+/// DOC-07's "ALARM/soft-reset force coolant off" rule. A feed hold (`!`) deliberately does NOT set this.
+pub static COOLANT_ESTOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// The optional-stop (`M1`) switch state, toggled by the `0x88` real-time byte (grblHAL's optional-stop toggle).
+/// `false` (the power-on / grblHAL default) makes an `M1` a no-op `ok`; `true` makes `M1` halt like `M0`. There is
+/// no `$`-setting for this in grbl — the switch is a runtime toggle — so it is held here as a plain flag, NOT
+/// persisted. A soft reset does NOT reset it (grbl keeps the operator's switch position across a reset). `Relaxed`
+/// is sufficient: it gates a pause decision, not other memory.
+pub static OPTIONAL_STOP_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Cycle-start (`~`) resume nudge for an active M0/M1/M6 program-flow pause. The `~` handler raises it whenever a
+/// resume is requested AND a pause is active ([`PAUSE_ACTIVE`]); [`run_program_pause`] awaits it to leave the hold.
+/// The pause's own state check ([`ControlState::resumes_on_cycle_start`]) is authoritative — this `Signal` only
+/// nudges the awaiting pause out of its wait, so a coalesced wake loses nothing. A dedicated `Signal` per waiter
+/// (only `run_program_pause` awaits it) keeps it from being stolen by the executor's `HOLD_WAKE`.
+pub static PAUSE_RESUME: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// "An M0/M1/M6 program-flow pause is currently holding" — set by [`run_program_pause`] for the duration of the
+/// hold, read by the `~` real-time handler so a cycle-start during a pause raises [`PAUSE_RESUME`] (and not just
+/// the feed-hold release path). `AcqRel`/`Acquire` publishes it from the consumer to the reader half. Cleared when
+/// the pause ends (resume / preemption).
+pub static PAUSE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// The last-sampled LOGICAL probe-asserted state (after the `$6` invert), published by the core-1 probe cycle and
 /// read by `status_responder` to source the `Pn:P` letter (Phase E / Phase C). `AcqRel`/`Acquire` publishes it
@@ -918,6 +962,12 @@ fn dispatch_realtime(cmd: RealtimeCommand) {
         set_control_state(current.cycle_start());
         HOLD_REQUESTED.store(false, Ordering::Release);
         HOLD_WAKE.signal(());
+        // If an M0/M1/M6 program-flow pause is the thing holding, nudge it to leave its hold-await and resume the
+        // stream (it owns clearing PAUSE_ACTIVE + acking the line). The executor release above is shared with a
+        // plain feed-hold; this dedicated nudge wakes the consumer's pause wait without racing the executor wake.
+        if PAUSE_ACTIVE.load(Ordering::Acquire) {
+          PAUSE_RESUME.signal(());
+        }
       }
     }
     RealtimeCommand::SoftReset | RealtimeCommand::Stop => {
@@ -1016,6 +1066,12 @@ fn dispatch_realtime(cmd: RealtimeCommand) {
       if suspended {
         AUTO_REPORT_WAKE.signal(());
       }
+    }
+    RealtimeCommand::ToggleOptionalStop => {
+      // `0x88`: flip the optional-stop switch that gates `M1`. A `Relaxed` flip, non-blocking on the real-time
+      // path; the next `M1` pause consults it. Never acked (it is a real-time toggle, not a line). grblHAL leaves
+      // this OFF by default, so until a host sends `0x88` an `M1` is a no-op `ok` (an `M0`-equivalent only when on).
+      OPTIONAL_STOP_ENABLED.fetch_xor(true, Ordering::Relaxed);
     }
     // Parser-state-on-demand and safety door are accepted but not yet acted on (Stage 2/3). They correctly
     // produce no `ok`.
@@ -1241,8 +1297,11 @@ async fn emit_alarm(code: AlarmCode) {
   // spindle is parked at once even if the RESPONSE channel is back-pressured and the alarm-text awaits stall.
   // The commanded direction is also cleared so a later `~`/`$X` does not silently restart a spindle that the
   // program never re-commanded. (A feed hold does NOT route through here, so it leaves the spindle running,
-  // matching grblHAL.) This is the universal alarm-emit chokepoint, so the e-stop lives here once.
+  // matching grblHAL.) This is the universal alarm-emit chokepoint, so the e-stop lives here once. Coolant is
+  // forced off alongside the spindle: DOC-07 kills both on any alarm (a feed hold, which does not route here,
+  // leaves both running).
   force_spindle_off();
+  force_coolant_off();
   let mut a = Response::new();
   if ResponseWriter::alarm(&mut a, code).is_ok() {
     enqueue(a).await;
@@ -1262,6 +1321,43 @@ async fn emit_alarm(code: AlarmCode) {
 fn force_spindle_off() {
   SPINDLE_DIRECTION.store(SPINDLE_DIR_STOP, Ordering::Release);
   SPINDLE_ESTOP.signal(());
+}
+
+/// Force coolant OFF (DOC-07 safety): clear the commanded modal coolant state and signal the [`coolant`] task's
+/// emergency stop. Used by every coolant-killing event — ALARM ([`emit_alarm`]), soft reset ([`reset_pipeline`]),
+/// program end ([`program_end`]), graceful stop ([`program_stop_cycle`]), and sleep ([`handle_sleep`]) — mirroring
+/// [`force_spindle_off`]. Synchronous (an atomic store + a coalesced `Signal`), callable from any context.
+fn force_coolant_off() {
+  COOLANT_STATE.store(0, Ordering::Release);
+  COOLANT_ESTOP.signal(());
+}
+
+/// Drive the [`coolant`] task from the parser's MODAL coolant state (M7/M8/M9), called after every clean parse.
+/// Like [`sync_spindle_from_modal`], keying off modal state (not the per-line emit) is what makes an M7/M8 that
+/// SHARES a line with a move still actuate coolant (the emit is the move). Acts only on a real change vs the last
+/// dispatched mask. Synchronous (an atomic store + a coalesced `Signal`).
+fn sync_coolant_from_modal(modal: &ModalState, state: &mut ConsumerState) {
+  let mask = coolant_mask(modal.coolant);
+  if mask != state.last_coolant {
+    COOLANT_STATE.store(mask, Ordering::Release);
+    COOLANT_UPDATE.signal(());
+    state.last_coolant = mask;
+  }
+}
+
+/// Pack a [`CoolantState`](firmware_core::gcode::CoolantState) into the [`COOLANT_STATE`] bitmask.
+fn coolant_mask(coolant: firmware_core::gcode::CoolantState) -> u8 {
+  (if coolant.mist { COOLANT_BIT_MIST } else { 0 }) | (if coolant.flood { COOLANT_BIT_FLOOD } else { 0 })
+}
+
+/// Unpack the live [`COOLANT_STATE`] bitmask into a [`CoolantState`](firmware_core::gcode::CoolantState), for the
+/// [`coolant`] task. An `Acquire` load pairs with the consumer's `Release` store.
+pub fn commanded_coolant() -> firmware_core::gcode::CoolantState {
+  let mask = COOLANT_STATE.load(Ordering::Acquire);
+  firmware_core::gcode::CoolantState {
+    mist: mask & COOLANT_BIT_MIST != 0,
+    flood: mask & COOLANT_BIT_FLOOD != 0,
+  }
 }
 
 /// Reset the parser/planner pipeline state this task owns on a soft reset (`0x18`): restore the parser to
@@ -1285,8 +1381,11 @@ fn force_spindle_off() {
 /// documents an aborted-mid-move position, recovered by `$H`.)
 async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   // `Parser` exposes no in-place reset; reconstructing it restores the documented power-on modal defaults
-  // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state.
+  // (G0, G90, G21, F0, S0) — exactly grbl's warm-reset modal state. The CURRENT tool is RETAINED across the reset
+  // (grbl keeps the physically-loaded tool through a soft reset), so snapshot it and restore it after the rebuild.
+  let retained_tool = parser.state().current_tool;
   *parser = Parser::new();
+  parser.set_current_tool(retained_tool);
   state.error_hold = false;
   // Drop any partially accumulated `$PBX=` import so a frame begun before the reset cannot bleed into one after.
   state.pb.reset();
@@ -1337,6 +1436,10 @@ async fn reset_pipeline(parser: &mut Parser, state: &mut ConsumerState) {
   // e-stop is issued here unconditionally. The commanded direction is cleared so the spindle stays off until a
   // fresh M3/M4 after the reset.
   force_spindle_off();
+  // DOC-07: a soft reset also forces coolant off (grbl resets coolant on `0x18`). Clear the commanded state and
+  // the consumer's last-dispatched mask so the first post-reset M7/M8 is seen as a fresh change.
+  force_coolant_off();
+  state.last_coolant = 0;
   reset_ov_reporter();
   // Phase F: a soft reset re-seeds the auto-report cadence from the (post-reset) live `$481` and clears the
   // `0x8C` runtime suspend, so auto-reporting returns to its configured state. Wake the task so it re-arms (or
@@ -1386,6 +1489,10 @@ struct ConsumerState {
   /// bare `S` change re-drive the duty of a RUNNING spindle (grbl updates a spinning spindle's speed on a lone
   /// `S`); compared only while the spindle is running. Reset to `0` on a soft reset.
   last_spindle_rpm: u16,
+  /// The last COOLANT bitmask this consumer dispatched to the [`coolant`] task (`bit0 = mist`, `bit1 = flood`).
+  /// Compared against the parser's modal coolant after each clean parse so an M7/M8/M9 change — including one that
+  /// SHARED a line with a move — re-drives the outputs exactly once. Reset to `0` (off) on a soft reset / M30.
+  last_coolant: u8,
 }
 
 /// The maximum stored startup-line length, in bytes. Bounded so the `$N` echo (`$Nn=<gcode>\r\n`) always fits
@@ -1423,14 +1530,19 @@ async fn handle_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerState
     state.error_hold = false;
     handle_system_command(rest, parser, state, flash).await;
   } else {
-    plan_gcode_line(trimmed, parser, state).await;
+    plan_gcode_line(trimmed, parser, state, flash).await;
   }
 }
 
 /// Parse and plan one GCode line, emitting exactly one `ok`/`error:N`. Honors the error-hold: while held,
 /// a GCode line is rejected without parsing. On a parse or planner error the hold is armed; on acceptance
 /// (including modal-only `Ok(None)` lines) a single `ok` is emitted.
-async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerState) {
+async fn plan_gcode_line(
+  line: &[u8],
+  parser: &mut Parser,
+  state: &mut ConsumerState,
+  flash: &'static SharedFlash,
+) {
   if state.error_hold {
     // Held by a prior error: reject without parsing until a recovery trigger. Reuse the generic
     // "expected command letter" code, matching how a sender already in error-recovery treats any further
@@ -1478,6 +1590,10 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
     // so it is gated here. The check guard in the `match` below only suppresses planning, which is too late.
     if control != ControlState::Check {
       sync_spindle_from_modal(modal, state);
+      // Drive coolant from modal state too (M7/M8/M9), gated off check mode for the same reason: a dry run must
+      // validate the program without actuating any output. Keying off modal state makes an M7/M8 sharing a line
+      // with a move actuate coolant (the per-line emit is the move), mirroring the spindle.
+      sync_coolant_from_modal(modal, state);
     }
   }
   match parsed {
@@ -1569,6 +1685,25 @@ async fn plan_gcode_line(line: &[u8], parser: &mut Parser, state: &mut ConsumerS
             apply_soft_reset(parser, state).await;
           }
         }
+        // An M0/M1/M6 program-flow pause: drain motion and hold until cycle-start (`~`), then `ok`. The `ok`
+        // follows normal char-counting — it is emitted when the pause COMPLETES (after the resume), exactly like
+        // a dwell, so the host's send-ahead window naturally stalls while paused. `run_program_pause` returns
+        // `Resumed` on cycle-start, or a preemption (soft reset / graceful stop) the caller honors with no `ok`.
+        PlanResult::ProgramPause { optional, tool_change } => {
+          // The committed CURRENT tool (M6 commits pending->current before this point) names the tool-change
+          // prompt so a bare-terminal operator knows which tool to insert.
+          let current_tool = parser.state().current_tool;
+          match run_program_pause(optional, tool_change, current_tool, parser, state, flash).await {
+            PauseOutcome::Resumed => ack().await,
+            PauseOutcome::Skipped => ack().await,
+            PauseOutcome::Aborted => apply_soft_reset(parser, state).await,
+            PauseOutcome::Stopped => program_stop_cycle(parser, state).await,
+          }
+        }
+        // An M7/M8/M9 coolant command: the coolant outputs were ALREADY driven from the modal coolant state by
+        // `sync_coolant_from_modal` (on the clean parse), so a coolant-only line just `ok`s here — mirroring how
+        // a spindle-only line is handled. Driving off modal state makes an M7/M8 sharing a line with a move work.
+        PlanResult::Coolant(_state) => ack().await,
         // A `G38.x` probe: run the probe-watching cycle on the core-1 executor and decide the response from the
         // outcome and the mode's alarm-on-fail flag.
         PlanResult::Probe { request, alarm_on_fail } => {
@@ -1622,6 +1757,19 @@ enum PlanResult {
   /// resets the parser's modal state to power-on defaults (grbl's M30 reset). Carried out of `plan_command` so the
   /// drain wait + spindle/modal reset run in the consumer task.
   ProgramEnd,
+  /// An M0/M1/M6 program-flow pause. The planner flushed look-ahead; the consumer drains motion and holds until
+  /// cycle-start (`~`), reusing the graceful-hold machinery. `optional` flags M1 (the optional-stop gate decides
+  /// whether it actually halts); `tool_change` flags M6 (the consumer prompts the operator to swap the tool).
+  /// Carried out of `plan_command` so the drain + hold-await run in the consumer task that owns the stream.
+  ProgramPause {
+    /// True for M1 (optional stop): only halts when the optional-stop toggle ([`OPTIONAL_STOP_ENABLED`]) is on.
+    optional: bool,
+    /// True for M6 (manual tool change): the consumer emits a `[MSG:..]` swap prompt before holding.
+    tool_change: bool,
+  },
+  /// An M7/M8/M9 coolant command. The planner passed it through with no motion; the consumer drives the
+  /// (hardware-gated) coolant outputs from the carried [`CoolantState`]. Mirrors [`Spindle`](PlanResult::Spindle).
+  Coolant(firmware_core::gcode::CoolantState),
   /// A `G38.x` probe (Phase C): the planner resolved the machine target and flushed look-ahead. The consumer
   /// runs the probe-watching cycle on the core-1 executor (carrying the resolved request + the alarming sense),
   /// syncs the planner position to the stop point, emits `[PRB:]`, and decides ALARM/ok.
@@ -1718,6 +1866,14 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // `M30` program end: the planner flushed look-ahead; the consumer drains motion, stops the spindle, and
       // resets modal state. Surfaced so those side effects run in the consumer task.
       Ok(PlannerOutcome::ProgramEnd) => return PlanResult::ProgramEnd,
+      // M0/M1/M6 program-flow pause: the planner flushed look-ahead (the pause is a synchronized boundary, like a
+      // dwell). Surface it so the consumer drains motion and runs the hold-until-cycle-start cycle in its own task.
+      Ok(PlannerOutcome::ProgramPause { optional, tool_change }) => {
+        return PlanResult::ProgramPause { optional, tool_change };
+      }
+      // An M7/M8/M9 coolant command: the planner passes it through with no motion. Surface it so the consumer drives
+      // the coolant task off the modal state, mirroring how the spindle outcome is handled.
+      Ok(PlannerOutcome::Coolant(state)) => return PlanResult::Coolant(state),
       // G28/G30 is NOT planned through this generic path — the consumer intercepts it before `plan_command`
       // (see `handle_go_to_predefined`) because it must read the stored predefined position from the coordinate
       // model, which lives in the consumer, not the planner. The pass-through `GoToPredefined` outcome is therefore
@@ -2040,12 +2196,18 @@ async fn program_end(parser: &mut Parser, state: &mut ConsumerState) -> bool {
     return false;
   }
   // M30 turns the spindle off: park it (SPIN_EN off + duty 0) and clear the commanded direction + programmed RPM.
+  // grbl's M30 also turns COOLANT off (group 8 → M9); force both off and clear the last-dispatched mask.
   force_spindle_off();
+  force_coolant_off();
+  state.last_coolant = 0;
   PROGRAMMED_SPINDLE_RPM.store(0, Ordering::Release);
   // Reset modal state to defaults and the spindle tracking to match, so the next line's `sync_spindle_from_modal`
   // sees a fresh `Stop`/`S0` baseline rather than the just-ended program's direction. `Parser::new()` resets the
-  // modal WCS to G54 (index 0).
+  // modal WCS to G54 (index 0). The CURRENT tool is RETAINED across M30 (grbl: program end is a rewind, not a tool
+  // change — the selected tool survives), so snapshot it and restore it after the rebuild.
+  let retained_tool = parser.state().current_tool;
   *parser = Parser::new();
+  parser.set_current_tool(retained_tool);
   state.spin_up = SpinUpGate::new();
   state.last_spindle_dir = SpindleState::Stop;
   state.last_spindle_rpm = 0;
@@ -2058,6 +2220,180 @@ async fn program_end(parser: &mut Parser, state: &mut ConsumerState) -> bool {
   set_overrides(Overrides::new());
   reset_ov_reporter();
   true
+}
+
+/// The outcome of an M0/M1/M6 program-flow pause ([`run_program_pause`]).
+enum PauseOutcome {
+  /// The pause completed: motion drained, the machine held, and a cycle-start (`~`) resumed it. The caller `ok`s.
+  Resumed,
+  /// The pause did NOT halt: an `M1` whose optional-stop gate is off. No hold occurred; the caller still `ok`s the
+  /// line so the stream continues (an `M1` is always a valid line, it simply does nothing when the switch is off).
+  Skipped,
+  /// A soft reset (`0x18`) preempted the drain or the hold-await; the caller runs the warm reset and drops the `ok`.
+  Aborted,
+  /// A graceful program stop (`0x86`) preempted the drain or the hold-await; the caller runs the clean stop and
+  /// drops the `ok`. Distinct from [`Aborted`](PauseOutcome::Aborted) — a stop returns to Idle with position
+  /// retained and no alarm.
+  Stopped,
+}
+
+/// Run an M0/M1/M6 program-flow pause (grbl program-flow). The line's `ok` is the CALLER's job and is emitted only
+/// when this returns [`Resumed`](PauseOutcome::Resumed) / [`Skipped`](PauseOutcome::Skipped) — i.e. once the pause
+/// has run to completion — so the host's character-counting naturally stalls while paused (this is correct flow
+/// control, exactly like the `G4` dwell, NOT a deferred ack).
+///
+/// Sequencing, reusing the existing graceful-hold machinery rather than a parallel hold path:
+/// 1. **M1 gate**: an optional stop whose [`OPTIONAL_STOP_ENABLED`] switch is OFF returns [`Skipped`] immediately
+///    (no hold) — grbl's default M1 behavior. M0 and M6 always pause.
+/// 2. **Drain**: wait for the core-1 executor to drain to a stop ([`wait_for_motion_idle`] — the planner already
+///    flushed look-ahead so the preceding block decelerates to rest). A soft reset here returns [`Aborted`].
+/// 3. **M6 prompt**: a tool-change pause emits a `[MSG:..]` NAMING `current_tool` so the operator knows which tool
+///    to swap in, then resume. (The tool number is human-readable only; `skirnir` sources it from the program.)
+/// 4. **Hold**: latch `Hold:0` (M0/M1) or the `Tool` state (M6) and mark [`PAUSE_ACTIVE`], then [`hold_until_resume`]
+///    awaits a cycle-start [`PAUSE_RESUME`] nudge (raced against a soft reset and a graceful stop) WHILE STILL
+///    SERVICING read-only `$`-queries — so the hold returns to `Normal` on `~` and a host is never stalled.
+///
+/// ## `$`-QUERIES ARE SERVICED DURING THE HOLD (grbl-faithful)
+/// Real grbl/grblHAL answers read-only queries (`$G`/`$#`/`$$`/`$I`…) DURING a hold — the motion is held, the
+/// protocol loop is not — and so does this firmware: [`hold_until_resume`] PEEKS the line queue and answers any
+/// read-only `$`-query in place (its report + `ok`) without releasing the hold, while LEAVING every motion / write /
+/// action line queued to run after resume. This is the fix for the earlier divergence where a `$G` on entering the
+/// `Tool` state stalled a character-counting host until `~`. (`?` was always answered — it is served by the separate
+/// [`status_responder`] task — so live state/DRO is available throughout regardless.) See [`hold_until_resume`] for
+/// the exact serviced-vs-deferred routing.
+async fn run_program_pause(
+  optional: bool,
+  tool_change: bool,
+  current_tool: u16,
+  parser: &mut Parser,
+  state: &mut ConsumerState,
+  flash: &'static SharedFlash,
+) -> PauseOutcome {
+  // 1. An M1 with the optional-stop switch off does not halt (grbl default). It is still a valid, acknowledged line.
+  if optional && !OPTIONAL_STOP_ENABLED.load(Ordering::Relaxed) {
+    return PauseOutcome::Skipped;
+  }
+  // 2. Drain pending motion to a stop so the pause holds at rest (the planner flushed look-ahead already). A soft
+  //    reset abandons the drain; the consumed signal is honored by the caller.
+  if !wait_for_motion_idle().await {
+    return PauseOutcome::Aborted;
+  }
+  // 3. A manual tool change: prompt the operator to swap the tool before holding. This machine has no ATC, so the
+  //    swap is manual and the operator resumes with `~` when done (grblHAL reports the `Tool` state during a manual
+  //    change; the state below reports the dedicated grblHAL `Tool` state for an M6 so a sender shows a tool-change
+  //    prompt, while M0/M1 report `Hold:0`).
+  if tool_change {
+    // Build the tool-named prompt with the host-tested formatter, then push it. A formatter failure (buffer too
+    // small — unreachable for this fixed-length text) simply skips the prompt rather than panicking.
+    let mut text = Response::new();
+    if ResponseWriter::tool_change_message(&mut text, current_tool).is_ok() {
+      send_message(text.as_str()).await;
+    }
+  }
+  // 4. Latch the hold and mark the pause active so the `~` handler nudges THIS wait, then await the resume. An M6
+  //    enters the dedicated `Tool` state (grblHAL `STATE_TOOLCHANGE`, reported as `<Tool|...>`); M0/M1 enter the
+  //    feed-hold `Hold:0`. BOTH resume on cycle-start (`resumes_on_cycle_start` covers Tool too) back to `Normal`.
+  let paused_state = if tool_change { ControlState::tool_change() } else { control_state().feed_hold() };
+  set_control_state(paused_state);
+  PAUSE_ACTIVE.store(true, Ordering::Release);
+  let outcome = hold_until_resume(parser, state, flash).await;
+  PAUSE_ACTIVE.store(false, Ordering::Release);
+  outcome
+}
+
+/// Hold (the M0/M1/M6 pause body) until a cycle-start resume, a soft reset, or a graceful stop — while STILL
+/// SERVICING read-only `$`-queries (grbl answers `$G`/`$#`/`$$`/`$I` etc. during a hold). This is the fix for the
+/// "held machine appears to HANG a character-counting host" bug: a query that arrives during the hold is answered
+/// (report + `ok`) IN PLACE so the host's send-ahead window frees, and the hold is NOT released.
+///
+/// ## Exactly what is serviced vs deferred
+/// Each iteration PEEKS the head of [`LINE_QUEUE`] WITHOUT consuming it ([`Channel::try_peek`]) and routes by
+/// [`peeked_line_is_holdable_query`]:
+/// - A pure read-only `$`-query (`$`, `$$`, `$I`/`$I+`, `$G`, `$#`, `$N`, `$ES`/`$EG`/`$EE`/`$EA`, `$SED=`, `$PBX`):
+///   CONSUME it and answer via [`handle_system_command`] (its report + the one `ok`), then loop back into the hold.
+///   The `$`-query also clears the gcode error-hold, exactly as it would outside a pause (a `$` command is a grbl
+///   recovery trigger).
+/// - ANYTHING ELSE — a gcode/jog motion line, a blank line, a setting WRITE (`$n=val`), `$X`/`$C`/`$SLP`/`$H`, a
+///   `$N0=`/`$PBX=` write, or an `Unknown` `$` command — is LEFT ON THE QUEUE (peeked, not received). It is NOT
+///   executed during the hold and runs IN ORDER once the pause resumes, so a held machine never mutates state or
+///   moves behind the operator's back, and stream order is preserved (no reordering — the deferred line stays at
+///   the head). The `select` then drops the line arm so a deferred head does not busy-spin: it waits only on the
+///   resume / reset / stop signals until one fires (or `~` resumes and the consumer's normal loop reads the line).
+///
+/// `?` is unaffected throughout — it is served by the separate [`status_responder`] task, so a host polling `?`
+/// sees the live `<Tool|...>` / `<Hold:0|...>` state and DRO for the whole hold.
+async fn hold_until_resume(
+  parser: &mut Parser,
+  state: &mut ConsumerState,
+  flash: &'static SharedFlash,
+) -> PauseOutcome {
+  loop {
+    // Whether the head line (if any) is a serviceable read-only `$`-query. A peek that finds the queue empty, or a
+    // head that is a deferred (non-query) line, both yield `false` — in which case we wait only on the signals so a
+    // deferred head cannot busy-spin the `ready_to_receive` arm.
+    let head_is_query = matches!(LINE_QUEUE.try_peek(), Ok(line) if peeked_line_is_holdable_query(line.as_slice()));
+    // The three terminating signals, plus — ONLY when a serviceable query is at the head — a line-ready arm. With no
+    // query at the head the line arm is omitted, so the select parks on the signals until a resume/reset/stop.
+    let signals = select(PAUSE_RESUME.wait(), select(SOFT_RESET.wait(), PROGRAM_STOP.wait()));
+    if head_is_query {
+      match select(signals, LINE_QUEUE.ready_to_receive()).await {
+        Either::First(resolved) => return resolve_pause_signal(resolved),
+        // A serviceable query is at the head and ready: consume it and answer it in place, then loop back into the
+        // hold. `try_receive` cannot fail here — we just peeked it ready, and this task is the sole receiver.
+        Either::Second(()) => {
+          if let Ok(line) = LINE_QUEUE.try_receive() {
+            service_held_query(line.as_slice(), parser, state, flash).await;
+          }
+        }
+      }
+    } else {
+      // No serviceable query at the head (empty queue, or a deferred non-query line that must wait for resume): park
+      // on the signals only. A deferred line stays at the head and is read by the consumer's normal loop after `~`.
+      return resolve_pause_signal(signals.await);
+    }
+  }
+}
+
+/// Map the resolved pause-await signal `select` to its [`PauseOutcome`]. The soft-reset / graceful-stop signals are
+/// CONSUMED here; the caller runs `apply_soft_reset` / `program_stop_cycle` directly (matching `run_dwell`'s abort
+/// contract — do NOT re-signal, or the consumer would act twice). A cycle-start resume has already cleared the hold
+/// level + set the control state back to `Normal` via the `~` handler's `cycle_start()`.
+fn resolve_pause_signal(resolved: Either<(), Either<(), ()>>) -> PauseOutcome {
+  match resolved {
+    Either::First(()) => PauseOutcome::Resumed,
+    Either::Second(Either::First(())) => PauseOutcome::Aborted,
+    Either::Second(Either::Second(())) => PauseOutcome::Stopped,
+  }
+}
+
+/// Service a read-only `$`-query line that arrived DURING a pause hold, mirroring `handle_line`'s `$`-command path:
+/// trim, strip the leading `$`, clear the gcode error-hold (a `$` command is a grbl recovery trigger), and dispatch
+/// to [`handle_system_command`] (which emits the report + the single `ok`). Only ever called on a line
+/// [`peeked_line_is_holdable_query`] has already confirmed is a read-only query, so the strip/classify is provably a
+/// read-only command; the defensive re-check keeps it correct if the head changed between peek and receive.
+async fn service_held_query(line: &[u8], parser: &mut Parser, state: &mut ConsumerState, flash: &'static SharedFlash) {
+  let trimmed = trim_ascii(line);
+  if let Some(rest) = trimmed.strip_prefix(b"$") {
+    if SystemCommand::classify(rest).is_readonly_query() {
+      state.error_hold = false;
+      handle_system_command(rest, parser, state, flash).await;
+    }
+  }
+}
+
+/// Whether a peeked line is a read-only `$`-query that may be SERVICED while an M0/M1/M6 pause hold is active
+/// (without releasing the hold). True only for a `$`-prefixed line (after trimming) whose [`SystemCommand`] is a
+/// [`is_readonly_query`](SystemCommand::is_readonly_query). A `$J=` jog is deliberately excluded (it is a MOTION
+/// command, not a `$`-query — `strip_jog_prefix` routes it elsewhere), as is any blank/gcode line and any `$`-write.
+fn peeked_line_is_holdable_query(line: &[u8]) -> bool {
+  let trimmed = trim_ascii(line);
+  if strip_jog_prefix(trimmed).is_some() {
+    return false; // `$J=` is a jog (motion), never a held-state query.
+  }
+  match trimmed.strip_prefix(b"$") {
+    Some(rest) => SystemCommand::classify(rest).is_readonly_query(),
+    None => false,
+  }
 }
 
 /// The spindle task (DOC-07, core 0 / PRO_CPU). The SINGLE driver of the spindle outputs: it owns the
@@ -2090,6 +2426,40 @@ pub async fn spindle(controller: &'static mut spindle::Spindle) {
             Either::First(()) => complete_spindle_reverse(controller).await,
             Either::Second(()) => spindle_emergency_stop(controller),
           }
+        }
+      }
+    }
+  }
+}
+
+/// The coolant task (DOC-07 follow-up, core 0 / PRO_CPU). The SINGLE driver of the (hardware-gated) coolant
+/// outputs: it owns the [`CoolantController`](firmware_core::coolant::CoolantController) and awaits two signals,
+/// exactly mirroring the [`spindle`] task —
+/// - [`COOLANT_UPDATE`]: re-apply from the commanded [`COOLANT_STATE`] (an M7/M8/M9).
+/// - [`COOLANT_ESTOP`]: force BOTH circuits off immediately (ALARM / soft reset / hard limit / sleep / M2/M30).
+///
+/// The task NEVER blocks the consumer (the consumer only stores an atomic + signals). Because the coolant GPIO is
+/// stubbed today (no driver stage budgeted), the `apply`/`emergency_stop` calls drive the stub outputs — the logic,
+/// the safety chokepoints, and the task topology are all real now; only the pin write is a no-op until a stage exists.
+#[embassy_executor::task]
+pub async fn coolant(controller: &'static mut crate::coolant::Coolant) {
+  loop {
+    // E-stop is polled FIRST (the `select` first-future bias) so that when BOTH an e-stop and an update are pending
+    // — e.g. an ALARM raised while an M8 update is still queued — the stop wins and coolant never briefly re-asserts.
+    match select(COOLANT_ESTOP.wait(), COOLANT_UPDATE.wait()).await {
+      // Emergency stop wins unconditionally: both circuits off regardless of the commanded state. A driver error is
+      // logged (defmt) and swallowed so the task keeps running for the next command / e-stop (matching the spindle).
+      Either::First(()) => {
+        if let Err(_e) = controller.emergency_stop() {
+          #[cfg(feature = "defmt")]
+          defmt::error!("coolant emergency-stop failed: {:?}", _e);
+        }
+      }
+      // Re-read the commanded modal coolant state and drive both circuits to it.
+      Either::Second(()) => {
+        if let Err(_e) = controller.apply(commanded_coolant()) {
+          #[cfg(feature = "defmt")]
+          defmt::error!("coolant apply failed: {:?}", _e);
         }
       }
     }
@@ -2559,8 +2929,15 @@ async fn program_stop_cycle(parser: &mut Parser, state: &mut ConsumerState) {
   //    stop, not a warm reset): no banner, no parser-rebuild that drops the WCS, no position zero.
   release_hold();
   force_spindle_off();
+  // A graceful program stop clears coolant too (it mirrors M30's reset-to-defaults); force both off.
+  force_coolant_off();
+  state.last_coolant = 0;
   PROGRAMMED_SPINDLE_RPM.store(0, Ordering::Release);
+  // Like M30 / soft reset, the CURRENT tool is RETAINED across a graceful stop (the spindle still holds it); carry
+  // it across the parser rebuild.
+  let retained_tool = parser.state().current_tool;
   *parser = Parser::new();
+  parser.set_current_tool(retained_tool);
   state.spin_up = SpinUpGate::new();
   state.last_spindle_dir = SpindleState::Stop;
   state.last_spindle_rpm = 0;
@@ -2827,9 +3204,10 @@ async fn handle_sleep() {
     // uses keeps one parking mechanism for both.
     HOLD_REQUESTED.store(true, Ordering::Release);
     HOLD_WAKE.signal(());
-    // DOC-07: `$SLP` stops the spindle (LEDC duty → 0, SPIN_EN de-asserted), independent of motion state. The
-    // TMC driver de-energize (STEP_EN high) remains a DOC-03 follow-up, flagged in the report.
+    // DOC-07: `$SLP` stops the spindle (LEDC duty → 0, SPIN_EN de-asserted) AND coolant, independent of motion
+    // state. The TMC driver de-energize (STEP_EN high) remains a DOC-03 follow-up, flagged in the report.
     force_spindle_off();
+    force_coolant_off();
     ack().await;
   } else {
     // Sleep is rejected from any non-Normal state (alarm/check/already asleep), matching grbl.
@@ -3436,6 +3814,14 @@ fn parser_snapshot(state: &ModalState) -> ParserSnapshot {
     },
     // The parser tracks spindle speed as f32 RPM; the snapshot reports whole RPM (grbl's `$G` S word).
     spindle_rpm: state.spindle_speed.max(0.0) as u16,
+    plane: match state.plane {
+      firmware_core::gcode::Plane::XY => ParserPlane::XY,
+      firmware_core::gcode::Plane::ZX => ParserPlane::ZX,
+      firmware_core::gcode::Plane::YZ => ParserPlane::YZ,
+    },
+    coolant: ParserCoolant { mist: state.coolant.mist, flood: state.coolant.flood },
+    // The CURRENT (active) tool, committed by M6; reported as `T<n>` in `$G` (`T0` = none).
+    tool: state.current_tool,
   }
 }
 

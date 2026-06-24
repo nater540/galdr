@@ -1,3 +1,3 @@
-- [ESP-HAL Version Matrix](project-esp-hal-version-matrix.md) — definitive pins for esp-hal-embassy 0.9.1 stack; requires esp-hal =1.0.0-rc.0; esp-hal-embassy officially deprecated but user-mandated
+- [ESP-HAL Version Matrix](project-esp-hal-version-matrix.md) — current stack (esp-hal =1.0.0 + esp-rtos =0.2.0) and full esp-hal 1.1.0 upgrade plan with breaking-change map
 - [Skirnir UI Stack](project-skirnir-ui-stack.md) — eframe/egui 0.34.3 + rfd 0.17.2; glow backend preferred; MSRV 1.92; rfd tokio feature removed in 0.17.0
 - [Skirnir Persistence Layer](project-skirnir-persistence-layer.md) — ron 0.12 + directories 6.0 chosen for config persistence; serde 1 reuses existing lock instance; typeid + dirs-sys are net-new transitives

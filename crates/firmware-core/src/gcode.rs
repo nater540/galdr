@@ -62,6 +62,11 @@ pub enum GcodeError {
   /// probe is rejected — even a redundant `A` equal to the current position — so the contract is unambiguous. Maps
   /// to grbl's "Invalid target" code 33 (the probe-target-invalid family), distinct at the call site.
   ProbeRotaryAxisWord,
+  /// `error:23` — a `T` tool-select word was not a non-negative INTEGER within the tool-number (u16) range (e.g.
+  /// `T1.5`, `T-1`, `T70000`). grbl's "G-code command value not integer": a tool number is an integer index, so a
+  /// fractional / negative / out-of-range value is rejected rather than coerced — coercing it would let the M6
+  /// prompt and `$G` name a DIFFERENT tool than the program literally requested (a wrong-cutter hazard).
+  BadToolNumber,
 }
 
 impl GcodeError {
@@ -77,6 +82,7 @@ impl GcodeError {
       GcodeError::JogNoAxis => 26,
       GcodeError::ProbeInverseTimeUnsupported => 22,
       GcodeError::ProbeRotaryAxisWord => 33,
+      GcodeError::BadToolNumber => 23,
     }
   }
 }
@@ -264,6 +270,45 @@ pub enum FeedMode {
   InverseTime,
 }
 
+/// Active plane (grbl modal group 2): the coordinate plane G2/G3 arcs are interpreted in. G17 (XY) is the
+/// power-on default; G18 (ZX) and G19 (YZ) select the alternate planes for arcs cut about the Y or X axis.
+///
+/// The plane fixes BOTH the two axes the arc is circularly interpolated in AND which arc-center offset words map
+/// to them (grbl convention): G17 uses `I`/`J` (X/Y), G18 uses `I`/`K` (X/Z), G19 uses `J`/`K` (Y/Z). The third
+/// axis (and any rotary `A`) is linearly slaved across the arc as a helix. The planner reads this to choose the
+/// in-plane axis pair; a stored-but-unhonored plane would silently cut arcs in the wrong plane, so it is threaded
+/// all the way through [`PlannerCommand::Arc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Plane {
+  /// G17 — the XY plane (arcs about Z). The grbl power-on / reset default.
+  #[default]
+  XY,
+  /// G18 — the ZX plane (arcs about Y).
+  ZX,
+  /// G19 — the YZ plane (arcs about X).
+  YZ,
+}
+
+/// Coolant modal state (grbl modal group 8). `mist` (M7) and `flood` (M8) are INDEPENDENT — both can be active at
+/// once — and M9 clears both. The firmware drives the (hardware-gated) coolant outputs from this; a soft reset /
+/// ALARM / M2/M30 forces it back to all-off, mirroring the spindle safety behavior (DOC-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CoolantState {
+  /// Mist coolant (M7) on/off.
+  pub mist: bool,
+  /// Flood coolant (M8) on/off.
+  pub flood: bool,
+}
+
+impl CoolantState {
+  /// The power-on / post-reset state: both mist and flood off (grbl resets to `M9` on reset / M2 / M30).
+  pub const fn off() -> Self {
+    CoolantState { mist: false, flood: false }
+  }
+}
+
 /// The four `G38.x` probe modes (DOC-09, `docs/tlo-offsets.md` §8, `docs/gcode-streaming.md` §9). Each pairs a
 /// direction sense with whether a failed probe ALARMS:
 /// - **G38.2** — probe TOWARD the workpiece, stop on contact; **error/ALARM if no contact** within the travel.
@@ -340,6 +385,18 @@ pub struct ModalState {
   /// Sticky across lines so the commanded direction survives even when the M-word shares a line with a move
   /// (the per-line emit can carry only one command, so the firmware drives the spindle from this modal value).
   pub spindle: SpindleState,
+  /// Active plane (modal group 2): G17 XY (default) / G18 ZX / G19 YZ. Governs how G2/G3 arcs are interpreted.
+  pub plane: Plane,
+  /// Active coolant state (modal group 8): mist (M7) / flood (M8), independently. Sticky across lines like the
+  /// spindle so an M7/M8 sharing a line with a move still latches; the firmware drives coolant from this value.
+  pub coolant: CoolantState,
+  /// The pending tool number from the last `T` word, committed by `M6` (grbl stores `T` until an M6 acts on it).
+  /// This machine has no automatic tool changer, so a `T` word only stages the request; `0` at power-on.
+  pub pending_tool: u16,
+  /// The CURRENT (active) tool number — the one physically in the spindle. `M6` commits the [`pending_tool`] here
+  /// (and clears the pending slot). Reported as `T<n>` in `$G` (`T0` = no tool). `0` at power-on; grbl keeps the
+  /// selected tool across program end (M2/M30) and soft reset, so the consumer carries it across its reset.
+  pub current_tool: u16,
 }
 
 impl Default for ModalState {
@@ -354,6 +411,10 @@ impl Default for ModalState {
       feed: 0.0,
       spindle_speed: 0.0,
       spindle: SpindleState::Stop,
+      plane: Plane::XY,
+      coolant: CoolantState::off(),
+      pending_tool: 0,
+      current_tool: 0,
     }
   }
 }
@@ -487,8 +548,9 @@ pub enum PlannerCommand {
     /// so the planner must NOT apply the active work offset. False for an ordinary work-coordinate move.
     machine_coords: bool,
   },
-  /// An arc move (G2/G3). `cw` distinguishes G2 from G3; `i`/`j` are the center offsets in the active
-  /// units relative to the start point (grbl IJ arc form). Plane is fixed to G17 (XY) per DOC-04.
+  /// An arc move (G2/G3). `cw` distinguishes G2 from G3; `i`/`j`/`k` are the center offsets in the active units
+  /// relative to the start point (grbl IJK arc form). `plane` (G17/G18/G19) selects which two axes the arc is
+  /// circularly interpolated in and which offset words map to them (I/J for G17, I/K for G18, J/K for G19).
   Arc {
     /// True for G2 clockwise, false for G3 counter-clockwise.
     cw: bool,
@@ -498,6 +560,10 @@ pub enum PlannerCommand {
     i: Option<f32>,
     /// J center offset (Y axis) relative to the start point, if present.
     j: Option<f32>,
+    /// K center offset (Z axis) relative to the start point, if present (used by G18/G19 arcs).
+    k: Option<f32>,
+    /// The active plane (G17/G18/G19) the arc is interpreted in.
+    plane: Plane,
     /// Active units for the axis/offset/feed words.
     units: Units,
     /// Active distance mode for the axis words.
@@ -560,6 +626,21 @@ pub enum PlannerCommand {
   },
   /// M30 program end: stop motion, stop spindle, and reset modal state to defaults (caller's policy).
   ProgramEnd,
+  /// A program-flow PAUSE: M0 (unconditional stop), M1 (optional stop), or M6 (manual tool change). The machine
+  /// drains motion to a stop and holds until the operator issues cycle-start (`~`), reusing the firmware's
+  /// graceful-hold machinery. `optional` is set for M1 (the firmware's optional-stop gate decides whether it
+  /// actually halts); `tool_change` is set for M6 so the firmware prompts the operator to swap the tool. The
+  /// `ok` for the line is emitted when the pause executes from the queue (normal char-counting), not at parse time.
+  ProgramPause {
+    /// True for M1 (optional stop): the firmware's optional-stop gate decides whether this actually halts.
+    optional: bool,
+    /// True for M6 (manual tool change): the firmware prompts the operator for the swap before resuming.
+    tool_change: bool,
+  },
+  /// M7/M8/M9 coolant control (modal group 8). Carries the resolved [`CoolantState`] (mist and/or flood) the
+  /// firmware drives onto the coolant outputs. M9 carries an all-off state. The planner passes it through with no
+  /// motion, exactly like the spindle command.
+  Coolant(CoolantState),
 }
 
 /// The supported modal groups. A line may carry at most one word from each group; a second word from
@@ -578,11 +659,13 @@ enum Group {
   FeedMode,
   /// Work-coordinate-system select (grbl modal group 12): G54-G59.
   Coordinate,
-  /// Tool-length-offset mode (grbl modal group 8): G43.1 / G49.
+  /// Tool-length-offset mode (grbl modal group 8 in grbl's numbering for G43/G49): G43.1 / G49.
   ToolOffset,
   /// Non-modal group 0 one-shot commands that share a line slot with motion: G10 / G28.1 / G30.1 / G92 / G92.1.
   /// G53 is also group 0 but is a one-shot MODIFIER of a motion word, so it has its own flag, not this slot.
   NonModal,
+  /// Coolant (grbl modal group 8 for M-codes): M7 / M8 / M9. Two on one line is a modal conflict.
+  Coolant,
 }
 
 /// Tracks which modal groups have already been set on the current line so a repeat is rejected.
@@ -598,6 +681,7 @@ struct GroupGuard {
   coordinate: bool,
   tool_offset: bool,
   non_modal: bool,
+  coolant: bool,
 }
 
 impl GroupGuard {
@@ -615,6 +699,7 @@ impl GroupGuard {
       Group::Coordinate => &mut self.coordinate,
       Group::ToolOffset => &mut self.tool_offset,
       Group::NonModal => &mut self.non_modal,
+      Group::Coolant => &mut self.coolant,
     };
     if *slot {
       return Err(GcodeError::ModalGroupViolation);
@@ -637,6 +722,12 @@ struct LineAccumulator {
   pending_probe: Option<ProbeKind>,
   pending_spindle: Option<SpindleState>,
   pending_program_end: bool,
+  /// A pending program-flow pause (M0/M1/M6), in the `Stop` modal group. Resolved at emit time into a
+  /// [`PlannerCommand::ProgramPause`]; the flags carry the M1 optional + M6 tool-change senses.
+  pending_pause: Option<PendingPause>,
+  /// A pending coolant change (M7/M8/M9), in the `Coolant` modal group. Holds the resolved [`CoolantState`] the
+  /// line's M-word produced (folded against the prior modal coolant so M7 and M8 accumulate, M9 clears both).
+  pending_coolant: Option<CoolantState>,
   /// A pending non-motion coordinate op (G10/G92/G92.1/G28.1/G30.1/G43.1/G49) that takes the whole line. The
   /// WCS-select (G54-G59) is modal and does NOT use this slot — it updates `next_state.wcs` and emits its own
   /// `SelectWcs` op only when the line carries no other action.
@@ -655,7 +746,16 @@ struct LineAccumulator {
   axes: AxisWords,
   i: Option<f32>,
   j: Option<f32>,
+  k: Option<f32>,
   p: Option<f32>,
+}
+
+/// A pending program-flow pause staged on the current line, resolved into a [`PlannerCommand::ProgramPause`] at
+/// emit time. `optional` marks M1, `tool_change` marks M6; M0 is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPause {
+  optional: bool,
+  tool_change: bool,
 }
 
 impl LineAccumulator {
@@ -702,6 +802,15 @@ impl Parser {
   /// The current persistent modal state. Used by `$G` modal-state reporting (DOC-04) and tests.
   pub fn state(&self) -> &ModalState {
     &self.state
+  }
+
+  /// Set the CURRENT (active) tool number, for the firmware's reset paths to RESTORE the selected tool after they
+  /// rebuild the parser to its modal defaults. grbl keeps the selected tool across program end (M2/M30) and soft
+  /// reset — the spindle still physically holds it — but a `Parser::new()` rebuild starts at `T0`, so the consumer
+  /// snapshots `state().current_tool` before the rebuild and restores it here. The pending tool is intentionally
+  /// NOT carried (a pending, un-committed `T` is dropped by the modal reset, matching grbl).
+  pub fn set_current_tool(&mut self, tool: u16) {
+    self.state.current_tool = tool;
   }
 
   /// Parse one line (CR/LF terminator already removed) and, on success, return the emitted command.
@@ -825,6 +934,10 @@ impl Parser {
         acc.j = Some(word.value);
         Ok(())
       }
+      b'K' => {
+        acc.k = Some(word.value);
+        Ok(())
+      }
       b'P' => {
         acc.p = Some(word.value);
         Ok(())
@@ -842,11 +955,17 @@ impl Parser {
         next_state.spindle_speed = word.value;
         Ok(())
       }
-      // Tool select (`T<n>`): accepted as a no-op. This machine has no automatic tool changer and does not
-      // implement `M6`, so there is nothing for a tool word to act on — but CAM posts (e.g. Vectric) emit `T1`
-      // before starting the spindle, and rejecting it would abort the whole program with `error:20`. grbl itself
-      // only stores the pending tool until an `M6` consumes it; here it is simply consumed.
-      b'T' => Ok(()),
+      // Tool select (`T<n>`): record the pending tool for a later `M6` to consume. This machine has no automatic
+      // tool changer, so a `T` word never moves anything on its own — but CAM posts (e.g. Vectric) emit `T1`
+      // before starting the spindle, and rejecting it would abort the whole program with `error:20`. grbl stores
+      // the pending tool until an `M6` acts on it, so the value is staged into modal state here, not discarded.
+      b'T' => {
+        // A tool number must be a non-negative INTEGER within the u16 range. A fractional / negative / out-of-range
+        // value is REJECTED (`error:23`), not coerced: coercing it would let the M6 prompt and `$G` name a different
+        // tool than the program requested (a wrong-cutter hazard). A well-formed CAM post only ever emits integers.
+        next_state.pending_tool = tool_number(word.value)?;
+        Ok(())
+      }
       // Line number (`N<n>`): a sequence label some posts prefix to every line. It carries no machine action, so
       // it is accepted and ignored — grbl uses it only for error reporting, which this firmware does by other means.
       b'N' => Ok(()),
@@ -901,9 +1020,21 @@ impl Parser {
         acc.pending_coordinate = Some(PendingCoordinate::G10);
         Ok(())
       }
+      // G17/G18/G19 select the active plane (modal group 2). The plane fixes which axis pair G2/G3 arcs are
+      // interpolated in and which I/J/K offsets map to them; the planner reads `next_state.plane`.
       17 => {
-        // G17 XY plane is the only supported plane; claim its group so `G17 G17` still violates.
         guard.claim(Group::Plane)?;
+        next_state.plane = Plane::XY;
+        Ok(())
+      }
+      18 => {
+        guard.claim(Group::Plane)?;
+        next_state.plane = Plane::ZX;
+        Ok(())
+      }
+      19 => {
+        guard.claim(Group::Plane)?;
+        next_state.plane = Plane::YZ;
         Ok(())
       }
       20 => {
@@ -1037,6 +1168,53 @@ impl Parser {
     next_state: &mut ModalState,
   ) -> Result<(), GcodeError> {
     match g_code(value)? {
+      // M0 (unconditional pause), M1 (optional stop), M6 (manual tool change) are modal group 4 alongside M2/M30,
+      // so they share the `Stop` group: two on one line is a modal-group violation. They drain motion and hold
+      // until cycle-start (`~`); the consumer reuses the graceful-hold machinery. M6 consumes the pending tool.
+      0 => {
+        guard.claim(Group::Stop)?;
+        acc.pending_pause = Some(PendingPause { optional: false, tool_change: false });
+        Ok(())
+      }
+      1 => {
+        guard.claim(Group::Stop)?;
+        acc.pending_pause = Some(PendingPause { optional: true, tool_change: false });
+        Ok(())
+      }
+      6 => {
+        guard.claim(Group::Stop)?;
+        // M6 COMMITS the pending `T` word as the current (active) tool and clears the pending slot — grbl's "M6
+        // loads whatever T is pending". This machine has no ATC, so the change is realized by the operator's manual
+        // swap during the hold; the committed `current_tool` is what `$G` reports as the active `T<n>`.
+        next_state.current_tool = next_state.pending_tool;
+        next_state.pending_tool = 0;
+        acc.pending_pause = Some(PendingPause { optional: false, tool_change: true });
+        Ok(())
+      }
+      // M7 mist on, M8 flood on, M9 all off (modal group 8). M7 and M8 are INDEPENDENT — they accumulate onto the
+      // prior modal coolant rather than replacing it — so `M8` then `M7` leaves both on; M9 clears both. The staged
+      // state is folded against `next_state.coolant`, and the modal state is updated so an M7/M8 sharing a line with
+      // a move still latches (the move wins the single emit; the firmware drives coolant from the modal value).
+      7 => {
+        guard.claim(Group::Coolant)?;
+        let coolant = CoolantState { mist: true, ..next_state.coolant };
+        next_state.coolant = coolant;
+        acc.pending_coolant = Some(coolant);
+        Ok(())
+      }
+      8 => {
+        guard.claim(Group::Coolant)?;
+        let coolant = CoolantState { flood: true, ..next_state.coolant };
+        next_state.coolant = coolant;
+        acc.pending_coolant = Some(coolant);
+        Ok(())
+      }
+      9 => {
+        guard.claim(Group::Coolant)?;
+        next_state.coolant = CoolantState::off();
+        acc.pending_coolant = Some(CoolantState::off());
+        Ok(())
+      }
       3 => {
         guard.claim(Group::Spindle)?;
         acc.pending_spindle = Some(SpindleState::Clockwise);
@@ -1091,6 +1269,14 @@ impl Parser {
   ) -> Result<Option<PlannerCommand>, GcodeError> {
     if acc.pending_program_end {
       return Ok(Some(PlannerCommand::ProgramEnd));
+    }
+    // A program-flow pause (M0/M1/M6) takes the line ahead of any motion: like a dwell/program-end it is a
+    // synchronized boundary the consumer realizes, draining motion and holding until cycle-start.
+    if let Some(pause) = acc.pending_pause {
+      return Ok(Some(PlannerCommand::ProgramPause {
+        optional: pause.optional,
+        tool_change: pause.tool_change,
+      }));
     }
     if acc.pending_dwell {
       return Ok(Some(PlannerCommand::Dwell { seconds: acc.p.unwrap_or(0.0) }));
@@ -1150,6 +1336,12 @@ impl Parser {
     if let Some(spindle) = acc.pending_spindle {
       return Ok(Some(PlannerCommand::Spindle { state: spindle, speed: state.spindle_speed }));
     }
+    // A coolant change (M7/M8/M9) with no move on the line emits a Coolant command; when it SHARES a line with a
+    // move the move took the line above and the modal coolant state (already updated in `next_state`) carries it,
+    // exactly like the spindle precedence — the firmware drives coolant from modal state in that case.
+    if let Some(coolant) = acc.pending_coolant {
+      return Ok(Some(PlannerCommand::Coolant(coolant)));
+    }
     // A bare WCS select (no move on the line) emits a SelectWcs op so the consumer can push the new WCO into
     // the planner. When a select SHARES a line with a move, the move takes the line; the consumer keeps the
     // active WCS in sync with the parser's modal `wcs` before planning, so the move still uses the right offset.
@@ -1186,6 +1378,8 @@ impl Parser {
         axes: acc.axes,
         i: acc.i,
         j: acc.j,
+        k: acc.k,
+        plane: state.plane,
         units: state.units,
         distance: state.distance,
         feed: state.feed,
@@ -1197,6 +1391,8 @@ impl Parser {
         axes: acc.axes,
         i: acc.i,
         j: acc.j,
+        k: acc.k,
+        plane: state.plane,
         units: state.units,
         distance: state.distance,
         feed: state.feed,
@@ -1270,6 +1466,20 @@ fn feed_is_undefined(state: &ModalState, saw_feed: bool, needs_feed: bool) -> bo
     return true;
   }
   state.feed_mode == FeedMode::InverseTime && !saw_feed
+}
+
+/// Validate a `T` tool-select value as a non-negative INTEGER within the u16 tool-number range, returning it or
+/// [`GcodeError::BadToolNumber`] (`error:23`). A fractional (`T1.5`), negative (`T-1`), or out-of-range (`T70000`)
+/// value is REJECTED rather than coerced: a tool number is an integer index, and silently coercing it would let the
+/// M6 prompt and `$G` name a different cutter than the program requested. Round-to-nearest absorbs f32
+/// representation error (e.g. `5.0` stored as `4.9999995`) the same way [`g_code`] does, but a value off an integer
+/// by more than the tolerance is a genuine fractional tool and is rejected.
+fn tool_number(value: f32) -> Result<u16, GcodeError> {
+  let rounded = libm::roundf(value);
+  if !(0.0..=u16::MAX as f32).contains(&rounded) || libm::fabsf(value - rounded) > 1e-3 {
+    return Err(GcodeError::BadToolNumber);
+  }
+  Ok(rounded as u16)
 }
 
 /// Convert a G/M word value to its integer code, rejecting non-integer codes (e.g. `G1.5`). grbl
@@ -1511,6 +1721,8 @@ mod tests {
         axes: AxisWords { x: Some(10.0), y: Some(0.0), z: None, a: None },
         i: Some(5.0),
         j: Some(0.0),
+        k: None,
+        plane: Plane::XY,
         units: Units::Millimeter,
         distance: DistanceMode::Absolute,
         feed: 100.0,
@@ -1997,10 +2209,204 @@ mod tests {
   #[test]
   fn parse_tool_select_is_accepted_as_noop() {
     // A standalone tool select (Vectric posts emit `T1` before the spindle starts) must not abort the program;
-    // it carries no motion, so the line yields no command.
+    // it carries no motion, so the line yields no command. The pending tool is recorded for a later M6.
     let mut parser = Parser::new();
     let cmd = parser.parse_line(b"T1").expect("tool select is accepted");
     assert_eq!(cmd, None);
+    assert_eq!(parser.state().pending_tool, 1, "the T word is recorded as the pending tool for M6");
+    // T0 (deselect / no tool) is valid and records 0.
+    let mut z = Parser::new();
+    z.parse_line(b"T0").expect("T0 is valid");
+    assert_eq!(z.state().pending_tool, 0);
+    // A large but in-range tool number is accepted verbatim (no coercion).
+    let mut big = Parser::new();
+    big.parse_line(b"T5").expect("T5 is valid");
+    assert_eq!(big.state().pending_tool, 5);
+  }
+
+  #[test]
+  fn parse_rejects_invalid_tool_numbers_instead_of_coercing() {
+    // A T value MUST be a non-negative INTEGER within the tool-number (u16) range. A fractional, negative, or
+    // out-of-range value is REJECTED (grbl's `error:23` "value must be integer"), not silently coerced — coercing
+    // T1.5→1 / T-1→0 / T70000→65535 would make the M6 prompt and `$G` name a DIFFERENT tool than the program
+    // literally requested (a wrong-cutter hazard). The rejection leaves modal state untouched.
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse_line(b"T1.5"), Err(GcodeError::BadToolNumber), "a fractional tool is rejected");
+    assert_eq!(parser.state().pending_tool, 0, "a rejected T leaves the pending tool untouched");
+    assert_eq!(parser.parse_line(b"T-1"), Err(GcodeError::BadToolNumber), "a negative tool is rejected");
+    assert_eq!(parser.parse_line(b"T70000"), Err(GcodeError::BadToolNumber), "a tool above u16 range is rejected");
+    // The grblHAL wire code for an invalid tool value is 23.
+    assert_eq!(GcodeError::BadToolNumber.code(), 23);
+  }
+
+  // ---- Program-flow pauses: M0 / M1 / M6 --------------------------------------------------------
+
+  #[test]
+  fn parse_m0_is_unconditional_pause() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"M0").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::ProgramPause { optional: false, tool_change: false }));
+  }
+
+  #[test]
+  fn parse_m1_is_optional_pause() {
+    // M1 is the OPTIONAL stop: the parser always emits the pause command and tags it `optional`; the host-side
+    // optional-stop gate (the firmware's `0x88` toggle, default off) decides whether it actually halts.
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"M1").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::ProgramPause { optional: true, tool_change: false }));
+  }
+
+  #[test]
+  fn parse_m6_is_tool_change_pause_and_commits_pending_tool() {
+    // M6 is a manual-tool-change pause (M0-like hold): it COMMITS the pending `T` word as the CURRENT tool (so `$G`
+    // reports the active `T<n>`) and clears the pending slot, and tags the pause `tool_change` so the consumer
+    // prompts the swap.
+    let mut parser = Parser::new();
+    assert_eq!(parser.state().current_tool, 0, "power-on tool is T0");
+    parser.parse_line(b"T3").expect("tool select");
+    assert_eq!(parser.state().pending_tool, 3);
+    let cmd = parser.parse_line(b"M6").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::ProgramPause { optional: false, tool_change: true }));
+    assert_eq!(parser.state().current_tool, 3, "M6 commits the pending tool as the current tool");
+    assert_eq!(parser.state().pending_tool, 0, "the pending slot is cleared once committed");
+    // A `T5 M6` on ONE line is the common CAM form; the pending tool is still committed as the current tool.
+    let mut combined = Parser::new();
+    let cmd = combined.parse_line(b"T5 M6").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::ProgramPause { optional: false, tool_change: true }));
+    assert_eq!(combined.state().current_tool, 5);
+    // A bare M6 with NO pending tool commits the (zero) pending tool — grbl's "M6 loads whatever T is pending",
+    // and pending defaults to 0 after a prior M6 cleared it.
+    let mut none = Parser::new();
+    none.parse_line(b"T2 M6").expect("load T2");
+    assert_eq!(none.state().current_tool, 2);
+    none.parse_line(b"M6").expect("bare M6");
+    assert_eq!(none.state().current_tool, 0, "a bare M6 commits the (zero) pending tool, i.e. T0");
+  }
+
+  #[test]
+  fn current_tool_persists_in_parser_modal_state() {
+    // grbl keeps the SELECTED tool across M2/M30 (program end is a rewind, not a tool change — the spindle still
+    // physically holds the tool). The parser does NOT reset `current_tool` on M2/M30; the consumer carries it
+    // across its reset-to-defaults (it rebuilds the parser, so the consumer is the one that must preserve it).
+    let mut parser = Parser::new();
+    parser.parse_line(b"T4 M6").expect("load T4");
+    assert_eq!(parser.state().current_tool, 4);
+    parser.parse_line(b"M2").expect("program end");
+    assert_eq!(parser.state().current_tool, 4, "the current tool survives M2 in the parser modal state");
+  }
+
+  #[test]
+  fn set_current_tool_restores_the_tool_after_a_rebuild() {
+    // The firmware's reset paths rebuild the parser to modal defaults (`Parser::new()`) but must RETAIN the selected
+    // tool (grbl keeps it across reset). `set_current_tool` is the seam that restores it; a fresh parser starts T0.
+    let mut fresh = Parser::new();
+    assert_eq!(fresh.state().current_tool, 0);
+    fresh.set_current_tool(7);
+    assert_eq!(fresh.state().current_tool, 7);
+    // Other modal state is untouched by the setter (it only restores the tool).
+    assert_eq!(fresh.state().motion, MotionMode::Rapid);
+    assert_eq!(fresh.state().wcs, 0);
+  }
+
+  #[test]
+  fn parse_m0_m6_share_the_stop_group_with_m2_m30() {
+    // M0/M1/M6 are modal group 4 alongside M2/M30, so two of them on one line is a modal-group violation.
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse_line(b"M0 M2"), Err(GcodeError::ModalGroupViolation));
+    assert_eq!(Parser::new().parse_line(b"M6 M1"), Err(GcodeError::ModalGroupViolation));
+  }
+
+  // ---- Plane select: G17 / G18 / G19 ------------------------------------------------------------
+
+  #[test]
+  fn parse_plane_select_words_update_modal_plane() {
+    let mut parser = Parser::new();
+    assert_eq!(parser.state().plane, Plane::XY, "G17 XY is the power-on default plane");
+    assert_eq!(parser.parse_line(b"G18").expect("valid"), None);
+    assert_eq!(parser.state().plane, Plane::ZX);
+    assert_eq!(parser.parse_line(b"G19").expect("valid"), None);
+    assert_eq!(parser.state().plane, Plane::YZ);
+    assert_eq!(parser.parse_line(b"G17").expect("valid"), None);
+    assert_eq!(parser.state().plane, Plane::XY);
+  }
+
+  #[test]
+  fn parse_plane_select_is_modal_and_propagates_into_an_arc() {
+    // The active plane rides into the emitted Arc so the planner subdivides in the right plane. G18 ZX maps the
+    // I/K offsets to the ZX pair.
+    let mut parser = Parser::new();
+    parser.parse_line(b"G1 F100").expect("valid");
+    parser.parse_line(b"G18").expect("valid");
+    let cmd = parser.parse_line(b"G2 X10 Z0 I5 K0").expect("valid");
+    assert_eq!(
+      cmd,
+      Some(PlannerCommand::Arc {
+        cw: true,
+        axes: AxisWords { x: Some(10.0), y: None, z: Some(0.0), a: None },
+        i: Some(5.0),
+        j: None,
+        k: Some(0.0),
+        plane: Plane::ZX,
+        units: Units::Millimeter,
+        distance: DistanceMode::Absolute,
+        feed: 100.0,
+        feed_mode: FeedMode::UnitsPerMin,
+        machine_coords: false,
+      })
+    );
+  }
+
+  #[test]
+  fn parse_two_plane_words_is_modal_group_violation() {
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse_line(b"G17 G18"), Err(GcodeError::ModalGroupViolation));
+  }
+
+  // ---- Coolant: M7 / M8 / M9 (modal group 8) ----------------------------------------------------
+
+  #[test]
+  fn parse_m8_flood_on() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"M8").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coolant(CoolantState { mist: false, flood: true })));
+    assert_eq!(parser.state().coolant, CoolantState { mist: false, flood: true });
+  }
+
+  #[test]
+  fn parse_m7_mist_on() {
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"M7").expect("valid");
+    assert_eq!(cmd, Some(PlannerCommand::Coolant(CoolantState { mist: true, flood: false })));
+  }
+
+  #[test]
+  fn parse_m7_and_m8_are_independently_active() {
+    // grbl modal group 8: M7 (mist) and M8 (flood) can BOTH be on; they do not cancel each other. M9 clears both.
+    let mut parser = Parser::new();
+    parser.parse_line(b"M8").expect("flood on");
+    let cmd = parser.parse_line(b"M7").expect("mist on too");
+    assert_eq!(cmd, Some(PlannerCommand::Coolant(CoolantState { mist: true, flood: true })));
+    assert_eq!(parser.state().coolant, CoolantState { mist: true, flood: true });
+    let cmd = parser.parse_line(b"M9").expect("all off");
+    assert_eq!(cmd, Some(PlannerCommand::Coolant(CoolantState { mist: false, flood: false })));
+    assert_eq!(parser.state().coolant, CoolantState { mist: false, flood: false });
+  }
+
+  #[test]
+  fn parse_two_coolant_words_is_modal_group_violation() {
+    let mut parser = Parser::new();
+    assert_eq!(parser.parse_line(b"M7 M8"), Err(GcodeError::ModalGroupViolation));
+  }
+
+  #[test]
+  fn parse_coolant_survives_a_combined_move_line() {
+    // Like the spindle, an M7/M8 sharing a line with a move latches the modal coolant state while the move wins
+    // the single per-line emit, so the firmware can drive coolant from modal state.
+    let mut parser = Parser::new();
+    let cmd = parser.parse_line(b"M8 G1 X10 F100").expect("valid");
+    assert!(matches!(cmd, Some(PlannerCommand::Move { .. })), "the move wins the single per-line emit");
+    assert_eq!(parser.state().coolant, CoolantState { mist: false, flood: true });
   }
 
   #[test]
