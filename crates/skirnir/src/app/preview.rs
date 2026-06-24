@@ -1,15 +1,18 @@
 //! Pure geometry helpers backing the toolpath preview's live-motion overlay.
 //!
-//! The preview's position marker and "cut so far" colouring used to be driven by GCode line acknowledgements
-//! (`Progress::acked`). That makes the marker jump line-by-line and actually *lead* the real cutter, because
-//! grbl emits `ok` when a line enters the planner buffer, not when the move finishes. This module derives the
-//! same overlay from the live machine position carried in the `<...>` status report instead, so the marker
-//! tracks where the tool actually is.
+//! The overlay is driven by the live machine position carried in the `<...>` status report, not by GCode line
+//! acknowledgements (`ok` arrives when a line enters the planner buffer, not when the move finishes, so it leads
+//! the real tool). Two things are drawn from the live work position: a smoothed marker dot showing where the
+//! tool is now, and a **position trail** — a LinuxCNC-AXIS-style "backplot" polyline accumulating where the tool
+//! has actually been. The trail replaced an earlier attempt to recolour the preview's own segments by progress,
+//! which was hopelessly ambiguous on self-intersecting paths (a spiral's parallel rings, a star tip's near-
+//! touching edges); plotting the real positions sidesteps that entirely — it draws where the tool went rather
+//! than guessing which preview segment it is on.
 //!
 //! Everything here is pure and framework-agnostic — plain `(f32, f32)` model-space points, no egui and no
-//! `ViewState`/UI types — so the marker derivation, the per-frame smoothing step, and the monotonic
-//! cut-progress computation are unit-tested without a window or a real status feed. The view layer adapts
-//! these tuples to `egui::Vec2`/`Pos2` and projects them through its fit transform.
+//! `ViewState`/UI types — so the marker derivation, the per-frame smoothing step, and the trail accumulation/break
+//! rules are unit-tested without a window or a real status feed. The view layer adapts these tuples to
+//! `egui::Vec2`/`Pos2` and projects them through its fit transform.
 
 /// A point in toolpath model space (work-coordinate XY, millimetres). The toolpath segments live in this same
 /// space, so the live marker and the segment geometry share one coordinate frame.
@@ -40,94 +43,24 @@ pub fn smooth_marker(current: Option<ModelPoint>, target: ModelPoint, snap_dist:
   (current.0 + (target.0 - current.0) * t, current.1 + (target.1 - current.1) * t)
 }
 
-/// A toolpath segment in model space, as its `(start, end)` end points. The progress projection needs both ends
-/// (it projects the live point onto the segment's *line*, not just its endpoints), so the cached list is segment
-/// pairs rather than the bare endpoints the old endpoint-proximity scan used.
-pub type Segment = (ModelPoint, ModelPoint);
-
-/// How far along a segment the projected live point must reach before that segment is counted "cut". At `0.5`
-/// the segment flips to cut once the tool passes its midpoint, which keeps the coloured boundary tracking the
-/// real cutter without claiming a segment the tool has barely entered or lagging a whole segment behind.
-const COMPLETE_FRACTION: f32 = 0.5;
-
-/// Project a point onto a segment and return `(fraction, distance_squared)`: `fraction` is the clamped position
-/// of the foot of the perpendicular along `start→end` in `0..=1` (0 at `start`, 1 at `end`), and `distance_sq`
-/// is the squared distance from `p` to that foot. A degenerate zero-length segment projects to its start.
-fn project_onto(start: ModelPoint, end: ModelPoint, p: ModelPoint) -> (f32, f32) {
-  let dx = end.0 - start.0;
-  let dy = end.1 - start.1;
-  let len_sq = dx * dx + dy * dy;
-  if len_sq <= f32::EPSILON {
-    return (0.0, dist_sq(start, p));
+/// Decide whether a fresh live work position should be appended to the position trail (the LinuxCNC-AXIS-style
+/// "backplot" of where the tool has actually been). Appends when there is no prior trail point, or when the
+/// candidate has moved at least `min_step` from the last appended point. The step gate decimates the 5–10 Hz
+/// status feed and rejects sub-step status jitter, so a stationary tool does not pile up coincident points. Pure
+/// so the accumulation rule is unit-tested; the caller owns the trail buffer and the cap on its length.
+pub fn trail_should_append(last: Option<ModelPoint>, candidate: ModelPoint, min_step: f32) -> bool {
+  match last {
+    None => true,
+    Some(last) => dist_sq(last, candidate) >= min_step * min_step,
   }
-  let t = (((p.0 - start.0) * dx + (p.1 - start.1) * dy) / len_sq).clamp(0.0, 1.0);
-  let foot = (start.0 + dx * t, start.1 + dy * t);
-  (t, dist_sq(foot, p))
 }
 
-/// Compute the cut-progress boundary by combining the two signals the sender actually has: the line counter (what
-/// has been STREAMED to the controller) and the live tool position (where the cutter actually is). Returns the
-/// count of leading segments to colour "cut".
-///
-/// Geometry alone cannot localise a sampled point on a self-intersecting path — a spiral pocket's parallel rings
-/// and a star tip's out/back edges sit right on top of each other, so "where on the path is the tool?" is
-/// ambiguous, and a pure-geometry rule either leaps onto a spatially-near future ring or stalls on a reversal.
-/// The line counter removes that ambiguity. `acked` lines have been accepted by the controller, so nothing past
-/// segment frontier `hi = {segments with line_index < acked}` can be cut. The controller runs BEHIND `acked` by
-/// its buffer depth (grbl acks a line when it enters the planner buffer, not when the move finishes), so the
-/// executing line is roughly `acked - in_flight_lines`; the caller derives `in_flight_lines` from the live `Bf:`
-/// buffer report. That bounds the cutter to a small, CONTIGUOUS line-window `[lo, hi)` which does not fold back on
-/// itself, so within it the nearest segment to the live position is the move executing now — unambiguously.
-///
-/// The search starts at `previous.clamp(lo, hi)`: capped at the frontier so progress can never run ahead of what
-/// is streamed (no over-advance), and floored at `lo` so that as `acked` advances `lo` drags the boundary forward
-/// even if the position match stumbles (no stall). The matched segment is counted cut once its foot passes
-/// [`COMPLETE_FRACTION`]. The boundary never retreats below `previous` (monotonic within a run; reset `previous`
-/// to 0 for a fresh run). `line_index` is the per-segment program line, parallel to `segments` and monotonic
-/// non-decreasing, so the frontier lookups are binary partitions. Pure, so the whole rule is unit-tested.
-pub fn live_cut_boundary(
-  segments: &[Segment],
-  line_index: &[u32],
-  work: ModelPoint,
-  acked: u32,
-  in_flight_lines: u32,
-  previous: usize,
-) -> usize {
-  debug_assert_eq!(segments.len(), line_index.len(), "segments and line_index must be parallel");
-  // Frontier: segments whose program line has been acknowledged. Nothing beyond this is even in the controller
-  // yet, so it is a hard upper bound on what can be cut. line_index is monotonic, so this is a binary partition.
-  let hi = line_index.partition_point(|&l| l < acked);
-  if hi == 0 {
-    return 0; // Nothing acknowledged yet — nothing cut.
-  }
-  // Clamp a stale `previous` (e.g. the program shrank) to the frontier so the monotonic floor below cannot exceed
-  // the path length and the `clamp` calls stay well-ordered.
-  let previous = previous.min(hi);
-  // The executing line trails `acked` by the live buffer depth; map that line back to the first in-flight segment.
-  let lo_line = acked.saturating_sub(in_flight_lines.max(1));
-  let lo = line_index.partition_point(|&l| l < lo_line);
-  // Search the in-flight window: floored at `lo` (advances with `acked`, so it cannot stall) and capped at `hi`
-  // (cannot run past what is streamed). Monotonic: never below `previous`.
-  let start = previous.clamp(lo, hi);
-  if start >= hi {
-    return start;
-  }
-  // Within this small contiguous window the path does not self-intersect, so the nearest segment to the live
-  // position is the move executing now. Ties resolve to the earliest index so the boundary advances steadily.
-  let mut best = start;
-  let mut best_fraction = 0.0_f32;
-  let mut best_dist = f32::INFINITY;
-  for (offset, &(seg_start, seg_end)) in segments[start..hi].iter().enumerate() {
-    let (fraction, dist) = project_onto(seg_start, seg_end, work);
-    if dist < best_dist {
-      best_dist = dist;
-      best_fraction = fraction;
-      best = start + offset;
-    }
-  }
-  // The executing segment counts as cut once the foot passes its midpoint, else it is the move in progress.
-  let reached = if best_fraction >= COMPLETE_FRACTION { best + 1 } else { best };
-  reached.clamp(previous, hi)
+/// Whether two consecutive trail points should be JOINED by a drawn line, i.e. they are within `max_gap` of each
+/// other. A larger gap means the tool jumped — a rapid reposition between moves, a reconnect, or a teleport — and
+/// joining it would draw a spurious straight streak across the work that the tool never cut, so the trail is left
+/// broken there instead. Pure so the break rule is unit-tested.
+pub fn trail_connects(a: ModelPoint, b: ModelPoint, max_gap: f32) -> bool {
+  dist_sq(a, b) <= max_gap * max_gap
 }
 
 /// Decide whether the live tool marker should be drawn this frame, given the live work point, the toolpath's
@@ -226,94 +159,28 @@ mod tests {
     assert_eq!(smooth_marker(Some((4.0, 0.0)), (10.0, 0.0), 50.0, -5.0), (4.0, 0.0));
   }
 
-  /// A straight path of `n` unit `(start, end)` segments along X — segment `i` spans `(i,0)→(i+1,0)` and comes
-  /// from program line `i`, so the line index is parallel and monotonic (one segment per line).
-  fn line_path(n: u32) -> (Vec<Segment>, Vec<u32>) {
-    let segs = (0..n).map(|i| ((i as f32, 0.0), ((i + 1) as f32, 0.0))).collect();
-    let lines = (0..n).collect();
-    (segs, lines)
+  #[test]
+  fn trail_should_append_takes_the_first_point_unconditionally() {
+    // With no prior trail point there is nothing to compare against, so the first live position is always taken.
+    assert!(trail_should_append(None, (3.0, 4.0), 1.0));
   }
 
   #[test]
-  fn live_cut_boundary_is_zero_before_anything_is_acknowledged() {
-    let (s, l) = line_path(5);
-    // Nothing streamed yet (`acked == 0`): the frontier is empty, so nothing is cut regardless of position.
-    assert_eq!(live_cut_boundary(&s, &l, (3.0, 0.0), 0, 8, 0), 0);
+  fn trail_should_append_decimates_sub_step_jitter_and_takes_real_moves() {
+    // A move shorter than `min_step` (status jitter / a near-stationary tool) is rejected so coincident points do
+    // not pile up; a move that clears the step is appended.
+    assert!(!trail_should_append(Some((0.0, 0.0)), (0.3, 0.0), 1.0), "a sub-step wiggle must not append");
+    assert!(trail_should_append(Some((0.0, 0.0)), (1.5, 0.0), 1.0), "a move past the step must append");
+    // Exactly at the step threshold counts as a move (>=).
+    assert!(trail_should_append(Some((0.0, 0.0)), (1.0, 0.0), 1.0));
   }
 
   #[test]
-  fn live_cut_boundary_never_colours_past_the_streamed_frontier() {
-    let (s, l) = line_path(10);
-    // Only lines 0..3 are acknowledged. Even though the live position sits way down at segment 8, the boundary
-    // cannot exceed the streamed frontier (3) — the controller has not even received the later moves. This is the
-    // over-advance cap: a spatially-near future segment that has not been streamed can never be coloured.
-    let b = live_cut_boundary(&s, &l, (8.5, 0.0), 3, 8, 0);
-    assert!(b <= 3, "must not colour past the acked frontier, got {b}");
-  }
-
-  #[test]
-  fn live_cut_boundary_localises_the_cutter_within_the_in_flight_window() {
-    let (s, l) = line_path(10);
-    // Six lines acked, the controller running two lines behind (executing ~line 4). The live tool is on segment 4,
-    // so the boundary lands just past it (5) — the position refines within the line-bounded in-flight window.
-    assert_eq!(live_cut_boundary(&s, &l, (4.5, 0.0), 6, 2, 0), 5);
-  }
-
-  #[test]
-  fn live_cut_boundary_floor_advances_with_acked_so_it_cannot_stall() {
-    let (s, l) = line_path(10);
-    // The live position is useless here (far off the path), so geometry alone could never localise — the failure
-    // mode that left the preview all white. The streamed-line floor (`acked - in_flight_lines`) still drags the
-    // boundary forward, so progress tracks the stream instead of freezing at zero.
-    let b = live_cut_boundary(&s, &l, (1000.0, 1000.0), 8, 2, 0);
-    assert!(b >= 6, "the streamed-line floor must advance progress even with a useless position match, got {b}");
-  }
-
-  #[test]
-  fn live_cut_boundary_is_monotonic_and_never_backtracks() {
-    let (s, l) = line_path(6);
-    // Having progressed to 4, a jittery sample that projects back near segment 1 must not un-cut later segments.
-    assert_eq!(live_cut_boundary(&s, &l, (1.0, 0.0), 6, 3, 4), 4);
-  }
-
-  #[test]
-  fn live_cut_boundary_tracks_a_reversing_path_marched_frame_by_frame() {
-    // THE all-white regression, now via the line window. A direction-reversing path (spiral/raster) defeated every
-    // pure-geometry rule (leap, then stall). Here the line counter anchors which stretch is in flight and the
-    // position localises within it. March the cutter along the whole path, advancing `acked` each frame, and
-    // assert the boundary follows to the end. One program line per segment, buffer one line deep.
-    let path = vec![
-      ((0.0, 0.0), (10.0, 0.0)),  // line 0 → right
-      ((10.0, 0.0), (10.0, 1.0)), // line 1 ↑
-      ((10.0, 1.0), (0.0, 1.0)),  // line 2 ← left (a reversal)
-      ((0.0, 1.0), (0.0, 2.0)),   // line 3 ↑
-      ((0.0, 2.0), (10.0, 2.0)),  // line 4 → right
-    ];
-    let lines = vec![0, 1, 2, 3, 4];
-    let frames = [((5.0, 0.0), 1u32), ((10.0, 0.5), 2), ((5.0, 1.0), 3), ((0.0, 1.5), 4), ((5.0, 2.0), 5)];
-    let mut prev = 0;
-    for (pt, acked) in frames {
-      prev = live_cut_boundary(&path, &lines, pt, acked, 1, prev);
-    }
-    assert_eq!(prev, 5, "the boundary must track across reversals to the path end, not stall near 0");
-  }
-
-  #[test]
-  fn live_cut_boundary_excludes_an_unstreamed_overlapping_ring() {
-    // The self-approach ambiguity, resolved by the line counter. Segment 4 is a "next ring" running right on top of
-    // segment 0, but it comes from a later, NOT-yet-streamed line. The cutter on segment 0 must colour segment 0,
-    // never the spatially-coincident-but-unstreamed segment 4.
-    let segs = vec![
-      ((0.0, 0.0), (10.0, 0.0)),    // line 0: the move the cutter is on
-      ((10.0, 0.0), (10.0, 1.0)),   // line 1
-      ((10.0, 1.0), (0.0, 1.0)),    // line 2
-      ((0.0, 1.0), (0.0, 2.0)),     // line 3
-      ((0.0, 0.05), (10.0, 0.05)),  // line 4: a parallel ring ~on top of line 0, not yet streamed
-    ];
-    let lines = vec![0, 1, 2, 3, 4];
-    // Cutter at the midpoint of segment 0; only lines 0..2 acked, so segment 4 is beyond the frontier and excluded.
-    let b = live_cut_boundary(&segs, &lines, (5.0, 0.0), 2, 4, 0);
-    assert!((1..=2).contains(&b), "the unstreamed overlapping ring must not be coloured, got {b}");
+  fn trail_connects_joins_near_points_and_breaks_across_a_jump() {
+    // Consecutive trail points within the gap are joined into the drawn trail; a large jump (a rapid reposition, a
+    // reconnect) is left broken so no spurious streak is drawn across work the tool never cut.
+    assert!(trail_connects((0.0, 0.0), (2.0, 0.0), 5.0), "a small step joins");
+    assert!(!trail_connects((0.0, 0.0), (50.0, 0.0), 5.0), "a large jump breaks the trail");
   }
 
   #[test]
@@ -375,21 +242,5 @@ mod tests {
   fn flatten_arc_degenerate_radius_yields_just_the_endpoint() {
     // A near-zero-radius arc (start == center) cannot define a sweep; it degrades to a single chord to the end.
     assert_eq!(flatten_arc((0.0, 0.0), (2.0, 3.0), (0.0, 0.0), false), vec![(2.0, 3.0)]);
-  }
-
-  #[test]
-  fn project_onto_clamps_and_measures_perpendicular_distance() {
-    // The foot of the perpendicular from a point above the middle of a unit X segment lands at the midpoint
-    // (fraction 0.5) and its squared distance is the perpendicular height squared.
-    let (f, d) = project_onto((0.0, 0.0), (1.0, 0.0), (0.5, 0.25));
-    assert!((f - 0.5).abs() < 1e-5, "foot at the midpoint: {f}");
-    assert!((d - 0.0625).abs() < 1e-5, "perpendicular distance squared: {d}");
-    // A point beyond the far end clamps the fraction to 1.0 (the projection cannot run past the segment).
-    let (f, _) = project_onto((0.0, 0.0), (1.0, 0.0), (5.0, 0.0));
-    assert_eq!(f, 1.0);
-    // A degenerate zero-length segment projects to its start.
-    let (f, d) = project_onto((2.0, 2.0), (2.0, 2.0), (2.0, 5.0));
-    assert_eq!(f, 0.0);
-    assert!((d - 9.0).abs() < 1e-5, "distance to the degenerate point: {d}");
   }
 }

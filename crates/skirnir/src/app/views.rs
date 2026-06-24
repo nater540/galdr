@@ -59,31 +59,17 @@ pub struct UiState {
   toolpath: Vec<Segment>,
   /// The model-space `(min, max)` bounds of [`Self::toolpath`], cached alongside it. `None` when empty.
   toolpath_bounds: Option<(Vec2, Vec2)>,
-  /// The model-space `(start, end)` segment pairs of [`Self::toolpath`], in order, cached at load so the per-frame
-  /// live cut-progress search ([`super::preview::live_cut_boundary`]) borrows them with no allocation. Segment
-  /// PAIRS (not bare endpoints) because the search projects the live point onto each segment's line, not just its
-  /// endpoints. Rebuilt by [`Self::set_program`] alongside the toolpath.
-  progress_segments: Vec<super::preview::Segment>,
-  /// The program line index of each toolpath segment, parallel to [`Self::progress_segments`] and monotonic
-  /// non-decreasing. Cached at load so [`super::preview::live_cut_boundary`] can bound the in-flight window in
-  /// line space (acked lines vs. the live `Bf:` buffer depth) with a binary partition and no per-frame allocation.
-  progress_line_index: Vec<u32>,
   /// The smoothed live tool-position marker, in toolpath **model space** (work-coordinate XY mm) — NOT screen
   /// space, so a viewport resize cannot corrupt the lerp. Eased one frame at a time toward the latest status
   /// sample (see [`super::preview::smooth_marker`]); `None` until the first live work position is acquired or
-  /// while no live status exists (then the preview falls back to the acked-line marker). Reset by
-  /// [`Self::set_program`].
+  /// while no live status exists. Reset by [`Self::set_program`].
   marker_pos: Option<Vec2>,
-  /// The monotonically-advancing cut-progress boundary: the count of leading toolpath segments coloured as cut,
-  /// derived from the live work position (see [`super::preview::live_cut_boundary`]). Never retreats within a
-  /// run; reset to 0 by [`Self::set_program`] and whenever a fresh run begins (no program line acked yet).
-  progress_segment: usize,
-  /// Self-calibrated controller buffer capacities, learned from the largest `Bf:(planner_blocks_free,
-  /// rx_bytes_free)` ever reported (the idle report shows the full buffer). Used to turn a live `Bf:` reading into
-  /// the in-flight depth (capacity − free) that bounds the cut-progress window, without hard-coding the firmware's
-  /// planner/RX sizes. Both default to 0 and only grow.
-  planner_capacity: u32,
-  rx_capacity: u32,
+  /// The position trail: a LinuxCNC-AXIS-style "backplot" of where the tool has ACTUALLY been, in toolpath model
+  /// space (work-coordinate XY mm), oldest first. Live work positions are appended as the tool moves (decimated by
+  /// a step gate) and the trail is drawn as a polyline over the dim preview, so it shows real travel rather than
+  /// guessing which preview segment the tool is on. Capped at [`MAX_TRAIL_POINTS`] (rolling, oldest dropped) and
+  /// cleared by [`Self::set_program`].
+  trail: std::collections::VecDeque<Vec2>,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
   /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
@@ -202,12 +188,8 @@ impl Default for UiState {
       program: std::sync::Arc::from([] as [String; 0]),
       toolpath: Vec::new(),
       toolpath_bounds: None,
-      progress_segments: Vec::new(),
-      progress_line_index: Vec::new(),
       marker_pos: None,
-      progress_segment: 0,
-      planner_capacity: 0,
-      rx_capacity: 0,
+      trail: std::collections::VecDeque::new(),
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
@@ -295,18 +277,13 @@ impl UiState {
     self.program_path = path;
     self.toolpath = parse_xy_path(&self.program);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
-    // Cache the segment (start, end) pairs and their parallel program-line indices once, for the per-frame live
-    // cut-progress search (no per-frame alloc).
-    self.progress_segments =
-      self.toolpath.iter().map(|seg| ((seg.from.x, seg.from.y), (seg.to.x, seg.to.y))).collect();
-    self.progress_line_index = self.toolpath.iter().map(|seg| seg.line_index as u32).collect();
     // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
     // even if the old program happened to leave us followed at the same row index.
     self.program_followed_line = None;
-    // The live overlay is program-scoped: a new file starts with no acquired marker and no cut progress, so the
-    // marker snaps to the first sample of the new run rather than easing in from the old program's last position.
+    // The live overlay is program-scoped: a new file starts with no acquired marker and an empty trail, so the
+    // marker snaps to the first sample of the new run and the trail does not carry over the old program's travel.
     self.marker_pos = None;
-    self.progress_segment = 0;
+    self.trail.clear();
   }
 }
 
@@ -2138,22 +2115,20 @@ const MARKER_LERP: f32 = 0.35;
 /// animate. Below it, normal cutting moves between samples are smoothed.
 const MARKER_SNAP_SPAN_FRACTION: f32 = 0.25;
 
-/// Estimated bytes per streamed GCode line, used to turn the RX-buffer bytes in flight (`Bf:` second field) into a
-/// rough count of buffered-but-unexecuted lines. A typical `G1X..Y..Z..F..` move is ~25 chars including the
-/// terminator; the estimate only has to bound the in-flight window, which the live position then refines within.
-const AVG_LINE_BYTES: u32 = 25;
+/// Minimum tool travel before a new live work position is appended to the trail, as a fraction of the toolpath's
+/// model-space span diagonal (so it is resolution-independent). The step gate decimates the 5–10 Hz status feed
+/// and rejects sub-step jitter; small enough to keep fine detail, large enough that a stationary tool does not
+/// pile up points.
+const TRAIL_MIN_STEP_FRACTION: f32 = 0.002;
 
-/// Slack lines added to the estimated in-flight depth so the bounded window comfortably CONTAINS the executing
-/// line even when the planner-block-to-line and RX-byte-to-line conversions under-count; the live position
-/// localises within the window, so a little generosity costs nothing.
-const IN_FLIGHT_SLACK_LINES: u32 = 4;
+/// Maximum gap between two consecutive trail points that is still drawn as a connected line, as a fraction of the
+/// span diagonal. A larger gap is a jump — a rapid reposition between moves, or a reconnect — and is left broken
+/// rather than drawn as a spurious streak across uncut work.
+const TRAIL_BREAK_FRACTION: f32 = 0.12;
 
-/// Clamp on the estimated in-flight depth (lines). The floor keeps a window even when `Bf:` is momentarily full;
-/// the ceiling stops a pathological reading from widening the window enough to re-admit a far self-approaching
-/// ring. When no `Bf:` is reported at all, [`IN_FLIGHT_DEFAULT_LINES`] stands in.
-const IN_FLIGHT_MIN_LINES: u32 = 2;
-const IN_FLIGHT_MAX_LINES: u32 = 80;
-const IN_FLIGHT_DEFAULT_LINES: u32 = 24;
+/// Rolling cap on trail length. Past this the oldest points are dropped (like AXIS's limited live-plot history),
+/// bounding memory and per-frame draw cost on a long job; the decimating step gate keeps a typical job well under.
+const MAX_TRAIL_POINTS: usize = 30_000;
 
 /// How far outside the toolpath's model-space bounds the live marker may sit and still be drawn, as a fraction of
 /// the span diagonal. Generous enough that a tool a little outside the drawn extents (lead-in, clearance move)
@@ -2167,20 +2142,17 @@ fn span_diagonal(span: egui::Vec2) -> f32 {
   (span.x * span.x + span.y * span.y).sqrt().max(1.0)
 }
 
-/// Estimate how many streamed-but-unexecuted GCode lines the controller is holding, from a live `Bf:` reading and
-/// the self-calibrated buffer capacities. The controller acks a line when it enters the planner buffer, so the
-/// executing line trails `acked` by roughly this depth: the planner blocks in flight (capacity − free; one block
-/// ≈ one move, an over-count for arcs that only widens the window harmlessly) plus the RX bytes in flight divided
-/// by [`AVG_LINE_BYTES`], plus [`IN_FLIGHT_SLACK_LINES`], clamped to a sane band. `buffer` is the `Bf:(planner
-/// blocks free, rx bytes free)` pair; `None` (no `Bf:` reported) falls back to [`IN_FLIGHT_DEFAULT_LINES`]. Pure
-/// so the estimate is unit-tested. `planner_cap`/`rx_cap` are the largest free counts seen (the full buffers).
-fn in_flight_lines(buffer: Option<(u32, u32)>, planner_cap: u32, rx_cap: u32) -> u32 {
-  let Some((planner_free, rx_free)) = buffer else {
-    return IN_FLIGHT_DEFAULT_LINES;
-  };
-  let planner_in_flight = planner_cap.saturating_sub(planner_free);
-  let rx_in_flight_lines = rx_cap.saturating_sub(rx_free) / AVG_LINE_BYTES;
-  (planner_in_flight + rx_in_flight_lines + IN_FLIGHT_SLACK_LINES).clamp(IN_FLIGHT_MIN_LINES, IN_FLIGHT_MAX_LINES)
+/// Append the live work position to the trail if the tool has moved at least `min_step` from the last point, and
+/// enforce the rolling [`MAX_TRAIL_POINTS`] cap (oldest dropped). The decision itself is the pure
+/// [`super::preview::trail_should_append`]; this just owns the `VecDeque` mutation.
+fn push_trail_point(trail: &mut std::collections::VecDeque<Vec2>, point: Vec2, min_step: f32) {
+  let last = trail.back().map(|p| (p.x, p.y));
+  if preview::trail_should_append(last, (point.x, point.y), min_step) {
+    trail.push_back(point);
+    while trail.len() > MAX_TRAIL_POINTS {
+      trail.pop_front();
+    }
+  }
 }
 
 /// Render the 2D toolpath viewport: a top-down XY preview of the loaded program drawn with [`egui::Painter`].
@@ -2229,46 +2201,36 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   let offset = egui::vec2(rect.left() + (rect.width() - used.x) * 0.5, rect.top() + (rect.height() - used.y) * 0.5);
   let to_screen = |p: egui::Vec2| egui::pos2(offset.x + (p.x - min.x) * scale, offset.y + (max.y - p.y) * scale);
 
-  // Fold this frame's live status into the cached overlay (smoothed marker + monotonic cut boundary), returning
-  // the model-space marker to draw, or `None` to fall back to the acked-line dot. This mutates the cached state
-  // before the immutable draw borrow of `state.toolpath` below.
+  // Fold this frame's live status into the overlay: extend the position trail and smooth the marker. Returns the
+  // model-space marker to draw, or `None` to draw no dot. This mutates the cached state (trail/marker) before the
+  // immutable draw borrows of `state.toolpath`/`state.trail` below.
   let live_marker = update_live_overlay(state, view, (min, max), span);
 
-  let segments = &state.toolpath;
-  let cut_until = if live_marker.is_some() { state.progress_segment } else { 0 };
-  let acked = view.progress.acked;
-  // The live boundary, when present, is fixed for the whole frame, so choose the fallback acked marker only when
-  // there is no live marker — never compute the per-segment acked endpoint when the live path will win (#11).
-  let live = live_marker.is_some();
-  let mut acked_tool: Option<egui::Pos2> = None;
-  for (index, seg) in segments.iter().enumerate() {
-    // A segment is "cut" either by the live position-driven boundary (preferred when live) or, as a fallback
-    // with no live status, by the acked line index. Cut moves are the warm "motion" orange; pending cuts the
-    // neutral path colour; rapids stay dim. Track the last acked-traversed endpoint for the fallback marker.
-    let traversed = if live { index < cut_until } else { seg.line_index < acked };
-    let color = if seg.rapid {
-      Theme::BORDER_RAISED
-    } else if traversed {
-      Theme::ACCENT_MOTION
-    } else {
-      Theme::TEXT_DIM
-    };
-    let width = if traversed && !seg.rapid { 1.6 } else { 1.0 };
-    painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(width, color));
-    // Only accumulate the acked-fallback marker when we will actually use it (no live marker this frame).
-    if !live && seg.line_index < acked {
-      acked_tool = Some(to_screen(seg.to));
-    }
+  // The program preview underneath is drawn uniformly DIM (cuts neutral, rapids dimmer) — it is the reference
+  // geometry, not the progress. Progress is shown by the trail drawn over it, so there is no per-segment cut state.
+  for seg in &state.toolpath {
+    let color = if seg.rapid { Theme::BORDER_RAISED } else { Theme::TEXT_DIM };
+    painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(1.0, color));
   }
 
-  // The tool dot (warm motion accent) marks where the machine is: the smoothed live position when available, or
-  // the last acked-traversed endpoint as a fallback. Drawing it projects the model-space marker through the same
-  // fit transform the segments use, so it always sits on the geometry.
-  let dot = match live_marker {
-    Some(model) => Some(to_screen(model)),
-    None => acked_tool,
-  };
-  if let Some(pos) = dot {
+  // The position trail (warm motion accent): the AXIS-style backplot of where the tool has actually been, drawn
+  // over the dim preview. Consecutive points are joined only when close enough — a large gap is a rapid reposition
+  // or a reconnect and is left broken rather than streaked across uncut work (see [`preview::trail_connects`]).
+  let break_gap = span_diagonal(span) * TRAIL_BREAK_FRACTION;
+  let mut prev: Option<&Vec2> = None;
+  for cur in &state.trail {
+    if let Some(a) = prev
+      && preview::trail_connects((a.x, a.y), (cur.x, cur.y), break_gap)
+    {
+      painter.line_segment([to_screen(*a), to_screen(*cur)], egui::Stroke::new(1.6, Theme::ACCENT_MOTION));
+    }
+    prev = Some(cur);
+  }
+
+  // The tool dot (warm motion accent) marks where the machine is now: the smoothed live position, projected
+  // through the same fit transform so it sits on the geometry. Suppressed (no dot) when there is no live position.
+  if let Some(model) = live_marker {
+    let pos = to_screen(model);
     painter.circle_filled(pos, 4.0, Theme::ACCENT_MOTION);
     painter.circle_stroke(pos, 8.0, egui::Stroke::new(1.0, Theme::ACCENT_MOTION.gamma_multiply(0.5)));
   }
@@ -2282,38 +2244,27 @@ fn is_moving_state(run_state: Option<crate::protocol::RunState>) -> bool {
   matches!(run_state, Some(Run | Jog | Hold))
 }
 
-/// Fold one frame of live status into the cached preview overlay: smooth the model-space marker toward the latest
-/// work position and advance the monotonic cut-progress boundary. Returns the smoothed marker in model space when
-/// a live marker should be drawn, or `None` to fall back to the acked-line dot. Kept as a small helper so the
-/// per-frame state mutation is isolated from rendering; the smoothing, progress, and gating decisions themselves
-/// live in pure, unit-tested [`super::preview`] functions.
+/// Fold one frame of live status into the cached overlay: extend the position trail from the raw work position and
+/// smooth the model-space marker toward it. Returns the smoothed marker in model space when a marker dot should be
+/// drawn, or `None` for no dot. Kept as a small helper so the per-frame state mutation is isolated from rendering;
+/// the smoothing, trail, and gating decisions themselves live in pure, unit-tested [`super::preview`] functions.
 ///
 /// Three live-status cases are distinguished (findings #3/#4/#5/#6):
-/// - **No status at all** (disconnected / pre-connect): drop the held marker so a later reconnect snaps fresh,
-///   and fall back to the acked-line dot.
+/// - **No status at all** (disconnected / pre-connect): drop the held marker so a later reconnect snaps fresh.
 /// - **A status with no derivable work position** (grbl pushes `WCO` only intermittently, so a mid-run report can
 ///   lack one): HOLD the last marker through the gap rather than nulling it — nulling would re-snap on the next
-///   valid frame, a visible blink/teleport, and revert colouring to the acked fallback for that frame.
-/// - **A status with a work position**: smooth toward it and advance the cut boundary, but draw the marker only
-///   when [`preview::marker_is_on_path`] passes (on/near the path, or while actively moving) — a parked machine
-///   far off the path (homed to machine origin, a units mismatch, a WCS mismatch) draws nothing rather than a
-///   confident-but-wrong dot.
+///   valid frame, a visible blink/teleport. The trail is simply not extended this frame.
+/// - **A status with a work position**: extend the trail and smooth toward it, but draw the marker dot only when
+///   [`preview::marker_is_on_path`] passes (on/near the path, or while actively moving) — a parked machine far off
+///   the path (homed to machine origin, a units mismatch, a WCS mismatch) draws no dot rather than a
+///   confident-but-wrong one.
 fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec2), span: egui::Vec2) -> Option<Vec2> {
-  // Self-calibrate the controller buffer capacities from the live `Bf:` free counts (the idle report shows the
-  // full buffer), so the in-flight depth that bounds the cut window needs no hard-coded firmware sizes. Learn this
-  // before any early return so a WCO-less frame still updates it.
-  if let Some((planner_free, rx_free)) = view.status.as_ref().and_then(|s| s.buffer) {
-    state.planner_capacity = state.planner_capacity.max(planner_free);
-    state.rx_capacity = state.rx_capacity.max(rx_free);
-  }
   let Some(target) = view.work_xy().map(|(x, y)| (x as f32, y as f32)) else {
     // No derivable work position this frame. Two cases (finding #6):
-    // - No status at all (disconnected / pre-connect): clear the marker so a later reconnect snaps fresh, and
-    //   fall back to the acked-line dot/colouring.
+    // - No status at all (disconnected / pre-connect): clear the marker so a later reconnect snaps fresh.
     // - A status with no derivable work position (grbl pushes WCO only intermittently, so a mid-run report can
-    //   lack one): HOLD the last marker AND keep returning it, so the dot stays put and the colouring stays on
-    //   the live boundary for this frame rather than blinking back to the acked fallback and re-snapping next
-    //   frame. The cut boundary is simply not advanced this frame (no live point to project), which is correct.
+    //   lack one): HOLD the last marker AND keep returning it, so the dot stays put rather than blinking out and
+    //   re-snapping next frame. The trail is simply not extended this frame (no live point), which is correct.
     if view.status.is_none() {
       state.marker_pos = None;
       return None;
@@ -2326,24 +2277,14 @@ fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec
   let smoothed = preview::smooth_marker(current, target, snap_dist, MARKER_LERP);
   state.marker_pos = Some(egui::vec2(smoothed.0, smoothed.1));
 
-  // Advance the cut boundary with the hybrid line-window + position rule: the streamed line count (`acked`) and
-  // the live `Bf:` buffer depth bound a small in-flight window of the path, and the live position localises within
-  // it. The line counter removes the self-intersection ambiguity that defeated pure geometry; the cached segment
-  // and line-index lists are pre-computed, so this allocates nothing per frame. `acked == 0` (a fresh run) yields
-  // a boundary of 0 inside the helper, so re-running a loaded file does not paint it cut from the first frame.
-  let depth = in_flight_lines(view.status.as_ref().and_then(|s| s.buffer), state.planner_capacity, state.rx_capacity);
-  state.progress_segment = preview::live_cut_boundary(
-    &state.progress_segments,
-    &state.progress_line_index,
-    target,
-    view.progress.acked as u32,
-    depth,
-    state.progress_segment,
-  );
+  // Extend the position trail (the backplot of where the tool has actually been) from the RAW live work position —
+  // not the smoothed marker, which lags — so the trail records true travel. The step gate decimates the status
+  // feed; the rolling cap bounds it.
+  push_trail_point(&mut state.trail, egui::vec2(target.0, target.1), diagonal * TRAIL_MIN_STEP_FRACTION);
 
   // Gate the marker: drawn on/near the path or while actively moving, suppressed for a parked-off-path point
-  // (#3/#4/#5). Use the SMOOTHED position so the gate matches what is drawn. The boundary still advanced above,
-  // so colouring stays correct even when the dot is hidden.
+  // (#3/#4/#5). Use the SMOOTHED position so the gate matches what is drawn. The trail still extended above, so it
+  // keeps recording even when the dot is hidden.
   let (min, max) = bounds;
   let margin = diagonal * MARKER_ON_PATH_MARGIN_FRACTION;
   let moving = is_moving_state(view.status.as_ref().map(|s| s.machine_state.state));
@@ -2383,8 +2324,6 @@ struct Segment {
   to: egui::Vec2,
   /// Whether this is a rapid (G0) travel move rather than a cut.
   rapid: bool,
-  /// The program line index this segment came from, for progress highlighting.
-  line_index: usize,
 }
 
 /// Parse the loaded program into a flat list of XY segments for the preview. A pragmatic linear interpreter:
@@ -2396,16 +2335,15 @@ struct Segment {
 ///
 /// **Arcs (G2/G3) are FLATTENED into many short chord segments** via [`super::preview::flatten_arc`], using the
 /// I/J centre offset (XY plane / G17 assumed — the firmware's only arc plane). This makes the preview draw the
-/// real curve and lets the live-progress projection colour an arc smoothly as the tool sweeps it, instead of one
-/// start→end chord whose endpoint the swept point never reaches (findings #2). An arc with neither I/J nor a
-/// usable centre degrades to a single straight chord, so a malformed or R-form arc never breaks the parse.
+/// real curve rather than a single start→end chord. An arc with neither I/J nor a usable centre degrades to a
+/// single straight chord, so a malformed or R-form arc never breaks the parse.
 fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
   let mut segments = Vec::new();
   let mut pos = egui::vec2(0.0, 0.0);
   // Modal motion mode: 0 == G0 rapid, 1 == G1 cut, 2 == G2 CW arc, 3 == G3 CCW arc.
   let mut motion = 0u8;
   let mut absolute = true; // modal distance mode: true == G90 (absolute), false == G91 (relative).
-  for (index, line) in lines.iter().enumerate() {
+  for line in lines {
     let code = line.split(';').next().unwrap_or("").to_ascii_uppercase();
     if code.trim().is_empty() {
       continue;
@@ -2464,13 +2402,12 @@ fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
         let center = (pos.x + arc_i, pos.y + arc_j);
         let mut from = (pos.x, pos.y);
         for point in super::preview::flatten_arc(from, (next.x, next.y), center, motion == 2) {
-          segments.push(Segment { from: egui::vec2(from.0, from.1), to: egui::vec2(point.0, point.1),
-            rapid, line_index: index });
+          segments.push(Segment { from: egui::vec2(from.0, from.1), to: egui::vec2(point.0, point.1), rapid });
           from = point;
         }
       } else {
         // A linear move, or an arc with no centre offset (degrade to its chord rather than guessing a centre).
-        segments.push(Segment { from: pos, to: next, rapid, line_index: index });
+        segments.push(Segment { from: pos, to: next, rapid });
       }
       pos = next;
     }
@@ -2779,17 +2716,22 @@ mod tests {
   use super::*;
 
   #[test]
-  fn in_flight_lines_estimates_buffer_depth_and_falls_back_without_bf() {
-    // No `Bf:` reported: fall back to the default depth.
-    assert_eq!(in_flight_lines(None, 32, 1024), IN_FLIGHT_DEFAULT_LINES);
-    // With capacities 32 planner blocks / 1024 RX bytes: 20 blocks in flight (32 − 12) + 200 RX bytes (1024 − 824)
-    // ≈ 8 lines, plus slack. The estimate is planner_in_flight + rx_bytes/AVG_LINE_BYTES + slack.
-    let depth = in_flight_lines(Some((12, 824)), 32, 1024);
-    assert_eq!(depth, 20 + 200 / AVG_LINE_BYTES + IN_FLIGHT_SLACK_LINES);
-    // A full buffer (free == capacity) yields just the slack, so the window never vanishes.
-    assert_eq!(in_flight_lines(Some((32, 1024)), 32, 1024), IN_FLIGHT_SLACK_LINES);
-    // A pathological reading is capped so the window cannot widen enough to re-admit a far self-approaching ring.
-    assert_eq!(in_flight_lines(Some((0, 0)), 200, 100_000), IN_FLIGHT_MAX_LINES);
+  fn push_trail_point_appends_real_moves_decimates_jitter_and_caps_length() {
+    use std::collections::VecDeque;
+    let mut trail: VecDeque<Vec2> = VecDeque::new();
+    // First point is always taken; a sub-step wiggle is dropped; a real move is appended.
+    push_trail_point(&mut trail, egui::vec2(0.0, 0.0), 1.0);
+    push_trail_point(&mut trail, egui::vec2(0.3, 0.0), 1.0); // jitter < min_step → ignored
+    push_trail_point(&mut trail, egui::vec2(2.0, 0.0), 1.0); // real move → appended
+    assert_eq!(trail.len(), 2);
+    assert_eq!(*trail.back().unwrap(), egui::vec2(2.0, 0.0));
+    // The rolling cap drops the oldest once full.
+    let mut full: VecDeque<Vec2> = (0..MAX_TRAIL_POINTS as i32).map(|i| egui::vec2(i as f32 * 10.0, 0.0)).collect();
+    let newest = egui::vec2(MAX_TRAIL_POINTS as f32 * 10.0, 0.0);
+    push_trail_point(&mut full, newest, 1.0);
+    assert_eq!(full.len(), MAX_TRAIL_POINTS, "length is capped");
+    assert_eq!(*full.back().unwrap(), newest, "newest point retained");
+    assert_eq!(*full.front().unwrap(), egui::vec2(10.0, 0.0), "oldest point dropped");
   }
 
   #[test]
@@ -3120,7 +3062,7 @@ mod tests {
   fn toolpath_parser_flattens_a_g2_arc_into_many_chords() {
     // A G2 (CW) quarter arc from (1,0) to (0,1) about the origin (I-1 J0 → centre = start + (−1,0) = (0,0)) must
     // flatten into many short chord segments on the unit radius, not a single start→end chord — so the preview
-    // draws the curve and the live-progress projection colours it smoothly (findings #2).
+    // draws the curve.
     let program = vec!["G0 X1 Y0".to_string(), "G2 X0 Y1 I-1 J0".to_string()];
     let segments = parse_xy_path(&program);
     // One rapid to the start, then several arc chords (a quarter circle subdivides into multiple segments).
@@ -3134,9 +3076,8 @@ mod tests {
       let r = (s.to.x * s.to.x + s.to.y * s.to.y).sqrt();
       assert!((r - 1.0).abs() < 1e-2, "every chord endpoint sits on the radius: {:?} r={r}", s.to);
     }
-    // The final chord ends exactly on the commanded endpoint, and all arc chords share the source line index.
+    // The final chord ends exactly on the commanded endpoint.
     assert_eq!(arc.last().unwrap().to, egui::vec2(0.0, 1.0));
-    assert!(arc.iter().all(|s| s.line_index == 1), "all arc chords come from the G2 line");
   }
 
   #[test]
