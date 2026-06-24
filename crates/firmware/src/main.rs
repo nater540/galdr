@@ -274,10 +274,13 @@ async fn main(spawner: Spawner) {
   let peripherals = esp_hal::init(config);
 
   // 2. Start the esp-rtos scheduler with the TIMG0 timer as the time source. This also installs the
-  //    Embassy time-driver, so `embassy-time` and channel/Signal awaits operate from here on. On Xtensa
-  //    `start` takes only the timer (the RISC-V `int0` argument does not apply).
+  //    Embassy time-driver, so `embassy-time` and channel/Signal awaits operate from here on. As of
+  //    esp-rtos 0.3 (#4459) `start` claims `software_interrupt0` for the scheduler on all CPUs, so the
+  //    `SoftwareInterruptControl` must be created BEFORE `start`; its remaining interrupts (1 for the
+  //    second-core bring-up, 2 for the motion `InterruptExecutor`) are consumed later.
+  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
   let timg0 = TimerGroup::new(peripherals.TIMG0);
-  esp_rtos::start(timg0.timer0);
+  esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
   // 3. Bring up the USB Serial/JTAG CDC controller (internal PHY on GPIO19/20; no descriptors, no eFuse).
   //    Convert to the async driver and split into independent RX/TX halves for the two USB tasks.
@@ -413,13 +416,13 @@ async fn main(spawner: Spawner) {
   comms::init_coordinates(coordinates);
   comms::seed_planner_work_offset().await;
 
-  // 6. Start core 1 and its high-priority interrupt executor, then spawn `motion_executor` on it. On Xtensa
-  //    `start_second_core` consumes software interrupts 0 and 1 for the esp-rtos SMP scheduler; the motion
-  //    interrupt executor therefore uses SWI 2. The `func` closure runs ONCE on core 1 (pinned, via the
+  // 6. Start core 1 and its high-priority interrupt executor, then spawn `motion_executor` on it. As of
+  //    esp-rtos 0.3 the SMP scheduler claims SWI 0 (consumed by `esp_rtos::start` above) and SWI 1 (consumed
+  //    by `start_second_core` below); the motion interrupt executor therefore uses SWI 2. The `func` closure
+  //    runs ONCE on core 1 (pinned, via the
   //    app-core boot vector): it starts the interrupt executor — binding the SWI-2 handler and enabling
   //    FROM_CPU_INTR2 on core 1 so the task is polled there — spawns `motion_executor`, then returns
   //    (esp-rtos idles the core-1 main thread in `waiti`; the interrupt executor keeps running).
-  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
   // Initialize the core-1 stack arena (stack + trailing ABI headroom). The `#[repr(C)]` arena guarantees
   // `_abi_headroom` sits immediately above the stack top, absorbing the Xtensa windowed-ABI over-top register
   // spill that would otherwise corrupt the adjacent control statics (see [`AppCoreStackArena`] — the headroom is
@@ -437,9 +440,11 @@ async fn main(spawner: Spawner) {
   // Re-borrow `arena.stack` AFTER arming so the canary write is sequenced before the stack hand-off; the closure
   // does not need the arena, so only `&mut arena.stack` crosses into `start_second_core`.
   let app_stack = &mut arena.stack;
+  // As of esp-rtos 0.3 (#4459) `start_second_core` no longer takes `software_interrupt0` (claimed by
+  // `start` above); it takes only `software_interrupt1` for the second-core bring-up. SWI 2 remains free
+  // for the motion `InterruptExecutor` below.
   esp_rtos::start_second_core(
     peripherals.CPU_CTRL,
-    sw_int.software_interrupt0,
     sw_int.software_interrupt1,
     app_stack,
     move || {
@@ -450,11 +455,17 @@ async fn main(spawner: Spawner) {
       // SMP scheduler (which claims 0 and 1).
       let executor = MOTION_EXECUTOR.init(InterruptExecutor::new(sw_int.software_interrupt2));
       let motion_spawner = executor.start(MOTION_EXECUTOR_PRIORITY);
-      // `must_spawn` is appropriate at init: a spawn failure (token already used) is a static, unrecoverable
-      // wiring bug, not a runtime condition. The task takes the `'static` sink/probe by mutable borrow. The axis
-      // max-rates (`$110-112`) bound the Phase-E feed-override scale-up so a boosted feed never exceeds the
-      // configured rate limit; they are passed alongside the step-timing config.
-      motion_spawner.must_spawn(motion_executor(sink, probe, limits, motion_config, planner_config.max_rate_mm_min));
+      // As of embassy-executor 0.10 the `#[task]` macro returns the `SpawnToken` as a `Result` (the pool
+      // check moved to token creation; #4459) and `spawn` itself is infallible. `expect` on the token at
+      // init replicates the old `must_spawn`: a failure means the pool is exhausted / the task was already
+      // spawned — a static, unrecoverable wiring bug, not a runtime condition (CLAUDE.md permits `expect` in
+      // init). The task takes the `'static` sink/probe by mutable borrow. The axis max-rates (`$110-112`)
+      // bound the Phase-E feed-override scale-up so a boosted feed never exceeds the configured rate limit;
+      // they are passed alongside the step-timing config.
+      motion_spawner.spawn(
+        motion_executor(sink, probe, limits, motion_config, planner_config.max_rate_mm_min)
+          .expect("spawn motion_executor"),
+      );
     },
   );
 
@@ -471,29 +482,31 @@ async fn main(spawner: Spawner) {
     defmt::error!("core1 abi-headroom canary disturbed: over-top register spill exceeded the modeled worst case");
   }
 
-  // 7. Spawn the core-0 comms tasks on the thread-mode executor. `must_spawn` is appropriate at init (a
-  //    spawn failure is a static wiring bug). The RX path is split: `usb_rx` (reader half) extracts real-time
-  //    bytes and buffers the rest into `RX_PIPE`, while `line_assembler` frames lines from that buffer — so
-  //    real-time commands never block behind line back-pressure (DOC-08 grbl ISR model). `comms_consumer` is
-  //    the real parser → planner pipeline; it now wakes the core-1 motion executor via `BLOCK_AVAILABLE`.
-  spawner.must_spawn(comms::usb_rx(usb_rx));
-  spawner.must_spawn(comms::line_assembler());
-  spawner.must_spawn(comms::usb_tx(usb_tx));
+  // 7. Spawn the core-0 comms tasks on the thread-mode executor. As of embassy-executor 0.10 the `#[task]`
+  //    macro returns the `SpawnToken` as a `Result` and `spawn` is infallible, so we `expect` each token at
+  //    init (a spawn failure is a static wiring bug; CLAUDE.md permits `expect` in init). The RX path is
+  //    split: `usb_rx` (reader half) extracts real-time bytes and buffers the rest into `RX_PIPE`, while
+  //    `line_assembler` frames lines from that buffer — so real-time commands never block behind line
+  //    back-pressure (DOC-08 grbl ISR model). `comms_consumer` is the real parser → planner pipeline; it now
+  //    wakes the core-1 motion executor via `BLOCK_AVAILABLE`.
+  spawner.spawn(comms::usb_rx(usb_rx).expect("spawn usb_rx"));
+  spawner.spawn(comms::line_assembler().expect("spawn line_assembler"));
+  spawner.spawn(comms::usb_tx(usb_tx).expect("spawn usb_tx"));
   // The consumer takes the shared flash so a `$x=val` setting write is persisted to the NVS region (DOC-04).
-  spawner.must_spawn(comms::comms_consumer(flash));
-  spawner.must_spawn(comms::status_responder());
+  spawner.spawn(comms::comms_consumer(flash).expect("spawn comms_consumer"));
+  spawner.spawn(comms::status_responder().expect("spawn status_responder"));
   // The auto-report task (Phase F, DOC-08 §5) pushes a `<...>` status report every `$481`-ms when enabled,
   // reusing `status_responder`'s single formatter/writer so an auto-report is byte-identical to a `?` report.
-  spawner.must_spawn(comms::auto_report_task());
+  spawner.spawn(comms::auto_report_task().expect("spawn auto_report_task"));
   // The TMC2209 manager runs the driver init sequence at startup (from the loaded settings), then polls
   // DRV_STATUS for faults. It owns the UART1 bus by value (a `'static` peripheral handle), so no `StaticCell`
   // is needed (DOC-03).
-  spawner.must_spawn(tmc::tmc_manager(tmc_bus, tmc_config));
+  spawner.spawn(tmc::tmc_manager(tmc_bus, tmc_config).expect("spawn tmc_manager"));
   // The spindle task (DOC-07, core 0 / PRO_CPU, priority 0) is the sole driver of the spindle outputs. It awaits
   // the consumer's spindle-update wake (an M3/M4/M5 or a spindle override/stop change) and the emergency-stop
   // signal (ALARM / soft-reset / sleep), drives the `SpindleController`, and runs the `$393` reverse dwell.
-  spawner.must_spawn(comms::spindle(spindle));
-  spawner.must_spawn(comms::coolant(coolant));
+  spawner.spawn(comms::spindle(spindle).expect("spawn spindle"));
+  spawner.spawn(comms::coolant(coolant).expect("spawn coolant"));
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
