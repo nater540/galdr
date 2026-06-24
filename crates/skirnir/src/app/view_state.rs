@@ -14,7 +14,7 @@ use crate::engine::Event;
 use crate::error::TransportError;
 use crate::protocol::{
   CodeBook, ConnectionState, PinState, PositionKind, Response, SettingValue, StatusReport, parse_alarm_code_meta,
-  parse_error_code_meta, parse_setting_meta, parse_status,
+  parse_error_code_meta, parse_gc_body, parse_setting_meta, parse_status,
 };
 
 /// How many console lines to retain. The console is a diagnostic tail, not a transcript — capping it bounds
@@ -149,6 +149,11 @@ pub struct ViewState {
   /// The last-seen `WCO:` vector, cached across reports (grbl pushes it only intermittently) so we can always
   /// derive the position kind the current report did not carry.
   pub last_wco: Vec<f64>,
+  /// The active tool number, sourced from the `T<n>` word of the `$G` / `[GC:]` parser-state line — the
+  /// authoritative "what tool is loaded" per the streaming contract (the `<...>` status report carries no tool
+  /// number). `Some(0)` means no tool; `None` means none has been reported yet this session. Cleared on
+  /// disconnect so a reconnect to a (possibly different) board never shows a stale tool.
+  pub current_tool: Option<u32>,
   /// Streaming progress.
   pub progress: Progress,
   /// A latched alarm/error banner, if active.
@@ -180,6 +185,7 @@ impl Default for ViewState {
       status: None,
       pins: PinState::default(),
       last_wco: Vec::new(),
+      current_tool: None,
       progress: Progress::default(),
       banner: None,
       probe_op: None,
@@ -373,6 +379,18 @@ impl ViewState {
         return;
       }
       Response::Message(body) => {
+        // A `[GC:...]` parser-state line (the `$G` answer) carries the active tool (`T<n>`) — the single
+        // authoritative tool source — among the modal G/M words. Fold the tool into the DRO when present. We
+        // suppress the console echo ONLY when a tool was successfully extracted (the auto-reconcile `$G` the shell
+        // fires on connect / on entering Tool would otherwise be console noise). A `[GC:]` that yields no tool —
+        // a hand-typed `$G` we model no field of, or a malformed/garbled line — must NOT be swallowed: it falls
+        // through to the console below so it stays visible-as-text rather than vanishing silently.
+        if let Some(parser_state) = parse_gc_body(body)
+          && let Some(tool) = parser_state.tool
+        {
+          self.current_tool = Some(tool);
+          return;
+        }
         // A `[SETTING:...]` enumeration row enriches the settings model with the setting's label/unit/bounds and
         // is not console noise; every other bracketed message still reaches the console below.
         if let Some(meta) = parse_setting_meta(body) {
@@ -432,6 +450,9 @@ impl ViewState {
     // Drop the cached WCO so a reconnect does not show "WCO set" or derive WPos/MPos from a stale offset before
     // the new session reports its own. Report-derived state must not survive across a disconnect.
     self.last_wco.clear();
+    // The active tool is the previous board's parser state; clear it so a reconnect shows no tool until the new
+    // session's `$G` answers, rather than carrying a stale `T<n>` across the disconnect.
+    self.current_tool = None;
     // The settings list is the previous board's; clear it so a reconnect re-fetches rather than showing stale.
     self.settings.clear();
     // The codebook overrides are the previous board's `$EE`/`$EA` enumeration; clear them so a reconnect
@@ -525,6 +546,53 @@ mod tests {
   /// Convenience: feed a status-report body through the reducer as the engine would.
   fn feed_status(view: &mut ViewState, body: &str) {
     view.apply(Event::Response(Response::Status(body.to_string())));
+  }
+
+  /// Convenience: feed a bracketed `[...]` message body through the reducer as the engine would.
+  fn feed_message(view: &mut ViewState, body: &str) {
+    view.apply(Event::Response(Response::Message(body.to_string())));
+  }
+
+  #[test]
+  fn a_gc_parser_state_line_sets_the_active_tool_without_console_noise() {
+    let mut view = ViewState::default();
+    feed_message(&mut view, "GC:G0 G54 G17 G21 G90 G94 M5 M9 T3 F0 S0");
+    assert_eq!(view.current_tool, Some(3), "the `T<n>` word sources the active tool");
+    assert!(view.console.is_empty(), "a `[GC:]` parser-state line is folded, not echoed to the console");
+  }
+
+  #[test]
+  fn a_gc_line_with_no_tool_word_leaves_a_known_tool_untouched() {
+    let mut view = ViewState::default();
+    feed_message(&mut view, "GC:T2 F0 S0");
+    assert_eq!(view.current_tool, Some(2));
+    // A later parser-state line that happens to carry no `T` word must not clobber the known tool with `None`.
+    feed_message(&mut view, "GC:G0 G54 F0 S0");
+    assert_eq!(view.current_tool, Some(2), "an absent `T` word must not wipe a good tool");
+  }
+
+  #[test]
+  fn a_gc_line_without_an_extractable_tool_is_echoed_not_swallowed() {
+    // A `[GC:]` that yields no tool — a hand-typed `$G` we model no field of, or a malformed/garbled line — must
+    // still reach the console so it is visible-as-text rather than vanishing silently. We suppress the echo ONLY
+    // when a tool was successfully extracted (the auto-reconcile `$G` the shell fires would otherwise be noise).
+    let mut view = ViewState::default();
+    feed_message(&mut view, "GC:G0 G54 F0 S0");
+    assert_eq!(view.console.len(), 1, "a `[GC:]` with no extractable tool must be echoed, not swallowed");
+    assert!(view.console.back().expect("a console line").text.contains("GC:"), "the verbatim line reaches the console");
+    // And a `[GC:]` that DID set the tool stays suppressed (no console noise from the auto-reconcile `$G`).
+    feed_message(&mut view, "GC:G0 G54 T7 F0 S0");
+    assert_eq!(view.current_tool, Some(7));
+    assert_eq!(view.console.len(), 1, "a parseable `[GC:]` is folded, not echoed");
+  }
+
+  #[test]
+  fn the_active_tool_is_cleared_on_disconnect() {
+    let mut view = ViewState::default();
+    feed_message(&mut view, "GC:T4 F0 S0");
+    assert_eq!(view.current_tool, Some(4));
+    view.apply(Event::Disconnected(None));
+    assert_eq!(view.current_tool, None, "the previous board's tool must not survive a disconnect");
   }
 
   #[test]

@@ -114,6 +114,11 @@ pub struct SkirnirApp {
   /// reading. Held in the shell (not the reducer) because it is wall-clock state the egui frame owns; cleared on a
   /// disconnect so a stale timestamp never carries into the next session.
   last_status_at: Option<Instant>,
+  /// The badge state observed at the end of the previous event drain, so the shell can act on a *transition*
+  /// rather than on the steady state. Used to request `$G` exactly once when the firmware enters the `Tool`
+  /// (M6 manual tool change) state, so the tool-change banner can name the tool the firmware is awaiting; the
+  /// `<...>` status report carries no tool number, so the authoritative `T<n>` must be solicited via `$G`.
+  last_badge: super::badge::BadgeState,
   /// The result channel of an in-flight on-demand port identify probe, if one is running. The probe runs on
   /// the runtime (off the UI thread); the verdict arrives here and is drained into the console each frame, so a
   /// 500ms probe never blocks rendering. `None` when no probe is in flight.
@@ -243,6 +248,7 @@ impl SkirnirApp {
       stream_started: None,
       jog_stream: None,
       last_status_at: None,
+      last_badge: super::badge::BadgeState::Disconnected,
       #[cfg(feature = "serial")]
       pending_probe: None,
       pending_zero_z: None,
@@ -336,10 +342,31 @@ impl SkirnirApp {
       self.override_tracker = super::overrides::OverrideTracker::default();
       self.on_engine_dropped();
     }
+    // Request the parser state (`$G`) so `current_tool` reflects the firmware's active tool — the single source
+    // for the DRO tool strip and the tool-change banner. We send it on two edges, each fired once (gated on the
+    // badge transition, never every frame):
+    //   • Becoming ready (a non-live badge → a live one): seeds `current_tool` on connect, BEFORE any first M6.
+    //   • Entering `Tool` (an M6 manual tool change): refreshes the tool the operator must insert. The firmware
+    //     answers `$G` DURING the M0/M1/M6 hold, so this resolves the banner even for a hold reached mid-stream.
+    let badge = self.view.badge_state();
+    use super::badge::BadgeState;
+    let became_live = !Self::badge_is_live(self.last_badge) && Self::badge_is_live(badge);
+    let entered_tool = badge == BadgeState::Tool && self.last_badge != BadgeState::Tool;
+    if became_live || entered_tool {
+      self.send_line("$G".to_string());
+    }
+    self.last_badge = badge;
     // Maintain the stream clock from the (now-current) lifecycle: start it the first frame streaming begins,
     // clear it the moment streaming ends, so the dock's elapsed/ETA times exactly one run.
     self.track_stream_clock();
     saw_any
+  }
+
+  /// Whether a badge state represents a live, ready link (the firmware can answer commands), as opposed to the
+  /// pre-readiness states. Used to fire the connect-time `$G` seed exactly once, on the edge into readiness.
+  fn badge_is_live(badge: super::badge::BadgeState) -> bool {
+    use super::badge::BadgeState;
+    !matches!(badge, BadgeState::Disconnected | BadgeState::Connecting)
   }
 
   /// React to the engine task ending (its terminal [`crate::engine::Event::Disconnected`]): drop the dead
@@ -1548,6 +1575,14 @@ impl eframe::App for SkirnirApp {
       egui::Panel::top("banner").show_inside(ui, |ui| {
         views::alarm_banner(ui, &self.view, &mut sink);
       });
+    } else if self.view.badge_state() == super::badge::BadgeState::Tool {
+      // No fault is latched, but the firmware is held for an M6 manual tool change: surface the prominent
+      // tool-change affordance in the same top slot (a fault banner, if any, takes precedence above). The Resume
+      // action routes through the existing cycle-start path, not a second control. The banner names the tool from
+      // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
+      egui::Panel::top("tool_change").show_inside(ui, |ui| {
+        views::tool_change_banner(ui, &self.view, &mut sink);
+      });
     }
 
     // The status bar is a fixed 24px mono strip (design §03).
@@ -1872,6 +1907,153 @@ mod tests {
     assert!(app.engine.is_none(), "the engine handle must be released once the terminal event drains");
     assert!(!app.auto_reconnect, "a deliberate disconnect must not re-arm auto-reconnect");
     assert!(app.reconnect_at.is_none(), "a deliberate disconnect must not schedule a reconnect");
+  }
+
+  /// The tool the tool-change banner would name: the firmware-reported `current_tool`, the single authoritative
+  /// source the banner reads directly. A test helper so a test can assert the banner's data source without driving
+  /// a real egui frame (the banner is a pure render of this value).
+  fn banner_tool(app: &SkirnirApp) -> Option<u32> {
+    app.view.current_tool
+  }
+
+  /// THE STREAMING-HOLD CASE under the new contract: the firmware answers `$G` DURING the M6 hold (including a hold
+  /// reached mid-stream), so the banner names the tool from that `[GC:...]` answer — no program-stream derivation.
+  /// We stream a program, enter the Tool hold mid-stream, let the shell's `$G` nudge fire, and answer it during the
+  /// hold; the banner must then name the reported tool.
+  #[test]
+  fn the_tool_change_banner_names_the_tool_from_the_g_answer_during_a_streaming_hold() {
+    let (mut app, mut controller) = app_with_engine();
+    // Complete the handshake to Idle (the banner is the readiness signal), then drain its writes (including the
+    // connect-time `$G` seed) so we assert only on the traffic the hold provokes.
+    assert!(controller.inject_line("GrblHAL 1.1f ['$' or '$HELP' for help]"));
+    assert!(pump_until(&mut app, |a| a.view.connection == ConnectionState::Idle));
+    let _ = pump_collect(&mut app, &mut controller);
+
+    // Stream a program through the engine for real, so the streaming state is the engine's own.
+    let program = vec![
+      "G21 G90".to_string(),
+      "T2 M6".to_string(),
+      "G1 X10 F300".to_string(),
+      "G1 X20".to_string(),
+    ];
+    app.ui.set_program(program.clone(), None);
+    app.start_stream();
+    assert!(
+      pump_until(&mut app, |a| a.view.connection == ConnectionState::Streaming),
+      "the engine never reached Streaming; got {:?}",
+      app.view.connection,
+    );
+    assert!(controller.inject_line("ok")); // ack the first streamed line so the cursor advances.
+    let _ = pump_collect(&mut app, &mut controller);
+
+    // The firmware halts mid-stream on the M6 tool change.
+    assert!(controller.inject_line("<Tool|MPos:0.000,0.000,0.000|FS:0,0>"));
+    assert!(
+      pump_until(&mut app, |a| a.view.badge_state() == super::super::badge::BadgeState::Tool),
+      "the engine never reached the Tool badge state; got {:?}",
+      app.view.badge_state(),
+    );
+    assert_eq!(app.view.connection, ConnectionState::Streaming, "the Tool hold must keep the lifecycle streaming");
+
+    // The shell nudges `$G` on entering Tool — even mid-stream — and the firmware ANSWERS it during the hold (the
+    // M0/M1/M6 `$G`-in-hold support). The answer's `T2` populates `current_tool`, which the banner names.
+    let written = String::from_utf8_lossy(&pump_collect(&mut app, &mut controller)).to_string();
+    assert!(written.contains("$G"), "entering Tool must nudge $G even mid-stream; wrote {written:?}");
+    assert!(controller.inject_line("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T2 G49 F0 S0]"));
+    assert!(
+      pump_until(&mut app, |a| a.view.current_tool == Some(2)),
+      "the [GC:] answer's T2 must set the active tool during the hold; got {:?}",
+      app.view.current_tool,
+    );
+    assert_eq!(banner_tool(&app), Some(2), "the banner names the firmware-reported tool from the in-hold $G answer");
+    assert_eq!(
+      views::tool_change_headline(banner_tool(&app)),
+      "🔧 Tool change: insert T2, then Resume",
+      "the banner copy names the firmware-reported tool",
+    );
+  }
+
+  /// THE NON-STREAMING CASE: an M6 issued from the console / MDI while idle. Same single source — the shell nudges
+  /// `$G` on entering `Tool`, the firmware answers with `[GC:...]`, and the banner names the reported tool.
+  #[test]
+  fn the_tool_change_banner_names_the_g_reported_tool_when_not_streaming() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // No program is streaming. The firmware reports the Tool hold.
+    assert!(controller.inject_line("<Tool|MPos:0.000,0.000,0.000|FS:0,0>"));
+    assert!(
+      pump_until(&mut app, |a| a.view.badge_state() == super::super::badge::BadgeState::Tool),
+      "the engine never reached the Tool badge state; got {:?}",
+      app.view.badge_state(),
+    );
+
+    // The shell nudges `$G` on entering Tool. The write reaches the loopback on the engine's background task, so
+    // collect across a short window.
+    let written = String::from_utf8_lossy(&pump_collect(&mut app, &mut controller)).to_string();
+    assert!(written.contains("$G"), "entering Tool must nudge $G; wrote {written:?}");
+
+    // The firmware answers; the reported tool populates and the banner names it.
+    assert!(controller.inject_line("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T3 G49 F0 S0]"));
+    assert!(
+      pump_until(&mut app, |a| a.view.current_tool == Some(3)),
+      "the [GC:] answer's T3 must set the active tool; got {:?}",
+      app.view.current_tool,
+    );
+    assert_eq!(banner_tool(&app), Some(3), "the banner names the firmware-reported tool");
+  }
+
+  /// Becoming ready (the connect handshake reaching a live state) must seed `current_tool` with a single `$G`, so
+  /// the DRO tool strip is populated BEFORE any first M6 — not left blank until a tool change.
+  #[test]
+  fn becoming_ready_seeds_the_active_tool_with_a_single_g_request() {
+    let (mut app, mut controller) = app_with_engine();
+
+    // Drive the handshake to a live (Idle) state; the readiness edge must provoke exactly one `$G` seed.
+    assert!(controller.inject_line("GrblHAL 1.1f ['$' or '$HELP' for help]"));
+    assert!(pump_until(&mut app, |a| a.view.connection == ConnectionState::Idle));
+    let written = String::from_utf8_lossy(&pump_collect(&mut app, &mut controller)).to_string();
+    assert!(written.contains("$G"), "becoming ready must seed the tool with a $G; wrote {written:?}");
+
+    // The firmware answers and the DRO source is populated before any tool change.
+    assert!(controller.inject_line("[GC:G0 G54 G17 G21 G90 G94 M5 M9 T1 G49 F0 S0]"));
+    assert!(
+      pump_until(&mut app, |a| a.view.current_tool == Some(1)),
+      "the seed $G answer must populate the active tool; got {:?}",
+      app.view.current_tool,
+    );
+  }
+
+  /// The `$G` request fires once per tool change, not on every frame the machine sits in `Tool`. Regression guard
+  /// for gating on the steady state instead of the transition edge, which would spam `$G` while held.
+  #[test]
+  fn the_tool_state_requests_g_only_on_the_transition_not_every_frame() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    assert!(controller.inject_line("<Tool|MPos:0.000,0.000,0.000|FS:0,0>"));
+    assert!(pump_until(&mut app, |a| a.view.badge_state() == super::super::badge::BadgeState::Tool));
+    // Let the one provoked `$G` fully flush to the loopback, then discard it (and any status polls). Only after
+    // the transition's request has drained do we open the assertion window, so we measure repeats, not the first.
+    let _ = pump_collect(&mut app, &mut controller);
+    // Keep the machine in Tool across more reports and confirm no further `$G` is issued while it stays held.
+    for _ in 0..5 {
+      assert!(controller.inject_line("<Tool|MPos:0.000,0.000,0.000|FS:0,0>"));
+    }
+    let after = String::from_utf8_lossy(&pump_collect(&mut app, &mut controller)).to_string();
+    assert!(!after.contains("$G"), "$G must not repeat while the machine stays in Tool; wrote {after:?}");
+  }
+
+  /// Pump a short window, accumulating everything written, so a test can assert on the traffic a steady state did
+  /// (or did not) provoke. Mirrors [`collect_written`] but drives the general event pump, not the jog-stream pump.
+  fn pump_collect(app: &mut SkirnirApp, controller: &mut LoopbackController) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..20 {
+      app.pump_events();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
   }
 
   /// Let the connect handshake's writes flush, then discard everything written so far so a test sees only the

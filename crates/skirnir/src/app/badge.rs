@@ -39,6 +39,9 @@ pub enum BadgeState {
   Check,
   /// Sleep state (`Sleep`).
   Sleep,
+  /// An M6 manual tool change is held awaiting resume (`Tool`): the operator inserts the tool, then cycle-starts
+  /// (`~`) to continue. Distinct from `Hold` so the UI can show the tool-change affordance, not a generic hold.
+  Tool,
   /// Controller is in an alarm state.
   Alarm,
   /// A line-level `error:N` halted the stream.
@@ -87,8 +90,10 @@ impl BadgeState {
       RunState::Check => Some(BadgeState::Check),
       RunState::Sleep => Some(BadgeState::Sleep),
       RunState::Alarm => Some(BadgeState::Alarm),
-      // Tool-change and unrecognised tokens defer to the host lifecycle.
-      RunState::Tool | RunState::Unknown => None,
+      // An M6 manual tool change is its own badge state so the UI can surface the tool-change affordance.
+      RunState::Tool => Some(BadgeState::Tool),
+      // An unrecognised token defers to the host lifecycle rather than guessing.
+      RunState::Unknown => None,
     }
   }
 
@@ -106,6 +111,7 @@ impl BadgeState {
       BadgeState::Door => "DOOR",
       BadgeState::Check => "CHECK",
       BadgeState::Sleep => "SLEEP",
+      BadgeState::Tool => "TOOL CHANGE",
       BadgeState::Alarm => "ALARM",
       BadgeState::Error => "ERROR",
     }
@@ -179,8 +185,10 @@ impl TransportGroup {
         stop_enabled: true,
         abort_enabled: true,
       },
-      // Held or door-suspended: the leading segment becomes "Resume"; clean stop and hard abort stay live.
-      BadgeState::Hold | BadgeState::Door => TransportGroup {
+      // Held, door-suspended, or holding for a manual tool change: the leading segment becomes "Resume" and a
+      // cycle-start (`~`) continues. A tool change resumes through the very same path as a feed hold, so it shares
+      // this row rather than introducing a second resume control. Clean stop and hard abort stay live throughout.
+      BadgeState::Hold | BadgeState::Door | BadgeState::Tool => TransportGroup {
         run_enabled: true,
         run_is_resume: true,
         run_active: false,
@@ -241,9 +249,28 @@ mod tests {
   }
 
   #[test]
-  fn unknown_and_tool_run_states_defer_to_the_lifecycle() {
+  fn an_unknown_run_state_defers_to_the_lifecycle() {
     assert_eq!(BadgeState::derive(ConnectionState::Streaming, Some(RunState::Unknown)), BadgeState::Run);
-    assert_eq!(BadgeState::derive(ConnectionState::Idle, Some(RunState::Tool)), BadgeState::Idle);
+  }
+
+  #[test]
+  fn the_tool_run_state_drives_its_own_badge_distinct_from_hold() {
+    // An M6 manual tool change is now its own badge state — NOT folded into the host lifecycle (which would have
+    // shown Idle/Run) — so the UI can surface the tool-change affordance. It arrives mid-stream, so the connection
+    // is typically `Streaming`, but the firmware run state wins regardless.
+    assert_eq!(BadgeState::derive(ConnectionState::Streaming, Some(RunState::Tool)), BadgeState::Tool);
+    assert_eq!(BadgeState::derive(ConnectionState::Idle, Some(RunState::Tool)), BadgeState::Tool);
+    assert_ne!(BadgeState::Tool, BadgeState::Hold, "Tool change is distinct from a feed hold");
+  }
+
+  #[test]
+  fn the_tool_change_resumes_through_the_same_cycle_start_path_as_a_hold() {
+    // The Tool-change transport row must read "Resume" and route through the existing cycle-start path, exactly
+    // like a feed hold — no second resume control. Stop and Abort stay live so the operator can still bail out.
+    let tool = TransportGroup::for_state(BadgeState::Tool, false);
+    assert!(tool.run_enabled && tool.run_is_resume, "Tool change offers Resume");
+    assert!(!tool.hold_enabled, "nothing to hold while already paused for a tool change");
+    assert!(tool.stop_enabled && tool.abort_enabled);
   }
 
   #[test]
@@ -259,6 +286,7 @@ mod tests {
       BadgeState::Door,
       BadgeState::Check,
       BadgeState::Sleep,
+      BadgeState::Tool,
       BadgeState::Alarm,
       BadgeState::Error,
     ];
@@ -292,6 +320,7 @@ mod tests {
       BadgeState::Door,
       BadgeState::Check,
       BadgeState::Sleep,
+      BadgeState::Tool,
       BadgeState::Alarm,
       BadgeState::Error,
     ] {

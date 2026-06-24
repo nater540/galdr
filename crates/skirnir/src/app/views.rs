@@ -114,6 +114,10 @@ pub struct UiState {
   pub setting_descriptions: super::setting_help::SettingDescriptions,
   /// The active tab in the bottom dock: Console or Program (design §03 — the two tabs share one dock surface).
   pub active_tab: DockTab,
+  /// The program line the listing last auto-scrolled to follow, so the Program tab only nudges the view when the
+  /// executing line actually moves — not on every frame, which would fight an operator who has scrolled back to
+  /// read an earlier line. `None` until the first followed line; cleared when a new program is loaded.
+  pub program_followed_line: Option<usize>,
   /// Whether the bottom dock is collapsed to just its tab strip, hiding the console/program body so the toolpath
   /// and panels reclaim the space. Defaults to expanded (the design opens the dock at its full 200px height).
   pub dock_collapsed: bool,
@@ -175,6 +179,7 @@ impl Default for UiState {
       setting_descriptions: super::setting_help::SettingDescriptions::bundled(),
       active_tab: DockTab::default(),
       dock_collapsed: false,
+      program_followed_line: None,
     }
   }
 }
@@ -217,6 +222,9 @@ impl UiState {
     self.program_path = path;
     self.toolpath = parse_xy_path(&self.program);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
+    // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
+    // even if the old program happened to leave us followed at the same row index.
+    self.program_followed_line = None;
   }
 }
 
@@ -641,6 +649,21 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
         ui.horizontal(|ui| {
           ui.label(RichText::new("WCO").monospace().size(10.5).color(Theme::TEXT_DIM));
           ui.label(RichText::new(wco.join(", ")).monospace().size(10.5).color(Theme::TEXT));
+        });
+      });
+  }
+
+  // Tool strip: the active tool reported by the firmware's `$G`/`[GC:]` parser state ([`ViewState::current_tool`]),
+  // the single authoritative source. `T0` reads as "none" so the operator can tell an explicitly-empty spindle from
+  // one that simply has a tool. Never sourced from the `<...>` status report (it carries no tool number).
+  if let Some(tool) = view.current_tool {
+    ui.add_space(6.0);
+    egui::Frame::new().fill(Theme::INSET).inner_margin(egui::Margin::symmetric(10, 6)).corner_radius(2.0)
+      .show(ui, |ui| {
+        ui.horizontal(|ui| {
+          ui.label(RichText::new("TOOL").monospace().size(10.5).color(Theme::TEXT_DIM));
+          let label = if tool == 0 { "none".to_string() } else { format!("T{tool}") };
+          ui.label(RichText::new(label).monospace().size(10.5).color(Theme::TEXT));
         });
       });
   }
@@ -1623,12 +1646,58 @@ fn dock_progress_separator(ui: &mut egui::Ui) {
   ui.label(RichText::new("·").size(11.0).color(Theme::TEXT_DISABLED));
 }
 
+/// Decide whether the Program listing should auto-scroll to follow the executing line this frame, and which row
+/// to centre on. Returns `Some(line)` only when auto-scroll is on, the stream is live, and the executing line has
+/// *moved* since we last followed it — so the view nudges once per advance and otherwise leaves the operator's
+/// manual scroll-back alone. `followed` is the last row we scrolled to (`UiState::program_followed_line`), updated
+/// by the caller to the returned value. Kept pure (no egui) so the follow logic is unit-testable without a GUI.
+fn program_follow_target(
+  auto_scroll: bool,
+  connection: ConnectionState,
+  current: usize,
+  program_len: usize,
+  followed: Option<usize>,
+) -> Option<usize> {
+  if !auto_scroll || connection != ConnectionState::Streaming || current >= program_len {
+    return None;
+  }
+  if followed == Some(current) {
+    return None;
+  }
+  Some(current)
+}
+
 /// Render the Program tab body: the loaded file's lines with the acked line highlighted, drawn lazily so a
-/// large program stays cheap to render.
-fn program_body(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
+/// large program stays cheap to render. While streaming, the listing auto-scrolls to keep the executing line in
+/// view (gated on the shared `auto-scroll` toggle), mirroring the console's stick-to-bottom follow.
+fn program_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
   let current = view.progress.acked;
+  // Resolve the follow target before drawing so we can scroll the area to the executing row even when row
+  // virtualisation has it off-screen (a `scroll_to_me` on the row only fires for rows actually in `range`).
+  let follow = program_follow_target(
+    state.auto_scroll,
+    view.connection,
+    current,
+    state.program.len(),
+    state.program_followed_line,
+  );
   ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_height, state.program.len(), |ui, range| {
+    // `show_rows` lays out only the visible slice, positioning the content `ui` so its top sits at the origin of
+    // the FIRST visible row (`range.start`), not row 0 — and rows advance by `row_height + item_spacing.y`, not
+    // the bare text height. Recover row 0's origin from the slice top, then any row's y is a flat multiple of the
+    // full row pitch; this lets us scroll to a line virtualisation has not drawn this frame, which `scroll_to_me`
+    // (row-local) cannot.
+    if let Some(target) = follow {
+      let row_pitch = row_height + ui.spacing().item_spacing.y;
+      let row_zero_top = ui.min_rect().top() - range.start as f32 * row_pitch;
+      let top = row_zero_top + target as f32 * row_pitch;
+      let rect = egui::Rect::from_min_max(
+        egui::pos2(ui.min_rect().left(), top),
+        egui::pos2(ui.min_rect().right(), top + row_height),
+      );
+      ui.scroll_to_rect(rect, Some(Align::Center));
+    }
     for index in range {
       let line = &state.program[index];
       let is_current = index == current && view.connection == ConnectionState::Streaming;
@@ -1657,6 +1726,11 @@ fn program_body(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
       }
     }
   });
+  // Record the row we just followed so the next frame only re-scrolls when the executing line advances again,
+  // leaving an operator who has scrolled back to read an earlier line undisturbed until the cursor moves.
+  if let Some(target) = follow {
+    state.program_followed_line = Some(target);
+  }
 }
 
 /// Render the Console tab body: a rolling, colour-tagged log (chevron coloured by line type) above an
@@ -1834,6 +1908,48 @@ pub fn alarm_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) 
           // Only an alarm offers the $X unlock; a stream error clears on reset / `$` / an empty line.
           if is_alarm && ui.button("Unlock $X").on_hover_text("Clear the alarm lock").clicked() {
             sink.push(Intent::SendLine("$X".to_string()));
+          }
+        });
+      });
+    });
+}
+
+/// The tool-change banner headline for a given active-tool value. `T0` ("none") and an as-yet-unreported tool
+/// both fall back to a generic prompt rather than naming a misleading number, so the copy is always truthful.
+/// Pulled out of [`tool_change_banner`] so the wording decision is a pure, testable function. `pub(crate)` so the
+/// shell's integration tests can assert the exact banner copy for a resolved tool.
+pub(crate) fn tool_change_headline(current_tool: Option<u32>) -> String {
+  match current_tool {
+    Some(tool) if tool != 0 => format!("🔧 Tool change: insert T{tool}, then Resume"),
+    _ => "🔧 Tool change: insert the tool, then Resume".to_string(),
+  }
+}
+
+/// Render the tool-change affordance: a full-width attention strip shown while the firmware is held for an M6
+/// manual tool change (`<Tool|...>`). It names the tool to insert from the firmware's `$G`/`[GC:]`-reported tool
+/// ([`ViewState::current_tool`]) — answered during the hold per the firmware's M0/M1/M6 `$G`-in-hold support — and
+/// offers a Resume that issues the cycle-start (`~`) through the existing run/resume path, never a second pathway.
+/// Drawn in the banner slot, distinct from the alarm surface: violet (attention), not red, so it never reads as a
+/// fault. A fault banner, if latched, takes precedence (the shell shows this only when none is).
+pub fn tool_change_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
+  let headline = tool_change_headline(view.current_tool);
+  egui::Frame::new()
+    .fill(Theme::INSET)
+    .stroke(egui::Stroke::new(1.0, Theme::STATE_CHECK))
+    .inner_margin(egui::Margin::symmetric(14, 10))
+    .show(ui, |ui| {
+      ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+          ui.label(RichText::new(&headline).color(Theme::STATE_CHECK).strong());
+          ui.label(RichText::new("The machine is paused for a manual tool change (M6). Insert the tool and press \
+            Resume (cycle-start) to continue.").size(11.5).color(Theme::TEXT_DIM));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          // Resume reuses the single run/resume intent — the same `~` cycle-start the toolbar's Resume segment and
+          // the keyboard hotkey issue — so there is exactly one resume pathway.
+          let resume = egui::Button::new(RichText::new("▶ Resume").color(Color32::WHITE)).fill(Theme::STATE_RUN);
+          if ui.add(resume).on_hover_text("Resume after the tool change (cycle-start, ~)").clicked() {
+            sink.push(Intent::RunOrResume);
           }
         });
       });
@@ -2377,6 +2493,28 @@ mod tests {
   }
 
   #[test]
+  fn program_follow_advances_only_while_streaming_and_on_a_new_line() {
+    // Off: auto-scroll disabled never follows, even mid-stream.
+    assert_eq!(program_follow_target(false, ConnectionState::Streaming, 5, 100, None), None);
+    // Wrong state: not streaming (e.g. Idle/Hold) never follows even with auto-scroll on.
+    assert_eq!(program_follow_target(true, ConnectionState::Idle, 5, 100, None), None);
+    // First streamed line follows (no prior followed row).
+    assert_eq!(program_follow_target(true, ConnectionState::Streaming, 0, 100, None), Some(0));
+    // The line advanced past the last followed row → follow the new one.
+    assert_eq!(program_follow_target(true, ConnectionState::Streaming, 6, 100, Some(5)), Some(6));
+    // The line has not moved since we last followed it → do not re-scroll (leave a manual scroll-back alone).
+    assert_eq!(program_follow_target(true, ConnectionState::Streaming, 5, 100, Some(5)), None);
+  }
+
+  #[test]
+  fn program_follow_ignores_an_out_of_range_cursor() {
+    // At end-of-program the acked count can equal the line count (cursor past the last index); never target a row
+    // that does not exist, and never follow an empty program.
+    assert_eq!(program_follow_target(true, ConnectionState::Streaming, 100, 100, Some(99)), None);
+    assert_eq!(program_follow_target(true, ConnectionState::Streaming, 0, 0, None), None);
+  }
+
+  #[test]
   fn jog_sense_senses_drag_only_in_continuous_mode() {
     // egui's `Sense::click()` senses clicks but not drags; `click_and_drag()` senses both. The drag bit must
     // flip with the mode so the press-and-hold edges become observable only when continuous, while a click is
@@ -2482,6 +2620,15 @@ mod tests {
   }
 
   #[test]
+  fn the_tool_change_headline_names_a_real_tool_and_falls_back_otherwise() {
+    // A real tool number is named so the operator knows which tool to fit.
+    assert_eq!(tool_change_headline(Some(3)), "🔧 Tool change: insert T3, then Resume");
+    // `T0` (no tool) and an unreported tool both use the generic prompt rather than naming a misleading number.
+    assert_eq!(tool_change_headline(Some(0)), "🔧 Tool change: insert the tool, then Resume");
+    assert_eq!(tool_change_headline(None), "🔧 Tool change: insert the tool, then Resume");
+  }
+
+  #[test]
   fn jog_is_enabled_only_in_idle_and_jog() {
     // grblHAL accepts `$J=` only in Idle and Jog.
     assert!(jog_enabled(BadgeState::Idle));
@@ -2496,6 +2643,7 @@ mod tests {
       BadgeState::Door,
       BadgeState::Check,
       BadgeState::Sleep,
+      BadgeState::Tool,
       BadgeState::Alarm,
       BadgeState::Error,
     ] {

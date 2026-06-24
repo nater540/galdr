@@ -116,7 +116,8 @@ impl Theme {
       BadgeState::Run | BadgeState::Home => Self::STATE_RUN,
       BadgeState::Jog => Self::STATE_JOG,
       BadgeState::Hold | BadgeState::Door => Self::STATE_HOLD,
-      BadgeState::Check => Self::STATE_CHECK,
+      // A manual tool change is an operator-attention pause; the violet accent sets it apart from the amber hold.
+      BadgeState::Check | BadgeState::Tool => Self::STATE_CHECK,
       BadgeState::Alarm | BadgeState::Error => Self::STATE_ALARM,
     }
   }
