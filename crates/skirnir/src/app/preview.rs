@@ -65,45 +65,54 @@ fn project_onto(start: ModelPoint, end: ModelPoint, p: ModelPoint) -> (f32, f32)
   (t, dist_sq(foot, p))
 }
 
-/// Compute the monotonically-advancing cut-progress index by PROJECTING the live work position onto the path,
-/// advancing only forward from `previous`. `segments` are the model-space `(start, end)` pairs in path order;
-/// the returned index is the count of leading segments coloured "cut".
+/// Compute the monotonically-advancing cut-progress index by walking the path forward from `previous` to the
+/// segment the cutter is currently CLOSEST to, advancing one segment at a time while the next is at least as near
+/// as the current and stopping at the first local distance-minimum. `segments` are the model-space `(start, end)`
+/// pairs in path order; the returned index is the count of leading segments coloured "cut".
 ///
-/// This replaces the old furthest-forward *endpoint-proximity* scan, which leapt the boundary forward the moment
-/// the cutter neared ANY revisited coordinate (closed contours, multi-pass pockets, peck drilling, a return to
-/// X0Y0 — findings #1/#7) and stalled across a single arc chord whose endpoint the swept curve never reached
-/// (#2). Instead we look only in a bounded forward `window` of segments starting at `previous`, project the live
-/// point onto each, and pick the nearest. The chosen segment `k` is counted complete (index `k+1`) once the
-/// projection passes [`COMPLETE_FRACTION`] of its length, else the boundary holds at `k` — so progress tracks the
-/// foot of the cutter along the path, not endpoint coincidence, and an arc flattened into chords colours smoothly
-/// as the tool sweeps it. The boundary never retreats below `previous` (monotonic within a run): a small
-/// overshoot or status jitter that projects back onto an earlier segment cannot un-cut a later one. The bounded
-/// `window` keeps this O(window) per frame regardless of path length (finding #12) and stops a far-away revisited
-/// coordinate from being mistaken for forward progress. Takes a borrowed slice so the caller passes a cached list
-/// with no per-frame allocation; reset `previous` to 0 for a fresh run.
+/// Two earlier approaches each failed on real toolpaths, and this rule is chosen to avoid both:
+/// - A "nearest segment across the whole forward window" scan OVER-advanced: on a self-approaching path — a
+///   spiral pocket's parallel rings, the out/back edges that nearly touch at a star tip, a self-crossing move, or
+///   the centre where a spiral's rings converge — a FUTURE segment is often physically closer than the one the
+///   cutter is on, so the boundary leapt onto it and the monotonic guard froze the over-advance, painting most of
+///   the job "cut" before the tool reached it.
+/// - A contiguous walk gated on the AXIAL projection fraction STALLED: a spiral reverses direction every pass, so
+///   the cutter's position projects to a low fraction on segments it has already traversed, halting the walk at
+///   the first reversing segment so nothing coloured at all.
+///
+/// Walking to the first local minimum of PERPENDICULAR distance fixes both. Perpendicular distance does not flip
+/// on a reversal, so a reversing move advances normally (no stall). Stopping at the first local minimum keeps the
+/// walk contiguous: to reach a spatially-near future ring the walk would have to cross the current segment's far
+/// end, where distance rises and the walk breaks — so it can never leap (no over-advance). The cutter's segment
+/// is counted cut once the foot passes [`COMPLETE_FRACTION`] of it, else it is the move in progress and the
+/// boundary sits just before it. The boundary never retreats below `previous` (it starts there and only climbs).
+/// `window` caps the per-frame advance so the walk is O(window) even after a long status gap (it catches up over
+/// a few frames). Takes a borrowed slice so the caller passes a cached list with no per-frame allocation; reset
+/// `previous` to 0 for a fresh run.
 pub fn progressed_segment(segments: &[Segment], work: ModelPoint, previous: usize, window: usize) -> usize {
-  let start = previous.min(segments.len());
-  let end = (start + window.max(1)).min(segments.len());
-  if start >= end {
-    return start; // No segment in the forward window (already at the path's end): hold the boundary.
+  let len = segments.len();
+  let start = previous.min(len);
+  if start >= len {
+    return start; // Already at (or past) the path's end — nothing left to walk; hold the boundary.
   }
-  // Find the nearest segment in the forward window by perpendicular projection distance, tracking how far along
-  // it the foot lands. Ties resolve to the earliest index so the boundary advances steadily, not in jumps.
-  let mut best_index = start;
-  let mut best_fraction = 0.0_f32;
-  let mut best_dist = f32::INFINITY;
-  for (offset, (seg_start, seg_end)) in segments[start..end].iter().enumerate() {
-    let (fraction, dist) = project_onto(*seg_start, *seg_end, work);
-    if dist < best_dist {
-      best_dist = dist;
-      best_fraction = fraction;
-      best_index = start + offset;
+  let limit = (start + window.max(1)).min(len);
+  // Walk to the locally-closest segment: advance while the NEXT segment is at least as near the cutter as the
+  // current one. Perpendicular distance (not axial fraction) follows a reversing move; the first local minimum
+  // stops the walk contiguously so it cannot jump across a spatially-near future segment.
+  let mut boundary = start;
+  while boundary + 1 < limit {
+    let (_, d_cur) = project_onto(segments[boundary].0, segments[boundary].1, work);
+    let (_, d_next) = project_onto(segments[boundary + 1].0, segments[boundary + 1].1, work);
+    if d_next <= d_cur {
+      boundary += 1;
+    } else {
+      break;
     }
   }
-  // The nearest segment is complete once the cutter has passed COMPLETE_FRACTION of it; otherwise it is the move
-  // in progress and the boundary sits just before it. Never retreat below `previous` (monotonic within a run).
-  let reached = if best_fraction >= COMPLETE_FRACTION { best_index + 1 } else { best_index };
-  reached.max(previous)
+  // The cutter sits on `boundary` (the locally-closest segment): count it cut once the foot passes the midpoint,
+  // otherwise it is the move in progress and the boundary holds just before it.
+  let (fraction, _) = project_onto(segments[boundary].0, segments[boundary].1, work);
+  if fraction >= COMPLETE_FRACTION { boundary + 1 } else { boundary }
 }
 
 /// Decide whether the live tool marker should be drawn this frame, given the live work point, the toolpath's
@@ -248,6 +257,47 @@ mod tests {
     // is the move in progress, barely entered) — emphatically NOT 4 (the whole square), which the old scan gave
     // because the final segment also ends at (0,0).
     assert_eq!(progressed_segment(&square, (0.0, 0.0), 0, 2), 0);
+  }
+
+  #[test]
+  fn progressed_segment_does_not_leap_to_a_spatially_nearer_future_segment() {
+    // THE bright-orange-everywhere regression. A path that later crosses back over an earlier segment, so a FUTURE
+    // segment passes physically NEARER the cutter than the one it is actually on — exactly what a spiral pocket's
+    // parallel rings and a star tip's out/back edges do. The cutter is just past the midpoint of segment 0, sitting
+    // a hair off it (a flattened-arc secant / smoothing lag), right where the vertical segment 3 crosses:
+    let crossing = vec![
+      ((0.0, 0.0), (10.0, 0.0)),   // seg 0: the move the cutter is ON, near its midpoint (x≈5)
+      ((10.0, 0.0), (10.0, 10.0)), // seg 1
+      ((10.0, 10.0), (5.0, 10.0)), // seg 2
+      ((5.0, 10.0), (5.0, -5.0)),  // seg 3: a vertical at x=5 that crosses seg 0 at (5,0) — spatially ON the cutter
+    ];
+    // The cutter is at (5, 0.01): essentially the midpoint of seg 0, but its perpendicular distance to the vertical
+    // seg 3 is ~0 (nearer than to seg 0). A nearest-in-window scan would leap the boundary onto seg 3 (returning 4 —
+    // the whole path "cut"). The contiguous walk passes only seg 0 (it cannot reach seg 3 without passing 1 and 2,
+    // which the cutter has not), so the boundary is 1.
+    assert_eq!(progressed_segment(&crossing, (5.0, 0.01), 0, WIN), 1);
+  }
+
+  #[test]
+  fn progressed_segment_tracks_a_reversing_path_without_stalling() {
+    // THE all-white / nothing-coloured regression. A spiral or raster reverses direction every pass. A walk gated
+    // on the AXIAL projection fraction stalls at the first right-to-left segment (the cutter's position projects to
+    // a low fraction on a segment it is traversing backwards), freezing progress at the start. Walking the local
+    // minimum of perpendicular distance tracks the reversal. Simulate the cutter marching along the whole path
+    // frame-by-frame (threading `previous`, as the view does) and assert the boundary follows it to the end.
+    let path = vec![
+      ((0.0, 0.0), (10.0, 0.0)),  // → right
+      ((10.0, 0.0), (10.0, 1.0)), // ↑
+      ((10.0, 1.0), (0.0, 1.0)),  // ← left (a reversal)
+      ((0.0, 1.0), (0.0, 2.0)),   // ↑
+      ((0.0, 2.0), (10.0, 2.0)),  // → right
+    ];
+    let samples = [(5.0, 0.0), (10.0, 0.5), (5.0, 1.0), (0.0, 1.5), (5.0, 2.0)];
+    let mut prev = 0;
+    for s in samples {
+      prev = progressed_segment(&path, s, prev, WIN);
+    }
+    assert_eq!(prev, 5, "the boundary must track across reversals to the path end, not stall near 0");
   }
 
   #[test]
