@@ -80,19 +80,35 @@ wizards index A *separately*, never inside a probe), and **`G10 L2/L20`** offset
 Every rotary probe is **index-then-probe**, never probe-while-rotating (cosine error / invalid tip comp):
 1. Retract Z to a safe clearance (`G53 G0 Z<safe>` or a configured clearance height).
 2. `G0 A<angle>` to index, then **HOLD** — insert a short settle/dwell (`G4 P<settle>`) before the probe so any
-   rotary backlash/oscillation damps out. Both the clearance height and the settle time are **bench-tuned
-   parameters** (open question — start conservative). **[verified]** index-then-probe with the rotary held is the
+   rotary backlash/oscillation damps out. The clearance, settle, feed, depth, and side-probe Z are **bench-tuned
+   parameters** — now **operator-editable** in the wizard's "Bench params" section and persisted across sessions
+   in `Prefs.rotary_bench` (start conservative). **[verified]** index-then-probe with the rotary held is the
    universal practice; probing during rotation is unsound (cosine error / invalid tip comp).
-3. A single **linear** `G38.2` along the chosen axis (X/Y/Z) — never an `A` word in the probe (firmware rejects it).
-4. Await the `ProbeResult` (Phase 0.2).
+3. **[corrected] A SIDE (X/Y) touch must descend before it probes; a TOP (Z) touch must not.** The clearance in
+   step 1 lifts the tool *above* the dowel so the index never drags through it — but a lateral probe at that
+   height sails clean over the flank and never touches. So a side touch inserts a `G53 G0 Z<side_probe_z>` step
+   (after the settle) that drops the tool back into the dowel's Z-extent at the approach Y (off to the side, clear
+   of the dowel) before the lateral `G38.2`. A top touch skips that step and descends as the probe itself. A
+   single clearance cannot serve both (above-the-top is right for the index/top-probe, too high for a side probe),
+   and `side_probe_z` is a distinct **bench-tuned** parameter that must lie within the dowel's Z-extent. Both
+   opposing side touches share the one `side_probe_z`, so they probe at an identical height — which is what makes
+   their midpoint cancel the tool radius (a height mismatch biases `Y_c`). Implemented in
+   `crates/skirnir/src/app/rotary_probe.rs` (`rotary_safe_probe_lines` is axis-aware).
+4. A single **linear** `G38.2` along the chosen axis (X/Y/Z) — never an `A` word in the probe (firmware rejects it).
+5. Await the `ProbeResult` (Phase 0.2).
 A reusable helper drives this; the wizards below compose it. TDD: assert the emitted line sequence for a given
-angle/axis/feed (retract, `G0 A…`, `G38.2 …`), and that no probe line ever contains an `A` word.
+angle/axis/feed (retract, `G0 A…`, the side descend for X/Y only, `G38.2 …`), and that no probe line ever
+contains an `A` word.
 
 ### 1.2 Rotary center-finder wizard (the headline feature)
 Finds the A centerline (its Y and Z machine coords) relative to the spindle, using a known-diameter dowel/gauge
 clamped concentric. **Math (research-confirmed):**
-- **Y center first**, probe both sides at center height: `Y_c = (Y_left + Y_right) / 2`. The tool/probe radius
-  cancels in the midpoint (equal-and-opposite), so no tip-radius term is needed for Y.
+- **Y center first**, probe both sides at a common height: `Y_c = (Y_left + Y_right) / 2`. The tool/probe radius
+  cancels in the midpoint (equal-and-opposite), so no tip-radius term is needed for Y. **[corrected]** the two
+  side touches need only share the *same* height (the §1.1 `side_probe_z`), not specifically center height — at any
+  common height the chord is symmetric about the axis in Y, so the midpoint is still `Y_c`. They must match each
+  other, which the single shared `side_probe_z` guarantees; this also means `Y_c` does **not** require `Z_c` to be
+  known first.
 - **Then Z center**, probe the top *at the true Y center*: `Z_c = Z_top − D/2` (D = dowel diameter, operator
   input). Order matters — a top probe off the Y center reads a chord, not the diameter.
 - UX: a guided wizard — operator enters D, jogs the tool to the approximate approach for each touch; the wizard

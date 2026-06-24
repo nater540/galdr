@@ -28,5 +28,5 @@ pub use probe::parse_prb_body;
 pub use realtime::RealtimeCommand;
 pub use response::{Response, is_grbl_evidence, parse_line};
 pub use settings::{SettingMeta, SettingValue, parse_setting_meta, parse_setting_value, setting_write_line};
-pub use status::{MachineState, PinState, PositionKind, RunState, StatusReport, parse_status};
+pub use status::{MachineState, PinState, PositionKind, RunState, StatusReport, parse_status, peek_run_state};
 pub use terminator::LineReassembler;

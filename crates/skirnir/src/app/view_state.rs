@@ -282,6 +282,31 @@ impl ViewState {
     }
   }
 
+  /// The live work-coordinate `(x, y)` for the toolpath overlay, with NO per-frame allocation. [`Self::dro`]
+  /// clones `status.position` and builds a second derived `Vec` every call; the overlay runs at up to 20 Hz and
+  /// reads only the work XY, so it takes this allocation-free path instead (finding #10). When the report already
+  /// carries the work position we read X/Y straight from it; when it carries the machine position we derive only
+  /// the two work components we need (`WPos = MPos − WCO`) rather than a whole vector. `None` until a status with
+  /// at least an X and Y axis (and, for a machine report, a usable cached WCO) is available.
+  pub fn work_xy(&self) -> Option<(f64, f64)> {
+    let status = self.status.as_ref()?;
+    if status.position.len() < 2 {
+      return None;
+    }
+    match status.position_kind {
+      // The report is already in work coordinates: read X/Y directly, no offset, no allocation.
+      PositionKind::Work => Some((status.position[0], status.position[1])),
+      // The report is in machine coordinates: derive only the two work components from the cached WCO. A WCO of a
+      // different length than the position is a malformed mix; refuse it rather than mis-pairing axes.
+      PositionKind::Machine => {
+        if self.last_wco.len() != status.position.len() {
+          return None;
+        }
+        Some((status.position[0] - self.last_wco[0], status.position[1] - self.last_wco[1]))
+      }
+    }
+  }
+
   /// Derive the position kind the current report omitted, from the cached WCO. `MPos` and `WPos` relate by
   /// `WPos = MPos − WCO`. Returns `None` if no WCO is known or the lengths disagree (a malformed mix).
   fn derive_other_position(&self, status: &StatusReport) -> Option<Vec<f64>> {
@@ -653,6 +678,31 @@ mod tests {
     let (machine, work) = view.dro();
     assert_eq!(machine, Some(vec![1.0, 2.0, 3.0]));
     assert_eq!(work, None);
+  }
+
+  #[test]
+  fn work_xy_returns_the_work_position_without_allocating_a_derived_vec() {
+    let mut view = ViewState::default();
+    // No status yet: no work XY.
+    assert_eq!(view.work_xy(), None);
+    // A work report yields its XY directly (no offset, the allocation-free fast path of finding #10).
+    feed_status(&mut view, "Run|WPos:-1.500,2.250,-0.100");
+    assert_eq!(view.work_xy(), Some((-1.5, 2.25)));
+    // A machine report derives work XY from the cached WCO — only the two components, never a whole Vec.
+    feed_status(&mut view, "Run|MPos:10.000,20.000,5.000|WCO:1.000,2.000,3.000");
+    feed_status(&mut view, "Run|MPos:11.000,22.000,8.000");
+    assert_eq!(view.work_xy(), Some((10.0, 20.0))); // 11−1, 22−2
+  }
+
+  #[test]
+  fn work_xy_is_none_when_a_machine_report_has_no_usable_wco() {
+    let mut view = ViewState::default();
+    // A machine report with no cached WCO cannot derive work coordinates: no marker (mirrors `dro`).
+    feed_status(&mut view, "Run|MPos:1.0,2.0,3.0");
+    assert_eq!(view.work_xy(), None);
+    // A degenerate single-axis report cannot place a planar marker either.
+    feed_status(&mut view, "Run|WPos:5.0");
+    assert_eq!(view.work_xy(), None);
   }
 
   #[test]

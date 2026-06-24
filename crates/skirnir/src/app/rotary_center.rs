@@ -475,7 +475,7 @@ mod tests {
     w.on_probe_result(&success(vec![0.0, 2.0, 0.0]));
     w.begin_y_right();
     w.on_probe_result(&success(vec![0.0, 4.0, 0.0]));
-    let params = RotaryProbeParams { clearance_mm: -2.0, settle_secs: 0.5, feed: 50.0, depth_mm: 10.0 };
+    let params = RotaryProbeParams { clearance_mm: -2.0, settle_secs: 0.5, feed: 50.0, depth_mm: 10.0, side_probe_z: -8.0 };
     let lines = w.move_to_yc_lines(params).expect("Yc is known after both touches");
     assert_eq!(lines, vec!["G53 G0 Z-2.000".to_string(), "G53 G0 Y3.000".to_string()]);
   }

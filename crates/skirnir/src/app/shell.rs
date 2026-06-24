@@ -515,8 +515,8 @@ impl SkirnirApp {
       Intent::SetWorkZero { axes } => {
         self.send_line(super::intent::work_zero_line(&axes));
       }
-      Intent::RotaryCenterStart { dowel_diameter, index_angle_deg } => {
-        self.rotary_center_start(dowel_diameter, index_angle_deg)
+      Intent::RotaryCenterStart { dowel_diameter, index_angle_deg, params } => {
+        self.rotary_center_start(dowel_diameter, index_angle_deg, params)
       }
       Intent::RotaryCenterProbe => self.rotary_center_probe(),
       Intent::RotaryCenterMoveToYc => self.rotary_center_move_to_yc(),
@@ -1023,10 +1023,15 @@ impl SkirnirApp {
   /// Start a fresh rotary center-finder run (DOC-11 §1.2): build the pure wizard state for the given dowel
   /// diameter / index angle with the conservative bench defaults, replacing any run in progress. The operator
   /// then jogs to each approach and triggers the touches.
-  fn rotary_center_start(&mut self, dowel_diameter: f64, index_angle_deg: f64) {
+  fn rotary_center_start(
+    &mut self,
+    dowel_diameter: f64,
+    index_angle_deg: f64,
+    params: super::rotary_probe::RotaryProbeParams,
+  ) {
     self.wizard = Some(RotaryCenterRun {
       state: super::rotary_center::WizardState::new(dowel_diameter, index_angle_deg),
-      params: super::rotary_probe::RotaryProbeParams::default(),
+      params,
       touch_fallback: None,
     });
     self.notice(format!("rotary center-finder: dowel {dowel_diameter:.3} mm @ A{index_angle_deg:.1}°"));
@@ -1269,7 +1274,10 @@ impl SkirnirApp {
     self.sweep = Some(SweepRun {
       kind: super::view_state::ProbeKind::FlipVerify,
       sweep: super::angle_sweep::AngleSweep::new(angles, axis, dir),
-      params: super::rotary_probe::RotaryProbeParams::default(),
+      // Use the operator-tuned bench params (clearance / side-probe Z / settle / feed / depth), not the placeholder
+      // defaults — a flip-verify run with the default side-probe Z would touch at the wrong height and produce a
+      // garbage residual that could be applied as a bogus `G10 L2` WCS correction.
+      params: self.ui.rotary_bench,
       touch_fallback: None,
     });
     self.notice(format!("180°-flip verify: probe {} at A{angle_deg:.1}° then A{:.1}°", axis.letter(),
@@ -1289,7 +1297,9 @@ impl SkirnirApp {
     self.sweep = Some(SweepRun {
       kind: super::view_state::ProbeKind::Runout,
       sweep: super::angle_sweep::AngleSweep::new(angles, axis, dir),
-      params: super::rotary_probe::RotaryProbeParams::default(),
+      // The runout sweep must probe at the operator's dialed-in side-probe height too; the placeholder default
+      // would touch off the flank and report meaningless TIR / eccentricity.
+      params: self.ui.rotary_bench,
       touch_fallback: None,
     });
     self.notice(format!("runout report: {n} angles along {}", axis.letter()));
@@ -1488,6 +1498,7 @@ impl SkirnirApp {
       baud: self.ui.baud,
       rotary_dowel_diameter: self.ui.rotary_dowel_diameter,
       rotary_index_angle: self.ui.rotary_index_angle,
+      rotary_bench: self.ui.rotary_bench,
     };
   }
 
@@ -1587,7 +1598,7 @@ impl eframe::App for SkirnirApp {
 
     // The status bar is a fixed 24px mono strip (design §03).
     egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |ui| {
-      views::status_bar(ui, &self.view, &self.ui, &mut sink);
+      views::status_bar(ui, &self.view, &self.ui);
     });
 
     // The bottom dock spans the full window width under the body grid (design §03: a single 200px dock hosting
@@ -1656,7 +1667,7 @@ impl eframe::App for SkirnirApp {
     // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
     // its own `INSET` canvas over the rect, so the frame fill never shows through.
     egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Theme::INSET)).show_inside(ui, |ui| {
-      views::toolpath(ui, &self.view, &self.ui);
+      views::toolpath(ui, &self.view, &mut self.ui);
     });
 
     if self.ui.settings_open {
@@ -2257,7 +2268,7 @@ mod tests {
     flush_handshake(&mut app, &mut controller);
 
     // Start a run: 6 mm dowel at A0.
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     controller.drain_written();
 
     // Touch 1 — left Y face. The emitted sequence must be the rotary-safe primitive (retract, index, settle,
@@ -2294,6 +2305,34 @@ mod tests {
     assert!(!g10.contains('A'), "the WCS write must never carry an A word; saw {g10:?}");
   }
 
+  /// The operator-tuned bench params must flow all the way into the emitted g-code — not just live in the UI.
+  /// Starting a run with a custom `side_probe_z`/`clearance` and then probing a SIDE (Y) touch must emit those
+  /// exact machine-Z moves (the retract clearance and the side-probe descent the §1.1 fix introduced).
+  #[test]
+  fn the_operator_tuned_bench_params_reach_the_emitted_probe_lines() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // A non-default bench setup: a deeper clearance and a side-probe height the operator dialed in for the bench.
+    let params = crate::app::rotary_probe::RotaryProbeParams {
+      clearance_mm: -4.0,
+      settle_secs: 0.5,
+      feed: 60.0,
+      depth_mm: 12.0,
+      side_probe_z: -7.5,
+    };
+    app.rotary_center_start(6.0, 0.0, params);
+    controller.drain_written();
+
+    // The first (left Y) touch is a SIDE touch: it must retract to the custom clearance, then descend to the
+    // custom side-probe Z before the lateral G38.2 — proving the tuned params were not silently replaced by the
+    // old hard-coded defaults.
+    let left = wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
+    assert!(left.contains("G53 G0 Z-4.000"), "the retract must use the tuned clearance; saw {left:?}");
+    assert!(left.contains("G53 G0 Z-7.500"), "the side touch must descend to the tuned side-probe Z; saw {left:?}");
+    assert!(left.contains("G38.2 Y") && left.contains("F60"), "the probe must use the tuned feed; saw {left:?}");
+  }
+
   /// Writing a found rotary center must PERSIST it (DOC-11 §1.3): the wizard's `(Y_c, Z_c, D, A-datum, Z-datum)`
   /// is saved to the profile file, and a fresh app loading that file restores the center so it can be re-applied
   /// next session without re-probing. This is the end-to-end persistence wiring over a temp profile file.
@@ -2312,7 +2351,7 @@ mod tests {
     flush_handshake(&mut app, &mut controller);
 
     // Run the full three-touch center-finder: Y_c = (-3+5)/2 = 1.0, Z_c = -10 - 6/2 = -13.0.
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     controller.drain_written();
     wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
     wizard_touch(&mut app, &mut controller, "[PRB:0.000,5.000,0.000:1]");
@@ -2405,7 +2444,7 @@ mod tests {
     let (mut app, mut controller) = app_with_engine();
     flush_handshake(&mut app, &mut controller);
 
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     controller.drain_written();
     wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
     wizard_touch(&mut app, &mut controller, "[PRB:0.000,5.000,0.000:1]");
@@ -2433,7 +2472,7 @@ mod tests {
     let (mut app, mut controller) = app_with_engine();
     flush_handshake(&mut app, &mut controller);
 
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     controller.drain_written();
     wizard_touch(&mut app, &mut controller, "[PRB:0.000,-3.000,0.000:1]");
     // The right touch fails (no contact, `:0`): the wizard must abort.
@@ -2564,6 +2603,31 @@ mod tests {
     assert_eq!(app.sweep.as_ref().unwrap().sweep.step(), SweepStep::Aborted);
   }
 
+  /// Finding #14: a Phase 2 sweep (flip-verify and runout) must probe with the OPERATOR-TUNED bench params, not
+  /// the placeholder `RotaryProbeParams::default()`. The decisive evidence is the side-probe descent height: a Y
+  /// touch emits `G53 G0 Z<side_probe_z>`, and the operator's dialed-in value (here −7.5) must appear, never the
+  /// −10.0 default. A garbage descent height would touch the wrong place and apply a bogus WCS correction.
+  #[test]
+  fn a_sweep_uses_the_operator_tuned_bench_params_not_the_default() {
+    use crate::app::intent::{Axis, Dir};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Dial in a distinctive side-probe Z the default never produces.
+    app.ui.rotary_bench.side_probe_z = -7.5;
+
+    // Flip-verify: the first Y touch's lateral descent must use the tuned −7.5, not the −10.0 placeholder.
+    app.flip_verify_start(0.0, Axis::Y, Dir::Neg);
+    let t1 = sweep_touch(&mut app, &mut controller, "[PRB:0.000,4.000,0.000:1]");
+    assert!(t1.contains("G53 G0 Z-7.500"), "flip-verify must descend to the tuned side-probe Z; saw {t1:?}");
+    assert!(!t1.contains("G53 G0 Z-10.000"), "flip-verify must NOT use the default side-probe Z; saw {t1:?}");
+
+    // Runout: same requirement on its touches.
+    app.runout_start(2, 0.0, Axis::Y, Dir::Neg);
+    let r1 = sweep_touch(&mut app, &mut controller, "[PRB:0.000,1.000,0.000:1]");
+    assert!(r1.contains("G53 G0 Z-7.500"), "runout must descend to the tuned side-probe Z; saw {r1:?}");
+  }
+
   /// A lost wizard-touch push in a Phase 2 sweep must fall back to `$#` (the SHARED fallback), exactly like the
   /// ZeroZ and center-finder flows — a dropped `[PRB:]` must not hang the sweep.
   #[test]
@@ -2600,7 +2664,7 @@ mod tests {
 
     // Arm a ZeroZ and a center-finder, then start a flip-verify and issue its touch — both others must cancel.
     app.probe_z(2.5, 50.0, 1.0);
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     app.flip_verify_start(0.0, Axis::Y, Dir::Neg);
     app.sweep_probe();
     assert!(app.pending_zero_z.is_none(), "starting a sweep must cancel a pending ZeroZ");
@@ -2626,7 +2690,7 @@ mod tests {
     // Arm a ZeroZ touch-off (deferred). Then, before it resolves, start a rotary run and issue its first touch —
     // which re-arms the shared latch as a RotaryCenter op and must cancel the ZeroZ pending.
     app.probe_z(2.5, 50.0, 1.0);
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     app.rotary_center_probe();
     assert!(app.pending_zero_z.is_none(), "starting a rotary touch must cancel the pending ZeroZ follow-up");
     controller.drain_written();
@@ -2670,7 +2734,7 @@ mod tests {
     let (mut app, mut controller) = app_with_engine();
     flush_handshake(&mut app, &mut controller);
 
-    app.rotary_center_start(6.0, 0.0);
+    app.rotary_center_start(6.0, 0.0, crate::app::rotary_probe::RotaryProbeParams::default());
     app.rotary_center_probe();
     // Backdate the touch's issue past the push timeout; no `[PRB:]` push arrives (it was lost).
     if let Some(run) = app.wizard.as_mut() && let Some(f) = run.touch_fallback.as_mut() {

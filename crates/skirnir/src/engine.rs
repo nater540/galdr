@@ -38,11 +38,37 @@ use crate::transport::Transport;
 /// burst of status/`ok` lines be drained in a single read without over-allocating.
 const READ_CHUNK: usize = 256;
 
-/// How often the engine polls the firmware with a `?` real-time status request while connected. grbl's docs
-/// recommend senders poll at no more than 5–10 Hz to avoid overwhelming the controller; 5 Hz (200 ms) is the
-/// common sender norm and keeps the DRO / state badge / feed-speed / overrides live without flooding the link.
-/// The `?` rides the out-of-band real-time path (uncounted), so polling never disturbs the send-ahead window.
-const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// The idle status-poll interval: how often the engine sends a `?` while the machine is NOT actively running.
+/// grbl's docs recommend senders poll at no more than 5–10 Hz to avoid overwhelming the controller; 5 Hz
+/// (200 ms) is the common sender norm and keeps the DRO / state badge / feed-speed / overrides live without
+/// flooding the link. The `?` rides the out-of-band real-time path (uncounted), so polling never disturbs the
+/// send-ahead window. This is also the starting interval before any status report has classified the state.
+const STATUS_POLL_IDLE: Duration = Duration::from_millis(200);
+
+/// The active status-poll interval: 10 Hz (100 ms) while the machine reports `Run`. A live cut benefits from a
+/// faster position feed so the toolpath marker tracks the real cutter closely; grbl tolerates up to 10 Hz, and
+/// we step down to [`STATUS_POLL_IDLE`] the moment the run ends so idle links never poll faster than 5 Hz.
+const STATUS_POLL_RUN: Duration = Duration::from_millis(100);
+
+/// Choose the status-poll interval for a run state. Only an actively executing machine (`Run`) earns the faster
+/// 10 Hz feed; every other state (Idle/Hold/Jog/Alarm/Door/Check/Home/Sleep/Tool, or none reported yet) stays at
+/// the conservative 5 Hz idle rate. Pure so the gating — "idle never polls faster than 5 Hz" — is unit-tested.
+fn poll_interval_for(run_state: Option<crate::protocol::RunState>) -> Duration {
+  match run_state {
+    Some(crate::protocol::RunState::Run) => STATUS_POLL_RUN,
+    _ => STATUS_POLL_IDLE,
+  }
+}
+
+/// The delay before the first tick of a rebuilt poller, given the `old` and `new` periods: the SHORTER of the
+/// two. Scheduling a full `new` interval on every rate change lets rapid Run↔Idle flapping postpone the next
+/// tick indefinitely (finding #8); bounding the first tick to the shorter period guarantees a poll fires within
+/// that bound no matter how often the rate changes, while the poller then settles to the full `new` period for
+/// every tick after. Pure so the bound — "a rate change can never push the next poll past the shorter period" —
+/// is unit-tested without a runtime.
+fn next_tick_delay(old: Duration, new: Duration) -> Duration {
+  old.min(new)
+}
 
 /// How long the teardown flush of pending real-time bytes may block before disconnect proceeds regardless. A
 /// few hundred ms is ample for a healthy port to accept a one-or-two-byte Stop, while guaranteeing an alive-but-
@@ -141,6 +167,8 @@ impl Engine {
       line_out: VecDeque::new(),
       realtime_in_flight: None,
       line_in_flight: None,
+      run_state: None,
+      poll_interval: STATUS_POLL_IDLE,
     };
     let task = tokio::spawn(driver.run(command_rx));
     EngineHandle { command_tx, event_rx, task }
@@ -171,6 +199,14 @@ struct Driver<T: Transport> {
   /// semantics as [`Self::realtime_in_flight`]: a partial write under backpressure is resumed from the cursor, so
   /// a line is never torn or duplicated, and the character-count window stays in sync. Dropped on `AbortQueued`.
   line_in_flight: Option<(Vec<u8>, usize)>,
+  /// The machine run state from the most recent status report, used to adapt the status-poll rate. `None` until
+  /// the first report is parsed. The engine only peeks the leading state token of `<...>` reports for this — the
+  /// full structured decode still happens in the reducer; this is the one bit of report content the engine reads
+  /// itself, to drive the 5↔10 Hz poll. See [`poll_interval_for`].
+  run_state: Option<crate::protocol::RunState>,
+  /// The interval the status poller is currently ticking at, so the loop rebuilds the timer only when the
+  /// desired rate (a pure function of [`Self::run_state`]) actually changes — never thrashing it per report.
+  poll_interval: Duration,
 }
 
 impl<T: Transport> Driver<T> {
@@ -191,16 +227,22 @@ impl<T: Transport> Driver<T> {
 
     // The live status poller: a periodic `?` keeps the DRO / state badge / feed-speed / overrides fresh. The
     // first tick fires one interval from now (the handshake already sent an initial `?`), and ticks ride the
-    // out-of-band real-time path so polling never touches the character-count window. The interval is owned
-    // here (the only timing the otherwise-pure core cannot do); it stops the instant this loop ends on
+    // out-of-band real-time path so polling never touches the character-count window. The interval starts at the
+    // idle rate and is adapted per loop iteration by [`Self::refresh_poll_interval`] (10 Hz while `Run`). It is
+    // owned here (the only timing the otherwise-pure core cannot do); it stops the instant this loop ends on
     // disconnect. `MissedTickBehavior::Delay` (the default) avoids a tick storm if the loop was briefly busy.
     let mut status_poll = tokio::time::interval_at(
-      tokio::time::Instant::now() + STATUS_POLL_INTERVAL,
-      STATUS_POLL_INTERVAL,
+      tokio::time::Instant::now() + self.poll_interval,
+      self.poll_interval,
     );
 
     let mut read_buf = [0u8; READ_CHUNK];
     let disconnect_reason = loop {
+      // Adapt the poll rate to the latest run state (10 Hz while `Run`, else 5 Hz). A no-op unless the desired
+      // rate changed, so a steady run never rebuilds the timer; on a change the first tick is bounded to the
+      // shorter of the two periods so rapid flapping cannot indefinitely postpone the next poll (finding #8).
+      self.refresh_poll_interval(&mut status_poll);
+
       // Priority 1: flush every pending real-time byte first, out-of-band, before any line write or read. These
       // are tiny; we write the whole buffer at once. The flush itself races a Disconnect/Stop so it can never
       // wedge the loop under backpressure. A write failure ends the loop.
@@ -350,10 +392,34 @@ impl<T: Transport> Driver<T> {
   fn handle_inbound(&mut self, bytes: &[u8]) {
     for line in self.reassembler.push(bytes) {
       if let Some(response) = parse_line(&line) {
+        // Peek the run state from a status report so the poll rate can adapt (faster during a live cut). Only
+        // the leading state token is read here (a cheap split, not a full structural decode); the reducer still
+        // owns the full `parse_status` pass, so the body is decoded once for the engine and once for the UI —
+        // never the full parse twice per report (finding #9).
+        if let Response::Status(body) = &response {
+          self.run_state = Some(crate::protocol::peek_run_state(body));
+        }
         let effects = self.core.on_response(response);
         self.apply_effects(effects);
       }
     }
+  }
+
+  /// Rebuild the status poller if the desired interval (a pure function of the latest run state) has changed,
+  /// preserving the existing timer otherwise so a steady run never thrashes it. On a change the first tick is
+  /// scheduled [`next_tick_delay`] out — the SHORTER of the old and new periods — not a fresh full new interval.
+  /// That is the fix for finding #8: rapid Run↔Idle flapping (feed holds, stop-start) rebuilds the timer each
+  /// time, and scheduling a full new interval each rebuild would keep postponing the next tick before it ever
+  /// fired, freezing the DRO/badge/marker. Bounding to the shorter period guarantees a poll fires within that
+  /// bound regardless of flapping, while steady-state idle still ticks at the full 5 Hz period thereafter.
+  fn refresh_poll_interval(&mut self, status_poll: &mut tokio::time::Interval) {
+    let desired = poll_interval_for(self.run_state);
+    if desired == self.poll_interval {
+      return;
+    }
+    let delay = next_tick_delay(self.poll_interval, desired);
+    self.poll_interval = desired;
+    *status_poll = tokio::time::interval_at(tokio::time::Instant::now() + delay, desired);
   }
 
   /// Sort an ordered batch of core effects into the outbound queues and forward every informational effect to
@@ -477,6 +543,64 @@ mod tests {
   fn connect() -> (EngineHandle, LoopbackController) {
     let (transport, controller) = LoopbackTransport::new();
     (Engine::connect(transport), controller)
+  }
+
+  #[test]
+  fn poll_interval_is_faster_only_while_running() {
+    use crate::protocol::RunState;
+    // A live cut earns the 10 Hz feed so the toolpath marker tracks the cutter closely.
+    assert_eq!(poll_interval_for(Some(RunState::Run)), STATUS_POLL_RUN);
+    // Every other state — and the pre-report `None` — stays at the conservative 5 Hz idle rate, so an idle or
+    // held link never polls faster than 5 Hz.
+    assert_eq!(poll_interval_for(None), STATUS_POLL_IDLE);
+    for state in [
+      RunState::Idle,
+      RunState::Hold,
+      RunState::Jog,
+      RunState::Alarm,
+      RunState::Door,
+      RunState::Check,
+      RunState::Home,
+      RunState::Sleep,
+      RunState::Tool,
+      RunState::Unknown,
+    ] {
+      assert_eq!(poll_interval_for(Some(state)), STATUS_POLL_IDLE, "{state:?} must poll at the idle rate");
+    }
+  }
+
+  #[test]
+  fn a_rate_change_bounds_the_next_tick_to_the_shorter_period() {
+    // Finding #8: on a rate change the first tick of the rebuilt poller must be bounded by the SHORTER of the two
+    // periods, never a fresh full new interval — so rapid Run↔Idle flapping cannot keep postponing the next poll.
+    // Speeding up (Idle→Run): the shorter period is the new (faster) one.
+    assert_eq!(next_tick_delay(STATUS_POLL_IDLE, STATUS_POLL_RUN), STATUS_POLL_RUN);
+    // Slowing down (Run→Idle): the shorter period is the OLD (faster) one, so the next tick is not pushed out to
+    // a full idle interval — it fires at most one run-period away, then settles to the idle period.
+    assert_eq!(next_tick_delay(STATUS_POLL_RUN, STATUS_POLL_IDLE), STATUS_POLL_RUN);
+    // The bound is symmetric and never exceeds either operand.
+    assert_eq!(next_tick_delay(Duration::from_millis(50), Duration::from_millis(300)), Duration::from_millis(50));
+  }
+
+  #[test]
+  fn peek_run_state_reads_only_the_leading_token() {
+    use crate::protocol::{RunState, parse_status, peek_run_state};
+    // The cheap engine-side peek (finding #9) maps just the leading state element, ignoring substate and the rest
+    // of the report, matching what the full `parse_status` would have put in `machine_state.state`.
+    assert_eq!(peek_run_state("Run|MPos:1.0,2.0,3.0|FS:500,0"), RunState::Run);
+    assert_eq!(peek_run_state("Hold:0|WPos:0,0,0"), RunState::Hold);
+    assert_eq!(peek_run_state("Idle"), RunState::Idle);
+    assert_eq!(peek_run_state(""), RunState::Unknown);
+    // The peek must agree with the full decode for the field it shares.
+    assert_eq!(peek_run_state("Run:2|WPos:0,0,0"), parse_status("Run:2|WPos:0,0,0").machine_state.state);
+  }
+
+  #[test]
+  fn run_poll_rate_is_within_grbl_tolerance() {
+    // grbl tolerates 5–10 Hz; guard the constants so a future tweak cannot drift outside that band.
+    assert!(STATUS_POLL_RUN >= Duration::from_millis(100), "run poll must not exceed 10 Hz");
+    assert!(STATUS_POLL_IDLE <= Duration::from_millis(200), "idle poll must stay at least 5 Hz");
+    assert!(STATUS_POLL_RUN <= STATUS_POLL_IDLE, "the run rate must be at least as fast as idle");
   }
 
   /// Drain events until one satisfying `pred` arrives, or fail after a bounded number of awaits. Keeps tests
@@ -677,10 +801,38 @@ mod tests {
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
 
     // With time paused, no poll has fired yet. Advancing one interval must produce exactly one `?` poll.
-    tokio::time::advance(STATUS_POLL_INTERVAL).await;
+    tokio::time::advance(STATUS_POLL_IDLE).await;
     assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
     // A second interval produces a second poll, proving the poller is periodic, not one-shot.
-    tokio::time::advance(STATUS_POLL_INTERVAL).await;
+    tokio::time::advance(STATUS_POLL_IDLE).await;
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn the_status_poller_speeds_up_to_10hz_while_running_and_reverts_when_idle() {
+    let (mut handle, mut controller) = connect();
+    // Drain the connect handshake writes so the next writes are poller traffic.
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?', 0x87]);
+    assert_eq!(wait_for_written(&mut controller).await, b"$I\n");
+    // Report `Run`: the engine should adopt the 10 Hz (100 ms) rate on the next loop iteration.
+    assert!(controller.inject_line("<Run|MPos:0,0,0|FS:0,0>"));
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Idle))).await;
+
+    // At the run rate, advancing only 100 ms must already produce a poll (the idle rate would need 200 ms).
+    tokio::time::advance(STATUS_POLL_RUN).await;
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
+    tokio::time::advance(STATUS_POLL_RUN).await;
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
+
+    // Now report `Idle`: the rate must step back down. Let the loop observe the Idle report (and consume its
+    // triggered idle poll) before timing the cadence.
+    assert!(controller.inject_line("<Idle|MPos:0,0,0|FS:0,0>"));
+    tokio::time::advance(STATUS_POLL_IDLE).await;
+    assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
+    // A bare run-interval now yields nothing; only after a full idle interval does the next poll land — proving
+    // idle never polls faster than 5 Hz.
+    tokio::time::advance(STATUS_POLL_RUN).await;
+    tokio::time::advance(STATUS_POLL_RUN).await;
     assert_eq!(wait_for_written(&mut controller).await, vec![b'?']);
   }
 
@@ -915,7 +1067,7 @@ mod tests {
 
     // Arm the poll timer, release the held `ok` burst, and let the loop run to a quiescent point. Then assert the
     // `?` poll reached the wire BEFORE the burst of line writes it would otherwise be starved behind.
-    tokio::time::advance(STATUS_POLL_INTERVAL).await;
+    tokio::time::advance(STATUS_POLL_IDLE).await;
     controls.release();
     let wire = settle_chan(&mut writes).await;
     let poll_at = wire.iter().position(|c| c.as_slice() == b"?").expect("a `?` poll reached the wire");

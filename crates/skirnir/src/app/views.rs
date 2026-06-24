@@ -10,6 +10,7 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, ScrollArea, Vec2};
 use super::badge::{BadgeState, TransportGroup};
 use super::intent::{Axis, Dir, Intent, IntentSink};
 use super::metrics::Metrics;
+use super::preview;
 use super::settings_model::SettingRow;
 use super::theme::Theme;
 use super::view_state::{Banner, LogLine, LogSource, ViewState};
@@ -23,6 +24,11 @@ const BAUD_RANGE: std::ops::RangeInclusive<u32> = 9_600..=2_000_000;
 
 /// The fallback baud when none is remembered or a loaded one is out of [`BAUD_RANGE`].
 const DEFAULT_BAUD: u32 = 115_200;
+
+/// How many clicks on the machine-state badge flip the hidden "fabulous" pride accent (the June easter egg).
+/// Six — one per rainbow stripe — so it is reachable by a curious operator yet never triggered by an idle
+/// double-click. The toggle policy lives in [`UiState::register_fabulous_click`].
+const FABULOUS_CLICKS: u8 = 6;
 
 /// Hold a baud to [`BAUD_RANGE`], falling back to [`DEFAULT_BAUD`] when it is out of range (the settings knob
 /// clamps live edits, but a value loaded from a hand-edited/corrupt profile bypasses that — `0` would fail the
@@ -53,6 +59,21 @@ pub struct UiState {
   toolpath: Vec<Segment>,
   /// The model-space `(min, max)` bounds of [`Self::toolpath`], cached alongside it. `None` when empty.
   toolpath_bounds: Option<(Vec2, Vec2)>,
+  /// The model-space `(start, end)` segment pairs of [`Self::toolpath`], in order, cached at load so the per-frame
+  /// live-progress projection ([`super::preview::progressed_segment`]) borrows them with no allocation. Segment
+  /// PAIRS (not bare endpoints) because the projection projects the live point onto each segment's line, not just
+  /// its endpoints. Rebuilt by [`Self::set_program`] alongside the toolpath.
+  progress_segments: Vec<super::preview::Segment>,
+  /// The smoothed live tool-position marker, in toolpath **model space** (work-coordinate XY mm) — NOT screen
+  /// space, so a viewport resize cannot corrupt the lerp. Eased one frame at a time toward the latest status
+  /// sample (see [`super::preview::smooth_marker`]); `None` until the first live work position is acquired or
+  /// while no live status exists (then the preview falls back to the acked-line marker). Reset by
+  /// [`Self::set_program`].
+  marker_pos: Option<Vec2>,
+  /// The monotonically-advancing cut-progress boundary: the count of leading toolpath segments coloured as cut,
+  /// derived from the live work position (see [`super::preview::progressed_segment`]). Never retreats within a
+  /// run; reset to 0 by [`Self::set_program`] and whenever a fresh run begins (no program line acked yet).
+  progress_segment: usize,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
   /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
@@ -80,6 +101,16 @@ pub struct UiState {
   pub rotary_dowel_diameter: f64,
   /// The rotary center-finder's index-angle input (degrees) every touch holds A at during a run.
   pub rotary_index_angle: f64,
+  /// The rotary-safe touch's bench-tuned parameters edited in the wizard's advanced section (retract clearance,
+  /// side-probe descent height, settle, feed, depth). Seeded from [`crate::profile::Prefs`] and carried into a
+  /// run via [`Intent::RotaryCenterStart`]; these used to be hard-coded `RotaryProbeParams::default()`.
+  pub rotary_bench: super::rotary_probe::RotaryProbeParams,
+  /// Whether the operator has explicitly confirmed the side-probe Z is tuned for the mounted dowel this session.
+  /// The side-probe Z ([`super::rotary_probe::RotaryProbeParams::side_probe_z`]) defaults to a conservative
+  /// PLACEHOLDER that is setup-specific: an untuned value can drive a side touch into the part or miss the flank
+  /// entirely (a crash risk, finding #13). Every center-finder run uses a side (Y) touch, so Start is gated on
+  /// this acknowledgement — it is transient (never persisted), so each session must re-confirm the bench is right.
+  pub rotary_side_probe_confirmed: bool,
   /// The Phase 2 verify/measure starting A angle (degrees): θ for the flip-verify pair, and the first runout angle.
   pub verify_start_angle: f64,
   /// The Phase 2 runout report's number of evenly-spaced angles (N ≥ 2).
@@ -121,6 +152,13 @@ pub struct UiState {
   /// Whether the bottom dock is collapsed to just its tab strip, hiding the console/program body so the toolpath
   /// and panels reclaim the space. Defaults to expanded (the design opens the dock at its full 200px height).
   pub dock_collapsed: bool,
+  /// Whether "fabulous" mode — the hidden Pride-month accent — is on, painting a thin rainbow band along the
+  /// toolbar and status bar. A pure cosmetic flourish that never touches the machine; off by default and
+  /// transient (not persisted), toggled by the [`Self::register_fabulous_click`] badge easter egg.
+  pub fabulous: bool,
+  /// Running count of state-badge clicks toward the next fabulous-mode toggle, reset each time the threshold
+  /// ([`FABULOUS_CLICKS`]) is reached. Transient bookkeeping for the easter egg; see [`Self::register_fabulous_click`].
+  pub fabulous_click_streak: u8,
 }
 
 /// A settings dialog action the operator requested while edits were still staged, deferred behind the discard
@@ -154,6 +192,9 @@ impl Default for UiState {
       program: std::sync::Arc::from([] as [String; 0]),
       toolpath: Vec::new(),
       toolpath_bounds: None,
+      progress_segments: Vec::new(),
+      marker_pos: None,
+      progress_segment: 0,
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
@@ -165,6 +206,8 @@ impl Default for UiState {
       plate_thickness: 1.0,
       rotary_dowel_diameter: 6.0,
       rotary_index_angle: 0.0,
+      rotary_bench: super::rotary_probe::RotaryProbeParams::default(),
+      rotary_side_probe_confirmed: false,
       verify_start_angle: 0.0,
       verify_runout_n: 4,
       settings_open: false,
@@ -180,6 +223,8 @@ impl Default for UiState {
       active_tab: DockTab::default(),
       dock_collapsed: false,
       program_followed_line: None,
+      fabulous: false,
+      fabulous_click_streak: 0,
     }
   }
 }
@@ -197,8 +242,23 @@ impl UiState {
       baud: sanitize_baud(prefs.baud),
       rotary_dowel_diameter: prefs.rotary_dowel_diameter,
       rotary_index_angle: prefs.rotary_index_angle,
+      rotary_bench: prefs.rotary_bench,
       ..UiState::default()
     }
+  }
+
+  /// Register one click on the machine-state badge toward the hidden "fabulous" Pride accent. Every
+  /// [`FABULOUS_CLICKS`]th click flips [`Self::fabulous`] and resets the streak; the rainbow band that appears is
+  /// the only feedback. Kept egui-free so the easter-egg toggle policy is unit-tested without a window. Returns
+  /// whether this click toggled the mode.
+  pub fn register_fabulous_click(&mut self) -> bool {
+    self.fabulous_click_streak = self.fabulous_click_streak.saturating_add(1);
+    if self.fabulous_click_streak >= FABULOUS_CLICKS {
+      self.fabulous = !self.fabulous;
+      self.fabulous_click_streak = 0;
+      return true;
+    }
+    false
   }
 
   /// Clear the connection-scoped transient widget state when the link drops. An in-progress setting edit and
@@ -222,9 +282,16 @@ impl UiState {
     self.program_path = path;
     self.toolpath = parse_xy_path(&self.program);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
+    // Cache the segment (start, end) pairs once for the per-frame live-progress projection (no per-frame alloc).
+    self.progress_segments =
+      self.toolpath.iter().map(|seg| ((seg.from.x, seg.from.y), (seg.to.x, seg.to.y))).collect();
     // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
     // even if the old program happened to leave us followed at the same row index.
     self.program_followed_line = None;
+    // The live overlay is program-scoped: a new file starts with no acquired marker and no cut progress, so the
+    // marker snaps to the first sample of the new run rather than easing in from the old program's last position.
+    self.marker_pos = None;
+    self.progress_segment = 0;
   }
 }
 
@@ -339,13 +406,31 @@ fn header_title(ui: &mut egui::Ui, title: &str) {
 fn chip_frame(
   ui: &mut egui::Ui, fill: Color32, border: Color32, margin: egui::Margin,
   content: impl FnOnce(&mut egui::Ui),
-) {
+) -> egui::Response {
   egui::Frame::new()
     .fill(fill)
     .stroke(egui::Stroke::new(1.0, border))
     .inner_margin(margin)
     .corner_radius(Metrics::CONTROL_RADIUS)
-    .show(ui, content);
+    .show(ui, content)
+    .response
+}
+
+/// Paint a smooth left-to-right six-stripe Pride rainbow filling `rect` — the "fabulous" easter-egg accent. The
+/// band is sampled from [`Theme::pride_at`] as a run of thin vertical slices so it blends rather than showing six
+/// hard bands, with each slice overdrawn by a pixel to hide the seams. A no-op for a non-positive-width rect.
+fn paint_pride(painter: &egui::Painter, rect: egui::Rect) {
+  const SLICES: usize = 64;
+  let slice_w = rect.width() / SLICES as f32;
+  if slice_w <= 0.0 {
+    return;
+  }
+  for i in 0..SLICES {
+    let t = (i as f32 + 0.5) / SLICES as f32; // sample each slice at its centre.
+    let x = rect.left() + i as f32 * slice_w;
+    let slice = egui::Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(slice_w + 1.0, rect.height()));
+    painter.rect_filled(slice, 0.0, Theme::pride_at(t));
+  }
 }
 
 /// Lay out a horizontal row of buttons at exact, vertically-aligned rects, so none of them drift the way
@@ -384,7 +469,7 @@ fn toolbar_divider(ui: &mut egui::Ui) {
 
 /// Draw the machine-state badge: a coloured dot, the uppercase label, and (when streaming) the feed/speed
 /// suffix. The dot colour is the *second* signal; the label is primary, per the design.
-fn state_badge(ui: &mut egui::Ui, view: &ViewState) {
+fn state_badge(ui: &mut egui::Ui, view: &ViewState, state_ui: &mut UiState) {
   let state = view.badge_state();
   let color = Theme::badge_color(state);
   let (fill, border, text_color) = match state {
@@ -393,7 +478,7 @@ fn state_badge(ui: &mut egui::Ui, view: &ViewState) {
   };
   let margin = egui::Margin { left: Metrics::BADGE_PAD.x as i8, right: Metrics::BADGE_PAD.x as i8,
     top: Metrics::BADGE_PAD.y as i8, bottom: Metrics::BADGE_PAD.y as i8 };
-  chip_frame(ui, fill, border, margin, |ui| {
+  let resp = chip_frame(ui, fill, border, margin, |ui| {
     ui.horizontal(|ui| {
       dot(ui, color, Metrics::BADGE_DOT);
       ui.add_space(2.0);
@@ -407,6 +492,13 @@ fn state_badge(ui: &mut egui::Ui, view: &ViewState) {
       }
     });
   });
+  // The badge doubles as the hidden Pride "fabulous mode" toggle: interact over the chip's rect (the frame
+  // itself only hovers) so six clicks flip the rainbow accent. Show the click cursor so the spot is at least
+  // feelable, but leave it unlabelled — discovering it is the point.
+  let egg = ui.interact(resp.rect, resp.id.with("fabulous_egg"), egui::Sense::click());
+  if egg.clicked() {
+    state_ui.register_fabulous_click();
+  }
 }
 
 /// Paint a small filled circle inline (a state dot), advancing the cursor by its diameter.
@@ -505,9 +597,19 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
 
     // Right-aligned state badge so it is always visible regardless of toolbar width.
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      state_badge(ui, view);
+      state_badge(ui, view, state);
     });
   });
+
+  // Fabulous mode: lay a thin Pride rainbow along the toolbar's bottom edge, overpainting the divider. Drawn
+  // after the bar's content so it sits on top, and bookended by the matching band on the status bar.
+  if state.fabulous {
+    let stripe = egui::Rect::from_min_max(
+      egui::pos2(bar.left(), bar.bottom() - Metrics::PRIDE_STRIPE_H),
+      egui::pos2(bar.right(), bar.bottom()),
+    );
+    paint_pride(ui.painter(), stripe);
+  }
 }
 
 /// The Run/Hold/Stop segmented group plus a separate Abort control. The leading segment starts a stream (Idle) or
@@ -1261,8 +1363,28 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
         ui.label("A angle");
         ui.add(egui::DragValue::new(&mut state.rotary_index_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
         ui.end_row();
+        // The side-probe Z is SAFETY-CRITICAL and setup-specific, so it lives in the always-visible setup rather
+        // than the collapsed bench section: every center-finder run descends a side touch to it, and a wrong value
+        // crashes into the part or misses the flank (finding #13). Editing it re-arms the confirmation below.
+        ui.label("Side-probe Z");
+        if ui.add(egui::DragValue::new(&mut state.rotary_bench.side_probe_z).speed(0.1).range(-300.0..=0.0)
+          .suffix(" mm")).on_hover_text("Machine-Z the side (X/Y) touches descend to — must lie within the dowel's \
+          Z-extent. A wrong value will crash into the part or miss the flank.").changed()
+        {
+          state.rotary_side_probe_confirmed = false;
+        }
+        ui.end_row();
       });
-      let enabled = view.connection == ConnectionState::Idle;
+      // The remaining bench-tuned parameters stay in a collapsing section so the common path is just the inputs
+      // above. The side-probe Z is hoisted out of it (above) because it is the crash-risk parameter.
+      rotary_bench_params(ui, state);
+      // Gate Start on an explicit acknowledgement that the side-probe Z is tuned for THIS bench. The default is a
+      // conservative placeholder; an untuned descent is a crash risk, so the operator must confirm before a run.
+      ui.add_space(4.0);
+      ui.checkbox(&mut state.rotary_side_probe_confirmed,
+        RichText::new(format!("Side-probe Z {:.3} mm is set for this dowel", state.rotary_bench.side_probe_z))
+          .size(11.0).color(Theme::TEXT_DIM));
+      let enabled = view.connection == ConnectionState::Idle && state.rotary_side_probe_confirmed;
       ui.add_enabled_ui(enabled, |ui| {
         if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0),
           egui::Button::new("Start center-finder")).clicked()
@@ -1270,6 +1392,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
           sink.push(Intent::RotaryCenterStart {
             dowel_diameter: state.rotary_dowel_diameter,
             index_angle_deg: state.rotary_index_angle,
+            params: state.rotary_bench,
           });
         }
       });
@@ -1359,6 +1482,38 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       sink.push(Intent::RotaryCenterCancel);
     }
   });
+}
+
+/// Render the editable bench-tuned rotary-touch parameters in a collapsing "Bench params" section, mutating
+/// `state.rotary_bench` in place. Collapsed by default so the common setup is just dowel ⌀ + A angle; opened when
+/// the operator needs to dial in a bench. The crash-risk side-probe Z is NOT here — it is hoisted into the
+/// always-visible setup grid and gated behind a confirmation (finding #13); this section holds the rest.
+fn rotary_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
+  let p = &mut state.rotary_bench;
+  egui::CollapsingHeader::new(RichText::new("Bench params").size(11.0).color(Theme::TEXT_DIM))
+    .id_salt("rotary_bench_params")
+    .show(ui, |ui| {
+      egui::Grid::new("rotary_bench").num_columns(2).show(ui, |ui| {
+        ui.label("Clearance Z");
+        ui.add(egui::DragValue::new(&mut p.clearance_mm).speed(0.1).range(-300.0..=0.0).suffix(" mm"))
+          .on_hover_text("Machine-Z retract above the dowel before the A index (G53).");
+        ui.end_row();
+        // Side-probe Z is intentionally NOT here — it is hoisted into the always-visible setup grid above (finding
+        // #13) because it is the crash-risk parameter and must be confirmed before a run, not buried in a collapse.
+        ui.label("Settle");
+        ui.add(egui::DragValue::new(&mut p.settle_secs).speed(0.05).range(0.0..=10.0).suffix(" s"))
+          .on_hover_text("Dwell after the A index so backlash/oscillation damps out before the probe.");
+        ui.end_row();
+        ui.label("Feed");
+        ui.add(egui::DragValue::new(&mut p.feed).speed(1.0).range(1.0..=2000.0).suffix(" mm/min"))
+          .on_hover_text("Probe feed for the G38.2 touch.");
+        ui.end_row();
+        ui.label("Depth");
+        ui.add(egui::DragValue::new(&mut p.depth_mm).speed(0.1).range(0.1..=200.0).suffix(" mm"))
+          .on_hover_text("How far the probe advances seeking contact before it gives up (alarms).");
+        ui.end_row();
+      });
+    });
 }
 
 /// Render the rotary wizard's captured readings + computed center as a compact dim list. Each is shown once
@@ -1834,9 +1989,18 @@ fn console_line_style(source: LogSource, text: &str) -> (&'static str, Color32) 
   }
 }
 
-/// Render the bottom status bar: the design's mono info strip (port dot · state · WCO · `Ln a/b · NN%` · F·S),
-/// with a couple of always-reachable real-time controls (status/reset) pushed to the right.
-pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
+/// Render the bottom status bar: the design's mono info strip (port dot · state · WCO · `Ln a/b · NN%` · F·S).
+pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
+  // Fabulous mode: a matching Pride band along the strip's top edge, bookending the toolbar's. Painted before
+  // the content so the mono text sits above it; the band is thin enough not to crowd the row.
+  if state.fabulous {
+    let bar = ui.max_rect();
+    let stripe = egui::Rect::from_min_max(
+      egui::pos2(bar.left(), bar.top()),
+      egui::pos2(bar.right(), bar.top() + Metrics::PRIDE_STRIPE_H),
+    );
+    paint_pride(ui.painter(), stripe);
+  }
   ui.horizontal(|ui| {
     let badge = view.badge_state();
     dot(ui, Theme::badge_color(badge), Metrics::STATUS_DOT);
@@ -1859,13 +2023,6 @@ pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &m
       ui.label(RichText::new("·").color(Theme::TEXT_DISABLED));
       ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5).color(Theme::TEXT_DIM));
     }
-
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      let connected = view.connection.is_connected();
-      if ui.add_enabled(connected, egui::Button::new("?")).on_hover_text("Status report (?)").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::StatusReport));
-      }
-    });
   });
 }
 
@@ -1956,10 +2113,50 @@ pub fn tool_change_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut Intent
     });
 }
 
+/// The per-frame lerp fraction the live marker eases toward each fresh status sample. At up to 20 Hz repaint
+/// against a 5–10 Hz status feed this hides the sample-rate step within a couple of frames without lagging
+/// perceptibly. Lerp-only (no extrapolation), so the marker can never overshoot the real tool.
+const MARKER_LERP: f32 = 0.35;
+
+/// The marker snaps (rather than eases) to a new sample once the jump exceeds this fraction of the toolpath's
+/// model-space span diagonal — a new program, a `$X`/teleport, or a coordinate-system change is not motion to
+/// animate. Below it, normal cutting moves between samples are smoothed.
+const MARKER_SNAP_SPAN_FRACTION: f32 = 0.25;
+
+/// How many segments ahead of the current cut boundary the live-progress projection scans each frame. The live
+/// point is projected onto the segments in this forward window and the nearest is chosen, so the window must be
+/// large enough to span a few moves between two 5–10 Hz status samples (a fast feed can complete several short
+/// flattened-arc chords per poll) yet small enough that a far-away REVISITED coordinate — a closed contour
+/// returning to the origin, a peck-drill retract — cannot be mistaken for forward progress (findings #1/#7).
+/// Bounding the scan also keeps it O(window) per frame regardless of program length (finding #12).
+const PROGRESS_FORWARD_WINDOW: usize = 24;
+
+/// How far outside the toolpath's model-space bounds the live marker may sit and still be drawn, as a fraction of
+/// the span diagonal. Generous enough that a tool a little outside the drawn extents (lead-in, clearance move)
+/// still shows while idle, tight enough that a grossly displaced point — a 25.4× units mismatch (#3), a homed-off
+/// machine-origin park (#4), or a WCS-mismatch float (#5) — falls outside and is suppressed.
+const MARKER_ON_PATH_MARGIN_FRACTION: f32 = 0.15;
+
+/// The model-space span diagonal used to scale the resolution-independent marker/progress tolerances. Clamped to
+/// a small floor so a degenerate (single-point) program cannot collapse the tolerances to zero.
+fn span_diagonal(span: egui::Vec2) -> f32 {
+  (span.x * span.x + span.y * span.y).sqrt().max(1.0)
+}
+
+/// Decide the monotonic cut-progress baseline for this frame, resetting it to zero when a fresh run has begun.
+/// A run that has acknowledged no program line yet (`acked == 0`) is at or before its start, so any progress
+/// carried over from a previous run of the same loaded file must be cleared — otherwise re-running a program
+/// without reloading would paint it entirely "cut" from the first frame. Otherwise the previous boundary is
+/// kept and [`super::preview::progressed_segment`] advances it. Pure so the reset policy is unit-tested.
+fn progress_baseline(acked: usize, previous: usize) -> usize {
+  if acked == 0 { 0 } else { previous }
+}
+
 /// Render the 2D toolpath viewport: a top-down XY preview of the loaded program drawn with [`egui::Painter`].
-/// The path is fit to the available rect; the current acked line is highlighted so the operator can see
-/// progress against the geometry. Parsing is a cheap single pass over the loaded lines.
-pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
+/// The path is fit to the available rect. When a live status report carries a work position the marker and the
+/// "cut so far" colouring track the real machine position (smoothed against the status sample rate); with no
+/// live status they fall back to the acknowledged-line position. Parsing is a cheap single pass done at load.
+pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   // The viewport header carries the filename/line-count on the right, inside the 30px strip (design §03).
   let progress = view.progress;
   let name = state.program_path.as_deref().map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string());
@@ -1979,8 +2176,6 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
     },
   );
   ui.add_space(2.0);
-  // The toolpath is parsed once at load (see [`UiState::set_program`]); here we only fit it to the viewport.
-  let segments = &state.toolpath;
   let available = ui.available_size();
   let (response, painter) = ui.allocate_painter(available, egui::Sense::hover());
   let rect = response.rect;
@@ -2003,13 +2198,23 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
   let offset = egui::vec2(rect.left() + (rect.width() - used.x) * 0.5, rect.top() + (rect.height() - used.y) * 0.5);
   let to_screen = |p: egui::Vec2| egui::pos2(offset.x + (p.x - min.x) * scale, offset.y + (max.y - p.y) * scale);
 
-  let current = view.progress.acked;
-  let mut tool: Option<egui::Pos2> = None;
-  for seg in segments {
-    // Per the design: traversed cut moves are the warm "motion" orange; pending cuts are the neutral path
-    // colour; rapid travels are dim and dashed in spirit (drawn thin here). Track the last traversed point so
-    // we can mark the tool position.
-    let traversed = seg.line_index < current;
+  // Fold this frame's live status into the cached overlay (smoothed marker + monotonic cut boundary), returning
+  // the model-space marker to draw, or `None` to fall back to the acked-line dot. This mutates the cached state
+  // before the immutable draw borrow of `state.toolpath` below.
+  let live_marker = update_live_overlay(state, view, (min, max), span);
+
+  let segments = &state.toolpath;
+  let cut_until = if live_marker.is_some() { state.progress_segment } else { 0 };
+  let acked = view.progress.acked;
+  // The live boundary, when present, is fixed for the whole frame, so choose the fallback acked marker only when
+  // there is no live marker — never compute the per-segment acked endpoint when the live path will win (#11).
+  let live = live_marker.is_some();
+  let mut acked_tool: Option<egui::Pos2> = None;
+  for (index, seg) in segments.iter().enumerate() {
+    // A segment is "cut" either by the live position-driven boundary (preferred when live) or, as a fallback
+    // with no live status, by the acked line index. Cut moves are the warm "motion" orange; pending cuts the
+    // neutral path colour; rapids stay dim. Track the last acked-traversed endpoint for the fallback marker.
+    let traversed = if live { index < cut_until } else { seg.line_index < acked };
     let color = if seg.rapid {
       Theme::BORDER_RAISED
     } else if traversed {
@@ -2019,15 +2224,87 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
     };
     let width = if traversed && !seg.rapid { 1.6 } else { 1.0 };
     painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(width, color));
-    if traversed {
-      tool = Some(to_screen(seg.to));
+    // Only accumulate the acked-fallback marker when we will actually use it (no live marker this frame).
+    if !live && seg.line_index < acked {
+      acked_tool = Some(to_screen(seg.to));
     }
   }
 
-  // The tool dot (warm motion accent) marks the last traversed point — "where the machine is right now".
-  if let Some(pos) = tool {
+  // The tool dot (warm motion accent) marks where the machine is: the smoothed live position when available, or
+  // the last acked-traversed endpoint as a fallback. Drawing it projects the model-space marker through the same
+  // fit transform the segments use, so it always sits on the geometry.
+  let dot = match live_marker {
+    Some(model) => Some(to_screen(model)),
+    None => acked_tool,
+  };
+  if let Some(pos) = dot {
     painter.circle_filled(pos, 4.0, Theme::ACCENT_MOTION);
     painter.circle_stroke(pos, 8.0, egui::Stroke::new(1.0, Theme::ACCENT_MOTION.gamma_multiply(0.5)));
+  }
+}
+
+/// Whether a run state is one of active motion (Run/Jog/Hold) — the states in which the live tool marker is shown
+/// unconditionally (a legitimate cut may run just outside the drawn extents). Every other state (Idle/Alarm/…) is
+/// gated on the marker actually lying near the path, so a parked-off-path point is suppressed (finding #4).
+fn is_moving_state(run_state: Option<crate::protocol::RunState>) -> bool {
+  use crate::protocol::RunState::{Hold, Jog, Run};
+  matches!(run_state, Some(Run | Jog | Hold))
+}
+
+/// Fold one frame of live status into the cached preview overlay: smooth the model-space marker toward the latest
+/// work position and advance the monotonic cut-progress boundary. Returns the smoothed marker in model space when
+/// a live marker should be drawn, or `None` to fall back to the acked-line dot. Kept as a small helper so the
+/// per-frame state mutation is isolated from rendering; the smoothing, progress, and gating decisions themselves
+/// live in pure, unit-tested [`super::preview`] functions.
+///
+/// Three live-status cases are distinguished (findings #3/#4/#5/#6):
+/// - **No status at all** (disconnected / pre-connect): drop the held marker so a later reconnect snaps fresh,
+///   and fall back to the acked-line dot.
+/// - **A status with no derivable work position** (grbl pushes `WCO` only intermittently, so a mid-run report can
+///   lack one): HOLD the last marker through the gap rather than nulling it — nulling would re-snap on the next
+///   valid frame, a visible blink/teleport, and revert colouring to the acked fallback for that frame.
+/// - **A status with a work position**: smooth toward it and advance the cut boundary, but draw the marker only
+///   when [`preview::marker_is_on_path`] passes (on/near the path, or while actively moving) — a parked machine
+///   far off the path (homed to machine origin, a units mismatch, a WCS mismatch) draws nothing rather than a
+///   confident-but-wrong dot.
+fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec2), span: egui::Vec2) -> Option<Vec2> {
+  let Some(target) = view.work_xy().map(|(x, y)| (x as f32, y as f32)) else {
+    // No derivable work position this frame. Two cases (finding #6):
+    // - No status at all (disconnected / pre-connect): clear the marker so a later reconnect snaps fresh, and
+    //   fall back to the acked-line dot/colouring.
+    // - A status with no derivable work position (grbl pushes WCO only intermittently, so a mid-run report can
+    //   lack one): HOLD the last marker AND keep returning it, so the dot stays put and the colouring stays on
+    //   the live boundary for this frame rather than blinking back to the acked fallback and re-snapping next
+    //   frame. The cut boundary is simply not advanced this frame (no live point to project), which is correct.
+    if view.status.is_none() {
+      state.marker_pos = None;
+      return None;
+    }
+    return state.marker_pos.map(|p| egui::vec2(p.x, p.y));
+  };
+  let diagonal = span_diagonal(span);
+  let snap_dist = diagonal * MARKER_SNAP_SPAN_FRACTION;
+  let current = state.marker_pos.map(|p| (p.x, p.y));
+  let smoothed = preview::smooth_marker(current, target, snap_dist, MARKER_LERP);
+  state.marker_pos = Some(egui::vec2(smoothed.0, smoothed.1));
+
+  // Advance the monotonic cut boundary by projecting the live work position onto the cached segment pairs within
+  // a bounded forward window (snapping the baseline to 0 when a fresh run has begun). The list is pre-computed,
+  // so this projection allocates nothing per frame.
+  let baseline = progress_baseline(view.progress.acked, state.progress_segment);
+  state.progress_segment =
+    preview::progressed_segment(&state.progress_segments, target, baseline, PROGRESS_FORWARD_WINDOW);
+
+  // Gate the marker: drawn on/near the path or while actively moving, suppressed for a parked-off-path point
+  // (#3/#4/#5). Use the SMOOTHED position so the gate matches what is drawn. The boundary still advanced above,
+  // so colouring stays correct even when the dot is hidden.
+  let (min, max) = bounds;
+  let margin = diagonal * MARKER_ON_PATH_MARGIN_FRACTION;
+  let moving = is_moving_state(view.status.as_ref().map(|s| s.machine_state.state));
+  if preview::marker_is_on_path(smoothed, (min.x, min.y), (max.x, max.y), margin, moving) {
+    Some(egui::vec2(smoothed.0, smoothed.1))
+  } else {
+    None
   }
 }
 
@@ -2065,16 +2342,22 @@ struct Segment {
 }
 
 /// Parse the loaded program into a flat list of XY segments for the preview. A pragmatic linear interpreter:
-/// it tracks the modal motion mode (G0 travel vs G1/G2/G3 cuts — arcs are drawn as their straight chord here)
-/// and the modal distance mode (G90 absolute / G91 relative), then emits one segment per line that actually
-/// executes a motion. A line emits a segment only when the effective motion mode is G0/1/2/3 AND it carries an
-/// X/Y word AND it is not a non-motion command: G10/G28/G30/G92/G53/G4 take X/Y as parameters (or modify a
-/// single line) rather than as a normal modal move, so they update no position and draw nothing. Tokens may be
-/// spaced (`G1 X10 Y5`) or compact (`G1X10.0Y5.0`); both are handled by scanning letter+number words.
+/// it tracks the modal motion mode (G0 travel vs G1 cut vs G2/G3 arc) and the modal distance mode (G90 absolute /
+/// G91 relative), then emits one or more segments per line that actually executes a motion. A line emits geometry
+/// only when the effective motion mode is G0/1/2/3 AND it carries an X/Y word AND it is not a non-motion command:
+/// G10/G28/G30/G92/G53/G4 take X/Y as parameters (or modify a single line) rather than as a normal modal move, so
+/// they update no position and draw nothing. Tokens may be spaced (`G1 X10 Y5`) or compact (`G1X10.0Y5.0`).
+///
+/// **Arcs (G2/G3) are FLATTENED into many short chord segments** via [`super::preview::flatten_arc`], using the
+/// I/J centre offset (XY plane / G17 assumed — the firmware's only arc plane). This makes the preview draw the
+/// real curve and lets the live-progress projection colour an arc smoothly as the tool sweeps it, instead of one
+/// start→end chord whose endpoint the swept point never reaches (findings #2). An arc with neither I/J nor a
+/// usable centre degrades to a single straight chord, so a malformed or R-form arc never breaks the parse.
 fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
   let mut segments = Vec::new();
   let mut pos = egui::vec2(0.0, 0.0);
-  let mut rapid = true; // modal motion mode: true == G0 (travel), false == G1/G2/G3 (cut).
+  // Modal motion mode: 0 == G0 rapid, 1 == G1 cut, 2 == G2 CW arc, 3 == G3 CCW arc.
+  let mut motion = 0u8;
   let mut absolute = true; // modal distance mode: true == G90 (absolute), false == G91 (relative).
   for (index, line) in lines.iter().enumerate() {
     let code = line.split(';').next().unwrap_or("").to_ascii_uppercase();
@@ -2084,12 +2367,17 @@ fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
     let mut next = pos;
     let mut has_xy = false;
     let mut suppress = false; // a non-motion G-word on this line suppresses any segment for it.
+    // Arc centre offsets (I/J) relative to the current position; collected only for an arc line. Both default to
+    // zero (grbl treats an absent offset as zero), so an arc giving only one of I/J still resolves a centre.
+    let (mut arc_i, mut arc_j) = (0.0_f32, 0.0_f32);
+    let mut has_ij = false;
     for (letter, number) in gcode_words(&code) {
       match letter {
         'G' => match number.trim() {
-          "0" | "00" => rapid = true,
-          "1" | "01" => rapid = false,
-          "2" | "02" | "3" | "03" => rapid = false, // arcs: drawn as a chord in this preview.
+          "0" | "00" => motion = 0,
+          "1" | "01" => motion = 1,
+          "2" | "02" => motion = 2,
+          "3" | "03" => motion = 3,
           "90" => absolute = true,
           "91" => absolute = false,
           // Non-modal commands whose X/Y are parameters, not a move; they must not draw a segment.
@@ -2108,11 +2396,36 @@ fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
             has_xy = true;
           }
         }
+        'I' => {
+          if let Ok(v) = number.parse::<f32>() {
+            arc_i = v;
+            has_ij = true;
+          }
+        }
+        'J' => {
+          if let Ok(v) = number.parse::<f32>() {
+            arc_j = v;
+            has_ij = true;
+          }
+        }
         _ => {}
       }
     }
     if has_xy && !suppress {
-      segments.push(Segment { from: pos, to: next, rapid, line_index: index });
+      let rapid = motion == 0;
+      if (motion == 2 || motion == 3) && has_ij {
+        // An arc with a usable I/J centre: flatten it into chords. I/J are offsets from the START position.
+        let center = (pos.x + arc_i, pos.y + arc_j);
+        let mut from = (pos.x, pos.y);
+        for point in super::preview::flatten_arc(from, (next.x, next.y), center, motion == 2) {
+          segments.push(Segment { from: egui::vec2(from.0, from.1), to: egui::vec2(point.0, point.1),
+            rapid, line_index: index });
+          from = point;
+        }
+      } else {
+        // A linear move, or an arc with no centre offset (degrade to its chord rather than guessing a centre).
+        segments.push(Segment { from: pos, to: next, rapid, line_index: index });
+      }
       pos = next;
     }
   }
@@ -2420,6 +2733,24 @@ mod tests {
   use super::*;
 
   #[test]
+  fn progress_baseline_resets_on_a_fresh_run_and_holds_otherwise() {
+    // No program line acked yet means a run is at/before its start: any progress carried from a previous run of
+    // the same loaded file is cleared so the path is not painted entirely cut from frame one.
+    assert_eq!(progress_baseline(0, 42), 0, "a fresh run (acked == 0) resets the progress baseline");
+    // Once lines have acked the previous monotonic boundary is kept for `progressed_segment` to advance.
+    assert_eq!(progress_baseline(7, 42), 42, "a run in progress keeps its monotonic progress boundary");
+  }
+
+  #[test]
+  fn span_diagonal_has_a_floor_so_tolerances_never_collapse() {
+    // A normal span yields its Euclidean diagonal.
+    let d = span_diagonal(egui::vec2(3.0, 4.0));
+    assert!((d - 5.0).abs() < 1e-4, "3-4-5 diagonal: {d}");
+    // A degenerate (point) program clamps to the floor so reach/snap distances stay positive.
+    assert_eq!(span_diagonal(egui::vec2(0.0, 0.0)), 1.0, "a zero span must clamp to the floor");
+  }
+
+  #[test]
   fn ui_state_has_sane_defaults() {
     let state = UiState::default();
     assert_eq!(state.baud, DEFAULT_BAUD);
@@ -2490,6 +2821,27 @@ mod tests {
     assert_eq!(zero.baud, DEFAULT_BAUD, "a zero baud must fall back to the default");
     let huge = UiState::from_prefs(&Prefs { baud: 9_000_000, ..Prefs::default() });
     assert_eq!(huge.baud, DEFAULT_BAUD, "a baud above the accepted range must fall back to the default");
+  }
+
+  #[test]
+  fn fabulous_toggles_every_sixth_badge_click_and_is_off_by_default() {
+    let mut ui = UiState::default();
+    assert!(!ui.fabulous, "fabulous mode is off until the easter egg is found");
+    // The first five clicks only accumulate the streak; nothing flips yet.
+    for click in 1..FABULOUS_CLICKS {
+      assert!(!ui.register_fabulous_click(), "click {click} must not toggle yet");
+      assert!(!ui.fabulous);
+    }
+    // The sixth click flips it on and resets the streak.
+    assert!(ui.register_fabulous_click(), "the sixth click toggles fabulous mode");
+    assert!(ui.fabulous);
+    assert_eq!(ui.fabulous_click_streak, 0, "the streak resets after a toggle");
+    // Another six clicks turn it back off — the toggle is symmetric.
+    for _ in 1..FABULOUS_CLICKS {
+      assert!(!ui.register_fabulous_click());
+    }
+    assert!(ui.register_fabulous_click());
+    assert!(!ui.fabulous, "a second six-click run turns fabulous mode back off");
   }
 
   #[test]
@@ -2714,6 +3066,41 @@ mod tests {
   }
 
   #[test]
+  fn toolpath_parser_flattens_a_g2_arc_into_many_chords() {
+    // A G2 (CW) quarter arc from (1,0) to (0,1) about the origin (I-1 J0 → centre = start + (−1,0) = (0,0)) must
+    // flatten into many short chord segments on the unit radius, not a single start→end chord — so the preview
+    // draws the curve and the live-progress projection colours it smoothly (findings #2).
+    let program = vec!["G0 X1 Y0".to_string(), "G2 X0 Y1 I-1 J0".to_string()];
+    let segments = parse_xy_path(&program);
+    // One rapid to the start, then several arc chords (a quarter circle subdivides into multiple segments).
+    let arc: Vec<&Segment> = segments.iter().filter(|s| !s.rapid).collect();
+    assert!(arc.len() >= 3, "the arc must flatten into several chords, got {}", arc.len());
+    // Every arc-chord endpoint sits on the unit radius, and the chain is continuous (each from == previous to).
+    for w in arc.windows(2) {
+      assert_eq!(w[0].to, w[1].from, "the flattened chords must be continuous");
+    }
+    for s in &arc {
+      let r = (s.to.x * s.to.x + s.to.y * s.to.y).sqrt();
+      assert!((r - 1.0).abs() < 1e-2, "every chord endpoint sits on the radius: {:?} r={r}", s.to);
+    }
+    // The final chord ends exactly on the commanded endpoint, and all arc chords share the source line index.
+    assert_eq!(arc.last().unwrap().to, egui::vec2(0.0, 1.0));
+    assert!(arc.iter().all(|s| s.line_index == 1), "all arc chords come from the G2 line");
+  }
+
+  #[test]
+  fn toolpath_parser_degrades_an_arc_without_ij_to_a_single_chord() {
+    // An arc with no I/J (e.g. an R-form arc, which this preview does not resolve) must not break the parse — it
+    // degrades to a single straight chord to the endpoint rather than guessing a centre or panicking.
+    let program = vec!["G0 X1 Y0".to_string(), "G3 X0 Y1".to_string()];
+    let segments = parse_xy_path(&program);
+    let arc: Vec<&Segment> = segments.iter().filter(|s| !s.rapid).collect();
+    assert_eq!(arc.len(), 1, "an arc with no centre offset degrades to one chord");
+    assert_eq!(arc[0].from, egui::vec2(1.0, 0.0));
+    assert_eq!(arc[0].to, egui::vec2(0.0, 1.0));
+  }
+
+  #[test]
   fn toolpath_parser_respects_relative_distance_mode() {
     // Under G91 the X/Y words are offsets from the current position, not absolute targets.
     let program = vec![
@@ -2729,5 +3116,101 @@ mod tests {
     assert_eq!(segments[1].to, egui::vec2(15.0, 10.0));
     assert_eq!(segments[2].to, egui::vec2(15.0, 7.0));
     assert_eq!(segments[3].to, egui::vec2(0.0, 0.0));
+  }
+
+  #[test]
+  fn is_moving_state_is_run_jog_and_hold_only() {
+    use crate::protocol::RunState;
+    for s in [RunState::Run, RunState::Jog, RunState::Hold] {
+      assert!(is_moving_state(Some(s)), "{s:?} is an active-motion state");
+    }
+    for s in [RunState::Idle, RunState::Alarm, RunState::Door, RunState::Check, RunState::Home, RunState::Sleep,
+      RunState::Tool, RunState::Unknown]
+    {
+      assert!(!is_moving_state(Some(s)), "{s:?} must not count as moving");
+    }
+    assert!(!is_moving_state(None), "no report yet is not moving");
+  }
+
+  /// Build a `(UiState, ViewState)` pair with a small square program loaded, for the overlay-folding tests.
+  fn overlay_fixture() -> (UiState, ViewState) {
+    use crate::protocol::Response;
+    let mut state = UiState::default();
+    state.set_program(vec![
+      "G0 X0 Y0".to_string(),
+      "G1 X10 Y0".to_string(),
+      "G1 X10 Y10".to_string(),
+      "G1 X0 Y10".to_string(),
+      "G1 X0 Y0".to_string(),
+    ], None);
+    let mut view = ViewState::default();
+    // A WCO so a later machine report is derivable; the program is authored at WCO origin so work == machine here.
+    view.apply(crate::Event::Response(Response::Status("Run|MPos:0.000,0.000,0.000|WCO:0.000,0.000,0.000".into())));
+    (state, view)
+  }
+
+  fn feed_status_into(view: &mut ViewState, body: &str) {
+    use crate::protocol::Response;
+    view.apply(crate::Event::Response(Response::Status(body.to_string())));
+  }
+
+  #[test]
+  fn update_live_overlay_holds_the_marker_through_a_transient_missing_work_frame() {
+    // Finding #6: grbl pushes WCO only intermittently, so a mid-run machine report can momentarily lack a
+    // derivable work position. That frame must HOLD the last marker, not null it (which would re-snap/blink and
+    // revert colouring to the acked fallback on the next valid frame).
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+
+    // A normal running frame acquires a marker mid-path.
+    feed_status_into(&mut view, "Run|MPos:5.000,0.000,0.000|WCO:0.000,0.000,0.000");
+    assert!(update_live_overlay(&mut state, &view, bounds, span).is_some(), "a valid frame draws the marker");
+    let held = state.marker_pos.expect("a marker was acquired");
+
+    // A transient frame: a status arrives but with no cached-WCO-derivable work position. Simulate by clearing
+    // the cached WCO so the machine report is no longer derivable to work — the marker must be HELD, not cleared.
+    view.last_wco.clear();
+    feed_status_into(&mut view, "Run|MPos:6.000,0.000,0.000");
+    assert!(view.work_xy().is_none(), "this frame genuinely lacks a derivable work position");
+    let drawn = update_live_overlay(&mut state, &view, bounds, span);
+    // The held marker is both KEPT in state AND returned as the drawn marker, so the dot does not blink to the
+    // acked fallback and the colouring stays on the live boundary for this frame (#6).
+    assert_eq!(state.marker_pos, Some(held), "the marker is HELD through the transient gap, not nulled (#6)");
+    assert_eq!(drawn, Some(held), "the held marker is still drawn this frame (no revert to the acked dot)");
+  }
+
+  #[test]
+  fn update_live_overlay_clears_the_marker_only_when_no_status_at_all() {
+    // The disconnected/pre-connect case (no status report): the held marker IS cleared, so a later reconnect
+    // snaps fresh rather than easing in from a stale position.
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+    feed_status_into(&mut view, "Run|MPos:5.000,0.000,0.000|WCO:0.000,0.000,0.000");
+    update_live_overlay(&mut state, &view, bounds, span);
+    assert!(state.marker_pos.is_some());
+    // Now drop the status entirely (a disconnect clears it).
+    view.status = None;
+    update_live_overlay(&mut state, &view, bounds, span);
+    assert_eq!(state.marker_pos, None, "with no status at all the marker is cleared for a fresh snap on reconnect");
+  }
+
+  #[test]
+  fn update_live_overlay_suppresses_a_parked_off_path_marker_but_still_colours() {
+    // Finding #4/#3/#5: an IDLE machine parked far off the loaded path (homed to machine origin, a units
+    // mismatch, or a WCS mismatch) must not draw a confident-but-wrong dot. The marker is suppressed (None), yet
+    // the cut boundary is unaffected (it only advances from real progress, never retreats).
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+    // An IDLE report parked far off the path (work −500,−500 — well outside the 0..10 square plus margin).
+    feed_status_into(&mut view, "Idle|MPos:-500.000,-500.000,0.000|WCO:0.000,0.000,0.000");
+    let drawn = update_live_overlay(&mut state, &view, bounds, span);
+    assert!(drawn.is_none(), "a parked-off-path idle marker must be suppressed, not clipped to the rect edge");
+
+    // The SAME point while actively running IS shown (a legitimate cut can run outside the drawn extents).
+    feed_status_into(&mut view, "Run|MPos:-500.000,-500.000,0.000|WCO:0.000,0.000,0.000");
+    assert!(update_live_overlay(&mut state, &view, bounds, span).is_some(), "a moving machine always shows the dot");
   }
 }
