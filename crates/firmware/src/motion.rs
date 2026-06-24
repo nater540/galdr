@@ -300,6 +300,7 @@ impl StepSink for RmtStepSink {
     // transmitted to each RMT channel). If "emit_burst" prints but a following "wait ok" for some axis never
     // does, THAT axis's blocking `wait()` is spinning forever (the RMT TX-END never fired) — the RMT path stall.
     mtrace!("motion: emit_burst (events={=usize}, symbols={=usize})", ticks.len(), len);
+    crate::crash::record_stage(crate::crash::Stage::EmitBurst, 0);
 
     // Start all three transmits before waiting any, so the three channels fire together. `transmit`
     // consumes the channel; we take it out of its slot and restore it from the transaction's `wait()`.
@@ -311,6 +312,9 @@ impl StepSink for RmtStepSink {
       let Some(channel) = self.channels[axis].take() else {
         return Err(StepError::Transport);
       };
+      // Breadcrumb: about to start this axis's RMT transmit. A reboot frozen here pins the wedge to the transmit
+      // START of this channel (rarer than a wait wedge, but distinguishable). `axis` is small; the cast is exact.
+      crate::crash::record_stage(crate::crash::Stage::AxisTransmit, axis as u8);
       match channel.transmit(&self.scratch[axis][..len]) {
         Ok(txn) => {
           mtrace!("motion: axis {=usize} transmit Ok", axis);
@@ -341,13 +345,19 @@ impl StepSink for RmtStepSink {
         // The blocking `wait()` spins on the raw RMT TX-END/threshold status. If "wait begin" prints for an axis
         // but "wait ok"/"wait err" never does, this is the deadlock: that channel's TX-END never fired.
         mtrace!("motion: axis {=usize} wait begin", axis);
+        // Breadcrumb: about to block on this axis's RMT TX-END. This is THE prime core-1-wedge suspect — if a
+        // reboot's crash dump shows the last stage frozen at `axisN:wait_begin`, channel N's TX-END never fired
+        // (the unbounded `wait()` spin). The single most diagnostic marker in the whole chain.
+        crate::crash::record_stage(crate::crash::Stage::AxisWaitBegin, axis as u8);
         match txn.wait() {
           Ok(channel) => {
             mtrace!("motion: axis {=usize} wait ok", axis);
+            crate::crash::record_stage(crate::crash::Stage::AxisWaitDone, axis as u8);
             self.channels[axis] = Some(channel);
           }
           Err((_, channel)) => {
             mtrace!("motion: axis {=usize} wait err", axis);
+            crate::crash::record_stage(crate::crash::Stage::AxisWaitDone, axis as u8);
             self.channels[axis] = Some(channel);
             result = Err(StepError::Transport);
           }
@@ -425,6 +435,7 @@ pub async fn run(
   // The executor task is alive and entering its drain loop on core 1. If THIS line never appears over RTT, the
   // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
   mtrace!("motion: executor loop entered");
+  crate::crash::record_stage(crate::crash::Stage::LoopEntered, 0);
   loop {
     // Liveness beat (diagnostic), per drain-loop turn: bump the cross-core progress counter so the core-0
     // watchdog-feed task can tell whether core 1 is still scheduling at the block level (this site covers the
@@ -472,6 +483,7 @@ pub async fn run(
     let popped = {
       let mut guard = PLANNER.lock().await;
       mtrace!("motion: PLANNER lock acquired");
+      crate::crash::record_stage(crate::crash::Stage::LockAcquired, 0);
       match guard.as_mut() {
         Some(planner) => take_block(planner),
         None => None,
@@ -495,6 +507,7 @@ pub async fn run(
           block.rapid,
           exit_speed_sq
         );
+        crate::crash::record_stage(crate::crash::Stage::BlockPopped, 0);
         // Publish "a block is in flight" so `status_responder` reports `Run` for the whole duration of this
         // block — including the tail after the queue drained but the last burst is still emitting. Cleared
         // when the block finishes (or aborts). `AcqRel`/`Acquire` publishes the flag to the core-0 reporter.
@@ -525,6 +538,7 @@ pub async fn run(
         // `?` shows a queued block, the wake/enqueue handshake is racing (block enqueued without signaling, or
         // the signal consumed elsewhere) — not the RMT path.
         mtrace!("motion: queue empty -> awaiting block/reset/hold/probe/home");
+        crate::crash::record_stage(crate::crash::Stage::IdleWaiting, 0);
         // Race the existing four idle wakes against a `$H` homing request (DOC-06). Homing, like a probe, is a
         // synchronized boundary serviced only from the empty-queue branch — the consumer flushes look-ahead and
         // blocks on the result, so no block ever follows it out of order. The outer `select` consumes the homing
@@ -665,6 +679,7 @@ fn run_block(
   // this line but the wire still reports `FS:0`, the stall is BEFORE this point (the feed was never published) —
   // which means the executor never reached run_block, contradicting an "emit_burst hang" and pointing upstream.
   mtrace!("motion: feed published ({=f32} mm/min) -> running generator", block.nominal_speed() * 60.0);
+  crate::crash::record_stage(crate::crash::Stage::FeedPublished, 0);
 
   // Latch the live counter's direction from the same step signs the generator latches onto the sink, so the
   // counter advances each axis the correct way. A zero-length block never steps, so this is harmless then.

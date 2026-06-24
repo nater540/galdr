@@ -46,6 +46,12 @@ heapless          = "0.9"
 libm              = "0.2"
 defmt             = { version = "1", optional = true }
 static_cell       = "2"
+# `portable-atomic` supplies the atomic types esp-hal 1.1's `Persistable` marker is implemented for
+# (`unsafe impl Persistable for portable_atomic::AtomicU32`, NOT `core::sync::atomic`). The RTC_FAST crash
+# breadcrumb (`crash.rs`) is a `static [portable_atomic::AtomicU32; N]` under `#[ram(unstable(rtc_fast,
+# persistent))]`, so it must use this crate's atomics to satisfy that bound. Resolves to the same instance
+# esp-hal already pulls (single unified 1.x), so the trait impl applies to our type directly.
+portable-atomic   = "1"
 
 [dev-dependencies]
 embedded-hal-mock = "0.11"
@@ -53,6 +59,16 @@ embedded-hal-mock = "0.11"
 [features]
 # Opt-in defmt logging. Forwards to firmware-core so the no-defmt path stays the default; build a
 # logging image with `--features defmt`. Keeps a defmt-free release build available. `esp-println`'s
-# `defmt-espflash` feature supplies the `#[defmt::global_logger]` sink (over the espflash/RTT channel,
-# separate from the grbl USB stream), so a defmt build links — required now that `tmc` emits defmt logs.
+# `defmt-espflash` feature supplies the `#[defmt::global_logger]` sink, so a defmt build links — required
+# now that `tmc` emits defmt logs.
+#
+# IMPORTANT (ESP32-S3): the defmt sink is NOT a separate RTT/JTAG channel — on the S3 it rides the SAME
+# built-in USB-Serial-JTAG peripheral as the grbl GCode comms (`main` builds the link from
+# `peripherals.USB_DEVICE`, and esp-println 0.17's default S3 backend is that same USB-Serial-JTAG). So you
+# CANNOT stream GCode and watch defmt at once over the one USB port — one host owns it, and the byte streams
+# would interleave/corrupt. A genuine separate RTT channel needs an EXTERNAL JTAG probe on the JTAG pads,
+# which this board does not expose. For a both-cores-dead wedge, live defmt is doubly useless (the dead
+# core-0 sink emits nothing at the moment of death). The lockup-capture path is therefore the RTC_FAST crash
+# breadcrumb in `crash.rs`, emitted as a plain `[MSG:...]` over the normal grbl TX after the watchdog resets
+# the board — it works in the DEFAULT (no-defmt) build. defmt remains an optional extra for bench tracing.
 defmt = ["dep:defmt", "firmware-core/defmt", "esp-println/defmt-espflash"]

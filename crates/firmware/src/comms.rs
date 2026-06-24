@@ -378,6 +378,13 @@ pub static EXECUTOR_RUNNING: AtomicBool = AtomicBool::new(false);
 /// `u32::MAX` (harmless: the sampler compares for INEQUALITY, not magnitude, so a wrap still reads as "advanced").
 pub static MOTION_LIVENESS: AtomicU32 = AtomicU32::new(0);
 
+/// Core-0 (PRO_CPU) heartbeat counter, the companion to [`MOTION_LIVENESS`] for the crash-breadcrumb snapshot. It
+/// is bumped by [`watchdog_feed`] each tick (and by [`status_responder`] on every report) so the breadcrumb's
+/// per-core liveness snapshot can show whether CORE 0 stopped advancing before core 1, or vice-versa — the
+/// "which core died first" determination ([`crate::crash::froze_first`]). `Relaxed` lock-free, exactly like
+/// [`MOTION_LIVENESS`]; advancement (not magnitude) is all the boot dump reads.
+pub static CORE0_LIVENESS: AtomicU32 = AtomicU32::new(0);
+
 /// "A `$H` homing cycle is currently running" (DOC-06). Set by [`handle_home`] for the duration of the cycle and
 /// cleared when it ends, so two things happen: the status reporter overrides the wire State to `Home` (grbl
 /// reports `Home` during `$H` and queues live DRO motion — research finding #1), and the hard-limit monitor
@@ -830,6 +837,71 @@ pub async fn send_banner() {
   if ResponseWriter::banner(&mut s).is_ok() {
     enqueue(s).await;
   }
+}
+
+/// The formatted post-mortem crash report (`[MSG:CRASH ...]`), held after boot so it can be RE-EMITTED on the
+/// first `$I`/status request after a host connects. The native-USB link re-enumerates on the watchdog reset, so a
+/// host that reconnects a beat late would miss the boot-time emission; stashing the line here and replaying it on
+/// the first `$I`/`?` closes that race. `None` once there is nothing to report (a clean boot, or after a single
+/// replay — see [`take_pending_crash_report`]). A `Cell<Option<Response>>` behind the cross-core blocking mutex
+/// keeps it lock-free-ish and `Send`; `Response` is `heapless::String`, no allocation.
+static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<Option<Response>>> = BlockingMutex::new(Cell::new(None));
+
+/// Format the previous run's crash breadcrumb into a grbl `[MSG:CRASH ...]` line, emit it ONCE over the normal TX
+/// path right after the boot banner, AND stash it for one replay on the first `$I`/status after connect. Called
+/// from `main` after [`send_banner`], with the breadcrumb read from RTC_FAST and whether the reset was a
+/// watchdog/fault reset (a clean power-on / brown-out clears RTC_FAST anyway, so a valid breadcrumb after one of
+/// those would be impossible — but we still gate on the reset reason for clarity and defence in depth).
+///
+/// The breadcrumb survives a WATCHDOG reset, NOT a power-cycle (see [`crate::crash`]): the operator must let the
+/// dog bite (~8 s) and must not yank power, or the breadcrumb is lost. A no-op when the breadcrumb is invalid
+/// (clean boot, or the crumb was already consumed) — nothing is emitted or stashed.
+pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, reset_was_watchdog: bool) {
+  if !breadcrumb.is_valid() || !reset_was_watchdog {
+    return;
+  }
+  let Some(report) = format_crash_report(breadcrumb) else {
+    return;
+  };
+  // Stash a copy for the first-`$I`/`?` replay (reconnect race), then emit now over the guaranteed-delivery path.
+  CRASH_REPORT.lock(|c| c.set(Some(report.clone())));
+  enqueue(report).await;
+}
+
+/// Take the stashed crash report for a one-shot replay (consumes it so it is sent at most once more after the boot
+/// emission). Returns `None` once nothing is pending. Called from the `$I` build-info handler and the status
+/// responder so a host that reconnected late after the watchdog reset still receives the `[MSG:CRASH ...]` line.
+fn take_pending_crash_report() -> Option<Response> {
+  CRASH_REPORT.lock(|c| c.take())
+}
+
+/// Build the `[MSG:CRASH ...]` line from a decoded breadcrumb. Renders: the last executor stage (with axis for the
+/// per-axis RMT stages, e.g. `axis1:wait_begin`), the "which core froze first" verdict, and the newest core-0 /
+/// core-1 beats. Returns `None` only if the text could not be wrapped (never in practice — the line is far under
+/// [`RESPONSE_CAPACITY`]). Pure formatting; no I/O.
+fn format_crash_report(breadcrumb: &crate::crash::Breadcrumb) -> Option<Response> {
+  use core::fmt::Write as _;
+  // Build the inner text (without the `[MSG:...]` envelope), then wrap it. Sized well under RESPONSE_CAPACITY.
+  let mut inner: heapless::String<128> = heapless::String::new();
+  // Stage: name plus axis for the per-axis RMT stages. `write!` into a fixed string cannot panic; ignore the
+  // `Result` (a full buffer just truncates, which still yields a usable, if clipped, report).
+  let stage = breadcrumb.last_stage;
+  if crate::crash::stage_has_axis(stage) {
+    let _ = write!(inner, "CRASH stage=axis{}:{}", crate::crash::stage_axis(stage), crate::crash::stage_label(stage));
+  } else {
+    let _ = write!(inner, "CRASH stage={}", crate::crash::stage_label(stage));
+  }
+  // Which core stopped advancing first, from the snapshot ring.
+  let verdict = crate::crash::froze_first(&breadcrumb.snapshots);
+  let _ = write!(inner, " {}", verdict);
+  // Newest beats (index 0 of the newest-first ring) so the operator sees the absolute counters too.
+  let newest = breadcrumb.snapshots[0];
+  let _ = write!(inner, " beats c0={} c1={}", newest.core0_beat, newest.core1_beat);
+  // Remind that the breadcrumb is watchdog-survival only (so a power-cycle would have lost it — useful context).
+  let _ = write!(inner, " (RWDT-reset; not power-cycle)");
+  let mut out = Response::new();
+  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
+  Some(out)
 }
 
 /// Emit the boot `ALARM:N` (plus its `[MSG:..unlock]` prompt) IF the machine booted into an alarm — i.e.
@@ -2484,47 +2556,87 @@ pub async fn coolant(controller: &'static mut crate::coolant::Coolant) {
 /// task at all — i.e. a genuine core-0 wedge, exactly the condition we want a reset for, never a normal stall.
 const WATCHDOG_FEED_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The RTC watchdog feed task (core 0 / PRO_CPU, lowest practical priority — a plain thread-mode task). It pets the
-/// RWDT every [`WATCHDOG_FEED_INTERVAL`] so the dog never resets a HEALTHY board, but stops feeding — and thus lets
-/// the dog fire an auto-reset — the moment the core-0 thread-mode executor stops scheduling tasks (a hang, a
-/// deadlock, or a fault that wedged core 0). This converts the previously-required hard power-cycle into an
-/// automatic recovery AND, because the RWDT reset is recorded, lets the next boot log WHY it reset (see
-/// `log_reset_reason` in `main`).
+/// Number of consecutive [`WATCHDOG_FEED_INTERVAL`] ticks over which the core-1 liveness beat may stay frozen WHILE
+/// a block is actively executing before [`watchdog_feed`] declares a core-1-only wedge and withholds the feed (Goal
+/// B). At 500 ms/tick this is ~4 s — chosen CONSERVATIVELY above the worst-case legitimate gap between core-1 beats:
+/// the executor bumps [`MOTION_LIVENESS`] per BURST (see `motion::RmtStepSink::emit_burst`), and the slowest possible
+/// single burst is `MAX_SYMBOLS_PER_BURST` events × the max RMT period (`RMT_MAX_FIELD_LEN + $0` ≈ 0x7FFF ticks ≈
+/// 33 ms at 1 MHz) ≈ 1.5 s, so 4 s leaves >2.5x margin and CANNOT false-trip on a real slow move. Only a genuine
+/// "a block is in flight but core 1 has emitted no burst for 4 s" — i.e. core 1 wedged mid-motion (the suspected
+/// RMT `wait()` spin) — withholds the feed; the already-armed 8 s RWDT then resets the board, converting an
+/// otherwise-silent core-1-only stall into a recoverable reset + a captured breadcrumb.
+const CORE1_STALL_TICKS: u32 = 8;
+
+/// The RTC watchdog feed task (core 0 / PRO_CPU, a plain thread-mode task). It pets the RWDT every
+/// [`WATCHDOG_FEED_INTERVAL`] so the dog never resets a HEALTHY board, but stops feeding — letting the dog fire an
+/// auto-reset — in two wedge cases: (1) the core-0 thread-mode executor stops scheduling tasks at all (a hang /
+/// deadlock / fault that wedged core 0), so this task simply never runs; and (2, Goal B) a CORE-1-ONLY wedge that
+/// core 0 would otherwise paper over by continuing to feed — detected by [`MOTION_LIVENESS`] staying frozen for
+/// [`CORE1_STALL_TICKS`] while a block is actively in flight. Either way the RWDT reset is recorded, so the next
+/// boot reads the [`crate::crash`] breadcrumb and logs WHY it reset.
 ///
-/// ## Why feeding from a normal task is the right liveness test
-/// The feed is UNCONDITIONAL — it does not gate on [`MOTION_LIVENESS`] or any other progress signal — so an
-/// instrumentation bug can never starve the dog and cause a spurious reset. The watchdog's job here is narrow: catch
-/// a CORE-0 wedge (the reporter/consumer/USB tasks all stop, which is the reported lockup's core-0 symptom). It
-/// CANNOT directly catch a core-1-only wedge (core 1 runs its own interrupt executor and never feeds this dog), but
-/// [`MOTION_LIVENESS`] is sampled here so a `defmt` capture still shows whether core 1 froze first.
+/// ## Goal B — conditional feed for a core-1-only stall (conservative)
+/// Case 2 is gated tightly so it can NEVER false-trip on legitimate operation: the feed is withheld ONLY when
+/// `EXECUTOR_RUNNING` is set (a block is genuinely executing — not idle, not parked on a feed-hold, which both
+/// clear it at the block boundary) AND the core-1 beat has not advanced for [`CORE1_STALL_TICKS`] (~4 s, well above
+/// the ~1.5 s worst-case single burst). An idle, parked, or dwelling executor (whose beat naturally is not
+/// advancing) keeps `EXECUTOR_RUNNING` false, so it is never mistaken for a wedge. A `G4` dwell runs in the
+/// consumer, not the executor, so `EXECUTOR_RUNNING` is false then too. The conservatism is deliberate: a spurious
+/// reset mid-cut is worse than missing one stall, so the bar for forcing a reset is "provably should be moving but
+/// has emitted nothing for 4 s".
+///
+/// ## Breadcrumb snapshots
+/// Each tick also bumps the [`CORE0_LIVENESS`] heartbeat and pushes a `(seq, core0_beat, core1_beat)` snapshot into
+/// the RTC_FAST crash ring ([`crate::crash::push_snapshot`]) — OFF the real-time path — so after a reset the boot
+/// dump can show which core's beat stopped advancing FIRST. The current executor stage rides the always-updated
+/// last-stage breadcrumb word, not per snapshot.
 ///
 /// `Rtc::rwdt::feed` takes `&mut self`, so the task owns the `Rtc` by `&'static mut` (parked in a `StaticCell` in
-/// `main`); it is the SOLE feeder, so no lock is needed. The `MOTION_LIVENESS` sample + delta log is `defmt`-gated so
-/// the default release build pays only the feed + one atomic load per 500 ms.
+/// `main`); it is the SOLE feeder, so no lock is needed.
 #[embassy_executor::task]
 pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) -> ! {
-  // The previous core-1 liveness sample, so each tick can report whether core 1 advanced since the last feed. Only
-  // needed for the `defmt` delta log — the default build does not sample (the bump in `motion.rs` is the cost; the
-  // read here would be a dead store under `#![deny(warnings)]`). Seeded from the first read so the first delta is
-  // meaningful rather than a spurious "moved from 0".
-  #[cfg(feature = "defmt")]
-  let mut last_liveness = MOTION_LIVENESS.load(Ordering::Relaxed);
+  // The previous core-1 beat and how many consecutive ticks it has stayed frozen WHILE a block was executing. Seeded
+  // from the first read so the first delta is meaningful rather than a spurious "moved from 0".
+  let mut last_core1 = MOTION_LIVENESS.load(Ordering::Relaxed);
+  let mut core1_frozen_ticks: u32 = 0;
   loop {
-    // Pet the dog FIRST, unconditionally, so a slow `defmt` sink or the sampling below can never delay the feed past
-    // the timeout. A healthy core 0 reaches this line every 500 ms; a wedged core 0 never does, and the dog fires.
+    // Bump the core-0 heartbeat first (proves THIS task is still running for the breadcrumb's per-core compare).
+    let core0 = CORE0_LIVENESS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let core1 = MOTION_LIVENESS.load(Ordering::Relaxed);
+
+    // Goal B core-1-stall detection: count consecutive ticks where the beat is frozen AND a block is in flight.
+    // `EXECUTOR_RUNNING` false (idle / parked / dwell) resets the count, so a legitimately non-advancing beat is
+    // never a stall. The reset condition is "executing but no burst for CORE1_STALL_TICKS".
+    let block_in_flight = EXECUTOR_RUNNING.load(Ordering::Acquire);
+    if block_in_flight && core1 == last_core1 {
+      core1_frozen_ticks = core1_frozen_ticks.saturating_add(1);
+    } else {
+      core1_frozen_ticks = 0;
+    }
+    last_core1 = core1;
+    let core1_wedged = core1_frozen_ticks >= CORE1_STALL_TICKS;
+
+    // Push a liveness snapshot into the RTC_FAST crash ring (off the real-time path) so a reset's boot dump can
+    // determine which core froze first.
+    crate::crash::push_snapshot(core0, core1);
+
+    if core1_wedged {
+      // A block is in flight but core 1 has emitted nothing for ~4 s: a genuine core-1 wedge. WITHHOLD the feed and
+      // let the already-armed 8 s RWDT reset the board — the breadcrumb (last stage = the wedged RMT axis) survives
+      // the reset and is dumped on the next boot. Record the verdict for the breadcrumb's stage view, then spin out
+      // the remaining time WITHOUT feeding (we still await so we never busy-spin core 0).
+      #[cfg(feature = "defmt")]
+      defmt::error!("watchdog: core-1 wedged mid-motion ({=u32} frozen ticks) — withholding feed to force reset", core1_frozen_ticks);
+      Timer::after(WATCHDOG_FEED_INTERVAL).await;
+      continue;
+    }
+
+    // Healthy (or legitimately idle): pet the dog. A slow path above can never delay this past the 8 s timeout (the
+    // whole loop body is a handful of atomic ops + one await).
     rtc.rwdt.feed();
-    // Diagnostic-only (defmt): sample the core-1 liveness counter and log whether it advanced. A frozen `current`
-    // while this task keeps running localizes the lockup to core 1 (it stopped scheduling its drain loop) BEFORE
-    // core 0 — the key "which core died first" signal for the lockup capture. Compiled out of the default build.
     #[cfg(feature = "defmt")]
-    {
-      let current = MOTION_LIVENESS.load(Ordering::Relaxed);
-      if current == last_liveness {
-        defmt::warn!("watchdog: core-1 liveness STALLED at {=u32} (core 1 may have wedged; core 0 still feeding)", current);
-      } else {
-        defmt::trace!("watchdog: core-1 liveness {=u32} -> {=u32} (advancing)", last_liveness, current);
-      }
-      last_liveness = current;
+    if core1_frozen_ticks > 0 {
+      defmt::warn!("watchdog: core-1 beat frozen ({=u32}/{=u32} ticks) while executing", core1_frozen_ticks, CORE1_STALL_TICKS);
     }
     Timer::after(WATCHDOG_FEED_INTERVAL).await;
   }
@@ -3828,11 +3940,16 @@ async fn write_setting_command(body: &[u8]) {
   }
 }
 
-/// Queue the `$I`/`$I+` build-info lines.
+/// Queue the `$I`/`$I+` build-info lines. Also REPLAYS a pending crash report (`[MSG:CRASH ...]`) here: `$I` is
+/// the readiness probe a host sends right after connecting, so a sender that reconnected too late to catch the
+/// boot-time emission still receives the post-mortem breadcrumb. Consumed (sent at most once more).
 async fn send_build_info(extended: bool) {
   let mut s = Response::new();
   if ResponseWriter::build_info(&mut s, extended).is_ok() {
     enqueue(s).await;
+  }
+  if let Some(report) = take_pending_crash_report() {
+    enqueue(report).await;
   }
 }
 
@@ -3935,6 +4052,9 @@ async fn error_bare(code: u8) {
 pub async fn status_responder() -> ! {
   loop {
     STATUS_REQUEST.wait().await;
+    // Bump the core-0 heartbeat (crash breadcrumb): every served report is proof the core-0 executor is alive, a
+    // finer-grained companion to the watchdog task's own bump for the "which core froze first" determination.
+    CORE0_LIVENESS.fetch_add(1, Ordering::Relaxed);
     // Read the cached, pre-derived status config (steps/mm, the `$10` MPos/WPos choice, and the feed ceiling)
     // from a synchronous `Cell` — NO `SETTINGS` lock, no ~30-field `Settings` copy on the hot path (Finding
     // #14). The cache is refreshed at every settings-commit site (see `refresh_status_cfg`), so a `$100`/`$10`/
@@ -4013,6 +4133,11 @@ pub async fn status_responder() -> ! {
     let mut s = Response::new();
     if ResponseWriter::status_report(&mut s, &snap).is_ok() {
       enqueue(s).await;
+    }
+    // Replay a pending crash report after the first status too (a host may poll `?` before `$I`). Consumed, so it
+    // is emitted at most once more total across the `$I` and `?` paths — whichever the host reaches first.
+    if let Some(report) = take_pending_crash_report() {
+      enqueue(report).await;
     }
   }
 }

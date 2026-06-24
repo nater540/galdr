@@ -65,6 +65,7 @@ use firmware_core::motion::MotionConfig;
 
 mod comms;
 mod coolant;
+mod crash;
 mod motion;
 mod spindle;
 mod storage;
@@ -91,6 +92,7 @@ const MOTION_EXECUTOR_PRIORITY: Priority = Priority::Priority3;
 ///   a `?`/banner burst, a back-pressure retry) is dwarfed by the margin.
 /// - The longest legitimate core-0 stall is a flash erase/write (tens of ms) and the consumer's coalesced persist;
 ///   none approaches a second, let alone 8. Feed-hold / `$SLP` park the MOTION core, not the core-0 feed task.
+///
 /// Only a true core-0 hang/deadlock/fault — the reported lockup's core-0 symptom — keeps the task from running for
 /// 8 s, which is exactly when we WANT the reset. The RWDT runs off the slow RTC clock, so multi-second timeouts are
 /// well within range. Stage 0's default action on expiry is a system reset (we do not reconfigure the stage action).
@@ -317,13 +319,36 @@ fn reset_reason_label(reason: esp_hal::rtc_cntl::SocResetReason) -> &'static str
 /// `defmt-espflash` feature installs — plain `println!` is taken over by that logger under `defmt`), while the
 /// default build uses esp-println's `println!` so a plain serial monitor still sees the reason on the next boot.
 /// Gating the two avoids any interaction between esp-println's plain and defmt back-ends.
-fn log_reset_reason() {
-  let pro = reset_reason(Cpu::ProCpu).map(reset_reason_label).unwrap_or("unknown");
+/// Returns `true` when this reset reason is a WATCHDOG or FAULT reset — i.e. an unexpected, possibly-wedge-driven
+/// reset whose crash breadcrumb is worth dumping — as opposed to a clean power-on / brown-out / deliberate
+/// soft-reset. A clean power-on or brown-out also CLEARS RTC_FAST (so a valid breadcrumb could not survive one
+/// anyway), but classifying here keeps the emit decision explicit and lets a defmt build label the cause.
+fn reset_was_watchdog_or_fault(reason: Option<esp_hal::rtc_cntl::SocResetReason>) -> bool {
+  use esp_hal::rtc_cntl::SocResetReason::*;
+  matches!(
+    reason,
+    // RTC / timer / super watchdogs (the auto-recover path this firmware arms), plus a software/CPU reset (an
+    // esp-backtrace panic handler issues one — the fault-handler-hang hypothesis), plus efuse-CRC / clock-glitch
+    // faults. Variant names are the esp-hal 1.1.1 esp32s3 set (`CpuRtcWdt`/`CpuSw`/`CpuMwdt0`, NOT the generic-doc
+    // `Cpu0*` names) — verified against the installed source.
+    Some(
+      CoreRtcWdt | CpuRtcWdt | SysRtcWdt | SysSuperWdt | CoreMwdt0 | CpuMwdt0 | CoreMwdt1 | CpuMwdt1 | CoreSw | CpuSw
+        | CoreEfuseCrc | SysClkGlitch
+    )
+  )
+}
+
+fn log_reset_reason() -> bool {
+  let pro_reason = reset_reason(Cpu::ProCpu);
+  let pro = pro_reason.map(reset_reason_label).unwrap_or("unknown");
   let app = reset_reason(Cpu::AppCpu).map(reset_reason_label).unwrap_or("unknown");
   #[cfg(feature = "defmt")]
   defmt::info!("boot: reset reason PRO_CPU={=str}, APP_CPU={=str}", pro, app);
   #[cfg(not(feature = "defmt"))]
   esp_println::println!("[boot] reset reason: PRO_CPU={}, APP_CPU={}", pro, app);
+  // The crash-report emit decision keys off the PRO_CPU (core 0) reason — the RWDT this firmware arms resets the
+  // whole system and reports there. Returned so `main` can pass it to `maybe_emit_crash_report`.
+  reset_was_watchdog_or_fault(pro_reason)
 }
 
 /// Async entry point. `#[esp_rtos::main]` expands to an `#[esp_hal::main]` reset handler that builds the
@@ -336,12 +361,20 @@ async fn main(spawner: Spawner) {
   let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
   let peripherals = esp_hal::init(config);
 
-  // 1b. Capture WHY the chip last reset, BEFORE arming the new watchdog, and log it (defmt). This is the whole
-  //     point of the watchdog for the lockup hunt: after the dog auto-resets a wedged board, the next boot reports
+  // 1b. Capture WHY the chip last reset, BEFORE arming the new watchdog, and log it. This is the whole point of the
+  //     watchdog for the lockup hunt: after the dog auto-resets a wedged board, the next boot reports
   //     `Cpu0RtcWdt`/`CoreRtcWdt` here instead of leaving us with only "it needed a hard power-cycle". A clean
   //     power-on reads `ChipPowerOn`; a brown-out reads `SysBrownOut`; a panic-driven software reset reads
-  //     `Cpu0Sw`/`CoreSw`. Logged on a default build too via esp-println (so a non-defmt monitor still sees it).
-  log_reset_reason();
+  //     `Cpu0Sw`/`CoreSw`. Logged on a default build too via esp-println. Returns whether it was a watchdog/fault
+  //     reset, which (with a valid breadcrumb) gates the post-mortem crash report emitted after the banner.
+  let reset_was_watchdog = log_reset_reason();
+
+  // 1b-ii. Read the previous run's crash breadcrumb out of RTC_FAST and CONSUME it (clear the magic), THEN stamp
+  //     the magic for THIS run. The breadcrumb survives a watchdog reset but NOT a power-cycle (see `crash`). It is
+  //     read before arming/spawning anything so the read reflects the wedged run, not this one; the formatted
+  //     `[MSG:CRASH ...]` line is emitted after the banner (step 8) over the normal grbl TX.
+  let breadcrumb = crash::take_breadcrumb();
+  crash::init_magic();
 
   // 1c. Arm the RTC watchdog as early as possible (before the slower settings/coordinate flash loads below) so a
   //     hang anywhere in bring-up is also caught. Stage 0's default action is a system reset; we set only its
@@ -595,6 +628,12 @@ async fn main(spawner: Spawner) {
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
   //    pipeline reset, with a best-effort copy from the reader half).
   comms::send_banner().await;
+  // Post-mortem crash report: if the previous run left a valid RTC_FAST breadcrumb AND this was a watchdog/fault
+  // reset, emit a `[MSG:CRASH ...]` line over the normal grbl TX right after the banner so a connected sender logs
+  // where the firmware wedged (e.g. `stage=axis1:wait_begin core1-froze-first`). It is ALSO stashed for one replay
+  // on the first `$I`/`?` after connect, so a host that reconnected late across the USB re-enumeration still gets
+  // it. A no-op on a clean boot (no valid breadcrumb).
+  comms::maybe_emit_crash_report(&breadcrumb, reset_was_watchdog).await;
   // If homing is enabled the machine booted locked in `ALARM:11`; push the boot alarm + `[MSG:'$H'|'$X' to
   // unlock]` right after the banner so a sender detects the locked state on connect (DOC-08 §5). When homing
   // is disabled this is a no-op and the machine comes up Idle.

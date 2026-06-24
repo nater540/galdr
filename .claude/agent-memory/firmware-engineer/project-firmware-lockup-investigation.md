@@ -80,12 +80,54 @@ compile-verified by API research only, not by cargo):**
 - mtrace chain: already complete in motion.rs `emit_burst` (per-axis `transmit Ok` / `wait begin` / `wait ok`/`wait err`)
   + loop chain — NO new trace was needed; a `wait begin` with no matching `wait ok` localizes the wedge to the exact axis.
 
-CAPTURE PROCEDURE for next lockup: flash `just flash --features defmt`, stream T1_Test, watch RTT. (a) After it wedges,
-the LAST mtrace line localizes a core-1 wedge to the axis/channel (or shows core 1 fine). (b) `watchdog: core-1 liveness
-STALLED` while the feed task still logs = core 1 died FIRST; both silent = core 0 (or both) wedged. (c) ~8 s after the
-wedge the RWDT should auto-reset; the reboot's `boot: reset reason ... = cpu0-rtc-WDT` confirms the dog fired (vs
-`cpu0-sw-reset` = a panic into esp-backtrace = the fault-handler-hang hypothesis). Default `just flash` also works
-(watchdog + reset-reason via esp-println active, no defmt traces).
+**IMPLEMENTED 2026-06-24 (RTC_FAST POST-MORTEM crash breadcrumb — supersedes live-RTT capture; ACTUALLY COMPILED on the
+esp toolchain, both default + `--features defmt`, `-D warnings`-clean, clippy-clean, 522 firmware-core host tests green):**
+KEY INSIGHT (coordinator): live defmt/RTT is the WRONG tool — esp-println/defmt AND grbl comms BOTH ride the ONE
+USB-Serial-JTAG (`peripherals.USB_DEVICE`), so you can't stream + monitor at once, and a both-cores-dead wedge emits
+nothing live anyway. The capture is a POST-MORTEM over the normal grbl channel AFTER the watchdog resets the board, and
+works in the DEFAULT (no-defmt) build.
+- New module `crates/firmware/src/crash.rs` (+ `mod crash;` in main.rs). `static BREADCRUMB: [portable_atomic::AtomicU32;
+  LEN]` under `#[esp_hal::ram(unstable(rtc_fast, persistent))]` (VERIFIED attribute: NOT `#[ram(rtc_fast)]`; args MUST be
+  inside `unstable(...)`; `persistent` skips warm-reset re-init; there is no `uninitialized` kw). Type MUST be
+  `portable_atomic::AtomicU32` — esp-hal 1.1.1 impls `Persistable` for THAT, not `core::sync::atomic` (confirmed in the
+  installed `esp-hal-1.1.1/src/lib.rs` impl_persistable! macro). Added `portable-atomic = "1"` direct dep.
+- Layout: `[MAGIC, LAST_STAGE, SEQ, HEAD, ring...]`; ring = RING_LEN=4 snapshots × SNAP_WORDS=3 `[seq, core0_beat,
+  core1_beat]`. `record_stage(Stage, axis)` = ONE relaxed store on the hot path at each motion.rs mtrace site
+  (LoopEntered/LockAcquired/BlockPopped/FeedPublished/EmitBurst/AxisTransmit/AxisWaitBegin/AxisWaitDone/IdleWaiting; the
+  per-axis ones carry the RMT channel index). `push_snapshot` runs OFF the real-time path in the watchdog-feed task.
+  `take_breadcrumb()` (boot) reads + CONSUMES (clears magic), then `init_magic()` re-stamps for this run.
+- RETENTION: survives RWDT stage-0 "reset main system" (RTC domain preserved; esp-hal `persistent` doc names "watchdog
+  timeouts") — NOT a power-cycle/brownout (clears RTC_FAST). OPERATOR MUST LET THE DOG BITE, not yank power. CAVEAT: if a
+  ROM/bootloader path or a "reset RTC" WDT action ever clears the RTC domain the crumb is lost — BENCH-VERIFY once (write
+  crumb → force RWDT → confirm crumb readable after reset). Default RWDT stage-0 is the RTC-preserving action.
+- Core-0 heartbeat: `pub static CORE0_LIVENESS: AtomicU32` (comms.rs), bumped by `watchdog_feed` each tick AND
+  `status_responder` per report. `crash::froze_first(&snapshots)` compares trailing frozen-run lengths of c0 vs c1 beats →
+  `core1-froze-first`/`core0-froze-first`/`both-froze`/`no-stall`/`insufficient-data`.
+- Boot dump: `comms::maybe_emit_crash_report(&breadcrumb, reset_was_watchdog)` (main step 8, after banner) emits a grbl
+  `[MSG:CRASH stage=axis1:wait_begin core1-froze-first beats c0=N c1=M (RWDT-reset; not power-cycle)]` via the NORMAL TX
+  (`ResponseWriter::message` + `enqueue`, NOT raw esp-println), gated on valid crumb AND watchdog/fault reset
+  (`reset_was_watchdog_or_fault` — uses the REAL esp32s3 variants `CpuRtcWdt`/`CpuSw`/`CpuMwdt0/1`, NOT generic-doc
+  `Cpu0*`; the Cargo-comment-warned variant-name trap bit me here, caught by compiling). ALSO stashed in `CRASH_REPORT`
+  and replayed ONCE on the first `$I` (send_build_info) or `?` (status_responder) after connect, to survive a skirnir
+  reconnect race across the USB re-enumeration.
+- GOAL B (core-1-only stall → force reset): `watchdog_feed` WITHHOLDS the feed (lets the 8 s RWDT fire) when
+  `EXECUTOR_RUNNING` is true AND MOTION_LIVENESS frozen for `CORE1_STALL_TICKS=8` (~4 s, >2.5× the ~1.5 s worst-case
+  single burst). CONSERVATIVE: idle/parked/dwell all clear EXECUTOR_RUNNING so they never false-trip; only "provably
+  executing but no burst for 4 s" forces the reset. Not behind a feature gate (judged safe given the tight gating) — if
+  it ever false-trips on the bench, raise CORE1_STALL_TICKS or gate it.
+- Cargo.toml (Goal C): corrected the `defmt` feature comment — the defmt sink is NOT a separate RTT channel; it's the
+  SAME USB-Serial-JTAG as grbl on the S3 (no separate RTT without an external JTAG probe).
+- KNOWN LATENT BUG SPOTTED (not in scope, flagged): `RmtStepSink::emit_burst` calls `encode_channel` for axes 0,1,2 only
+  but the transmit/wait loops iterate `0..AXES`=0..4, so axis 3 (A) transmits STALE `scratch[3]` (all-end-marker from
+  init → completes instantly, harmless for T1_Test which has no A motion, but A never steps correctly). Fix later.
+
+CAPTURE PROCEDURE (no defmt needed): `just flash` (plain), connect skirnir, stream T1_Test NORMALLY. When it wedges, WAIT
+~8-12 s — do NOT power-cycle — for the RWDT auto-reset. After reboot, skirnir's console shows the banner then a
+`[MSG:CRASH stage=... <which-core>-froze-first beats c0=.. c1=..]` line (also replayed on the first `$I`/`?`). A frozen
+`stage=axisN:wait_begin` pins the wedge to RMT channel N's TX-END never firing — the prime suspect. `core1-froze-first`
+confirms core 1 died before core 0. The `[boot] reset reason: PRO_CPU=...` (esp-println) line shows `cpu-rtc-WDT` (dog
+fired) vs `cpu-sw-reset` (panic into esp-backtrace = fault-handler hang). `--features defmt` still adds the live mtrace
+chain if streaming over a SECOND path is ever possible, but is no longer required.
 
 **BEST NEXT STEP = BENCH INSTRUMENTATION (source review cannot pin it):** (1) add the watchdog (defect #1) and read the
 reset reason on the next lockup — distinguishes panic/fault (backtrace handler hang) from a pure spin. (2) Build
