@@ -63,6 +63,25 @@ pub fn trail_connects(a: ModelPoint, b: ModelPoint, max_gap: f32) -> bool {
   dist_sq(a, b) <= max_gap * max_gap
 }
 
+/// Classify a trail point as a rapid (non-cutting travel) move from the live realized feed rate, so the trail can
+/// colour rapids apart from cuts. The firmware reports the REALIZED feed (`FS:`), which for a G0 is the machine's
+/// rapid traverse rate — faster than any programmed cutting feed. So a realized feed above the program's maximum
+/// programmed feed (scaled by the live feed-override fraction, with `margin` of headroom) is a rapid; at or below
+/// it is a cut. Returns `false` (cut) when the feed is unknown or the program declares no cutting feed
+/// (`max_programmed_feed <= 0`), so an unclassifiable point takes the cut colour rather than mislabelling travel.
+/// Pure so the classification is unit-tested. (Edge case: an extreme feed-override-up combined with a programmed
+/// cut feed near the rapid rate can misclassify; the common cases — modest overrides, rapid rate well above cut
+/// feeds — are robust.)
+pub fn is_rapid_feed(feed: Option<f64>, max_programmed_feed: f64, feed_override_frac: f64, margin: f64) -> bool {
+  let Some(feed) = feed else {
+    return false;
+  };
+  if max_programmed_feed <= 0.0 {
+    return false;
+  }
+  feed > max_programmed_feed * feed_override_frac.max(0.01) * margin
+}
+
 /// Decide whether the live tool marker should be drawn this frame, given the live work point, the toolpath's
 /// model-space `(min, max)` bounds, the margin to allow outside them, and whether the machine is in an active
 /// motion state (Run/Jog/Hold). The marker is shown when the point lies within the bounds expanded by `margin`,
@@ -181,6 +200,22 @@ mod tests {
     // reconnect) is left broken so no spurious streak is drawn across work the tool never cut.
     assert!(trail_connects((0.0, 0.0), (2.0, 0.0), 5.0), "a small step joins");
     assert!(!trail_connects((0.0, 0.0), (50.0, 0.0), 5.0), "a large jump breaks the trail");
+  }
+
+  #[test]
+  fn is_rapid_feed_separates_rapids_from_cuts_around_the_max_programmed_feed() {
+    // Program tops out at F1000; rapids run faster than any cut. At 100% override with a 1.2 margin the threshold
+    // is 1200: a 3000 mm/min rapid is over it (rapid), an 800 mm/min cut is under it (cut), and a cut at the
+    // programmed max is still a cut.
+    assert!(is_rapid_feed(Some(3000.0), 1000.0, 1.0, 1.2), "a fast move is a rapid");
+    assert!(!is_rapid_feed(Some(800.0), 1000.0, 1.0, 1.2), "a slow move is a cut");
+    assert!(!is_rapid_feed(Some(1000.0), 1000.0, 1.0, 1.2), "a cut at the programmed max is still a cut");
+    // The threshold scales with the live feed override: at 200% a 1900 mm/min reading is still a cut (a 1000 cut
+    // run at 2× override), not a rapid.
+    assert!(!is_rapid_feed(Some(1900.0), 1000.0, 2.0, 1.2), "an overridden cut is not a rapid");
+    // Unknown feed, or a program with no cutting feed at all, defaults to cut (never paints travel-colour blindly).
+    assert!(!is_rapid_feed(None, 1000.0, 1.0, 1.2));
+    assert!(!is_rapid_feed(Some(5000.0), 0.0, 1.0, 1.2));
   }
 
   #[test]

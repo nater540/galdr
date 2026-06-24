@@ -67,9 +67,15 @@ pub struct UiState {
   /// The position trail: a LinuxCNC-AXIS-style "backplot" of where the tool has ACTUALLY been, in toolpath model
   /// space (work-coordinate XY mm), oldest first. Live work positions are appended as the tool moves (decimated by
   /// a step gate) and the trail is drawn as a polyline over the dim preview, so it shows real travel rather than
-  /// guessing which preview segment the tool is on. Capped at [`MAX_TRAIL_POINTS`] (rolling, oldest dropped) and
-  /// cleared by [`Self::set_program`].
-  trail: std::collections::VecDeque<Vec2>,
+  /// guessing which preview segment the tool is on. Each point carries whether it was a rapid (travel) move so the
+  /// trail can colour rapids apart from cuts. Capped at [`MAX_TRAIL_POINTS`] (rolling, oldest dropped) and cleared
+  /// by [`Self::set_program`].
+  trail: std::collections::VecDeque<TrailPoint>,
+  /// The maximum programmed feed (`F` word, mm/min) in the loaded program, scanned once at load. Rapids run faster
+  /// than any programmed cut, so the live realized feed measured against this (scaled by the live feed override)
+  /// classifies each trail point as rapid vs cut (see [`super::preview::is_rapid_feed`]). Zero when no program is
+  /// loaded or it carries no feed.
+  max_feed: f64,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
   /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
@@ -190,6 +196,7 @@ impl Default for UiState {
       toolpath_bounds: None,
       marker_pos: None,
       trail: std::collections::VecDeque::new(),
+      max_feed: 0.0,
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
@@ -277,6 +284,7 @@ impl UiState {
     self.program_path = path;
     self.toolpath = parse_xy_path(&self.program);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
+    self.max_feed = max_programmed_feed(&self.program);
     // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
     // even if the old program happened to leave us followed at the same row index.
     self.program_followed_line = None;
@@ -2130,6 +2138,10 @@ const TRAIL_BREAK_FRACTION: f32 = 0.12;
 /// bounding memory and per-frame draw cost on a long job; the decimating step gate keeps a typical job well under.
 const MAX_TRAIL_POINTS: usize = 30_000;
 
+/// Headroom above the (override-scaled) max programmed feed before a realized feed counts as a rapid. Absorbs the
+/// gap between cutting feeds and the machine's faster rapid-traverse rate while tolerating modest feed variation.
+const RAPID_FEED_MARGIN: f64 = 1.2;
+
 /// How far outside the toolpath's model-space bounds the live marker may sit and still be drawn, as a fraction of
 /// the span diagonal. Generous enough that a tool a little outside the drawn extents (lead-in, clearance move)
 /// still shows while idle, tight enough that a grossly displaced point — a 25.4× units mismatch (#3), a homed-off
@@ -2142,17 +2154,44 @@ fn span_diagonal(span: egui::Vec2) -> f32 {
   (span.x * span.x + span.y * span.y).sqrt().max(1.0)
 }
 
+/// One point of the position trail: a model-space tool position plus whether the move into it was a rapid (travel)
+/// rather than a cut, so the trail can colour the two apart.
+#[derive(Debug, Clone, Copy)]
+struct TrailPoint {
+  pos: Vec2,
+  rapid: bool,
+}
+
 /// Append the live work position to the trail if the tool has moved at least `min_step` from the last point, and
-/// enforce the rolling [`MAX_TRAIL_POINTS`] cap (oldest dropped). The decision itself is the pure
+/// enforce the rolling [`MAX_TRAIL_POINTS`] cap (oldest dropped). `rapid` is whether the current move is a travel
+/// move (see [`super::preview::is_rapid_feed`]). The append decision itself is the pure
 /// [`super::preview::trail_should_append`]; this just owns the `VecDeque` mutation.
-fn push_trail_point(trail: &mut std::collections::VecDeque<Vec2>, point: Vec2, min_step: f32) {
-  let last = trail.back().map(|p| (p.x, p.y));
+fn push_trail_point(trail: &mut std::collections::VecDeque<TrailPoint>, point: Vec2, rapid: bool, min_step: f32) {
+  let last = trail.back().map(|p| (p.pos.x, p.pos.y));
   if preview::trail_should_append(last, (point.x, point.y), min_step) {
-    trail.push_back(point);
+    trail.push_back(TrailPoint { pos: point, rapid });
     while trail.len() > MAX_TRAIL_POINTS {
       trail.pop_front();
     }
   }
+}
+
+/// Scan a loaded program for the maximum programmed feed (`F` word, mm/min). Used to classify trail points as
+/// rapid vs cut: rapids run faster than any programmed cut. Comments are stripped and words read with the same
+/// lexer as the toolpath parser; a program with no `F` word yields `0.0` (then nothing is classed as a rapid).
+fn max_programmed_feed(lines: &[String]) -> f64 {
+  let mut max = 0.0_f64;
+  for line in lines {
+    let code = line.split(';').next().unwrap_or("").to_ascii_uppercase();
+    for (letter, number) in gcode_words(&code) {
+      if letter == 'F'
+        && let Ok(f) = number.parse::<f64>()
+      {
+        max = max.max(f);
+      }
+    }
+  }
+  max
 }
 
 /// Render the 2D toolpath viewport: a top-down XY preview of the loaded program drawn with [`egui::Painter`].
@@ -2213,16 +2252,20 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
     painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(1.0, color));
   }
 
-  // The position trail (warm motion accent): the AXIS-style backplot of where the tool has actually been, drawn
-  // over the dim preview. Consecutive points are joined only when close enough — a large gap is a rapid reposition
-  // or a reconnect and is left broken rather than streaked across uncut work (see [`preview::trail_connects`]).
+  // The position trail: the AXIS-style backplot of where the tool has actually been, drawn over the dim preview.
+  // Cut moves take the warm motion accent; rapid (travel) moves take the cool accent and a thinner stroke, so the
+  // two read apart. Consecutive points are joined only when close enough — a large gap is a reconnect/teleport and
+  // is left broken rather than streaked across uncut work (see [`preview::trail_connects`]). The move INTO a point
+  // carries that point's rapid flag, so the drawn segment is coloured by `cur`.
   let break_gap = span_diagonal(span) * TRAIL_BREAK_FRACTION;
-  let mut prev: Option<&Vec2> = None;
+  let mut prev: Option<&TrailPoint> = None;
   for cur in &state.trail {
     if let Some(a) = prev
-      && preview::trail_connects((a.x, a.y), (cur.x, cur.y), break_gap)
+      && preview::trail_connects((a.pos.x, a.pos.y), (cur.pos.x, cur.pos.y), break_gap)
     {
-      painter.line_segment([to_screen(*a), to_screen(*cur)], egui::Stroke::new(1.6, Theme::ACCENT_MOTION));
+      let (color, width) =
+        if cur.rapid { (Theme::ACCENT, 1.0) } else { (Theme::ACCENT_MOTION, 1.6) };
+      painter.line_segment([to_screen(a.pos), to_screen(cur.pos)], egui::Stroke::new(width, color));
     }
     prev = Some(cur);
   }
@@ -2279,8 +2322,12 @@ fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec
 
   // Extend the position trail (the backplot of where the tool has actually been) from the RAW live work position —
   // not the smoothed marker, which lags — so the trail records true travel. The step gate decimates the status
-  // feed; the rolling cap bounds it.
-  push_trail_point(&mut state.trail, egui::vec2(target.0, target.1), diagonal * TRAIL_MIN_STEP_FRACTION);
+  // feed; the rolling cap bounds it. Classify the point as rapid vs cut from the live realized feed measured
+  // against the program's max programmed feed, scaled by the live feed override.
+  let feed = view.status.as_ref().and_then(|s| s.feed_speed).map(|(feed, _, _)| feed);
+  let feed_override = view.status.as_ref().and_then(|s| s.overrides).map_or(1.0, |(f, _, _)| f as f64 / 100.0);
+  let rapid = preview::is_rapid_feed(feed, state.max_feed, feed_override, RAPID_FEED_MARGIN);
+  push_trail_point(&mut state.trail, egui::vec2(target.0, target.1), rapid, diagonal * TRAIL_MIN_STEP_FRACTION);
 
   // Gate the marker: drawn on/near the path or while actively moving, suppressed for a parked-off-path point
   // (#3/#4/#5). Use the SMOOTHED position so the gate matches what is drawn. The trail still extended above, so it
@@ -2718,20 +2765,36 @@ mod tests {
   #[test]
   fn push_trail_point_appends_real_moves_decimates_jitter_and_caps_length() {
     use std::collections::VecDeque;
-    let mut trail: VecDeque<Vec2> = VecDeque::new();
-    // First point is always taken; a sub-step wiggle is dropped; a real move is appended.
-    push_trail_point(&mut trail, egui::vec2(0.0, 0.0), 1.0);
-    push_trail_point(&mut trail, egui::vec2(0.3, 0.0), 1.0); // jitter < min_step → ignored
-    push_trail_point(&mut trail, egui::vec2(2.0, 0.0), 1.0); // real move → appended
+    let mut trail: VecDeque<TrailPoint> = VecDeque::new();
+    // First point is always taken; a sub-step wiggle is dropped; a real move is appended (with its rapid flag).
+    push_trail_point(&mut trail, egui::vec2(0.0, 0.0), false, 1.0);
+    push_trail_point(&mut trail, egui::vec2(0.3, 0.0), false, 1.0); // jitter < min_step → ignored
+    push_trail_point(&mut trail, egui::vec2(2.0, 0.0), true, 1.0); // real move → appended
     assert_eq!(trail.len(), 2);
-    assert_eq!(*trail.back().unwrap(), egui::vec2(2.0, 0.0));
+    assert_eq!(trail.back().unwrap().pos, egui::vec2(2.0, 0.0));
+    assert!(trail.back().unwrap().rapid, "the move's rapid flag is recorded");
     // The rolling cap drops the oldest once full.
-    let mut full: VecDeque<Vec2> = (0..MAX_TRAIL_POINTS as i32).map(|i| egui::vec2(i as f32 * 10.0, 0.0)).collect();
+    let mut full: VecDeque<TrailPoint> =
+      (0..MAX_TRAIL_POINTS as i32).map(|i| TrailPoint { pos: egui::vec2(i as f32 * 10.0, 0.0), rapid: false }).collect();
     let newest = egui::vec2(MAX_TRAIL_POINTS as f32 * 10.0, 0.0);
-    push_trail_point(&mut full, newest, 1.0);
+    push_trail_point(&mut full, newest, false, 1.0);
     assert_eq!(full.len(), MAX_TRAIL_POINTS, "length is capped");
-    assert_eq!(*full.back().unwrap(), newest, "newest point retained");
-    assert_eq!(*full.front().unwrap(), egui::vec2(10.0, 0.0), "oldest point dropped");
+    assert_eq!(full.back().unwrap().pos, newest, "newest point retained");
+    assert_eq!(full.front().unwrap().pos, egui::vec2(10.0, 0.0), "oldest point dropped");
+  }
+
+  #[test]
+  fn max_programmed_feed_takes_the_largest_f_word() {
+    let program = vec![
+      "G0 X0 Y0".to_string(),         // rapid, no F
+      "G1 X10 Y0 F300".to_string(),   // cut at 300
+      "G1 X10 Y10 F1200.5".to_string(), // cut at 1200.5 (the max), decimal
+      "G1 X0 Y10 F800".to_string(),   // cut at 800
+      "; F9999 in a comment".to_string(), // comment-only line is ignored
+    ];
+    assert_eq!(max_programmed_feed(&program), 1200.5);
+    // A program with no feed word at all reports zero (nothing will be classed as a rapid).
+    assert_eq!(max_programmed_feed(&["G0 X1 Y1".to_string()]), 0.0);
   }
 
   #[test]
