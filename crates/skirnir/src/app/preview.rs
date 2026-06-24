@@ -65,54 +65,69 @@ fn project_onto(start: ModelPoint, end: ModelPoint, p: ModelPoint) -> (f32, f32)
   (t, dist_sq(foot, p))
 }
 
-/// Compute the monotonically-advancing cut-progress index by walking the path forward from `previous` to the
-/// segment the cutter is currently CLOSEST to, advancing one segment at a time while the next is at least as near
-/// as the current and stopping at the first local distance-minimum. `segments` are the model-space `(start, end)`
-/// pairs in path order; the returned index is the count of leading segments coloured "cut".
+/// Compute the cut-progress boundary by combining the two signals the sender actually has: the line counter (what
+/// has been STREAMED to the controller) and the live tool position (where the cutter actually is). Returns the
+/// count of leading segments to colour "cut".
 ///
-/// Two earlier approaches each failed on real toolpaths, and this rule is chosen to avoid both:
-/// - A "nearest segment across the whole forward window" scan OVER-advanced: on a self-approaching path — a
-///   spiral pocket's parallel rings, the out/back edges that nearly touch at a star tip, a self-crossing move, or
-///   the centre where a spiral's rings converge — a FUTURE segment is often physically closer than the one the
-///   cutter is on, so the boundary leapt onto it and the monotonic guard froze the over-advance, painting most of
-///   the job "cut" before the tool reached it.
-/// - A contiguous walk gated on the AXIAL projection fraction STALLED: a spiral reverses direction every pass, so
-///   the cutter's position projects to a low fraction on segments it has already traversed, halting the walk at
-///   the first reversing segment so nothing coloured at all.
+/// Geometry alone cannot localise a sampled point on a self-intersecting path — a spiral pocket's parallel rings
+/// and a star tip's out/back edges sit right on top of each other, so "where on the path is the tool?" is
+/// ambiguous, and a pure-geometry rule either leaps onto a spatially-near future ring or stalls on a reversal.
+/// The line counter removes that ambiguity. `acked` lines have been accepted by the controller, so nothing past
+/// segment frontier `hi = {segments with line_index < acked}` can be cut. The controller runs BEHIND `acked` by
+/// its buffer depth (grbl acks a line when it enters the planner buffer, not when the move finishes), so the
+/// executing line is roughly `acked - in_flight_lines`; the caller derives `in_flight_lines` from the live `Bf:`
+/// buffer report. That bounds the cutter to a small, CONTIGUOUS line-window `[lo, hi)` which does not fold back on
+/// itself, so within it the nearest segment to the live position is the move executing now — unambiguously.
 ///
-/// Walking to the first local minimum of PERPENDICULAR distance fixes both. Perpendicular distance does not flip
-/// on a reversal, so a reversing move advances normally (no stall). Stopping at the first local minimum keeps the
-/// walk contiguous: to reach a spatially-near future ring the walk would have to cross the current segment's far
-/// end, where distance rises and the walk breaks — so it can never leap (no over-advance). The cutter's segment
-/// is counted cut once the foot passes [`COMPLETE_FRACTION`] of it, else it is the move in progress and the
-/// boundary sits just before it. The boundary never retreats below `previous` (it starts there and only climbs).
-/// `window` caps the per-frame advance so the walk is O(window) even after a long status gap (it catches up over
-/// a few frames). Takes a borrowed slice so the caller passes a cached list with no per-frame allocation; reset
-/// `previous` to 0 for a fresh run.
-pub fn progressed_segment(segments: &[Segment], work: ModelPoint, previous: usize, window: usize) -> usize {
-  let len = segments.len();
-  let start = previous.min(len);
-  if start >= len {
-    return start; // Already at (or past) the path's end — nothing left to walk; hold the boundary.
+/// The search starts at `previous.clamp(lo, hi)`: capped at the frontier so progress can never run ahead of what
+/// is streamed (no over-advance), and floored at `lo` so that as `acked` advances `lo` drags the boundary forward
+/// even if the position match stumbles (no stall). The matched segment is counted cut once its foot passes
+/// [`COMPLETE_FRACTION`]. The boundary never retreats below `previous` (monotonic within a run; reset `previous`
+/// to 0 for a fresh run). `line_index` is the per-segment program line, parallel to `segments` and monotonic
+/// non-decreasing, so the frontier lookups are binary partitions. Pure, so the whole rule is unit-tested.
+pub fn live_cut_boundary(
+  segments: &[Segment],
+  line_index: &[u32],
+  work: ModelPoint,
+  acked: u32,
+  in_flight_lines: u32,
+  previous: usize,
+) -> usize {
+  debug_assert_eq!(segments.len(), line_index.len(), "segments and line_index must be parallel");
+  // Frontier: segments whose program line has been acknowledged. Nothing beyond this is even in the controller
+  // yet, so it is a hard upper bound on what can be cut. line_index is monotonic, so this is a binary partition.
+  let hi = line_index.partition_point(|&l| l < acked);
+  if hi == 0 {
+    return 0; // Nothing acknowledged yet — nothing cut.
   }
-  let limit = (start + window.max(1)).min(len);
-  // Walk to the locally-closest segment: advance while the NEXT segment is at least as near the cutter as the
-  // current one. Perpendicular distance (not axial fraction) follows a reversing move; the first local minimum
-  // stops the walk contiguously so it cannot jump across a spatially-near future segment.
-  let mut boundary = start;
-  while boundary + 1 < limit {
-    let (_, d_cur) = project_onto(segments[boundary].0, segments[boundary].1, work);
-    let (_, d_next) = project_onto(segments[boundary + 1].0, segments[boundary + 1].1, work);
-    if d_next <= d_cur {
-      boundary += 1;
-    } else {
-      break;
+  // Clamp a stale `previous` (e.g. the program shrank) to the frontier so the monotonic floor below cannot exceed
+  // the path length and the `clamp` calls stay well-ordered.
+  let previous = previous.min(hi);
+  // The executing line trails `acked` by the live buffer depth; map that line back to the first in-flight segment.
+  let lo_line = acked.saturating_sub(in_flight_lines.max(1));
+  let lo = line_index.partition_point(|&l| l < lo_line);
+  // Search the in-flight window: floored at `lo` (advances with `acked`, so it cannot stall) and capped at `hi`
+  // (cannot run past what is streamed). Monotonic: never below `previous`.
+  let start = previous.clamp(lo, hi);
+  if start >= hi {
+    return start;
+  }
+  // Within this small contiguous window the path does not self-intersect, so the nearest segment to the live
+  // position is the move executing now. Ties resolve to the earliest index so the boundary advances steadily.
+  let mut best = start;
+  let mut best_fraction = 0.0_f32;
+  let mut best_dist = f32::INFINITY;
+  for (offset, &(seg_start, seg_end)) in segments[start..hi].iter().enumerate() {
+    let (fraction, dist) = project_onto(seg_start, seg_end, work);
+    if dist < best_dist {
+      best_dist = dist;
+      best_fraction = fraction;
+      best = start + offset;
     }
   }
-  // The cutter sits on `boundary` (the locally-closest segment): count it cut once the foot passes the midpoint,
-  // otherwise it is the move in progress and the boundary holds just before it.
-  let (fraction, _) = project_onto(segments[boundary].0, segments[boundary].1, work);
-  if fraction >= COMPLETE_FRACTION { boundary + 1 } else { boundary }
+  // The executing segment counts as cut once the foot passes its midpoint, else it is the move in progress.
+  let reached = if best_fraction >= COMPLETE_FRACTION { best + 1 } else { best };
+  reached.clamp(previous, hi)
 }
 
 /// Decide whether the live tool marker should be drawn this frame, given the live work point, the toolpath's
@@ -211,129 +226,94 @@ mod tests {
     assert_eq!(smooth_marker(Some((4.0, 0.0)), (10.0, 0.0), 50.0, -5.0), (4.0, 0.0));
   }
 
-  /// A short straight path of four unit `(start, end)` segments along X: (0→1), (1→2), (2→3), (3→4).
-  fn straight_path() -> Vec<Segment> {
-    vec![((0.0, 0.0), (1.0, 0.0)), ((1.0, 0.0), (2.0, 0.0)), ((2.0, 0.0), (3.0, 0.0)), ((3.0, 0.0), (4.0, 0.0))]
-  }
-
-  /// A generous forward window for the straight-path tests — large enough to cover the whole path so the bound
-  /// itself is not what is under test (its own test exercises the bounding).
-  const WIN: usize = 16;
-
-  #[test]
-  fn progressed_segment_advances_as_the_foot_projects_along_the_path() {
-    let path = straight_path();
-    // At x=2.0 the tool sits exactly at the end of segment 1 (the 1→2 move): segments 0 and 1 are complete (the
-    // projection onto segment 1 is at fraction 1.0 ≥ the completion threshold), so the boundary is 2.
-    assert_eq!(progressed_segment(&path, (2.0, 0.0), 0, WIN), 2);
-    // Partway through segment 2 (x=2.7, past its midpoint) flips segment 2 to cut as well: boundary 3.
-    assert_eq!(progressed_segment(&path, (2.7, 0.0), 0, WIN), 3);
-    // Just inside segment 2 (x=2.2, before its midpoint) leaves it as the move in progress: boundary holds at 2.
-    assert_eq!(progressed_segment(&path, (2.2, 0.0), 0, WIN), 2);
+  /// A straight path of `n` unit `(start, end)` segments along X — segment `i` spans `(i,0)→(i+1,0)` and comes
+  /// from program line `i`, so the line index is parallel and monotonic (one segment per line).
+  fn line_path(n: u32) -> (Vec<Segment>, Vec<u32>) {
+    let segs = (0..n).map(|i| ((i as f32, 0.0), ((i + 1) as f32, 0.0))).collect();
+    let lines = (0..n).collect();
+    (segs, lines)
   }
 
   #[test]
-  fn progressed_segment_is_monotonic_and_never_backtracks() {
-    let path = straight_path();
-    // Having progressed to index 3, a status sample that projects back onto an earlier segment (jitter / a tiny
-    // overshoot correction) must NOT un-cut the later segments: the boundary holds at 3.
-    assert_eq!(progressed_segment(&path, (1.0, 0.0), 3, WIN), 3);
+  fn live_cut_boundary_is_zero_before_anything_is_acknowledged() {
+    let (s, l) = line_path(5);
+    // Nothing streamed yet (`acked == 0`): the frontier is empty, so nothing is cut regardless of position.
+    assert_eq!(live_cut_boundary(&s, &l, (3.0, 0.0), 0, 8, 0), 0);
   }
 
   #[test]
-  fn progressed_segment_does_not_leap_on_a_revisited_coordinate() {
-    // THE finding #1 regression: a closed contour that RETURNS to the origin. The old furthest-endpoint scan saw
-    // the live point near the shared (0,0) coordinate the *last* segment ends at and leapt the boundary to the end
-    // of the job while the tool was still at the start. The bounded forward projection only looks a `window` of
-    // segments ahead, so being at the origin colours just the first segment-in-progress, never the whole loop.
-    // A unit square traversed CCW, closing back to (0,0):
-    let square = vec![
-      ((0.0, 0.0), (1.0, 0.0)),
-      ((1.0, 0.0), (1.0, 1.0)),
-      ((1.0, 1.0), (0.0, 1.0)),
-      ((0.0, 1.0), (0.0, 0.0)),
-    ];
-    // The tool is at the start (0,0), having just begun. With a small forward window the boundary is 0 (segment 0
-    // is the move in progress, barely entered) — emphatically NOT 4 (the whole square), which the old scan gave
-    // because the final segment also ends at (0,0).
-    assert_eq!(progressed_segment(&square, (0.0, 0.0), 0, 2), 0);
+  fn live_cut_boundary_never_colours_past_the_streamed_frontier() {
+    let (s, l) = line_path(10);
+    // Only lines 0..3 are acknowledged. Even though the live position sits way down at segment 8, the boundary
+    // cannot exceed the streamed frontier (3) — the controller has not even received the later moves. This is the
+    // over-advance cap: a spatially-near future segment that has not been streamed can never be coloured.
+    let b = live_cut_boundary(&s, &l, (8.5, 0.0), 3, 8, 0);
+    assert!(b <= 3, "must not colour past the acked frontier, got {b}");
   }
 
   #[test]
-  fn progressed_segment_does_not_leap_to_a_spatially_nearer_future_segment() {
-    // THE bright-orange-everywhere regression. A path that later crosses back over an earlier segment, so a FUTURE
-    // segment passes physically NEARER the cutter than the one it is actually on — exactly what a spiral pocket's
-    // parallel rings and a star tip's out/back edges do. The cutter is just past the midpoint of segment 0, sitting
-    // a hair off it (a flattened-arc secant / smoothing lag), right where the vertical segment 3 crosses:
-    let crossing = vec![
-      ((0.0, 0.0), (10.0, 0.0)),   // seg 0: the move the cutter is ON, near its midpoint (x≈5)
-      ((10.0, 0.0), (10.0, 10.0)), // seg 1
-      ((10.0, 10.0), (5.0, 10.0)), // seg 2
-      ((5.0, 10.0), (5.0, -5.0)),  // seg 3: a vertical at x=5 that crosses seg 0 at (5,0) — spatially ON the cutter
-    ];
-    // The cutter is at (5, 0.01): essentially the midpoint of seg 0, but its perpendicular distance to the vertical
-    // seg 3 is ~0 (nearer than to seg 0). A nearest-in-window scan would leap the boundary onto seg 3 (returning 4 —
-    // the whole path "cut"). The contiguous walk passes only seg 0 (it cannot reach seg 3 without passing 1 and 2,
-    // which the cutter has not), so the boundary is 1.
-    assert_eq!(progressed_segment(&crossing, (5.0, 0.01), 0, WIN), 1);
+  fn live_cut_boundary_localises_the_cutter_within_the_in_flight_window() {
+    let (s, l) = line_path(10);
+    // Six lines acked, the controller running two lines behind (executing ~line 4). The live tool is on segment 4,
+    // so the boundary lands just past it (5) — the position refines within the line-bounded in-flight window.
+    assert_eq!(live_cut_boundary(&s, &l, (4.5, 0.0), 6, 2, 0), 5);
   }
 
   #[test]
-  fn progressed_segment_tracks_a_reversing_path_without_stalling() {
-    // THE all-white / nothing-coloured regression. A spiral or raster reverses direction every pass. A walk gated
-    // on the AXIAL projection fraction stalls at the first right-to-left segment (the cutter's position projects to
-    // a low fraction on a segment it is traversing backwards), freezing progress at the start. Walking the local
-    // minimum of perpendicular distance tracks the reversal. Simulate the cutter marching along the whole path
-    // frame-by-frame (threading `previous`, as the view does) and assert the boundary follows it to the end.
+  fn live_cut_boundary_floor_advances_with_acked_so_it_cannot_stall() {
+    let (s, l) = line_path(10);
+    // The live position is useless here (far off the path), so geometry alone could never localise — the failure
+    // mode that left the preview all white. The streamed-line floor (`acked - in_flight_lines`) still drags the
+    // boundary forward, so progress tracks the stream instead of freezing at zero.
+    let b = live_cut_boundary(&s, &l, (1000.0, 1000.0), 8, 2, 0);
+    assert!(b >= 6, "the streamed-line floor must advance progress even with a useless position match, got {b}");
+  }
+
+  #[test]
+  fn live_cut_boundary_is_monotonic_and_never_backtracks() {
+    let (s, l) = line_path(6);
+    // Having progressed to 4, a jittery sample that projects back near segment 1 must not un-cut later segments.
+    assert_eq!(live_cut_boundary(&s, &l, (1.0, 0.0), 6, 3, 4), 4);
+  }
+
+  #[test]
+  fn live_cut_boundary_tracks_a_reversing_path_marched_frame_by_frame() {
+    // THE all-white regression, now via the line window. A direction-reversing path (spiral/raster) defeated every
+    // pure-geometry rule (leap, then stall). Here the line counter anchors which stretch is in flight and the
+    // position localises within it. March the cutter along the whole path, advancing `acked` each frame, and
+    // assert the boundary follows to the end. One program line per segment, buffer one line deep.
     let path = vec![
-      ((0.0, 0.0), (10.0, 0.0)),  // → right
-      ((10.0, 0.0), (10.0, 1.0)), // ↑
-      ((10.0, 1.0), (0.0, 1.0)),  // ← left (a reversal)
-      ((0.0, 1.0), (0.0, 2.0)),   // ↑
-      ((0.0, 2.0), (10.0, 2.0)),  // → right
+      ((0.0, 0.0), (10.0, 0.0)),  // line 0 → right
+      ((10.0, 0.0), (10.0, 1.0)), // line 1 ↑
+      ((10.0, 1.0), (0.0, 1.0)),  // line 2 ← left (a reversal)
+      ((0.0, 1.0), (0.0, 2.0)),   // line 3 ↑
+      ((0.0, 2.0), (10.0, 2.0)),  // line 4 → right
     ];
-    let samples = [(5.0, 0.0), (10.0, 0.5), (5.0, 1.0), (0.0, 1.5), (5.0, 2.0)];
+    let lines = vec![0, 1, 2, 3, 4];
+    let frames = [((5.0, 0.0), 1u32), ((10.0, 0.5), 2), ((5.0, 1.0), 3), ((0.0, 1.5), 4), ((5.0, 2.0), 5)];
     let mut prev = 0;
-    for s in samples {
-      prev = progressed_segment(&path, s, prev, WIN);
+    for (pt, acked) in frames {
+      prev = live_cut_boundary(&path, &lines, pt, acked, 1, prev);
     }
     assert_eq!(prev, 5, "the boundary must track across reversals to the path end, not stall near 0");
   }
 
   #[test]
-  fn progressed_segment_starts_from_zero_with_no_progress() {
-    let path = straight_path();
-    // At the program origin nothing is cut yet (segment 0 barely entered).
-    assert_eq!(progressed_segment(&path, (0.0, 0.0), 0, WIN), 0);
-  }
-
-  #[test]
-  fn progressed_segment_walks_an_arc_flattened_into_chords() {
-    // An arc flattened into short chords around a quarter circle: projecting the swept live point onto each chord
-    // walks them one by one, so arcs colour progressively rather than stalling on a single start→end chord (#2).
-    let arc = vec![
-      ((1.0, 0.0), (0.92, 0.38)),
-      ((0.92, 0.38), (0.71, 0.71)),
-      ((0.71, 0.71), (0.38, 0.92)),
-      ((0.38, 0.92), (0.0, 1.0)),
+  fn live_cut_boundary_excludes_an_unstreamed_overlapping_ring() {
+    // The self-approach ambiguity, resolved by the line counter. Segment 4 is a "next ring" running right on top of
+    // segment 0, but it comes from a later, NOT-yet-streamed line. The cutter on segment 0 must colour segment 0,
+    // never the spatially-coincident-but-unstreamed segment 4.
+    let segs = vec![
+      ((0.0, 0.0), (10.0, 0.0)),    // line 0: the move the cutter is on
+      ((10.0, 0.0), (10.0, 1.0)),   // line 1
+      ((10.0, 1.0), (0.0, 1.0)),    // line 2
+      ((0.0, 1.0), (0.0, 2.0)),     // line 3
+      ((0.0, 0.05), (10.0, 0.05)),  // line 4: a parallel ring ~on top of line 0, not yet streamed
     ];
-    // The tool has swept to the end of the third chord: the first three chords are cut (boundary 3).
-    assert_eq!(progressed_segment(&arc, (0.38, 0.92), 0, WIN), 3);
-  }
-
-  #[test]
-  fn progressed_segment_bounds_the_scan_to_the_forward_window() {
-    let path = straight_path();
-    // With previous=0 and window=1 only segment 0 is examined; a live point far ahead (x=3.5, on segment 3)
-    // cannot jump the boundary past the window — it advances at most one segment, so the boundary is 1.
-    assert_eq!(progressed_segment(&path, (3.5, 0.0), 0, 1), 1);
-  }
-
-  #[test]
-  fn progressed_segment_clamps_a_stale_previous_index() {
-    // A `previous` past the end (e.g. after the program shrank) must not index out of bounds; it clamps.
-    let path = straight_path();
-    assert_eq!(progressed_segment(&path, (4.0, 0.0), 99, WIN), path.len());
+    let lines = vec![0, 1, 2, 3, 4];
+    // Cutter at the midpoint of segment 0; only lines 0..2 acked, so segment 4 is beyond the frontier and excluded.
+    let b = live_cut_boundary(&segs, &lines, (5.0, 0.0), 2, 4, 0);
+    assert!((1..=2).contains(&b), "the unstreamed overlapping ring must not be coloured, got {b}");
   }
 
   #[test]

@@ -60,10 +60,14 @@ pub struct UiState {
   /// The model-space `(min, max)` bounds of [`Self::toolpath`], cached alongside it. `None` when empty.
   toolpath_bounds: Option<(Vec2, Vec2)>,
   /// The model-space `(start, end)` segment pairs of [`Self::toolpath`], in order, cached at load so the per-frame
-  /// live-progress projection ([`super::preview::progressed_segment`]) borrows them with no allocation. Segment
-  /// PAIRS (not bare endpoints) because the projection projects the live point onto each segment's line, not just
-  /// its endpoints. Rebuilt by [`Self::set_program`] alongside the toolpath.
+  /// live cut-progress search ([`super::preview::live_cut_boundary`]) borrows them with no allocation. Segment
+  /// PAIRS (not bare endpoints) because the search projects the live point onto each segment's line, not just its
+  /// endpoints. Rebuilt by [`Self::set_program`] alongside the toolpath.
   progress_segments: Vec<super::preview::Segment>,
+  /// The program line index of each toolpath segment, parallel to [`Self::progress_segments`] and monotonic
+  /// non-decreasing. Cached at load so [`super::preview::live_cut_boundary`] can bound the in-flight window in
+  /// line space (acked lines vs. the live `Bf:` buffer depth) with a binary partition and no per-frame allocation.
+  progress_line_index: Vec<u32>,
   /// The smoothed live tool-position marker, in toolpath **model space** (work-coordinate XY mm) — NOT screen
   /// space, so a viewport resize cannot corrupt the lerp. Eased one frame at a time toward the latest status
   /// sample (see [`super::preview::smooth_marker`]); `None` until the first live work position is acquired or
@@ -71,9 +75,15 @@ pub struct UiState {
   /// [`Self::set_program`].
   marker_pos: Option<Vec2>,
   /// The monotonically-advancing cut-progress boundary: the count of leading toolpath segments coloured as cut,
-  /// derived from the live work position (see [`super::preview::progressed_segment`]). Never retreats within a
+  /// derived from the live work position (see [`super::preview::live_cut_boundary`]). Never retreats within a
   /// run; reset to 0 by [`Self::set_program`] and whenever a fresh run begins (no program line acked yet).
   progress_segment: usize,
+  /// Self-calibrated controller buffer capacities, learned from the largest `Bf:(planner_blocks_free,
+  /// rx_bytes_free)` ever reported (the idle report shows the full buffer). Used to turn a live `Bf:` reading into
+  /// the in-flight depth (capacity − free) that bounds the cut-progress window, without hard-coding the firmware's
+  /// planner/RX sizes. Both default to 0 and only grow.
+  planner_capacity: u32,
+  rx_capacity: u32,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
   /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
@@ -193,8 +203,11 @@ impl Default for UiState {
       toolpath: Vec::new(),
       toolpath_bounds: None,
       progress_segments: Vec::new(),
+      progress_line_index: Vec::new(),
       marker_pos: None,
       progress_segment: 0,
+      planner_capacity: 0,
+      rx_capacity: 0,
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
@@ -282,9 +295,11 @@ impl UiState {
     self.program_path = path;
     self.toolpath = parse_xy_path(&self.program);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
-    // Cache the segment (start, end) pairs once for the per-frame live-progress projection (no per-frame alloc).
+    // Cache the segment (start, end) pairs and their parallel program-line indices once, for the per-frame live
+    // cut-progress search (no per-frame alloc).
     self.progress_segments =
       self.toolpath.iter().map(|seg| ((seg.from.x, seg.from.y), (seg.to.x, seg.to.y))).collect();
+    self.progress_line_index = self.toolpath.iter().map(|seg| seg.line_index as u32).collect();
     // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
     // even if the old program happened to leave us followed at the same row index.
     self.program_followed_line = None;
@@ -2123,13 +2138,22 @@ const MARKER_LERP: f32 = 0.35;
 /// animate. Below it, normal cutting moves between samples are smoothed.
 const MARKER_SNAP_SPAN_FRACTION: f32 = 0.25;
 
-/// How many segments ahead of the current cut boundary the live-progress projection scans each frame. The live
-/// point is projected onto the segments in this forward window and the nearest is chosen, so the window must be
-/// large enough to span a few moves between two 5–10 Hz status samples (a fast feed can complete several short
-/// flattened-arc chords per poll) yet small enough that a far-away REVISITED coordinate — a closed contour
-/// returning to the origin, a peck-drill retract — cannot be mistaken for forward progress (findings #1/#7).
-/// Bounding the scan also keeps it O(window) per frame regardless of program length (finding #12).
-const PROGRESS_FORWARD_WINDOW: usize = 24;
+/// Estimated bytes per streamed GCode line, used to turn the RX-buffer bytes in flight (`Bf:` second field) into a
+/// rough count of buffered-but-unexecuted lines. A typical `G1X..Y..Z..F..` move is ~25 chars including the
+/// terminator; the estimate only has to bound the in-flight window, which the live position then refines within.
+const AVG_LINE_BYTES: u32 = 25;
+
+/// Slack lines added to the estimated in-flight depth so the bounded window comfortably CONTAINS the executing
+/// line even when the planner-block-to-line and RX-byte-to-line conversions under-count; the live position
+/// localises within the window, so a little generosity costs nothing.
+const IN_FLIGHT_SLACK_LINES: u32 = 4;
+
+/// Clamp on the estimated in-flight depth (lines). The floor keeps a window even when `Bf:` is momentarily full;
+/// the ceiling stops a pathological reading from widening the window enough to re-admit a far self-approaching
+/// ring. When no `Bf:` is reported at all, [`IN_FLIGHT_DEFAULT_LINES`] stands in.
+const IN_FLIGHT_MIN_LINES: u32 = 2;
+const IN_FLIGHT_MAX_LINES: u32 = 80;
+const IN_FLIGHT_DEFAULT_LINES: u32 = 24;
 
 /// How far outside the toolpath's model-space bounds the live marker may sit and still be drawn, as a fraction of
 /// the span diagonal. Generous enough that a tool a little outside the drawn extents (lead-in, clearance move)
@@ -2143,13 +2167,20 @@ fn span_diagonal(span: egui::Vec2) -> f32 {
   (span.x * span.x + span.y * span.y).sqrt().max(1.0)
 }
 
-/// Decide the monotonic cut-progress baseline for this frame, resetting it to zero when a fresh run has begun.
-/// A run that has acknowledged no program line yet (`acked == 0`) is at or before its start, so any progress
-/// carried over from a previous run of the same loaded file must be cleared — otherwise re-running a program
-/// without reloading would paint it entirely "cut" from the first frame. Otherwise the previous boundary is
-/// kept and [`super::preview::progressed_segment`] advances it. Pure so the reset policy is unit-tested.
-fn progress_baseline(acked: usize, previous: usize) -> usize {
-  if acked == 0 { 0 } else { previous }
+/// Estimate how many streamed-but-unexecuted GCode lines the controller is holding, from a live `Bf:` reading and
+/// the self-calibrated buffer capacities. The controller acks a line when it enters the planner buffer, so the
+/// executing line trails `acked` by roughly this depth: the planner blocks in flight (capacity − free; one block
+/// ≈ one move, an over-count for arcs that only widens the window harmlessly) plus the RX bytes in flight divided
+/// by [`AVG_LINE_BYTES`], plus [`IN_FLIGHT_SLACK_LINES`], clamped to a sane band. `buffer` is the `Bf:(planner
+/// blocks free, rx bytes free)` pair; `None` (no `Bf:` reported) falls back to [`IN_FLIGHT_DEFAULT_LINES`]. Pure
+/// so the estimate is unit-tested. `planner_cap`/`rx_cap` are the largest free counts seen (the full buffers).
+fn in_flight_lines(buffer: Option<(u32, u32)>, planner_cap: u32, rx_cap: u32) -> u32 {
+  let Some((planner_free, rx_free)) = buffer else {
+    return IN_FLIGHT_DEFAULT_LINES;
+  };
+  let planner_in_flight = planner_cap.saturating_sub(planner_free);
+  let rx_in_flight_lines = rx_cap.saturating_sub(rx_free) / AVG_LINE_BYTES;
+  (planner_in_flight + rx_in_flight_lines + IN_FLIGHT_SLACK_LINES).clamp(IN_FLIGHT_MIN_LINES, IN_FLIGHT_MAX_LINES)
 }
 
 /// Render the 2D toolpath viewport: a top-down XY preview of the loaded program drawn with [`egui::Painter`].
@@ -2268,6 +2299,13 @@ fn is_moving_state(run_state: Option<crate::protocol::RunState>) -> bool {
 ///   far off the path (homed to machine origin, a units mismatch, a WCS mismatch) draws nothing rather than a
 ///   confident-but-wrong dot.
 fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec2), span: egui::Vec2) -> Option<Vec2> {
+  // Self-calibrate the controller buffer capacities from the live `Bf:` free counts (the idle report shows the
+  // full buffer), so the in-flight depth that bounds the cut window needs no hard-coded firmware sizes. Learn this
+  // before any early return so a WCO-less frame still updates it.
+  if let Some((planner_free, rx_free)) = view.status.as_ref().and_then(|s| s.buffer) {
+    state.planner_capacity = state.planner_capacity.max(planner_free);
+    state.rx_capacity = state.rx_capacity.max(rx_free);
+  }
   let Some(target) = view.work_xy().map(|(x, y)| (x as f32, y as f32)) else {
     // No derivable work position this frame. Two cases (finding #6):
     // - No status at all (disconnected / pre-connect): clear the marker so a later reconnect snaps fresh, and
@@ -2288,12 +2326,20 @@ fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec
   let smoothed = preview::smooth_marker(current, target, snap_dist, MARKER_LERP);
   state.marker_pos = Some(egui::vec2(smoothed.0, smoothed.1));
 
-  // Advance the monotonic cut boundary by projecting the live work position onto the cached segment pairs within
-  // a bounded forward window (snapping the baseline to 0 when a fresh run has begun). The list is pre-computed,
-  // so this projection allocates nothing per frame.
-  let baseline = progress_baseline(view.progress.acked, state.progress_segment);
-  state.progress_segment =
-    preview::progressed_segment(&state.progress_segments, target, baseline, PROGRESS_FORWARD_WINDOW);
+  // Advance the cut boundary with the hybrid line-window + position rule: the streamed line count (`acked`) and
+  // the live `Bf:` buffer depth bound a small in-flight window of the path, and the live position localises within
+  // it. The line counter removes the self-intersection ambiguity that defeated pure geometry; the cached segment
+  // and line-index lists are pre-computed, so this allocates nothing per frame. `acked == 0` (a fresh run) yields
+  // a boundary of 0 inside the helper, so re-running a loaded file does not paint it cut from the first frame.
+  let depth = in_flight_lines(view.status.as_ref().and_then(|s| s.buffer), state.planner_capacity, state.rx_capacity);
+  state.progress_segment = preview::live_cut_boundary(
+    &state.progress_segments,
+    &state.progress_line_index,
+    target,
+    view.progress.acked as u32,
+    depth,
+    state.progress_segment,
+  );
 
   // Gate the marker: drawn on/near the path or while actively moving, suppressed for a parked-off-path point
   // (#3/#4/#5). Use the SMOOTHED position so the gate matches what is drawn. The boundary still advanced above,
@@ -2733,12 +2779,17 @@ mod tests {
   use super::*;
 
   #[test]
-  fn progress_baseline_resets_on_a_fresh_run_and_holds_otherwise() {
-    // No program line acked yet means a run is at/before its start: any progress carried from a previous run of
-    // the same loaded file is cleared so the path is not painted entirely cut from frame one.
-    assert_eq!(progress_baseline(0, 42), 0, "a fresh run (acked == 0) resets the progress baseline");
-    // Once lines have acked the previous monotonic boundary is kept for `progressed_segment` to advance.
-    assert_eq!(progress_baseline(7, 42), 42, "a run in progress keeps its monotonic progress boundary");
+  fn in_flight_lines_estimates_buffer_depth_and_falls_back_without_bf() {
+    // No `Bf:` reported: fall back to the default depth.
+    assert_eq!(in_flight_lines(None, 32, 1024), IN_FLIGHT_DEFAULT_LINES);
+    // With capacities 32 planner blocks / 1024 RX bytes: 20 blocks in flight (32 − 12) + 200 RX bytes (1024 − 824)
+    // ≈ 8 lines, plus slack. The estimate is planner_in_flight + rx_bytes/AVG_LINE_BYTES + slack.
+    let depth = in_flight_lines(Some((12, 824)), 32, 1024);
+    assert_eq!(depth, 20 + 200 / AVG_LINE_BYTES + IN_FLIGHT_SLACK_LINES);
+    // A full buffer (free == capacity) yields just the slack, so the window never vanishes.
+    assert_eq!(in_flight_lines(Some((32, 1024)), 32, 1024), IN_FLIGHT_SLACK_LINES);
+    // A pathological reading is capped so the window cannot widen enough to re-admit a far self-approaching ring.
+    assert_eq!(in_flight_lines(Some((0, 0)), 200, 100_000), IN_FLIGHT_MAX_LINES);
   }
 
   #[test]
