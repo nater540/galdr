@@ -75,6 +75,14 @@ fn next_tick_delay(old: Duration, new: Duration) -> Duration {
 /// wedged/backpressured port cannot hold teardown hostage and leak the serial FD (Bug 3).
 const TEARDOWN_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// How long a single mid-session write may make NO progress before the controller is declared unresponsive. A
+/// healthy grblHAL controller drains real-time bytes (`?`/`0x18`) out-of-band the instant they arrive — even with
+/// a full planner during a long move or a feed hold — so a write that cannot place a single byte for this long
+/// means the firmware has wedged and stopped reading its USB RX. The engine then disconnects with
+/// [`TransportError::Unresponsive`] rather than spinning forever on a write that will never complete (which is why
+/// a wedged firmware made Stop do nothing and the UI go stale). Generous, so normal backpressure never trips it.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A host intent sent from the UI to the engine. Each is fed straight into the [`ProtocolCore`]; the engine
 /// adds no policy of its own beyond carrying out the resulting effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,10 +361,13 @@ impl<T: Transport> Driver<T> {
           }
         }
 
-        result = self.transport.write(&remaining) => {
+        // Bound the write so a wedged controller (RX no longer draining) surfaces as a disconnect rather than a
+        // forever-pending write. A healthy port accepts a real-time byte well within the stall timeout.
+        result = tokio::time::timeout(WRITE_STALL_TIMEOUT, self.transport.write(&remaining)) => {
           match result {
-            Ok(0) => return FlushOutcome::WriteFailed(TransportError::Closed),
-            Ok(n) => {
+            Err(_elapsed) => return FlushOutcome::WriteFailed(TransportError::Unresponsive),
+            Ok(Ok(0)) => return FlushOutcome::WriteFailed(TransportError::Closed),
+            Ok(Ok(n)) => {
               // Advance the cursor; retire the batch once every byte is on the wire. A short write leaves the
               // remainder in the slot for the next iteration to resume.
               if let Some((batch, cur)) = &mut self.realtime_in_flight {
@@ -366,7 +377,7 @@ impl<T: Transport> Driver<T> {
                 }
               }
             }
-            Err(err) => return FlushOutcome::WriteFailed(err),
+            Ok(Err(err)) => return FlushOutcome::WriteFailed(err),
           }
         }
       }
@@ -494,10 +505,13 @@ impl<T: Transport> Driver<T> {
         FlushOutcome::Continue
       }
 
-      result = self.transport.write(&remaining) => {
+      // Bounded like the real-time flush: a wedged controller that stops draining RX surfaces as a disconnect
+      // instead of a forever-pending line write.
+      result = tokio::time::timeout(WRITE_STALL_TIMEOUT, self.transport.write(&remaining)) => {
         match result {
-          Ok(0) => FlushOutcome::WriteFailed(TransportError::Closed),
-          Ok(n) => {
+          Err(_elapsed) => FlushOutcome::WriteFailed(TransportError::Unresponsive),
+          Ok(Ok(0)) => FlushOutcome::WriteFailed(TransportError::Closed),
+          Ok(Ok(n)) => {
             // Advance the cursor; retire the line once every byte is on the wire. A short write leaves the
             // remainder in the slot for the next iteration to resume.
             if let Some((bytes, cur)) = &mut self.line_in_flight {
@@ -508,7 +522,7 @@ impl<T: Transport> Driver<T> {
             }
             FlushOutcome::Continue
           }
-          Err(err) => FlushOutcome::WriteFailed(err),
+          Ok(Err(err)) => FlushOutcome::WriteFailed(err),
         }
       }
     }
@@ -788,6 +802,27 @@ mod tests {
     // The real board was observed booting into Hold; the engine must reflect Hold, not fake Idle.
     assert!(controller.inject_line("<Hold:0|WPos:5.000,0.000,0.000|FS:0,0|Bf:32,1024>"));
     wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Hold))).await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn a_wedged_controller_that_stops_accepting_writes_disconnects_as_unresponsive() {
+    let (mut handle, controller) = connect();
+    // Reach Connecting so the driver is running its write path, then wedge the port: the firmware has stopped
+    // draining its RX, so every subsequent write pends forever (exactly the real lockup that made Stop do nothing).
+    wait_for(&mut handle, |e| matches!(e, Event::StateChanged(ConnectionState::Connecting))).await;
+    controller.gate_writes();
+    // Advance past the write-stall timeout (the pending poll/handshake write trips it) and the bounded teardown
+    // flush that follows; a few passes cover the two timeouts being armed in sequence.
+    for _ in 0..3 {
+      tokio::time::advance(WRITE_STALL_TIMEOUT + TEARDOWN_FLUSH_TIMEOUT).await;
+    }
+    // The engine surfaces the wedge as a disconnect carrying the unresponsive reason, rather than spinning on a
+    // write that will never complete — so the UI reflects it and the serial FD is released.
+    let evt = wait_for(&mut handle, |e| matches!(e, Event::Disconnected(_))).await;
+    assert!(
+      matches!(evt, Event::Disconnected(Some(crate::error::TransportError::Unresponsive))),
+      "a wedged controller must disconnect as unresponsive, got {evt:?}"
+    );
   }
 
   #[tokio::test(start_paused = true)]

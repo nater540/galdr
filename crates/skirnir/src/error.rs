@@ -15,6 +15,12 @@ pub enum TransportError {
   #[error("transport closed (end of stream)")]
   Closed,
 
+  /// A write made no progress within the stall timeout: the controller is connected but has stopped draining its
+  /// RX buffer (a firmware wedge), so the port pends forever. The engine surfaces this as a disconnect so the UI
+  /// reflects the wedge and the serial FD is released, instead of spinning on a write that will never complete.
+  #[error("controller not responding (write stalled — firmware may be wedged)")]
+  Unresponsive,
+
   /// An I/O error occurred while reading or writing bytes. The message carries the OS-level detail.
   #[error("transport I/O error: {0}")]
   Io(String),
