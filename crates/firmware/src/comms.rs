@@ -852,14 +852,15 @@ pub async fn send_banner() {
   }
 }
 
-/// The formatted post-mortem crash report lines (the `[MSG:CRASH ...]` summary plus, when an RMT hang was captured,
-/// a second `[MSG:CRASH rmt0: ...]` register-detail line), held after boot so they can be RE-EMITTED on the first
-/// `$I`/status request after a host connects. The native-USB link re-enumerates on the watchdog reset, so a host
-/// that reconnects a beat late would miss the boot-time emission; stashing the lines here and replaying them on the
-/// first `$I`/`?` closes that race. Empty once there is nothing left to replay. A `heapless::Vec<Response, 2>`
-/// behind the cross-core blocking mutex keeps it `Send` and allocation-free; each `Response` is far under
-/// [`RESPONSE_CAPACITY`], so splitting into two lines (rather than one over-long line) keeps every line in budget.
-static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 2>>> =
+/// The formatted post-mortem crash report lines: the `[MSG:CRASH ...]` summary, plus (when present) a `[MSG:CRASH
+/// rmt0: ...]` RMT register-detail line and a `[MSG:CRASH comms: ...]` per-task comms-stage line. Held after boot
+/// so they can be RE-EMITTED on the first `$I`/status request after a host connects. The native-USB link
+/// re-enumerates on the watchdog reset, so a host that reconnects a beat late would miss the boot-time emission;
+/// stashing the lines here and replaying them on the first `$I`/`?` closes that race. Empty once there is nothing
+/// left to replay. A `heapless::Vec<Response, 3>` behind the cross-core blocking mutex keeps it `Send` and
+/// allocation-free; each `Response` is far under [`RESPONSE_CAPACITY`], so splitting into separate lines (rather
+/// than one over-long line) keeps every line in budget.
+static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 3>>> =
   BlockingMutex::new(Cell::new(heapless::Vec::new()));
 
 /// Format the previous run's crash breadcrumb into grbl `[MSG:CRASH ...]` line(s), emit them ONCE over the normal
@@ -880,13 +881,17 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
   let Some(summary) = format_crash_report(breadcrumb) else {
     return;
   };
-  // Build the line set: the summary always, plus the RMT register-detail line when a hang was captured.
-  let mut lines: heapless::Vec<Response, 2> = heapless::Vec::new();
+  // Build the line set: the summary always, plus (when present) the RMT register-detail line and the per-task
+  // comms-stage breakdown line — each kept separate so none exceeds RESPONSE_CAPACITY.
+  let mut lines: heapless::Vec<Response, 3> = heapless::Vec::new();
   let _ = lines.push(summary);
   if let Some(hang) = breadcrumb.rmt_hang.as_ref()
     && let Some(rmt_line) = format_rmt_hang_report(hang)
   {
     let _ = lines.push(rmt_line);
+  }
+  if let Some(comms_line) = format_comms_stage_report(&breadcrumb.comms_stages) {
+    let _ = lines.push(comms_line);
   }
   // Stash a copy for the first-`$I`/`?` replay (reconnect race), then emit now over the guaranteed-delivery path.
   CRASH_REPORT.lock(|c| c.set(lines.clone()));
@@ -899,7 +904,7 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
 /// the boot emission). Returns an empty `Vec` once nothing is pending. Called from the `$I` build-info handler and
 /// the status responder so a host that reconnected late after the watchdog reset still receives the `[MSG:CRASH ...]`
 /// line(s).
-fn take_pending_crash_report() -> heapless::Vec<Response, 2> {
+fn take_pending_crash_report() -> heapless::Vec<Response, 3> {
   CRASH_REPORT.lock(|c| c.take())
 }
 
@@ -925,6 +930,12 @@ fn format_crash_report(breadcrumb: &crate::crash::Breadcrumb) -> Option<Response
     let _ = write!(inner, " stage=axis{}:{}", crate::crash::stage_axis(stage), crate::crash::stage_label(stage));
   } else {
     let _ = write!(inner, " stage={}", crate::crash::stage_label(stage));
+  }
+  // The CORE-0 comms park-point: prefer the first NON-IDLE task slot (the likely stuck await) for the summary; if
+  // every slot is idle-class, show the consumer's slot (the in-order pipeline owner). The full per-task breakdown
+  // is on the separate `comms:` line below. This is the field that localizes the core-0 wedge.
+  if let Some(label) = stuck_comms_stage_label(&breadcrumb.comms_stages) {
+    let _ = write!(inner, " comms-stage={}", label);
   }
   // Which side stopped advancing first, from the snapshot ring (comms = core-0 side, motion = core-1 side).
   let verdict = crate::crash::froze_first(&breadcrumb.snapshots);
@@ -973,6 +984,49 @@ fn format_rmt_hang_report(hang: &crate::crash::RmtHang) -> Option<Response> {
   Some(out)
 }
 
+/// The label of the LIKELY-STUCK core-0 comms await: the first NON-idle-class task slot (a task parked
+/// mid-operation), else the consumer's slot (the in-order pipeline owner) even if idle, else `None` when no comms
+/// stage was ever recorded. Used for the summary line's `comms-stage=` field; the per-task breakdown is on the
+/// `comms:` detail line.
+fn stuck_comms_stage_label(stages: &[u32; crate::crash::COMMS_TASK_COUNT]) -> Option<&'static str> {
+  // First a non-idle slot — that is the task stuck mid-operation, the most informative.
+  for packed in stages {
+    if !crate::crash::comms_stage_is_idle(*packed)
+      && let Some(label) = crate::crash::comms_stage_label(*packed)
+    {
+      return Some(label);
+    }
+  }
+  // Otherwise the consumer's slot (index = CommsTask::Consumer = 2), the pipeline owner, even if idle-class.
+  crate::crash::comms_stage_label(stages[crate::crash::CommsTask::Consumer as usize])
+}
+
+/// Format the per-task core-0 comms-stage slots into a `[MSG:CRASH comms: rx=.. line=.. con=.. tx=.. sta=..]` line,
+/// so the boot dump shows EVERY task's parked await (the stuck one has a non-idle stage; healthy ones sit at an
+/// idle-class wait). Kept as its own line so it stays under [`RESPONSE_CAPACITY`]. Returns `None` only if no comms
+/// stage was recorded at all (every slot untagged), in which case there is nothing useful to print.
+fn format_comms_stage_report(stages: &[u32; crate::crash::COMMS_TASK_COUNT]) -> Option<Response> {
+  use core::fmt::Write as _;
+  // Nothing tagged at all ⇒ skip (the summary already shows whatever single field it could).
+  if stages.iter().all(|p| crate::crash::comms_stage_label(*p).is_none()) {
+    return None;
+  }
+  let lbl = |task: crate::crash::CommsTask| crate::crash::comms_stage_label(stages[task as usize]).unwrap_or("-");
+  let mut inner: heapless::String<128> = heapless::String::new();
+  let _ = write!(
+    inner,
+    "CRASH comms: rx={} line={} con={} tx={} sta={}",
+    lbl(crate::crash::CommsTask::UsbRx),
+    lbl(crate::crash::CommsTask::LineAssembler),
+    lbl(crate::crash::CommsTask::Consumer),
+    lbl(crate::crash::CommsTask::UsbTx),
+    lbl(crate::crash::CommsTask::Status),
+  );
+  let mut out = Response::new();
+  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
+  Some(out)
+}
+
 /// Emit the boot `ALARM:N` (plus its `[MSG:..unlock]` prompt) IF the machine booted into an alarm — i.e.
 /// `$22` homing is enabled, so [`init_control_state`] latched `ALARM:11` (homing required). Called once from
 /// `main` after the banner so a sender detects the locked state on connect (DOC-08 §5). A no-op when the
@@ -1007,6 +1061,7 @@ pub async fn usb_rx(mut rx: UsbSerialJtagRx<'static, Async>) -> ! {
   // A modest read chunk: the USB Serial/JTAG FIFO is 64 bytes, so reads return promptly.
   let mut buf = [0u8; 64];
   loop {
+    crate::crash::record_comms_stage(crate::crash::CommsTask::UsbRx, crate::crash::CommsStage::RxRead);
     let n = match rx.read(&mut buf).await {
       Ok(n) => n,
       // A persistent USB read error must not become a tight spin that starves the other core-0 tasks: back
@@ -1055,6 +1110,7 @@ pub async fn line_assembler() -> ! {
   let mut engine = StreamEngine::new();
   let mut byte = [0u8; 1];
   loop {
+    crate::crash::record_comms_stage(crate::crash::CommsTask::LineAssembler, crate::crash::CommsStage::LineWaitByte);
     // Race the next byte against a soft reset so a `0x18` mid-line drops the partial line promptly. `read`
     // is cancel-safe (it consumes from the pipe only on completion), so losing this race loses no byte.
     match select(RX_PIPE.read(&mut byte), LINE_RESET.wait()).await {
@@ -1080,6 +1136,7 @@ async fn frame_byte(byte: u8, engine: &mut StreamEngine) {
       let _ = owned.extend_from_slice(line);
       // Block here if the consumer is briefly behind: this back-pressures the host stream (correct flow
       // control) without dropping a line. Real-time bytes already bypassed this path entirely.
+      crate::crash::record_comms_stage(crate::crash::CommsTask::LineAssembler, crate::crash::CommsStage::LineSendQueue);
       LINE_QUEUE.send(owned).await;
     }
     EngineEvent::Reject(code) => error(code).await,
@@ -1251,6 +1308,7 @@ pub static AUTO_REPORT_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new()
 #[embassy_executor::task]
 pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
   loop {
+    crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWaitResponse);
     let resp = RESPONSE.receive().await;
     // Comms-progress heartbeat: a response/ack/status line is leaving the firmware, which is the most direct
     // evidence the core-0 comms path is making host-facing forward progress. Bumped here (the single writer) so the
@@ -1259,7 +1317,10 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
     // counts as "the firmware produced a response" (the wedge is upstream of the writer, not in the USB write).
     COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
     // A write error on native USB means the host closed the port; drop the byte and continue, since the
-    // connection re-establishes on host reopen without a controller reset.
+    // connection re-establishes on host reopen without a controller reset. The breadcrumb marks the WRITE await —
+    // a stuck `write_all`/`flush` here is the prime "host-facing output never completes" suspect: it backs up the
+    // `RESPONSE` channel and blocks every producer (the consumer's `ack`/`error`, the status reporter) at once.
+    crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWrite);
     let _ = tx.write_all(resp.as_bytes()).await;
     let _ = tx.flush().await;
   }
@@ -1328,6 +1389,10 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // remaining window for an in-flight non-back-pressured line would require cancelling `handle_line`
     // mid-await; that is deferred to the alarm-state machine (Stage 2), which is where grbl gates response
     // emission during an abort. The stray response is benign: the host discards pending acks on `0x18`.
+    // About to park on the main consumer wait (next line / reset / jog-cancel / safety tick / hard-limit / stop).
+    // This is the idle-class park when the queue is drained; a wedge HERE with RX live means the next line never
+    // arrives through `LINE_QUEUE` (suspect `line_assembler`/`usb_rx` upstream, or `LINE_QUEUE` never delivering).
+    crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerWaitLine);
     let events = select4(LINE_QUEUE.receive(), SOFT_RESET.wait(), JOG_CANCEL.wait(), Timer::after(SETTINGS_FLUSH_SAFETY));
     // Race the four primary events against a hard-limit trip from the core-1 executor (DOC-06): a limit pressed
     // during normal motion must halt the program and enter `ALARM:1` regardless of what the consumer is waiting on.
@@ -1418,6 +1483,9 @@ async fn flush_settings(flash: &'static SharedFlash, retry_on_failure: bool) {
   }
   let snapshot = settings_snapshot().await;
   let mut store = FlashRecordStore::settings(flash);
+  // Mark the flash write: `store_settings` does the NVS erase/append which `multicore_auto_park` runs with the
+  // other core stalled and the cache disabled (Defect #2). A wedge here is the smoking gun for the flash hazard.
+  crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerFlashSettings);
   if settings::store_settings(&mut store, &snapshot).await.is_err() {
     #[cfg(feature = "defmt")]
     defmt::warn!("settings: failed to flush settings to flash");
@@ -2058,6 +2126,10 @@ async fn plan_command(command: &firmware_core::gcode::PlannerCommand) -> PlanRes
       // the delay is short relative to a block's execution time, so a normal retry wins the freed slot
       // promptly without busy-spinning the CPU.
       Err(PlannerError::QueueFull) => {
+        // Back-pressure: the consumer yields to the executor and retries. This park is TIMER-BACKED (it self-wakes
+        // every `QUEUE_FULL_RETRY`), so it cannot wedge here — the marker is for completeness so a wedge that LOOKS
+        // like back-pressure is distinguishable. (Motion idle ⇒ this is NOT the current wedge's site.)
+        crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerPlanBackpressure);
         // Race the retry delay against a soft reset (`0x18` → abort) AND a graceful program stop (`0x86` → clean
         // stop): both abandon a stuck back-pressured line at once rather than after the executor frees a slot.
         match select(Timer::after(QUEUE_FULL_RETRY), select(SOFT_RESET.wait(), PROGRAM_STOP.wait())).await {
@@ -2501,6 +2573,9 @@ async fn hold_until_resume(
   flash: &'static SharedFlash,
 ) -> PauseOutcome {
   loop {
+    // An M0/M1/M6 pause holds here until cycle-start/reset/stop — a legitimately LONG park (operator-gated). Mark
+    // it so a wedge here reads as the pause-wait, not a stuck await (it is RELEASED by `~`, which is expected).
+    crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerSyncWait);
     // Whether the head line (if any) is a serviceable read-only `$`-query. A peek that finds the queue empty, or a
     // head that is a deferred (non-query) line, both yield `false` — in which case we wait only on the signals so a
     // deferred head cannot busy-spin the `ready_to_receive` arm.
@@ -2914,6 +2989,7 @@ async fn run_probe_cycle(request: ProbeRequest) -> Option<ProbeResult> {
   // Drain any stale result so a result from a previous (aborted) probe cannot be mistaken for this one's.
   PROBE_RESULT.try_take();
   PROBE_REQUEST.signal(request);
+  crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerProbeResult);
   let result = match select(PROBE_RESULT.wait(), SOFT_RESET.wait()).await {
     Either::First(result) => result,
     // A soft reset landed mid-probe: abort. Drain the PROBE_REQUEST we just signalled in case the executor had
@@ -3128,6 +3204,7 @@ async fn quiesce_executor() -> QuiesceOutcome {
   MOTION_PARKED.try_take();
   HOLD_REQUESTED.store(true, Ordering::Release);
   HOLD_WAKE.signal(());
+  crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerSyncWait);
   match select(MOTION_PARKED.wait(), SOFT_RESET.wait()).await {
     Either::First(()) => QuiesceOutcome::Parked,
     // A soft reset preempted the quiesce: re-signal it so `comms_consumer` runs its reset, and report the
@@ -3637,6 +3714,7 @@ async fn handle_home(parser: &mut Parser, state: &mut ConsumerState) {
 async fn run_homing_cycle(config: HomingConfig) -> Option<Result<[i32; AXES], HomingError>> {
   HOME_RESULT.try_take();
   HOME_REQUEST.signal(config);
+  crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerHomeResult);
   match select(HOME_RESULT.wait(), SOFT_RESET.wait()).await {
     Either::First(result) => Some(result),
     Either::Second(()) => {
@@ -3927,6 +4005,8 @@ async fn flush_coordinates(flash: &'static SharedFlash, retry_on_failure: bool) 
   }
   let persistent = coordinates().persistent();
   let mut store = FlashRecordStore::coordinates(flash);
+  // Mark the flash write (same `multicore_auto_park`/cache-disable hazard as the settings flush, Defect #2).
+  crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerFlashCoords);
   if coords::store_coordinates(&mut store, &persistent).await.is_err() {
     #[cfg(feature = "defmt")]
     defmt::warn!("coordinates: failed to flush coordinate record to flash");
@@ -4168,6 +4248,10 @@ fn parser_snapshot(state: &ModalState) -> ParserSnapshot {
 async fn ack() {
   let mut s = Response::new();
   if ResponseWriter::ok(&mut s).is_ok() {
+    // Mark the consumer's response enqueue: `enqueue` is `RESPONSE.send().await`, which BLOCKS when the channel is
+    // full — i.e. `usb_tx` is behind/stuck. A wedge here (with `usb_tx`'s slot at `tx-write`) is the classic
+    // "output path stalled, consumer can't ack" chain.
+    crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerEnqueue);
     enqueue(s).await;
   }
 }
@@ -4196,6 +4280,8 @@ async fn error(code: u8) {
 async fn error_bare(code: u8) {
   let mut s = Response::new();
   if ResponseWriter::error(&mut s, code).is_ok() {
+    // Same `RESPONSE.send().await` enqueue chokepoint as `ack` — marks the consumer blocked emitting an error.
+    crate::crash::record_comms_stage(crate::crash::CommsTask::Consumer, crate::crash::CommsStage::ConsumerEnqueue);
     enqueue(s).await;
   }
 }
@@ -4209,7 +4295,12 @@ async fn error_bare(code: u8) {
 #[embassy_executor::task]
 pub async fn status_responder() -> ! {
   loop {
+    crate::crash::record_comms_stage(crate::crash::CommsTask::Status, crate::crash::CommsStage::StatusWaitRequest);
     STATUS_REQUEST.wait().await;
+    // From here on the task is BUILDING the report — it takes the `MACHINE`/`PLANNER` locks and enqueues the line,
+    // all of which can park (cross-core lock contention or a full `RESPONSE` channel). Mark that span so a wedge
+    // mid-report is distinguishable from the idle `?`-wait above.
+    crate::crash::record_comms_stage(crate::crash::CommsTask::Status, crate::crash::CommsStage::StatusBuildReport);
     // Comms-progress heartbeat: serving a `?` is the most frequent host-facing work (skirnir polls ~5 Hz), so this
     // is the watchdog's primary "the comms path is alive" signal. A wedge that stops answering `?` (the real-board
     // failure: writes succeed, DRO frozen) freezes this counter, which — with the host still sending RX — is what

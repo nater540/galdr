@@ -5,8 +5,49 @@ metadata:
   type: project
 ---
 
-**BURST-CAP FIX DID NOT WORK — RMT HARDWARE INSTRUMENTATION ADDED 2026-06-24 (compiled both configs, -D warnings + clippy
-clean, 522 host tests green).** Operator flashed the 47→46 burst-cap (commit c676a3d): SAME breadcrumb, now near-INSTANT
+**NEW SIGNATURE: CORE-0 COMMS WEDGE WITH MOTION IDLE — COMMS-STAGE BREADCRUMB ADDED 2026-06-24 (compiled both configs,
+-D warnings + clippy clean, 522 host tests green).** After the CCOUNT timeout fix (commit a829c8a — the coordinator
+switched my `Instant`-based RMT timeout to `esp_hal::xtensa_lx::timer::get_cycle_count` because `Instant::now()` was
+FROZEN by the busy-spin; LESSON: embassy-time `Instant` may not advance inside a tight core-1 busy-loop, use the cycle
+counter for in-spin deadlines), the operator re-ran and got a NEW breadcrumb: `[MSG:CRASH core0-comms-wedge
+stage=idle_waiting comms-froze-first beats comms=34037 motion=50605 (RWDT-reset)]`. KEY: `stage=idle_waiting` (motion
+executor IDLE/parked, queue drained) NOT `axis0:wait_begin` → NOT the RMT hang (which did not recur). No `rmt0:` line
+(the RMT timeout didn't fire — consistent with motion idle). So core 0's comms path parked on some `.await` that never
+returned while motion was idle; the task-watchdog caught it (comms froze + RX live → withheld feed → RWDT). Rare again
+(~2 runs to repro). We had instrumented MOTION stages but not COMMS, so `idle_waiting` only told us motion is fine.
+- FIX = a per-CORE-0-TASK comms-stage breadcrumb (same approach that nailed the RMT hang). `firmware/src/crash.rs`: new
+  `CommsTask` (5 slots: UsbRx/LineAssembler/Consumer/UsbTx/Status) + `CommsStage` enum + `record_comms_stage(task,stage)`
+  (one tagged relaxed store per slot). PER-TASK slots so concurrent core-0 tasks never clobber each other's marker — the
+  stuck task is UNAMBIGUOUS. Each task writes its slot IMMEDIATELY before every `.await` it can park on. Idle-class
+  stages (rx-read, line-wait-byte, consumer-wait-line, tx-wait-response, status-wait-request) = parked waiting for work;
+  a NON-idle stage persisting on a wedge = the culprit. Breadcrumb LEN grew to 28 words (RING_BASE 11→16); slots cleared
+  on consume.
+- INSTRUMENTED await sites (`firmware/src/comms.rs`): usb_rx `rx.read` (rx-read); line_assembler `RX_PIPE.read` select
+  (line-wait-byte) + `LINE_QUEUE.send` (line-send-queue); consumer main select (consumer-wait-line), `store_settings`
+  flash (consumer-flash-settings — the Defect-#2 `multicore_auto_park` smoking gun), `store_coordinates`
+  (consumer-flash-coords), `ack`/`error_bare` `RESPONSE.send` (consumer-enqueue), plan_command QueueFull
+  (consumer-plan-backpressure, timer-backed so self-wakes), PROBE_RESULT (consumer-probe-result), HOME_RESULT
+  (consumer-home-result), quiesce MOTION_PARKED + M0/M1/M6 pause (consumer-sync-wait); usb_tx `RESPONSE.receive`
+  (tx-wait-response) + `write_all`/`flush` (tx-write — PRIME "output never completes" suspect: a stuck write backs up
+  RESPONSE and blocks every producer); status_responder STATUS_REQUEST.wait (status-wait-request) + report build
+  (status-build-report).
+- BOOT DUMP: summary line gains `comms-stage=<first-non-idle-slot, else consumer slot>`; a THIRD `[MSG:CRASH comms:
+  rx=.. line=.. con=.. tx=.. sta=..]` line shows EVERY task's parked await. CRASH_REPORT stash now `Vec<Response,3>`.
+- HOW TO READ NEXT BREADCRUMB: the `comms:` line shows all 5 task park-points. The slot with a NON-idle stage is the
+  stuck task. LEADING SUSPECT given motion idle + RX live: `tx=tx-write` (usb_tx stuck in USB write/flush → RESPONSE
+  fills → all producers block → comms froze). Other smoking guns: `con=consumer-flash-settings/coords` (the Defect-#2
+  flash/cache-disable hazard — though Pikachu is pure motion, no settings writes expected after the initial `T1`);
+  `con=consumer-probe-result`/`-home-result` (a result signal from core 1 that never came); `con=consumer-sync-wait`
+  (a quiesce/pause never released). All-idle slots ⇒ the wedge is in an await we did NOT instrument (widen next).
+- HAPPY-PATH NO-REGRESSION: each marker is ONE relaxed store before an await, all on COLD paths (per-line/per-`?`/
+  per-response), zero changes to motion.rs/core-1, no new awaits/locks. Core-1 step timing untouched.
+- SECONDARY RESOLVED (no code change): VERIFIED `software_reset()` (CoreSw/RTC_CNTL_SW_SYS_RST) DOES preserve RTC_FAST
+  `persistent` on the S3 — esp-hal `persistent` macro doc names `software_reset()` FIRST in its survivable list; TRM:
+  all resets except Chip Reset preserve internal memory; esp-idf RTC_NOINIT survives `esp_restart()`. So the RMT-timeout
+  `software_reset()` path reliably preserves the breadcrumb. The MAGIC validity word is the checksum the doc recommends.
+
+**SUPERSEDED: RMT HARDWARE INSTRUMENTATION 2026-06-24 (the RMT hang stopped recurring after the CCOUNT fix).** Operator
+flashed the 47→46 burst-cap (commit c676a3d): SAME breadcrumb, now near-INSTANT
 (`comms=274 motion=942`, ~10 s in, was ~30 min). So the full-48-block-boundary theory was WRONG/incomplete — same core-1
 RMT ch0 `wait()` hang. KEEP the burst-cap (harmless, one real hazard removed — do NOT revert). GOOD news: a FAST
 (~seconds) repro now exists → instrument the HARDWARE instead of guessing from `rmt.rs`.

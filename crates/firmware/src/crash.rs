@@ -79,9 +79,78 @@ mod idx {
   pub const RMT_TX_CONF0: usize = 9;
   /// The monotonic burst (transmission) counter at the hang — which RMT transmission number since boot wedged.
   pub const RMT_BURST_SEQ: usize = 10;
-  /// First word of the snapshot ring. Each snapshot is [`super::SNAP_WORDS`] words: `[seq, core0_beat,
-  /// core1_beat]`. The current stage is carried by the always-updated [`LAST_STAGE`] word, not per snapshot.
-  pub const RING_BASE: usize = 11;
+  /// First word of the per-CORE-0-task comms-stage slots ([`super::COMMS_TASK_COUNT`] of them, one per
+  /// instrumented core-0 task). Each holds a tagged [`super::CommsStage`] written by the task IMMEDIATELY before
+  /// every `.await` it can park on, so on a wedge each slot names exactly the await that task is parked on (an
+  /// idle-class stage = parked waiting for work; a specific stage = stuck mid-operation). Because the slots are
+  /// PER TASK, concurrent tasks never clobber each other's marker — the stuck task is unambiguous. Distinct from
+  /// the core-1 [`LAST_STAGE`] (motion); the two cores are reported independently.
+  pub const COMMS_STAGE_BASE: usize = 11;
+  /// First word of the snapshot ring (after the comms-stage slots). Each snapshot is [`super::SNAP_WORDS`] words.
+  pub const RING_BASE: usize = COMMS_STAGE_BASE + super::COMMS_TASK_COUNT;
+}
+
+/// Number of instrumented core-0 tasks, each with its own comms-stage breadcrumb slot. One per [`CommsTask`].
+pub const COMMS_TASK_COUNT: usize = 5;
+
+/// The instrumented core-0 comms tasks. The discriminant is the slot index into the comms-stage breadcrumb words
+/// ([`idx::COMMS_STAGE_BASE`] + this). APPEND only — the values are decoded after a reset.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum CommsTask {
+  /// The USB reader half ([`usb_rx`](crate::comms::usb_rx)).
+  UsbRx = 0,
+  /// The line-assembly half ([`line_assembler`](crate::comms::line_assembler)).
+  LineAssembler = 1,
+  /// The parser → planner consumer ([`comms_consumer`](crate::comms::comms_consumer)).
+  Consumer = 2,
+  /// The single USB writer ([`usb_tx`](crate::comms::usb_tx)).
+  UsbTx = 3,
+  /// The status reporter ([`status_responder`](crate::comms::status_responder)).
+  Status = 4,
+}
+
+/// The specific `.await` park-points instrumented across the core-0 comms tasks. Each task writes the stage it is
+/// ABOUT TO await on into its [`CommsTask`] slot, so a wedge pins the exact stuck await. Idle-class stages (a task
+/// parked waiting for work) are NORMAL; a non-idle stage persisting on a wedge is the culprit. Stable on-wire
+/// values — APPEND, never renumber.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum CommsStage {
+  /// `usb_rx` awaiting the next USB read (idle-class: returns as soon as the host sends — with RX live it should
+  /// NOT sit here, so a wedge here means the USB read future itself never completes).
+  RxRead = 0,
+  /// `line_assembler` awaiting a byte from `RX_PIPE` / a line reset (idle-class).
+  LineWaitByte = 1,
+  /// `line_assembler` blocked sending a framed line into `LINE_QUEUE` (back-pressure: the consumer is behind).
+  LineSendQueue = 2,
+  /// `comms_consumer` at its main `select` awaiting the next line / reset / safety tick (idle-class).
+  ConsumerWaitLine = 3,
+  /// `comms_consumer` inside `handle_line` flushing settings to flash (NVS write — `multicore_auto_park`).
+  ConsumerFlashSettings = 4,
+  /// `comms_consumer` inside `handle_line` flushing coordinates to flash (NVS write — `multicore_auto_park`).
+  ConsumerFlashCoords = 5,
+  /// `comms_consumer` blocked enqueuing a response (`RESPONSE.send` — full channel ⇒ `usb_tx` is behind/stuck).
+  ConsumerEnqueue = 6,
+  /// `comms_consumer` waiting in `plan_command` back-pressure for the executor to free a planner slot.
+  ConsumerPlanBackpressure = 7,
+  /// `comms_consumer` awaiting a `G38.x` probe result from core 1.
+  ConsumerProbeResult = 8,
+  /// `comms_consumer` awaiting a `$H` homing result from core 1.
+  ConsumerHomeResult = 9,
+  /// `comms_consumer` running a `G4` dwell / an M0/M1/M6 pause / a quiesce wait (synchronized boundaries).
+  ConsumerSyncWait = 10,
+  // (slot 11 reserved — was a cross-core-lock marker; the PLANNER/SETTINGS/MACHINE locks are brief and a
+  // lock-held-across-await wedge is captured on the MOTION side, so it is not separately instrumented here.)
+  /// `usb_tx` awaiting the next response on the `RESPONSE` channel (idle-class).
+  TxWaitResponse = 12,
+  /// `usb_tx` blocked WRITING/flushing a response over USB (`write_all`/`flush` — the prime "host-facing output
+  /// never completes" suspect: a stuck write here backs up `RESPONSE` and blocks every producer).
+  TxWrite = 13,
+  /// `status_responder` awaiting a `?` request (idle-class).
+  StatusWaitRequest = 14,
+  /// `status_responder` taking the `MACHINE`/`PLANNER` lock or enqueuing the report (`RESPONSE.send`).
+  StatusBuildReport = 15,
 }
 
 /// Words per snapshot in the ring: `[seq, core0_beat, core1_beat]`. The per-snapshot stage is omitted — the
@@ -150,6 +219,55 @@ pub fn pack_stage(stage: Stage, axis: u8) -> u32 {
 /// concurrent reader to order against). The axis is `0` for non-per-axis stages.
 pub fn record_stage(stage: Stage, axis: u8) {
   BREADCRUMB[idx::LAST_STAGE].store(pack_stage(stage, axis), Ordering::Relaxed);
+}
+
+/// Tag in the high half of a comms-stage slot, so a cold-boot zero / garbage word never decodes as a stage.
+const COMMS_STAGE_TAG: u32 = 0x4353_0000; // "CS".
+
+/// Record the await park-point a core-0 comms task is ABOUT to enter, into that task's dedicated breadcrumb slot.
+/// A SINGLE relaxed store — called immediately before every `.await` a task can park on, so on a wedge the slot
+/// names exactly the stuck await. Per-task slots mean concurrent tasks never clobber each other's marker. `Relaxed`
+/// is correct: a best-effort post-mortem marker read only after a reset, no concurrent reader to order against.
+pub fn record_comms_stage(task: CommsTask, stage: CommsStage) {
+  BREADCRUMB[idx::COMMS_STAGE_BASE + task as u8 as usize].store(COMMS_STAGE_TAG | (stage as u8 as u32), Ordering::Relaxed);
+}
+
+/// Decode a packed comms-stage slot word into a short, stable label, or `None` if untagged (cold boot / a task
+/// that never recorded a stage). Idle-class stages are suffixed implicitly by their names (`*-wait*`/`*-read`).
+pub fn comms_stage_label(packed: u32) -> Option<&'static str> {
+  if packed & 0xFFFF_0000 != COMMS_STAGE_TAG {
+    return None;
+  }
+  let label = match (packed & 0xFF) as u8 {
+    0 => "rx-read",
+    1 => "line-wait-byte",
+    2 => "line-send-queue",
+    3 => "consumer-wait-line",
+    4 => "consumer-flash-settings",
+    5 => "consumer-flash-coords",
+    6 => "consumer-enqueue",
+    7 => "consumer-plan-backpressure",
+    8 => "consumer-probe-result",
+    9 => "consumer-home-result",
+    10 => "consumer-sync-wait",
+    11 => "consumer-reserved",
+    12 => "tx-wait-response",
+    13 => "tx-write",
+    14 => "status-wait-request",
+    15 => "status-build-report",
+    _ => return None,
+  };
+  Some(label)
+}
+
+/// True when a decoded comms-stage is an IDLE-CLASS park (a task legitimately waiting for work), so the boot dump
+/// can flag a non-idle stuck stage as the likely culprit. The idle-class stages are the routine top-of-loop waits.
+pub fn comms_stage_is_idle(packed: u32) -> bool {
+  if packed & 0xFFFF_0000 != COMMS_STAGE_TAG {
+    return false;
+  }
+  // RxRead(0), LineWaitByte(1), ConsumerWaitLine(3), TxWaitResponse(12), StatusWaitRequest(14) are idle-class.
+  matches!((packed & 0xFF) as u8, 0 | 1 | 3 | 12 | 14)
 }
 
 /// Why the core-0 watchdog task WITHHELD the feed to deliberately force a reset. Recorded in the breadcrumb so the
@@ -287,6 +405,10 @@ pub struct Breadcrumb {
   /// The captured RMT channel-0 hardware state, IF the core-1 executor's bounded RMT `wait()` poll-loop timed out
   /// this run (the hang). `None` when no RMT hang was captured. This is the decisive diagnostic for the ch0 wedge.
   pub rmt_hang: Option<RmtHang>,
+  /// The per-core-0-task comms-stage slots (packed), indexed by [`CommsTask`]. Each names the await its task was
+  /// parked on at the reset (decode via [`comms_stage_label`]; idle-class via [`comms_stage_is_idle`]). The slot
+  /// holding a NON-idle stage on a comms wedge is the stuck task.
+  pub comms_stages: [u32; COMMS_TASK_COUNT],
   /// The snapshots, NEWEST first (index 0 is the most recent). Empty-seq entries are filtered by the formatter.
   pub snapshots: [Snapshot; RING_LEN],
 }
@@ -325,6 +447,9 @@ pub fn take_breadcrumb() -> Breadcrumb {
   } else {
     None
   };
+  // The per-task comms-stage slots, in `CommsTask` order.
+  let comms_stages: [u32; COMMS_TASK_COUNT] =
+    core::array::from_fn(|i| BREADCRUMB[idx::COMMS_STAGE_BASE + i].load(Ordering::Relaxed));
   // The newest snapshot is at `(head + RING_LEN - 1) % RING_LEN`; walk backwards so index 0 is the most recent.
   let head = (BREADCRUMB[idx::HEAD].load(Ordering::Relaxed) as usize) % RING_LEN;
   let snapshots = core::array::from_fn(|i| {
@@ -336,12 +461,15 @@ pub fn take_breadcrumb() -> Breadcrumb {
       core1_beat: BREADCRUMB[base + 2].load(Ordering::Relaxed),
     }
   });
-  // Consume: clear the magic, the withhold word, AND the RMT-flags tag so this crumb is reported exactly once and
-  // no stale withhold/RMT marker bleeds into a later, unrelated reset. `init_magic` re-stamps the magic.
+  // Consume: clear the magic, the withhold word, the RMT-flags tag, AND every comms-stage slot so this crumb is
+  // reported exactly once and no stale marker bleeds into a later, unrelated reset. `init_magic` re-stamps magic.
   BREADCRUMB[idx::MAGIC].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::WITHHOLD].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::RMT_FLAGS].store(0, Ordering::Relaxed);
-  Breadcrumb { valid, last_stage, withhold, rmt_hang, snapshots }
+  for i in 0..COMMS_TASK_COUNT {
+    BREADCRUMB[idx::COMMS_STAGE_BASE + i].store(0, Ordering::Relaxed);
+  }
+  Breadcrumb { valid, last_stage, withhold, rmt_hang, comms_stages, snapshots }
 }
 
 /// Decode a packed last-stage marker into a short, stable label (e.g. `"axis1:wait_begin"`). Returns `"?"` for a
