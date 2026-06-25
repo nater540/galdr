@@ -173,6 +173,18 @@ pub enum PendingSettingsAction {
   Close,
 }
 
+/// The caveats that ride beside the dock ETA when a physics-based simulation drives it. A simulation grounded in
+/// the firmware's default machine model (no `$$` snapshot was loaded) is flagged so its figure is not mistaken for
+/// one grounded in the real board config; modeled operator pauses (`M0`/`M1`/`M6`) are surfaced as a count since
+/// their waits are unbounded and therefore excluded from the timed total. `None` (no simulation) renders nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EtaQualifier {
+  /// Whether the simulation fell back to default machine settings because no live `$$` snapshot was available.
+  pub default_settings: bool,
+  /// How many operator-pause lines (`M0`/`M1`/`M6`) the timeline modeled — unbounded waits not in the total.
+  pub pauses: usize,
+}
+
 /// The two tabs hosted by the bottom dock (design §03). The dock is a single surface whose body switches
 /// between the rolling console and the loaded-program listing; this selects which one is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -675,6 +687,20 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
     .clicked()
   {
     sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
+  }
+
+  // Simulate: a host-only physics ETA over the loaded program, available whenever a program is loaded — even
+  // disconnected, since it sends nothing to the board. Drawn as a ghost button (transparent rest, like Home) so it
+  // reads as a secondary, non-machine action set apart from the run controls. Disabled (greyed) with no program.
+  let has_program = !state.program.is_empty();
+  let sim_color = if has_program { Theme::TEXT_DIM } else { Theme::TEXT_DISABLED };
+  let simulate = egui::Button::new(RichText::new("∿ Simulate").color(sim_color)).fill(Color32::TRANSPARENT);
+  if ui
+    .add_enabled(has_program, simulate)
+    .on_hover_text("Estimate job time from the machine settings (no motion — host-only)")
+    .clicked()
+  {
+    sink.push(Intent::Simulate);
   }
 }
 
@@ -1700,7 +1726,7 @@ fn verify_readings_table(ui: &mut egui::Ui, s: &super::angle_sweep::AngleSweep) 
 /// in one dock matches the mock, where Console and Program share the 200px dock rather than sitting in
 /// separate panels.
 pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
-  sink: &mut IntentSink) {
+  eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
   let active = state.active_tab;
   let tabs = [("Console", active == DockTab::Console), ("Program", active == DockTab::Program)];
   let progress = view.progress;
@@ -1712,7 +1738,7 @@ pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: supe
   let mut toggle_clicked = false;
   let clicked = tab_strip(ui, &tabs, |ui| {
     toggle_clicked = dock_collapse_toggle(ui, collapsed);
-    dock_progress(ui, progress, time);
+    dock_progress(ui, progress, time, eta_qualifier);
   });
   state.active_tab = dock_tab_for_click(active, clicked);
   if toggle_clicked {
@@ -1761,9 +1787,14 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
 /// why the percent and clock previously ran together with no gap. This sets its own roomy row spacing so the
 /// fields breathe, and degrades on a narrow strip by dropping the bar first (the least-important field — the
 /// percent and count carry the same information) so the block never overflows into an unpainted gap.
-fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time: super::progress::TimeEstimate) {
+fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time: super::progress::TimeEstimate,
+  eta_qualifier: Option<EtaQualifier>) {
   use super::progress::format_progress_clock;
-  if progress.total == 0 {
+  // Show the readout while a program is streaming (`total > 0`) OR a simulation is stored — the latter surfaces the
+  // upfront ETA before any stream begins, when the progress total is still zero. With neither, there is nothing to
+  // show; bail so the strip stays bare.
+  let has_simulation = eta_qualifier.is_some();
+  if progress.total == 0 && !has_simulation {
     return;
   }
   // Own the row spacing rather than inheriting the tab strip's zeroed `item_spacing.x`. A roomy 8px gap gives
@@ -1771,12 +1802,26 @@ fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time:
   ui.spacing_mut().item_spacing.x = Metrics::DOCK_PROGRESS_GAP;
   // Decide up front whether the bar fits. The toggle was already drawn (this `ui` excludes it), so the remaining
   // width must hold the bar plus the textual fields; when it can't, drop the bar rather than overflow the strip.
-  let draw_bar = ui.available_width() >= Metrics::PROGRESS_W + Metrics::DOCK_PROGRESS_TEXT_RESERVE;
+  // The bar is also meaningless before a stream (no acked fraction), so it is gated on a real program total too.
+  let draw_bar = progress.total > 0
+    && ui.available_width() >= Metrics::PROGRESS_W + Metrics::DOCK_PROGRESS_TEXT_RESERVE;
 
-  // Rightmost: the elapsed / estimated-total clock. `total` is `None` until the ETA is projectable, so its right
-  // half shows the dim `--:--` placeholder rather than a wild early guess (see `format_progress_clock`).
+  // The simulation's caveats trail the clock at the far right (drawn first in this right-to-left strip): a
+  // "(default settings)" flag when the estimate used the default machine model, and a pause count when the
+  // timeline modeled unbounded operator waits. Rendered only when a simulation drives the ETA.
+  if let Some(qualifier) = eta_qualifier {
+    dock_eta_qualifier(ui, qualifier);
+  }
+  // Rightmost (after the qualifier): the elapsed / estimated-total clock. `total` is `None` until the ETA is
+  // projectable, so its right half shows the dim `--:--` placeholder rather than a wild early guess (a simulation
+  // populates `total` immediately, so the upfront figure shows at once). See `format_progress_clock`.
   let clock = format_progress_clock(time.elapsed, time.total);
   ui.label(RichText::new(clock).monospace().size(10.5).color(Theme::TEXT_DIM));
+  // The percent/count/bar fields only mean something once a stream is timing; skip them (and their separator)
+  // before streaming so the upfront ETA shows the clock + qualifier alone, not a `0%`/`0 / 0` placeholder row.
+  if progress.total == 0 {
+    return;
+  }
   dock_progress_separator(ui);
   let pct = (progress.fraction() * 100.0).round() as u32;
   ui.label(RichText::new(format!("{pct}%")).monospace().size(11.0).color(Theme::TEXT));
@@ -1799,6 +1844,33 @@ fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time:
 /// [`dock_progress`] uses one consistent glyph and colour instead of repeating the `RichText` at each call site.
 fn dock_progress_separator(ui: &mut egui::Ui) {
   ui.label(RichText::new("·").size(11.0).color(Theme::TEXT_DISABLED));
+}
+
+/// Render the simulation's caveats beside the dock clock: a dim "(default settings)" flag when the estimate used
+/// the firmware's default machine model rather than the board's real `$$` config, and a "pause(s) at N line(s)"
+/// note when the timeline modeled unbounded operator waits (`M0`/`M1`/`M6`) that are excluded from the timed
+/// total. Each part is its own label so the strip degrades gracefully; both are omitted when neither applies. The
+/// qualifier text is built by the pure [`eta_qualifier_text`] so the copy is unit-tested without a window.
+fn dock_eta_qualifier(ui: &mut egui::Ui, qualifier: EtaQualifier) {
+  if let Some(text) = eta_qualifier_text(qualifier) {
+    ui.label(RichText::new(text).size(10.0).color(Theme::TEXT_DISABLED));
+  }
+}
+
+/// Build the dock ETA qualifier string for a simulation, or `None` when there is nothing to qualify (real
+/// settings and no modeled pauses). Kept pure (no egui) so the copy — "(default settings)", the pause count, and
+/// their joining — is unit-tested without a window. The pause note uses "line"/"lines" so a single pause reads
+/// naturally.
+fn eta_qualifier_text(qualifier: EtaQualifier) -> Option<String> {
+  let mut parts: Vec<String> = Vec::new();
+  if qualifier.default_settings {
+    parts.push("(default settings)".to_string());
+  }
+  if qualifier.pauses > 0 {
+    let noun = if qualifier.pauses == 1 { "line" } else { "lines" };
+    parts.push(format!("pauses at {} {noun}", qualifier.pauses));
+  }
+  if parts.is_empty() { None } else { Some(parts.join(" · ")) }
 }
 
 /// Decide whether the Program listing should auto-scroll to follow the executing line this frame, and which row
@@ -2761,6 +2833,31 @@ pub fn settings_discard_confirm(ctx: &egui::Context, state: &mut UiState) -> Opt
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn eta_qualifier_text_joins_the_default_settings_flag_and_the_pause_count() {
+    // Nothing to qualify (real settings, no pauses): no text at all, so the dock shows the clock alone.
+    assert_eq!(eta_qualifier_text(EtaQualifier { default_settings: false, pauses: 0 }), None);
+    // Default settings only.
+    assert_eq!(
+      eta_qualifier_text(EtaQualifier { default_settings: true, pauses: 0 }).as_deref(),
+      Some("(default settings)")
+    );
+    // A single pause reads "line"; multiple read "lines".
+    assert_eq!(
+      eta_qualifier_text(EtaQualifier { default_settings: false, pauses: 1 }).as_deref(),
+      Some("pauses at 1 line")
+    );
+    assert_eq!(
+      eta_qualifier_text(EtaQualifier { default_settings: false, pauses: 3 }).as_deref(),
+      Some("pauses at 3 lines")
+    );
+    // Both caveats join with the dim middot the dock uses between fields.
+    assert_eq!(
+      eta_qualifier_text(EtaQualifier { default_settings: true, pauses: 2 }).as_deref(),
+      Some("(default settings) · pauses at 2 lines")
+    );
+  }
 
   #[test]
   fn push_trail_point_appends_real_moves_decimates_jitter_and_caps_length() {

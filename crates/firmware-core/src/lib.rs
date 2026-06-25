@@ -12,14 +12,17 @@
 //! and host-tested. The remaining subsystems are documented stubs awaiting their DOC-referenced
 //! implementations.
 
+// The GCode parser, motion planner, and step-generation motion model live in the shared
+// `cnc-kinematics` crate (the same pure logic the `skirnir` sender is intended to drive offline for
+// job-time estimation, leaving no second motion model to drift from). Re-export them flat so the rest of
+// firmware-core and the firmware bin keep their `firmware_core::{gcode,planner,motion}` paths.
+pub use cnc_kinematics::{gcode, motion, planner};
+
 pub mod coolant;
 pub mod coords;
 pub mod drivers;
-pub mod gcode;
 pub mod hal_traits;
 pub mod homing;
-pub mod motion;
-pub mod planner;
 pub mod protocol;
 pub mod settings;
 pub mod spindle;

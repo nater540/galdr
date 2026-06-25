@@ -34,7 +34,7 @@ pub mod view_state;
 pub use badge::{BadgeState, TransportGroup};
 pub use intent::{Axis, Dir, Intent, IntentSink, work_offset_line, work_zero_line};
 pub use overrides::{OverrideAxis, clamp_override, override_commands};
-pub use progress::{TimeEstimate, estimate, format_mmss};
+pub use progress::{TimeEstimate, estimate, format_mmss, physics_estimate};
 pub use setting_help::SettingDescriptions;
 pub use settings_model::{SettingRow, SettingsModel};
 pub use settings_staging::SettingsStaging;

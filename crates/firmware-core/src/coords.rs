@@ -35,12 +35,11 @@
 use crate::hal_traits::{RecordStore, StoreError};
 use crate::planner::AXES;
 
-/// The number of work coordinate systems grbl exposes as G54–G59. Each is one [`AXES`]-length offset in
-/// machine mm; the active one (plus G92 and the TLO) sums into the live WCO.
-pub const WCS_COUNT: usize = 6;
-
-/// The number of predefined positions (G28 and G30), stored in MACHINE coordinates.
-pub const PREDEFINED_COUNT: usize = 2;
+// The coordinate-system cardinalities are GCode-protocol facts owned by the shared parser
+// (`G54`–`G59` work systems, `G28`/`G30` predefined positions). Re-export them so this module's
+// `WCS_COUNT`-sized tables and the public `coords::WCS_COUNT` path both keep working, with a single
+// source of truth in `cnc_kinematics::gcode`.
+pub use crate::gcode::{PREDEFINED_COUNT, WCS_COUNT};
 
 /// The configured tool-length-offset axis: Z (index 2). grbl applies the dynamic `G43.1` TLO to a single
 /// linear axis — the machine default is Z — so the TLO scalar folds into the Z component of the WCO only.

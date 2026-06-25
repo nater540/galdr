@@ -82,7 +82,7 @@ pub(crate) fn build_dock_harness(
     .build_ui_state(
       move |ui, state: &mut HarnessState| {
         let mut sink = IntentSink::new();
-        views::dock(ui, &state.view, &mut state.ui, time, &mut sink);
+        views::dock(ui, &state.view, &mut state.ui, time, None, &mut sink);
         state.intents.extend(sink.drain());
       },
       state,
@@ -402,6 +402,45 @@ mod tests {
     assert!(
       !intents.iter().any(|i| matches!(i, Intent::Realtime(RealtimeCommand::ProgramStop))),
       "Abort must NOT emit the graceful ProgramStop",
+    );
+  }
+
+  #[test]
+  fn the_transport_group_simulate_button_emits_simulate_when_a_program_is_loaded() {
+    // The Simulate button is a host-only action available whenever a program is loaded — even disconnected. With a
+    // program in `UiState`, clicking it must emit `Intent::Simulate` (and nothing is sent to the engine — the shell
+    // handles that purity; here we only prove the button wires the intent).
+    let mut ui = UiState::default();
+    ui.set_program(vec!["G1 X10 F500".to_string()], None);
+    // A disconnected view is fine: Simulate does not need a live link.
+    let state = HarnessState::new(ViewState::default(), ui);
+    let mut harness = build_transport_group_harness(state);
+    harness.run();
+
+    harness.get_by_label("∿ Simulate").click();
+    harness.run();
+
+    assert!(
+      harness.state().intents.iter().any(|i| matches!(i, Intent::Simulate)),
+      "clicking Simulate with a program loaded must emit Intent::Simulate",
+    );
+  }
+
+  #[test]
+  fn the_transport_group_simulate_button_is_disabled_with_no_program() {
+    // With no program loaded the Simulate button is greyed and a click commands nothing — there is nothing to
+    // estimate. The button still renders (so it is discoverable), but emits no intent when clicked.
+    let state = HarnessState::new(ViewState::default(), UiState::default());
+    let mut harness = build_transport_group_harness(state);
+    harness.run();
+    assert!(harness.query_by_label("∿ Simulate").is_some(), "the Simulate control is present even with no program");
+    if let Some(node) = harness.query_by_label("∿ Simulate") {
+      node.click();
+      harness.run();
+    }
+    assert!(
+      !harness.state().intents.iter().any(|i| matches!(i, Intent::Simulate)),
+      "a disabled Simulate button must not emit Intent::Simulate",
     );
   }
 

@@ -1,0 +1,23 @@
+[package]
+name = "cnc-kinematics"
+version = "0.1.0"
+edition = "2024"
+
+# The shared, pure-logic CNC kinematics core: the GCode parser, the motion planner (look-ahead +
+# junction-deviation cornering), and the step-generation motion model (trapezoid timing). It is
+# `no_std` with NO esp-hal dependency, so it compiles and unit-tests on the host with stock Rust. It
+# is consumed by the `firmware` bin (on Xtensa, via `firmware-core`) AND by the native `skirnir` sender
+# (via the host-only `sim` feature), which drives the same planner offline to estimate job time —
+# leaving no second motion model to drift from. `firmware-core` re-exports the `gcode`/`planner`/`motion`
+# modules and the `step` traits so all existing `firmware_core::…` paths keep resolving.
+[dependencies]
+heapless = "0.9"
+libm     = "0.2"
+defmt    = { version = "1", optional = true }
+
+[features]
+defmt = ["dep:defmt"]
+# Host-side offline job-time simulation (`sim` module + `simulate`). It allocates (a per-command timeline),
+# so it pulls in `alloc` and is OFF by default — the no-alloc firmware build never enables it. `skirnir`
+# turns it on. `estimate_block_time` itself is alloc-free and always available, independent of this feature.
+sim = []

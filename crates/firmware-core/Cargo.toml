@@ -7,6 +7,7 @@ edition = "2024"
 # stock Rust, and is also consumed by the firmware bin on Xtensa. All hardware access lives behind
 # traits in `hal_traits`; only the firmware wiring layer touches esp-hal.
 [dependencies]
+cnc-kinematics    = { path = "../cnc-kinematics", default-features = false }
 galdr-proto       = { path = "../galdr-proto", default-features = false }
 heapless          = "0.9"
 libm              = "0.2"
@@ -14,6 +15,7 @@ defmt             = { version = "1", optional = true }
 
 [dev-dependencies]
 embedded-hal-mock = "0.11"
+heapless          = "0.9"
 
 [features]
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "cnc-kinematics/defmt"]

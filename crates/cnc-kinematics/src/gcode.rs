@@ -24,8 +24,18 @@
 //! parameter words). Floats are parsed by a hand-written `no_std` lexer; `core::str`'s float parsing
 //! is intentionally avoided so the numeric grammar matches what grbl senders actually emit.
 
+/// The number of work coordinate systems the GCode model addresses: `G54`–`G59` (DOC-04/DOC-05). The
+/// coordinate model in `firmware-core` sizes its WCS offset table to this and the parser validates
+/// `G54`-family selections against it, so the single source of truth for the count lives here in the
+/// shared parser; `firmware-core`'s `coords` re-exports it as `coords::WCS_COUNT`.
+pub const WCS_COUNT: usize = 6;
+
+/// The number of predefined positions the GCode model addresses: `G28` and `G30` (DOC-04). Like
+/// [`WCS_COUNT`], the canonical count lives here and `firmware-core`'s `coords` re-exports it.
+pub const PREDEFINED_COUNT: usize = 2;
+
 /// grblHAL-compatible status codes returned when a line cannot be parsed or validated. The numeric
-/// values match grblHAL's `error:N` responses so [`crate::protocol`] (DOC-08) can render them
+/// values match grblHAL's `error:N` responses so the `protocol` layer (DOC-08) can render them
 /// directly without a translation table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -372,7 +382,7 @@ pub struct ModalState {
   /// Active feed-rate mode (modal group 5): G94 units/min (default) or G93 inverse-time. Sticky across lines.
   pub feed_mode: FeedMode,
   /// Active work coordinate system (modal group 12): 0 = G54 … 5 = G59. Sticky across lines and reported in
-  /// `$G` as `G54`…`G59`. The actual offset for the active WCS lives in [`crate::coords::CoordinateSystems`].
+  /// `$G` as `G54`…`G59`. The actual offset for the active WCS lives in `firmware-core`'s `CoordinateSystems`.
   pub wcs: usize,
   /// Active tool-length-offset mode (modal group 8): `true` when a dynamic `G43.1` TLO is in effect, `false`
   /// after `G49`. Tracked for `$G` (`G43.1`/`G49`); the TLO value lives in the coordinate model.
@@ -438,7 +448,7 @@ pub struct AxisWords {
 }
 
 /// A coordinate-system / offset operation the parser emits for the Phase B words (G10, G54-G59, G92,
-/// G28.1/G30.1, G43.1/G49). These mutate the [`crate::coords::CoordinateSystems`] model the consumer owns,
+/// G28.1/G30.1, G43.1/G49). These mutate the `CoordinateSystems` model (in `firmware-core`) the consumer owns,
 /// NOT the planner geometry directly — so they carry only the WORK-coordinate words and intent; the consumer
 /// resolves any "make the current machine position read this work value" op against the live machine position
 /// (which the parser does not have). All axis/offset values are raw, in the active units (the consumer scales
@@ -615,7 +625,7 @@ pub enum PlannerCommand {
   },
   /// A coordinate-system / offset operation (G10, G54-G59, G92, G28.1/G30.1, G43.1/G49). The planner passes
   /// it through to the consumer (it does not move the machine); the consumer applies it to the shared
-  /// [`crate::coords::CoordinateSystems`] and pushes the recomputed WCO back into the planner.
+  /// `CoordinateSystems` model (in `firmware-core`) and pushes the recomputed WCO back into the planner.
   Coordinate(CoordinateOp),
   /// M3/M4/M5 spindle control. `speed` carries the active modal S value for M3/M4.
   Spindle {
@@ -1442,7 +1452,7 @@ fn wcs_index_from_p(p: Option<f32>, fallback: usize) -> usize {
   match p {
     Some(value) => {
       let n = libm::roundf(value) as i32;
-      if (1..=crate::coords::WCS_COUNT as i32).contains(&n) {
+      if (1..=WCS_COUNT as i32).contains(&n) {
         (n - 1) as usize
       } else {
         fallback

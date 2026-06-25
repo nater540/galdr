@@ -339,6 +339,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cnc-kinematics"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "heapless 0.9.3",
+ "libm",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1579,6 +1588,7 @@ dependencies = [
 name = "firmware-core"
 version = "0.1.0"
 dependencies = [
+ "cnc-kinematics",
  "defmt",
  "embedded-hal-mock",
  "galdr-proto",
@@ -3701,6 +3711,7 @@ name = "skirnir"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cnc-kinematics",
  "directories",
  "eframe",
  "egui_kittest",
