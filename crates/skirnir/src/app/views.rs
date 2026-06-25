@@ -12,8 +12,9 @@ use super::intent::{Axis, Dir, Intent, IntentSink};
 use super::metrics::Metrics;
 use super::preview;
 use super::settings_model::SettingRow;
-use super::theme::Theme;
+use super::theme::Palette;
 use super::view_state::{Banner, LogLine, LogSource, ViewState};
+use crate::config::ToolpathStyle;
 use crate::protocol::{ConnectionState, RealtimeCommand};
 use crate::transport::ports::PortInfo;
 
@@ -31,10 +32,24 @@ const DEFAULT_BAUD: u32 = 115_200;
 const FABULOUS_CLICKS: u8 = 6;
 
 /// Hold a baud to [`BAUD_RANGE`], falling back to [`DEFAULT_BAUD`] when it is out of range (the settings knob
-/// clamps live edits, but a value loaded from a hand-edited/corrupt profile bypasses that — `0` would fail the
-/// port open). The widget's own range still clamps subsequent edits.
-fn sanitize_baud(baud: u32) -> u32 {
+/// clamps live edits, but a value loaded from a hand-edited/corrupt profile OR from the config's `default_baud`
+/// bypasses that — `0` would fail the port open). The widget's own range still clamps subsequent edits. `pub(crate)`
+/// so the shell can hold the config-supplied `default_baud` to the same range before it reaches `SerialTransport::open`.
+pub(crate) fn sanitize_baud(baud: u32) -> u32 {
   if BAUD_RANGE.contains(&baud) { baud } else { DEFAULT_BAUD }
+}
+
+/// The resolved runtime appearance the views render against: the colour [`Palette`] (resolved from the config's
+/// active theme) and the [`ToolpathStyle`] (resolved toolpath-render tuning). Threaded through [`UiState`] so the
+/// ~15 view fns read `state.style.*` rather than baked-in constants — a config theme change swaps this in. `Default`
+/// is the design's dark palette plus the legacy render constants, so a `Default`-built UI (and every test) renders
+/// exactly as before the config existed.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RuntimeStyle {
+  /// The active colour palette (one field per design token).
+  pub palette: Palette,
+  /// The active toolpath-render tuning (stroke widths, arc step, grid, marker radius).
+  pub toolpath: ToolpathStyle,
 }
 
 /// Transient widget state the shell owns across frames: selections, text fields, and tunables that belong to
@@ -42,6 +57,10 @@ fn sanitize_baud(baud: u32) -> u32 {
 /// the shell persists it.
 #[derive(Debug, Clone)]
 pub struct UiState {
+  /// The resolved runtime appearance (palette + toolpath style) the views render with, resolved from the loaded
+  /// config in `SkirnirApp::new` and re-resolved on a config reload. `Default` is the design dark palette + legacy
+  /// render constants, so a test-built `UiState` renders identically to before the config existed.
+  pub style: RuntimeStyle,
   /// Serial ports discovered by the last enumeration, shown in the connect dropdown. Structured so the row can
   /// surface USB product / «likely Galdr» hints and the list arrives cu-preferred and Galdr-ranked.
   pub ports: Vec<PortInfo>,
@@ -199,6 +218,7 @@ pub enum DockTab {
 impl Default for UiState {
   fn default() -> Self {
     UiState {
+      style: RuntimeStyle::default(),
       ports: Vec::new(),
       selected_port: String::new(),
       baud: DEFAULT_BAUD,
@@ -294,7 +314,9 @@ impl UiState {
   pub fn set_program(&mut self, lines: Vec<String>, path: Option<String>) {
     self.program = std::sync::Arc::from(lines);
     self.program_path = path;
-    self.toolpath = parse_xy_path(&self.program);
+    // Flatten arcs at the config-resolved chord step so the preview density follows `toolpath.arc_step_deg`. Parsed
+    // once here (cached), not per frame.
+    self.toolpath = parse_xy_path(&self.program, self.style.toolpath.arc_step_rad);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
     self.max_feed = max_programmed_feed(&self.program);
     // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
@@ -304,6 +326,25 @@ impl UiState {
     // marker snaps to the first sample of the new run and the trail does not carry over the old program's travel.
     self.marker_pos = None;
     self.trail.clear();
+  }
+
+  /// Re-flatten the CURRENTLY LOADED program's cached toolpath at the current `style.toolpath.arc_step_rad`, without
+  /// disturbing the program lines, the live marker, or the position trail. Used after a config reload changes
+  /// `toolpath.arc_step_deg`: the cached arc-chord density would otherwise stay stale until the GCode is reloaded
+  /// (the reported F5 bug). A no-op when no program is loaded. Unlike [`Self::set_program`] this preserves the
+  /// program-scoped overlay state, since the program itself is unchanged — only the render density is recomputed.
+  pub fn reflow_toolpath(&mut self) {
+    if self.program.is_empty() {
+      return;
+    }
+    self.toolpath = parse_xy_path(&self.program, self.style.toolpath.arc_step_rad);
+    self.toolpath_bounds = toolpath_bounds(&self.toolpath);
+  }
+
+  /// The number of cached toolpath segments (chords). Exposed so the reload/arc-density behaviour can be asserted
+  /// without reaching into private fields; the count rises as arcs are flattened more finely.
+  pub fn toolpath_segment_count(&self) -> usize {
+    self.toolpath.len()
   }
 }
 
@@ -315,15 +356,15 @@ const JOG_STEPS: [f64; 5] = [0.01, 0.1, 1.0, 5.0, 10.0];
 /// bottom. The bar height is pinned (not content-driven) so every section header and the dock tab strip line
 /// up. `title` is rendered already-styled by the caller's pick; pass it as the design's uppercase tracked
 /// section title via [`section_header`], or hand-style it (e.g. dock tabs) and call this directly.
-fn header_bar(ui: &mut egui::Ui, left: impl FnOnce(&mut egui::Ui), right: impl FnOnce(&mut egui::Ui)) {
+fn header_bar(ui: &mut egui::Ui, palette: Palette, left: impl FnOnce(&mut egui::Ui), right: impl FnOnce(&mut egui::Ui)) {
   // Claim the full strip up front so the fill and divider span the panel's width regardless of content.
   let width = ui.available_width();
   let (rect, _) = ui.allocate_exact_size(Vec2::new(width, Metrics::HEADER_H), egui::Sense::hover());
   let painter = ui.painter();
-  painter.rect_filled(rect, 0.0, Theme::PANEL_ALT);
+  painter.rect_filled(rect, 0.0, palette.panel_alt);
   // 1px bottom divider, matching the `border-bottom:1px solid #2E2E2E` under every header in the mock.
   let y = rect.bottom() - 0.5;
-  painter.hline(rect.x_range(), y, egui::Stroke::new(Metrics::DIVIDER, Theme::DIVIDER));
+  painter.hline(rect.x_range(), y, egui::Stroke::new(Metrics::DIVIDER, palette.divider));
 
   // Lay the header content inside the strip, vertically centred, with the design's 14px horizontal padding.
   let content = rect.shrink2(Vec2::new(Metrics::HEADER_PAD_X, 0.0));
@@ -335,8 +376,8 @@ fn header_bar(ui: &mut egui::Ui, left: impl FnOnce(&mut egui::Ui), right: impl F
 
 /// Draw a section header with the design's uppercase, letter-tracked, dim title and no right-side controls —
 /// the common case above the override/probe/toolpath/jog sections.
-pub fn section_header(ui: &mut egui::Ui, title: &str) {
-  header_bar(ui, |ui| header_title(ui, title), |_ui| {});
+pub fn section_header(ui: &mut egui::Ui, palette: Palette, title: &str) {
+  header_bar(ui, palette, |ui| header_title(ui, palette, title), |_ui| {});
 }
 
 /// Draw a dock tab strip in the design's §03 style: the same 30px `panelAlt` bar, but with mixed-case tab
@@ -345,15 +386,15 @@ pub fn section_header(ui: &mut egui::Ui, title: &str) {
 /// progress readout). The tabs are clickable: the index of a clicked tab is returned so the caller can flip the
 /// dock's active tab, while the underline marks the current selection. Returns `None` when no tab was clicked
 /// this frame.
-fn tab_strip(ui: &mut egui::Ui, tabs: &[(&str, bool)], right: impl FnOnce(&mut egui::Ui)) -> Option<usize> {
+fn tab_strip(ui: &mut egui::Ui, palette: Palette, tabs: &[(&str, bool)], right: impl FnOnce(&mut egui::Ui)) -> Option<usize> {
   let labels: Vec<(String, bool)> = tabs.iter().map(|(t, a)| (t.to_string(), *a)).collect();
   let mut clicked = None;
   header_bar(
-    ui,
+    ui, palette,
     |ui| {
       ui.spacing_mut().item_spacing.x = 0.0;
       for (index, (label, active)) in labels.iter().enumerate() {
-        let (weight, color) = if *active { (true, Theme::TEXT) } else { (false, Theme::TEXT_DIM) };
+        let (weight, color) = if *active { (true, palette.text) } else { (false, palette.text_dim) };
         let mut text = RichText::new(label).size(Metrics::TAB_TEXT).color(color);
         if weight {
           text = text.strong();
@@ -373,7 +414,7 @@ fn tab_strip(ui: &mut egui::Ui, tabs: &[(&str, bool)], right: impl FnOnce(&mut e
           let r = response.rect;
           let floor = ui.max_rect().bottom();
           let y = floor - Metrics::TAB_UNDERLINE * 0.5;
-          ui.painter().hline(r.x_range(), y, egui::Stroke::new(Metrics::TAB_UNDERLINE, Theme::ACCENT));
+          ui.painter().hline(r.x_range(), y, egui::Stroke::new(Metrics::TAB_UNDERLINE, palette.accent));
         }
       }
     },
@@ -401,10 +442,10 @@ fn dock_toggle_label(collapsed: bool) -> &'static str {
 
 /// Render a header title in the design's section-header type: 11px Medium, uppercase, dim, with the 0.1em
 /// tracking approximated by `extra_letter_spacing` so the headers read as small-caps labels, not body text.
-fn header_title(ui: &mut egui::Ui, title: &str) {
+fn header_title(ui: &mut egui::Ui, palette: Palette, title: &str) {
   let text = RichText::new(title.to_ascii_uppercase())
     .size(Metrics::HEADER_TEXT)
-    .color(Theme::TEXT_DIM)
+    .color(palette.text_dim)
     .strong()
     .extra_letter_spacing(Metrics::HEADER_TEXT * Metrics::HEADER_TRACKING_EM);
   ui.label(text);
@@ -429,7 +470,7 @@ fn chip_frame(
 }
 
 /// Paint a smooth left-to-right six-stripe Pride rainbow filling `rect` — the "fabulous" easter-egg accent. The
-/// band is sampled from [`Theme::pride_at`] as a run of thin vertical slices so it blends rather than showing six
+/// band is sampled from [`Palette::pride_at`] as a run of thin vertical slices so it blends rather than showing six
 /// hard bands, with each slice overdrawn by a pixel to hide the seams. A no-op for a non-positive-width rect.
 fn paint_pride(painter: &egui::Painter, rect: egui::Rect) {
   const SLICES: usize = 64;
@@ -441,7 +482,7 @@ fn paint_pride(painter: &egui::Painter, rect: egui::Rect) {
     let t = (i as f32 + 0.5) / SLICES as f32; // sample each slice at its centre.
     let x = rect.left() + i as f32 * slice_w;
     let slice = egui::Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(slice_w + 1.0, rect.height()));
-    painter.rect_filled(slice, 0.0, Theme::pride_at(t));
+    painter.rect_filled(slice, 0.0, Palette::pride_at(t));
   }
 }
 
@@ -472,21 +513,22 @@ fn button_row(ui: &mut egui::Ui, gap: f32, weights: &[f32], mut cell: impl FnMut
 /// breathing room either side, replacing egui's full-height `separator()` so the toolbar groups read as
 /// distinct without the bar feeling crammed (the user-flagged toolbar styling, design §03's `1px #2E2E2E`
 /// group separators).
-fn toolbar_divider(ui: &mut egui::Ui) {
+fn toolbar_divider(ui: &mut egui::Ui, palette: Palette) {
   let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, Metrics::TOOLBAR_CONTROL_H), egui::Sense::hover());
   let center = rect.center();
   let half = 22.0 * 0.5;
-  ui.painter().vline(center.x, (center.y - half)..=(center.y + half), egui::Stroke::new(1.0, Theme::DIVIDER));
+  ui.painter().vline(center.x, (center.y - half)..=(center.y + half), egui::Stroke::new(1.0, palette.divider));
 }
 
 /// Draw the machine-state badge: a coloured dot, the uppercase label, and (when streaming) the feed/speed
 /// suffix. The dot colour is the *second* signal; the label is primary, per the design.
 fn state_badge(ui: &mut egui::Ui, view: &ViewState, state_ui: &mut UiState) {
+  let palette = state_ui.style.palette;
   let state = view.badge_state();
-  let color = Theme::badge_color(state);
+  let color = palette.badge_color(state);
   let (fill, border, text_color) = match state {
-    BadgeState::Alarm | BadgeState::Error => (Theme::ALARM_BG, Theme::ALARM_BORDER, Theme::ALARM_TEXT),
-    _ => (Theme::INSET, color.gamma_multiply(0.5), Theme::TEXT),
+    BadgeState::Alarm | BadgeState::Error => (palette.alarm_bg, palette.alarm_border, palette.alarm_text),
+    _ => (palette.inset, color.gamma_multiply(0.5), palette.text),
   };
   let margin = egui::Margin { left: Metrics::BADGE_PAD.x as i8, right: Metrics::BADGE_PAD.x as i8,
     top: Metrics::BADGE_PAD.y as i8, bottom: Metrics::BADGE_PAD.y as i8 };
@@ -500,7 +542,7 @@ fn state_badge(ui: &mut egui::Ui, view: &ViewState, state_ui: &mut UiState) {
         && let Some((feed, rpm, _)) = view.status.as_ref().and_then(|s| s.feed_speed)
       {
         ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5)
-          .color(Theme::TEXT_DIM));
+          .color(palette.text_dim));
       }
     });
   });
@@ -522,9 +564,10 @@ fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) {
 /// Render the 40px main toolbar: the connect group, Open, the Run/Hold/Stop segmented transport group, Home,
 /// Settings, and the right-aligned machine-state badge (design §03).
 pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   // 1px bottom divider under the bar (design §03's `border-bottom:1px #2E2E2E`), painted along the panel edge.
   let bar = ui.max_rect();
-  ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, Theme::DIVIDER));
+  ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, palette.divider));
   // `horizontal_centered` vertically centres the 26px controls in the 40px bar, giving the design's even
   // breathing room above and below rather than the top-aligned look the plain `horizontal` produced.
   ui.horizontal_centered(|ui| {
@@ -581,7 +624,7 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
       }
     }
 
-    toolbar_divider(ui);
+    toolbar_divider(ui, palette);
 
     if ui.button("Open…").on_hover_text("Load a G-code program").clicked()
       && let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "ngc", "tap"]).pick_file()
@@ -589,15 +632,15 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
       sink.push(Intent::OpenProgram(path));
     }
 
-    toolbar_divider(ui);
+    toolbar_divider(ui, palette);
     transport_group(ui, view, state, sink);
-    toolbar_divider(ui);
+    toolbar_divider(ui, palette);
 
     // Home runs the firmware homing cycle; safe to offer whenever connected and not already moving. Drawn as a
     // ghost button (transparent rest, design §03) so it reads as a secondary action beside the framed groups.
     let badge = view.badge_state();
     let can_home = connected && !matches!(badge, BadgeState::Run | BadgeState::Jog | BadgeState::Home);
-    let home_color = if can_home { Theme::TEXT_DIM } else { Theme::TEXT_DISABLED };
+    let home_color = if can_home { palette.text_dim } else { palette.text_disabled };
     let home = egui::Button::new(RichText::new("⌂ Home").color(home_color)).fill(Color32::TRANSPARENT);
     if ui.add_enabled(can_home, home).on_hover_text("Run homing cycle ($H)").clicked() {
       sink.push(Intent::Home);
@@ -629,6 +672,7 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
 /// return to Idle, no alarm); the standalone Abort issues the HARD soft-reset (`0x18` → `ALARM:3`). Enable/emphasis
 /// come from the pure [`TransportGroup`] matrix so the view stays a renderer.
 pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   use egui::CornerRadius;
   let group = TransportGroup::for_state(view.badge_state(), !state.program.is_empty());
 
@@ -650,9 +694,9 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   let prev_gap = ui.spacing().item_spacing.x;
   ui.spacing_mut().item_spacing.x = 0.0;
 
-  let mut run_button = egui::Button::new(RichText::new(run_label).color(Theme::STATE_RUN)).corner_radius(left);
+  let mut run_button = egui::Button::new(RichText::new(run_label).color(palette.state_run)).corner_radius(left);
   if group.run_active {
-    run_button = run_button.fill(Theme::INSET);
+    run_button = run_button.fill(palette.inset);
   }
   if ui.add_enabled(group.run_enabled, run_button).clicked() {
     sink.push(Intent::RunOrResume);
@@ -664,7 +708,7 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   // Stop is now the GRACEFUL program stop (`0x86`): the everyday "stop the job cleanly" button. It decelerates to a
   // block boundary, flushes the queue and returns to Idle with no alarm, so it reads as a normal-weight control
   // (amber, not danger-red) — the hard reset lives in the separate Abort button beside the group.
-  let stop = egui::Button::new(RichText::new("■ Stop").color(Theme::STATE_HOLD)).corner_radius(right);
+  let stop = egui::Button::new(RichText::new("■ Stop").color(palette.state_hold)).corner_radius(right);
   if ui
     .add_enabled(group.stop_enabled, stop)
     .on_hover_text("Stop the job cleanly (0x86) — decelerate, flush, return to Idle")
@@ -679,7 +723,7 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   // Abort / E-stop: the HARD soft-reset (`0x18` → `ALARM:3`). Visually distinct — danger-red, fully rounded, set
   // apart from the segmented group — and available the instant a transport is attached (even mid-handshake), so the
   // operator always has an emergency reset. The graceful Stop above is the routine control; this is the panic stop.
-  let abort = egui::Button::new(RichText::new("⏹ Abort").color(Theme::DANGER))
+  let abort = egui::Button::new(RichText::new("⏹ Abort").color(palette.state_alarm))
     .corner_radius(Metrics::CONTROL_RADIUS);
   if ui
     .add_enabled(group.abort_enabled, abort)
@@ -693,7 +737,7 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   // disconnected, since it sends nothing to the board. Drawn as a ghost button (transparent rest, like Home) so it
   // reads as a secondary, non-machine action set apart from the run controls. Disabled (greyed) with no program.
   let has_program = !state.program.is_empty();
-  let sim_color = if has_program { Theme::TEXT_DIM } else { Theme::TEXT_DISABLED };
+  let sim_color = if has_program { palette.text_dim } else { palette.text_disabled };
   let simulate = egui::Button::new(RichText::new("∿ Simulate").color(sim_color)).fill(Color32::TRANSPARENT);
   if ui
     .add_enabled(has_program, simulate)
@@ -707,9 +751,10 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
 /// Render the digital readout: a WPos/MPos toggle, large per-axis rows (coloured letter + big tabular value +
 /// unit), the Zero X/Y/Z/XYZ button row, and the WCO strip (design §03).
 pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   header_bar(
-    ui,
-    |ui| header_title(ui, "Digital Readout"),
+    ui, palette,
+    |ui| header_title(ui, palette, "Digital Readout"),
     |ui| {
       // The WPos/MPos toggle sits inside the header bar (design §03); the small joined buttons pick which
       // coordinate the big readout shows. The design defaults to WPos. `right_to_left` lays MPos then WPos so
@@ -728,10 +773,10 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   for (index, axis) in axes.iter().enumerate() {
     ui.horizontal(|ui| {
       ui.label(RichText::new(axis.letter().to_string()).size(Metrics::DRO_LETTER).strong()
-        .color(Theme::axis_color(*axis)));
+        .color(palette.axis_color(*axis)));
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new("mm").monospace().size(Metrics::DRO_UNIT).color(Theme::TEXT_DISABLED));
-        ui.label(big_axis_value(shown, index));
+        ui.label(RichText::new("mm").monospace().size(Metrics::DRO_UNIT).color(palette.text_disabled));
+        ui.label(big_axis_value(palette, shown, index));
       });
     });
     ui.add_space(Metrics::DRO_ROW_GAP - ui.spacing().item_spacing.y);
@@ -757,10 +802,10 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       };
       // Size the label to the design's ~11.5px and never wrap: the placed cell is narrow, and at egui's larger
       // default button font "Zero XYZ" wrapped onto two lines inside its slot. `Extend` keeps it one line.
-      let text = RichText::new(label).size(11.5).color(Theme::TEXT);
+      let text = RichText::new(label).size(11.5).color(palette.text);
       let mut button = egui::Button::new(text).wrap_mode(egui::TextWrapMode::Extend);
       if primary {
-        button = button.fill(Theme::ACCENT);
+        button = button.fill(palette.accent);
       }
       if ui.put(rect, button).clicked() {
         sink.push(Intent::SetWorkZero { axes });
@@ -772,11 +817,11 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   if !view.last_wco.is_empty() {
     ui.add_space(6.0);
     let wco: Vec<String> = view.last_wco.iter().map(|v| format!("{v:.3}")).collect();
-    egui::Frame::new().fill(Theme::INSET).inner_margin(egui::Margin::symmetric(10, 6)).corner_radius(2.0)
+    egui::Frame::new().fill(palette.inset).inner_margin(egui::Margin::symmetric(10, 6)).corner_radius(2.0)
       .show(ui, |ui| {
         ui.horizontal(|ui| {
-          ui.label(RichText::new("WCO").monospace().size(10.5).color(Theme::TEXT_DIM));
-          ui.label(RichText::new(wco.join(", ")).monospace().size(10.5).color(Theme::TEXT));
+          ui.label(RichText::new("WCO").monospace().size(10.5).color(palette.text_dim));
+          ui.label(RichText::new(wco.join(", ")).monospace().size(10.5).color(palette.text));
         });
       });
   }
@@ -786,12 +831,12 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   // one that simply has a tool. Never sourced from the `<...>` status report (it carries no tool number).
   if let Some(tool) = view.current_tool {
     ui.add_space(6.0);
-    egui::Frame::new().fill(Theme::INSET).inner_margin(egui::Margin::symmetric(10, 6)).corner_radius(2.0)
+    egui::Frame::new().fill(palette.inset).inner_margin(egui::Margin::symmetric(10, 6)).corner_radius(2.0)
       .show(ui, |ui| {
         ui.horizontal(|ui| {
-          ui.label(RichText::new("TOOL").monospace().size(10.5).color(Theme::TEXT_DIM));
+          ui.label(RichText::new("TOOL").monospace().size(10.5).color(palette.text_dim));
           let label = if tool == 0 { "none".to_string() } else { format!("T{tool}") };
-          ui.label(RichText::new(label).monospace().size(10.5).color(Theme::TEXT));
+          ui.label(RichText::new(label).monospace().size(10.5).color(palette.text));
         });
       });
   }
@@ -802,7 +847,7 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   // later without reopening the parser. Drawn unconditionally so the operator always has an endstop reference;
   // with no report (or an absent `Pn:`) all three read clear.
   ui.add_space(6.0);
-  endstop_chips(ui, view);
+  endstop_chips(ui, palette, view);
   });
 }
 
@@ -811,14 +856,14 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
 /// and chip inset so the three chips plus the `LIMITS` label never overflow the fixed 268px left column (the
 /// panel-overflow lesson). The lit-vs-clear decision comes from the typed [`ViewState::pins`], decoded once when
 /// each status report is ingested rather than re-parsed per frame, so this stays a dumb renderer.
-fn endstop_chips(ui: &mut egui::Ui, view: &ViewState) {
+fn endstop_chips(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
   let pins = view.pins;
   ui.horizontal(|ui| {
     ui.spacing_mut().item_spacing.x = 4.0;
-    ui.label(RichText::new("LIMITS").size(Metrics::HEADER_TEXT).color(Theme::TEXT_DIM)
+    ui.label(RichText::new("LIMITS").size(Metrics::HEADER_TEXT).color(palette.text_dim)
       .extra_letter_spacing(Metrics::HEADER_TEXT * Metrics::HEADER_TRACKING_EM));
     for (letter, asserted) in [("X", pins.limit_x), ("Y", pins.limit_y), ("Z", pins.limit_z)] {
-      endstop_chip(ui, letter, asserted);
+      endstop_chip(ui, palette, letter, asserted);
     }
   });
 }
@@ -826,13 +871,13 @@ fn endstop_chips(ui: &mut egui::Ui, view: &ViewState) {
 /// Draw one endstop chip: a small rounded inset with the axis letter, filled with the alarm surface and
 /// labelled in alarm text while asserted, dim/inset while clear. Sized tight (a 6/2 inner margin, no button
 /// chrome) so three fit the left column alongside the `LIMITS` label.
-fn endstop_chip(ui: &mut egui::Ui, letter: &str, asserted: bool) {
+fn endstop_chip(ui: &mut egui::Ui, palette: Palette, letter: &str, asserted: bool) {
   let (fill, text) = if asserted {
-    (Theme::ALARM_BG, Theme::ALARM_TEXT)
+    (palette.alarm_bg, palette.alarm_text)
   } else {
-    (Theme::INSET, Theme::TEXT_DISABLED)
+    (palette.inset, palette.text_disabled)
   };
-  let border = if asserted { Theme::ALARM_BORDER } else { Theme::DIVIDER };
+  let border = if asserted { palette.alarm_border } else { palette.divider };
   // Tight 6/2 inner margin so three chips plus the `LIMITS` label fit the fixed 268px column (overflow lesson).
   chip_frame(ui, fill, border, egui::Margin { left: 6, right: 6, top: 2, bottom: 2 }, |ui| {
     let mut label = RichText::new(letter).monospace().size(11.0).color(text);
@@ -846,8 +891,9 @@ fn endstop_chip(ui: &mut egui::Ui, letter: &str, asserted: bool) {
 /// One DRO coordinate-toggle button (WPos/MPos), styled as a small joined segment: the active side carries the
 /// `widget.active` fill and the accent text, the inactive side the widget rest fill and dim text (design §03).
 fn pos_toggle(ui: &mut egui::Ui, state: &mut UiState, machine: bool, label: &str) {
+  let palette = state.style.palette;
   let active = state.show_machine_pos == machine;
-  let (fill, text) = if active { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::WIDGET, Theme::TEXT_DIM) };
+  let (fill, text) = if active { (palette.widget_active, palette.accent) } else { (palette.widget, palette.text_dim) };
   let button = egui::Button::new(RichText::new(label).size(10.0).color(text)).fill(fill).corner_radius(0.0);
   if ui.add(button).clicked() {
     state.show_machine_pos = machine;
@@ -857,21 +903,22 @@ fn pos_toggle(ui: &mut egui::Ui, state: &mut UiState, machine: bool, label: &str
 /// Format one axis value as a large monospace tabular fixed-point string, or a dash when not derivable. Padded
 /// to 8 columns (`-999.999` through `9999.999`), which spans a PCB-mill envelope while keeping the row inside the
 /// fixed 268px column — a wider field overflowed the column and pushed the panel edge out (an unpainted gap).
-fn big_axis_value(positions: Option<&Vec<f64>>, axis: usize) -> RichText {
+fn big_axis_value(palette: Palette, positions: Option<&Vec<f64>>, axis: usize) -> RichText {
   match positions.and_then(|p| p.get(axis)) {
-    Some(value) => RichText::new(format!("{value:>8.3}")).monospace().size(Metrics::DRO_VALUE).color(Theme::TEXT),
-    None => RichText::new(format!("{:>8}", "—")).monospace().size(Metrics::DRO_VALUE).color(Theme::TEXT_DISABLED),
+    Some(value) => RichText::new(format!("{value:>8.3}")).monospace().size(Metrics::DRO_VALUE).color(palette.text),
+    None => RichText::new(format!("{:>8}", "—")).monospace().size(Metrics::DRO_VALUE).color(palette.text_disabled),
   }
 }
 
 /// Render the jog pad: a step selector, feed field, and directional buttons for X/Y/Z plus jog-cancel.
 pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   // The Jog header carries the cancel affordance on the right, matching the mock's "esc · cancel" hint.
   header_bar(
-    ui,
-    |ui| header_title(ui, "Jog"),
+    ui, palette,
+    |ui| header_title(ui, palette, "Jog"),
     |ui| {
-      if ui.add(egui::Button::new(RichText::new("esc · cancel").size(10.0).color(Theme::TEXT_DISABLED))
+      if ui.add(egui::Button::new(RichText::new("esc · cancel").size(10.0).color(palette.text_disabled))
         .fill(Color32::TRANSPARENT)).on_hover_text("Jog cancel (0x85)").clicked()
       {
         sink.push(Intent::Realtime(RealtimeCommand::JogCancel));
@@ -925,12 +972,12 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
 
       // Step selector (design §03: segmented quick steps) and the jog feed rate.
       ui.add_space(8.0);
-      ui.label(RichText::new("Step (mm)").size(10.5).color(Theme::TEXT_DIM));
+      ui.label(RichText::new("Step (mm)").size(10.5).color(palette.text_dim));
       ui.add_space(2.0);
       step_selector(ui, state);
       ui.add_space(6.0);
       ui.horizontal(|ui| {
-        ui.label(RichText::new("Feed").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("Feed").size(11.0).color(palette.text_dim));
         ui.add(egui::DragValue::new(&mut state.jog_feed).speed(10.0).range(1.0..=10_000.0).suffix(" mm/min"));
       });
     });
@@ -944,9 +991,10 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
 /// trailing wider `cont` chip; exactly one is active (accent fill + accent text), the rest dim, so the selected
 /// step is unmistakable. Picking a number turns continuous mode off; picking `cont` flips into press-and-hold.
 fn step_selector(ui: &mut egui::Ui, state: &mut UiState) {
+  let palette = state.style.palette;
   egui::Frame::new()
-    .fill(Theme::INSET)
-    .stroke(egui::Stroke::new(1.0, Theme::BORDER_RECESS))
+    .fill(palette.inset)
+    .stroke(egui::Stroke::new(1.0, palette.border_recess))
     .corner_radius(Metrics::CONTROL_RADIUS)
     .inner_margin(1)
     .show(ui, |ui| {
@@ -975,7 +1023,7 @@ fn step_selector(ui: &mut egui::Ui, state: &mut UiState) {
         } else {
           !state.jog_continuous && (state.jog_step - JOG_STEPS[index]).abs() < f64::EPSILON
         };
-        let (fill, text) = if active { (Theme::WIDGET_ACTIVE, Theme::ACCENT) } else { (Theme::PANEL, Theme::TEXT_DIM) };
+        let (fill, text) = if active { (palette.widget_active, palette.accent) } else { (palette.panel, palette.text_dim) };
         let label = if is_cont { "cont".to_string() } else { format!("{}", JOG_STEPS[index]) };
         let button = egui::Button::new(RichText::new(label).monospace().size(11.0).color(text))
           .fill(fill)
@@ -1016,9 +1064,10 @@ fn jog_blank(ui: &mut egui::Ui) {
 /// label (design §03). In fixed-step mode a click issues a single [`Intent::Jog`]; in continuous mode holding
 /// the cell issues [`Intent::JogStart`] on press and [`Intent::JogStop`] on release (see [`emit_jog`]).
 fn jog_button(ui: &mut egui::Ui, label: &str, state: &UiState, sink: &mut IntentSink, motion: Option<(Axis, Dir)>) {
+  let palette = state.style.palette;
   let Some((axis, dir)) = motion else {
     // The centre cell is a non-interactive label marking the pad's purpose.
-    let button = egui::Button::new(RichText::new(label).monospace().size(9.5).color(Theme::TEXT_DISABLED));
+    let button = egui::Button::new(RichText::new(label).monospace().size(9.5).color(palette.text_disabled));
     ui.add_sized(Vec2::splat(Metrics::JOG_CELL), button);
     return;
   };
@@ -1030,9 +1079,10 @@ fn jog_button(ui: &mut egui::Ui, label: &str, state: &UiState, sink: &mut Intent
 /// an inert label between Z+ and Z−. Step vs continuous behaviour matches [`jog_button`].
 fn jog_z(ui: &mut egui::Ui, label: &str, width: f32, state: &UiState, sink: &mut IntentSink,
   motion: Option<(Axis, Dir)>) {
+  let palette = state.style.palette;
   let size = Vec2::new(width, Metrics::JOG_CELL);
   let Some((axis, dir)) = motion else {
-    ui.add_sized(size, egui::Button::new(RichText::new(label).color(Theme::TEXT_DISABLED)));
+    ui.add_sized(size, egui::Button::new(RichText::new(label).color(palette.text_disabled)));
     return;
   };
   let response = ui.add_sized(size, egui::Button::new(label).sense(jog_sense(state)));
@@ -1081,19 +1131,20 @@ fn emit_jog(response: &egui::Response, state: &UiState, sink: &mut IntentSink, a
 /// express an absolute target; the shell turns that into the minimal relative ±10/±1/reset byte sequence
 /// against the live `Ov:` value, so the view never does the override byte arithmetic.
 pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   use super::overrides::OverrideAxis;
-  section_header(ui, "Overrides");
+  section_header(ui, palette, "Overrides");
   let (feed, rapid, spindle) = view.status.as_ref().and_then(|s| s.overrides).unwrap_or((100, 100, 100));
   // Overrides only do anything on a ready link — a relative ±10/±1/reset byte is a no-op with nothing connected
   // to act on it — so the whole panel is disabled until the board is connected and ready (Idle/Run/Hold/…).
   let enabled = view.connection.is_connected();
 
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    override_axis(ui, "Feed", OverrideAxis::Feed, feed, enabled, &mut state.feed_override_drag, sink,
+    override_axis(ui, palette, "Feed", OverrideAxis::Feed, feed, enabled, &mut state.feed_override_drag, sink,
       RealtimeCommand::FeedOverrideMinus1, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
       RealtimeCommand::FeedOverridePlus10, RealtimeCommand::FeedOverridePlus1);
     ui.add_space(4.0);
-    override_axis(ui, "Spindle", OverrideAxis::Spindle, spindle, enabled, &mut state.spindle_override_drag, sink,
+    override_axis(ui, palette, "Spindle", OverrideAxis::Spindle, spindle, enabled, &mut state.spindle_override_drag, sink,
       RealtimeCommand::SpindleOverrideMinus1, RealtimeCommand::SpindleOverrideMinus10,
       RealtimeCommand::SpindleOverrideReset, RealtimeCommand::SpindleOverridePlus10,
       RealtimeCommand::SpindleOverridePlus1);
@@ -1116,16 +1167,16 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
     // Realized feed/speed from the latest report: what the machine is actually doing after overrides.
     if let Some((feed, rpm, actual)) = view.status.as_ref().and_then(|s| s.feed_speed) {
       ui.add_space(6.0);
-      egui::Frame::new().fill(Theme::INSET).inner_margin(egui::Margin::symmetric(12, 8)).corner_radius(2.0)
+      egui::Frame::new().fill(palette.inset).inner_margin(egui::Margin::symmetric(12, 8)).corner_radius(2.0)
         .show(ui, |ui| {
           ui.horizontal(|ui| {
-            ui.label(RichText::new("Realized F").size(10.5).color(Theme::TEXT_DIM));
-            ui.label(RichText::new(format!("{feed:.0} mm/min")).monospace().color(Theme::TEXT));
+            ui.label(RichText::new("Realized F").size(10.5).color(palette.text_dim));
+            ui.label(RichText::new(format!("{feed:.0} mm/min")).monospace().color(palette.text));
           });
           ui.horizontal(|ui| {
-            ui.label(RichText::new("Realized S").size(10.5).color(Theme::TEXT_DIM));
+            ui.label(RichText::new("Realized S").size(10.5).color(palette.text_dim));
             let shown = actual.unwrap_or(rpm);
-            ui.label(RichText::new(format!("{shown:.0} RPM")).monospace().color(Theme::TEXT));
+            ui.label(RichText::new(format!("{shown:.0} RPM")).monospace().color(palette.text));
           });
         });
     }
@@ -1138,7 +1189,7 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
 /// and a square knob — no colour at all (the user-flagged "missing colors entirely"). The strip is taller than
 /// the 6px track so it is easy to grab; dragging or clicking maps the pointer x onto the value and reports the
 /// change through the returned [`egui::Response`] so the caller's commit/mirror logic is unchanged.
-fn override_slider(ui: &mut egui::Ui, value: &mut u32, fill_color: Color32) -> egui::Response {
+fn override_slider(ui: &mut egui::Ui, palette: Palette, value: &mut u32, fill_color: Color32) -> egui::Response {
   use super::overrides::{OVERRIDE_MAX, OVERRIDE_MIN, OVERRIDE_NEUTRAL};
   let width = ui.available_width().max(48.0);
   let (rect, mut response) = ui.allocate_exact_size(Vec2::new(width, 18.0), egui::Sense::click_and_drag());
@@ -1166,16 +1217,16 @@ fn override_slider(ui: &mut egui::Ui, value: &mut u32, fill_color: Color32) -> e
   let pos_frac = (value.saturating_sub(OVERRIDE_MIN)) as f32 / span;
   let radius = egui::CornerRadius::same(Metrics::CONTROL_RADIUS);
   let painter = ui.painter();
-  painter.rect_filled(track, radius, Theme::INSET);
+  painter.rect_filled(track, radius, palette.inset);
   let mut fill = track;
   fill.set_width(track.width() * fill_frac);
   painter.rect_filled(fill, radius, fill_color);
-  painter.rect_stroke(track, radius, egui::Stroke::new(1.0, Theme::BORDER_RECESS), egui::StrokeKind::Inside);
+  painter.rect_stroke(track, radius, egui::Stroke::new(1.0, palette.border_recess), egui::StrokeKind::Inside);
   // A 2px handle at the override's true position, brightened to the text colour, so the operator sees the grab
   // point and can read where in the 10–200% span the value sits even while the fill is saturated full.
   let handle_x = (track.left() + track.width() * pos_frac.clamp(0.0, 1.0)).clamp(track.left(), track.right());
   let handle = egui::Rect::from_center_size(egui::pos2(handle_x, track.center().y), Vec2::new(2.0, 14.0));
-  painter.rect_filled(handle, egui::CornerRadius::ZERO, Theme::TEXT);
+  painter.rect_filled(handle, egui::CornerRadius::ZERO, palette.text);
   response
 }
 
@@ -1193,8 +1244,8 @@ fn override_slider(ui: &mut egui::Ui, value: &mut u32, fill_color: Color32) -> e
 /// whole row is disabled unless a live link can act on the override (`enabled`), since overrides are no-ops
 /// otherwise.
 #[allow(clippy::too_many_arguments)]
-fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::OverrideAxis, live: u32, enabled: bool,
-  feedback: &mut super::overrides::OverrideFeedback, sink: &mut IntentSink, minus1: RealtimeCommand,
+fn override_axis(ui: &mut egui::Ui, palette: Palette, label: &str, axis: super::overrides::OverrideAxis, live: u32,
+  enabled: bool, feedback: &mut super::overrides::OverrideFeedback, sink: &mut IntentSink, minus1: RealtimeCommand,
   minus10: RealtimeCommand, reset: RealtimeCommand, plus10: RealtimeCommand, plus1: RealtimeCommand) {
   use super::overrides::OverrideAxis;
 
@@ -1206,16 +1257,16 @@ fn override_axis(ui: &mut egui::Ui, label: &str, axis: super::overrides::Overrid
   // Feed (and rapid) carry the cool control-blue fill; spindle carries the warm motion-orange, matching the
   // design's `#0E86D4` feed bar and `#FF7A1A` spindle bar (the colour that was missing entirely before).
   let fill_color = match axis {
-    OverrideAxis::Feed => Theme::ACCENT,
-    OverrideAxis::Spindle => Theme::ACCENT_MOTION,
+    OverrideAxis::Feed => palette.accent,
+    OverrideAxis::Spindle => palette.accent_motion,
   };
   ui.add_enabled_ui(enabled, |ui| {
     // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
     ui.horizontal(|ui| {
-      ui.label(RichText::new(label).size(11.0).color(Theme::TEXT_DIM));
+      ui.label(RichText::new(label).size(11.0).color(palette.text_dim));
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(Theme::TEXT));
-        let slider = override_slider(ui, &mut value, fill_color);
+        ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(palette.text));
+        let slider = override_slider(ui, palette, &mut value, fill_color);
         // A UI test (egui_kittest) needs the slider's on-screen rect to drive a pointer drag at known
         // coordinates, since the widget is hand-painted and label-less so AccessKit cannot locate it by text.
         #[cfg(all(test, feature = "gui"))]
@@ -1297,10 +1348,11 @@ pub(crate) mod slider_rect_probe {
 
 /// Render the probe panel: depth/feed/plate inputs and a "Probe Z" action that the shell sequences.
 pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
-  section_header(ui, "Probe Z · no plate");
+  let palette = state.style.palette;
+  section_header(ui, palette, "Probe Z · no plate");
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     ui.label(RichText::new("No-touch-plate Z zero. Lower until continuity, set Z = 0.").size(11.0)
-      .color(Theme::TEXT_DIM));
+      .color(palette.text_dim));
     ui.add_space(4.0);
     let enabled = view.connection == ConnectionState::Idle;
     ui.add_enabled_ui(enabled, |ui| {
@@ -1328,7 +1380,7 @@ pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mu
     // Render the latched probe result below the action so the operator sees the probed point + success here
     // rather than hunting for it in the console. Shows a live "Probing…" while awaiting, the contact point on
     // success, or the failure reason — driven entirely by the reducer's `probe_op` latch.
-    probe_result(ui, view);
+    probe_result(ui, palette, view);
   });
 }
 
@@ -1338,14 +1390,14 @@ pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mu
 /// DIFFERENT flow (a rotary wizard touch): this panel speaks only for the ZeroZ touch-off, so it must not claim
 /// "Work-Z set." for a rotary probe (the wizard has its own panel). Routing on `op.kind` is what keeps the two
 /// panels from narrating each other's probes.
-fn probe_result(ui: &mut egui::Ui, view: &ViewState) {
+fn probe_result(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
   use super::view_state::{ProbeKind, ProbeOutcome};
   let Some(op) = view.probe_op.as_ref().filter(|op| op.kind == ProbeKind::ZeroZ) else {
     return;
   };
   ui.add_space(6.0);
   if op.awaiting {
-    ui.label(RichText::new("Probing… awaiting result").size(11.0).color(Theme::TEXT_DIM));
+    ui.label(RichText::new("Probing… awaiting result").size(11.0).color(palette.text_dim));
     return;
   }
   match op.last.as_ref() {
@@ -1353,12 +1405,12 @@ fn probe_result(ui: &mut egui::Ui, view: &ViewState) {
       // Show the machine-coordinate contact point (X, Y, Z, then any rotary axis) at 3 decimals, the PRB report
       // precision. A short green confirmation reads as "done" without re-reading the console.
       let coords = position.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", ");
-      ui.label(RichText::new(format!("Contact at [{coords}]")).size(11.0).color(Theme::OK));
-      ui.label(RichText::new("Work-Z set.").size(11.0).color(Theme::TEXT_DIM));
+      ui.label(RichText::new(format!("Contact at [{coords}]")).size(11.0).color(palette.state_run));
+      ui.label(RichText::new("Work-Z set.").size(11.0).color(palette.text_dim));
     }
     Some(ProbeOutcome::Failure { reason }) => {
-      ui.label(RichText::new(format!("Probe failed: {reason}")).size(11.0).color(Theme::DANGER));
-      ui.label(RichText::new("Work-Z unchanged.").size(11.0).color(Theme::TEXT_DIM));
+      ui.label(RichText::new(format!("Probe failed: {reason}")).size(11.0).color(palette.state_alarm));
+      ui.label(RichText::new("Work-Z unchanged.").size(11.0).color(palette.text_dim));
     }
     // Resolved but no outcome recorded — unreachable in practice (resolving always sets `last`), but render
     // nothing rather than assume.
@@ -1373,14 +1425,15 @@ fn probe_result(ui: &mut egui::Ui, view: &ViewState) {
 /// borrow, so this stays a pure render that only emits intents.
 pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   wizard: Option<&super::rotary_center::WizardState>, has_saved_center: bool, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   use super::rotary_center::WizardStep;
-  section_header(ui, "Rotary center-finder");
+  section_header(ui, palette, "Rotary center-finder");
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     let Some(w) = wizard else {
       // No run: collect the dowel diameter + index angle and offer Start. Only meaningful while idle/connected,
       // but the inputs stay editable so the operator can set up before connecting.
       ui.label(RichText::new("Find the A centerline from a known-diameter dowel clamped concentric.").size(11.0)
-        .color(Theme::TEXT_DIM));
+        .color(palette.text_dim));
       ui.add_space(4.0);
       egui::Grid::new("rotary_setup").num_columns(2).show(ui, |ui| {
         ui.label("Dowel ⌀");
@@ -1409,7 +1462,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       ui.add_space(4.0);
       ui.checkbox(&mut state.rotary_side_probe_confirmed,
         RichText::new(format!("Side-probe Z {:.3} mm is set for this dowel", state.rotary_bench.side_probe_z))
-          .size(11.0).color(Theme::TEXT_DIM));
+          .size(11.0).color(palette.text_dim));
       let enabled = view.connection == ConnectionState::Idle && state.rotary_side_probe_confirmed;
       ui.add_enabled_ui(enabled, |ui| {
         if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0),
@@ -1439,7 +1492,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
 
     // A run is active: render the step guidance, the readings so far, and the step's action button. Probing
     // disables the action (one touch at a time); the latch's awaiting/result is shown by the probe panel above.
-    rotary_run_readings(ui, w);
+    rotary_run_readings(ui, palette, w);
     ui.add_space(6.0);
     let probing = w.is_probing();
     let idle = view.connection == ConnectionState::Idle;
@@ -1448,7 +1501,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
     let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
     match w.step {
       WizardStep::EnterDowel => {
-        ui.label(RichText::new("Jog to the −Y face approach, then probe.").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("Jog to the −Y face approach, then probe.").size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle && !probing, |ui| {
           if ui.add_sized(full, egui::Button::new("Probe Y (left side)")).clicked() {
             sink.push(Intent::RotaryCenterProbe);
@@ -1456,7 +1509,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
         });
       }
       WizardStep::ReadyYRight => {
-        ui.label(RichText::new("Jog to the +Y face approach, then probe.").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("Jog to the +Y face approach, then probe.").size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle && !probing, |ui| {
           if ui.add_sized(full, egui::Button::new("Probe Y (right side)")).clicked() {
             sink.push(Intent::RotaryCenterProbe);
@@ -1466,7 +1519,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       WizardStep::MoveToYc => {
         // ONLY the move is offered here — the top probe is locked until the move has actually been sent (the
         // wizard then advances to MovedToYc). This is the UI half of the type-enforced "move before top" order.
-        ui.label(RichText::new("Move to the Y center before probing the top.").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("Move to the Y center before probing the top.").size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle, |ui| {
           if ui.add_sized(full, egui::Button::new("Move to Y center")).clicked() {
             sink.push(Intent::RotaryCenterMoveToYc);
@@ -1475,7 +1528,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       }
       WizardStep::MovedToYc => {
         // The move was sent; now (and only now) the top probe is offered.
-        ui.label(RichText::new("At the Y center. Probe the dowel top.").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("At the Y center. Probe the dowel top.").size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle && !probing, |ui| {
           if ui.add_sized(full, egui::Button::new("Probe Z (dowel top)")).clicked() {
             sink.push(Intent::RotaryCenterProbe);
@@ -1484,10 +1537,10 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       }
       WizardStep::Review => {
         ui.label(RichText::new("Center found. Write it to the active WCS (Y/Z only).").size(11.0)
-          .color(Theme::OK));
+          .color(palette.state_run));
         // The operator picks which feature work-Z0 lands on. Y0 is always the axis centerline; only Z is
         // selectable. Defaults to the axis centerline (wrap-machining convention).
-        rotary_z_datum_picker(ui, w, sink);
+        rotary_z_datum_picker(ui, palette, w, sink);
         ui.add_enabled_ui(idle, |ui| {
           if ui.add_sized(full, egui::Button::new("Write center → WCS (G10 L2)")).clicked() {
             sink.push(Intent::RotaryCenterWriteWcs);
@@ -1496,11 +1549,11 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       }
       WizardStep::Aborted => {
         let reason = w.abort_reason.as_deref().unwrap_or("cancelled");
-        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(Theme::DANGER));
+        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(palette.state_alarm));
       }
       // The probing steps await a result (the probe panel shows it); only Cancel is offered here.
       WizardStep::ProbeYLeft | WizardStep::ProbeYRight | WizardStep::ProbeZTop => {
-        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(palette.text_dim));
       }
     }
     ui.add_space(4.0);
@@ -1515,8 +1568,9 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
 /// the operator needs to dial in a bench. The crash-risk side-probe Z is NOT here — it is hoisted into the
 /// always-visible setup grid and gated behind a confirmation (finding #13); this section holds the rest.
 fn rotary_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
+  let palette = state.style.palette;
   let p = &mut state.rotary_bench;
-  egui::CollapsingHeader::new(RichText::new("Bench params").size(11.0).color(Theme::TEXT_DIM))
+  egui::CollapsingHeader::new(RichText::new("Bench params").size(11.0).color(palette.text_dim))
     .id_salt("rotary_bench_params")
     .show(ui, |ui| {
       egui::Grid::new("rotary_bench").num_columns(2).show(ui, |ui| {
@@ -1544,9 +1598,9 @@ fn rotary_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
 
 /// Render the rotary wizard's captured readings + computed center as a compact dim list. Each is shown once
 /// available; `Y_c`/`Z_c` appear as the math resolves them. Pure render of [`super::rotary_center::WizardState`].
-fn rotary_run_readings(ui: &mut egui::Ui, w: &super::rotary_center::WizardState) {
+fn rotary_run_readings(ui: &mut egui::Ui, palette: Palette, w: &super::rotary_center::WizardState) {
   let dim = |ui: &mut egui::Ui, text: String| {
-    ui.label(RichText::new(text).size(11.0).color(Theme::TEXT_DIM));
+    ui.label(RichText::new(text).size(11.0).color(palette.text_dim));
   };
   dim(ui, format!("Dowel ⌀ {:.3} mm · A {:.1}°", w.dowel_diameter, w.index_angle_deg));
   if let Some(y) = w.y_left {
@@ -1556,23 +1610,23 @@ fn rotary_run_readings(ui: &mut egui::Ui, w: &super::rotary_center::WizardState)
     dim(ui, format!("Y right {y:.3}"));
   }
   if let Some(yc) = w.y_center() {
-    ui.label(RichText::new(format!("Y center {yc:.3}")).size(11.0).color(Theme::TEXT));
+    ui.label(RichText::new(format!("Y center {yc:.3}")).size(11.0).color(palette.text));
   }
   if let Some(z) = w.z_top {
     dim(ui, format!("Z top   {z:.3}"));
   }
   if let Some(zc) = w.z_center() {
-    ui.label(RichText::new(format!("Z center {zc:.3}")).size(11.0).color(Theme::TEXT));
+    ui.label(RichText::new(format!("Z center {zc:.3}")).size(11.0).color(palette.text));
   }
 }
 
 /// Render the Z-datum picker for the WCS write: two selectable labels — the rotary axis centerline (default) or
 /// the probed top surface — plus a one-line clarification and a preview of which Z the offered `G10` will use.
 /// Emits [`Intent::RotaryCenterSetZDatum`] on a change; pure render of the wizard's current selection.
-fn rotary_z_datum_picker(ui: &mut egui::Ui, w: &super::rotary_center::WizardState, sink: &mut IntentSink) {
+fn rotary_z_datum_picker(ui: &mut egui::Ui, palette: Palette, w: &super::rotary_center::WizardState, sink: &mut IntentSink) {
   use super::rotary_center::ZDatum;
   ui.add_space(4.0);
-  ui.label(RichText::new("Work-Z0 datum").size(11.0).color(Theme::TEXT_DIM));
+  ui.label(RichText::new("Work-Z0 datum").size(11.0).color(palette.text_dim));
   ui.horizontal(|ui| {
     let axis = w.z_datum == ZDatum::AxisCenterline;
     let top = w.z_datum == ZDatum::TopSurface;
@@ -1588,9 +1642,9 @@ fn rotary_z_datum_picker(ui: &mut egui::Ui, w: &super::rotary_center::WizardStat
     ZDatum::AxisCenterline => ("Z0 at the rotary axis (Z_top − D/2).", w.z_datum_value()),
     ZDatum::TopSurface => ("Z0 at the probed top surface (Z_top).", w.z_datum_value()),
   };
-  ui.label(RichText::new(desc).size(11.0).color(Theme::TEXT_DIM));
+  ui.label(RichText::new(desc).size(11.0).color(palette.text_dim));
   if let Some(z) = z {
-    ui.label(RichText::new(format!("G10 will set Z {z:.3}")).size(11.0).color(Theme::TEXT_DIM));
+    ui.label(RichText::new(format!("G10 will set Z {z:.3}")).size(11.0).color(palette.text_dim));
   }
 }
 
@@ -1601,16 +1655,17 @@ fn rotary_z_datum_picker(ui: &mut egui::Ui, w: &super::rotary_center::WizardStat
 /// (read-only). The probes use the conventional Y radial axis (matching the center-finder), probing toward −Y.
 pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   sweep: Option<(&super::angle_sweep::AngleSweep, super::view_state::ProbeKind)>, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   use super::angle_sweep::SweepStep;
   use super::intent::{Axis, Dir};
   use super::view_state::ProbeKind;
-  section_header(ui, "Verify · measure");
+  section_header(ui, palette, "Verify · measure");
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
     let idle = view.connection == ConnectionState::Idle;
     let Some((s, kind)) = sweep else {
       // No run: collect the shared start angle + (for runout) N, and offer both Start actions.
-      ui.label(RichText::new("180°-flip verify or N-angle runout, probing −Y.").size(11.0).color(Theme::TEXT_DIM));
+      ui.label(RichText::new("180°-flip verify or N-angle runout, probing −Y.").size(11.0).color(palette.text_dim));
       ui.add_space(4.0);
       egui::Grid::new("verify_setup").num_columns(2).show(ui, |ui| {
         ui.label("Start A");
@@ -1641,13 +1696,13 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       ProbeKind::Runout => "Runout report",
       _ => "Verify",
     };
-    ui.label(RichText::new(title).size(11.0).color(Theme::TEXT));
-    verify_readings_table(ui, s);
+    ui.label(RichText::new(title).size(11.0).color(palette.text));
+    verify_readings_table(ui, palette, s);
     ui.add_space(6.0);
     match s.step() {
       SweepStep::Ready => {
         ui.label(RichText::new(format!("Jog the approach for touch {} of {}, then probe.",
-          s.current_touch_number(), s.total_touches())).size(11.0).color(Theme::TEXT_DIM));
+          s.current_touch_number(), s.total_touches())).size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle, |ui| {
           if ui.add_sized(full, egui::Button::new("Probe this angle")).clicked() {
             sink.push(Intent::SweepProbe);
@@ -1655,12 +1710,12 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
         });
       }
       SweepStep::Probing => {
-        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(Theme::TEXT_DIM));
+        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(palette.text_dim));
       }
       SweepStep::Done => verify_done(ui, state, s, kind, idle, full, sink),
       SweepStep::Aborted => {
         let reason = s.abort_reason().unwrap_or("cancelled");
-        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(Theme::DANGER));
+        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(palette.state_alarm));
       }
     }
     ui.add_space(4.0);
@@ -1674,19 +1729,20 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
 /// TIR / eccentricity. Pure render of the computed values over the sweep's readings.
 fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &super::angle_sweep::AngleSweep,
   kind: super::view_state::ProbeKind, idle: bool, full: Vec2, sink: &mut IntentSink) {
+  let palette = _state.style.palette;
   use super::flip_verify::FlipResult;
   use super::runout::RunoutReport;
   use super::view_state::ProbeKind;
   match kind {
     ProbeKind::FlipVerify => {
       let Some(result) = FlipResult::from_readings(s.probe_axis(), s.readings()) else {
-        ui.label(RichText::new("Flip verify needs two readings.").size(11.0).color(Theme::DANGER));
+        ui.label(RichText::new("Flip verify needs two readings.").size(11.0).color(palette.state_alarm));
         return;
       };
       ui.label(RichText::new(format!("Residual eccentricity {:.3} mm.", result.error()))
-        .size(11.0).color(Theme::OK));
+        .size(11.0).color(palette.state_run));
       ui.label(RichText::new("Apply shifts the active WCS origin on this axis by the residual.")
-        .size(11.0).color(Theme::TEXT_DIM));
+        .size(11.0).color(palette.text_dim));
       ui.add_enabled_ui(idle, |ui| {
         if ui.add_sized(full, egui::Button::new("Apply correction → WCS (G10 L2)")).clicked() {
           sink.push(Intent::FlipVerifyWriteCorrection);
@@ -1696,11 +1752,11 @@ fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &super::angle_sweep::
     ProbeKind::Runout => match RunoutReport::from_readings(s.readings()) {
       Some(r) => {
         ui.label(RichText::new(format!("TIR {:.3} mm · eccentricity {:.3} mm ({} pts)", r.tir, r.eccentricity,
-          r.count)).size(11.0).color(Theme::OK));
-        ui.label(RichText::new("Read-only — no offset written.").size(11.0).color(Theme::TEXT_DIM));
+          r.count)).size(11.0).color(palette.state_run));
+        ui.label(RichText::new("Read-only — no offset written.").size(11.0).color(palette.text_dim));
       }
       None => {
-        ui.label(RichText::new("Runout needs at least two readings.").size(11.0).color(Theme::DANGER));
+        ui.label(RichText::new("Runout needs at least two readings.").size(11.0).color(palette.state_alarm));
       }
     },
     _ => {}
@@ -1709,14 +1765,14 @@ fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &super::angle_sweep::
 
 /// Render the sweep's per-angle readings as a compact dim list (angle → reading once captured). Pure render of
 /// the shared [`super::angle_sweep::AngleSweep`].
-fn verify_readings_table(ui: &mut egui::Ui, s: &super::angle_sweep::AngleSweep) {
+fn verify_readings_table(ui: &mut egui::Ui, palette: Palette, s: &super::angle_sweep::AngleSweep) {
   let readings = s.readings();
   for (i, &angle) in s.angles().iter().enumerate() {
     let text = match readings.get(i) {
       Some(r) => format!("A{angle:.1}°  →  {r:.3}"),
       None => format!("A{angle:.1}°  →  —"),
     };
-    ui.label(RichText::new(text).size(11.0).color(Theme::TEXT_DIM));
+    ui.label(RichText::new(text).size(11.0).color(palette.text_dim));
   }
 }
 
@@ -1727,6 +1783,7 @@ fn verify_readings_table(ui: &mut egui::Ui, s: &super::angle_sweep::AngleSweep) 
 /// separate panels.
 pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
   eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   let active = state.active_tab;
   let tabs = [("Console", active == DockTab::Console), ("Program", active == DockTab::Program)];
   let progress = view.progress;
@@ -1736,9 +1793,9 @@ pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: supe
   // left. The progress rides on the strip regardless of the active tab — it is a dock-level affordance — so the
   // operator always sees streaming progress while reading either tab, even when the body is collapsed.
   let mut toggle_clicked = false;
-  let clicked = tab_strip(ui, &tabs, |ui| {
-    toggle_clicked = dock_collapse_toggle(ui, collapsed);
-    dock_progress(ui, progress, time, eta_qualifier);
+  let clicked = tab_strip(ui, palette, &tabs, |ui| {
+    toggle_clicked = dock_collapse_toggle(ui, palette, collapsed);
+    dock_progress(ui, palette, progress, time, eta_qualifier);
   });
   state.active_tab = dock_tab_for_click(active, clicked);
   if toggle_clicked {
@@ -1761,7 +1818,7 @@ pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: supe
 /// Draw the dock's collapse/expand toggle as a small ghost icon button at the right of the tab strip: a `−`
 /// minimises the dock to its strip, a `+` restores it (see [`dock_toggle_label`]). Sized to the strip's control
 /// height so it sits centred in the 30px bar. Returns whether it was clicked this frame.
-fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
+fn dock_collapse_toggle(ui: &mut egui::Ui, palette: Palette, collapsed: bool) -> bool {
   let label = dock_toggle_label(collapsed);
   let hint = if collapsed { "Expand dock" } else { "Collapse dock" };
   // Square icon button matching the strip's control height, transparent at rest like the §02 icon-button state
@@ -1772,7 +1829,7 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
   // layout then centres within the 30px bar. The glyph is held at the header text size so it can't grow the box.
   ui.spacing_mut().button_padding = Vec2::ZERO;
   let size = Vec2::splat(Metrics::PANEL_CONTROL_H);
-  let button = egui::Button::new(RichText::new(label).size(Metrics::HEADER_TEXT).color(Theme::TEXT_DIM))
+  let button = egui::Button::new(RichText::new(label).size(Metrics::HEADER_TEXT).color(palette.text_dim))
     .fill(Color32::TRANSPARENT);
   ui.add_sized(size, button).on_hover_text(hint).clicked()
 }
@@ -1787,8 +1844,8 @@ fn dock_collapse_toggle(ui: &mut egui::Ui, collapsed: bool) -> bool {
 /// why the percent and clock previously ran together with no gap. This sets its own roomy row spacing so the
 /// fields breathe, and degrades on a narrow strip by dropping the bar first (the least-important field — the
 /// percent and count carry the same information) so the block never overflows into an unpainted gap.
-fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time: super::progress::TimeEstimate,
-  eta_qualifier: Option<EtaQualifier>) {
+fn dock_progress(ui: &mut egui::Ui, palette: Palette, progress: super::view_state::Progress,
+  time: super::progress::TimeEstimate, eta_qualifier: Option<EtaQualifier>) {
   use super::progress::format_progress_clock;
   // Show the readout while a program is streaming (`total > 0`) OR a simulation is stored — the latter surfaces the
   // upfront ETA before any stream begins, when the progress total is still zero. With neither, there is nothing to
@@ -1810,40 +1867,40 @@ fn dock_progress(ui: &mut egui::Ui, progress: super::view_state::Progress, time:
   // "(default settings)" flag when the estimate used the default machine model, and a pause count when the
   // timeline modeled unbounded operator waits. Rendered only when a simulation drives the ETA.
   if let Some(qualifier) = eta_qualifier {
-    dock_eta_qualifier(ui, qualifier);
+    dock_eta_qualifier(ui, palette, qualifier);
   }
   // Rightmost (after the qualifier): the elapsed / estimated-total clock. `total` is `None` until the ETA is
   // projectable, so its right half shows the dim `--:--` placeholder rather than a wild early guess (a simulation
   // populates `total` immediately, so the upfront figure shows at once). See `format_progress_clock`.
   let clock = format_progress_clock(time.elapsed, time.total);
-  ui.label(RichText::new(clock).monospace().size(10.5).color(Theme::TEXT_DIM));
+  ui.label(RichText::new(clock).monospace().size(10.5).color(palette.text_dim));
   // The percent/count/bar fields only mean something once a stream is timing; skip them (and their separator)
   // before streaming so the upfront ETA shows the clock + qualifier alone, not a `0%`/`0 / 0` placeholder row.
   if progress.total == 0 {
     return;
   }
-  dock_progress_separator(ui);
+  dock_progress_separator(ui, palette);
   let pct = (progress.fraction() * 100.0).round() as u32;
-  ui.label(RichText::new(format!("{pct}%")).monospace().size(11.0).color(Theme::TEXT));
+  ui.label(RichText::new(format!("{pct}%")).monospace().size(11.0).color(palette.text));
   if draw_bar {
-    dock_progress_separator(ui);
+    dock_progress_separator(ui, palette);
     let bar = Vec2::new(Metrics::PROGRESS_W, Metrics::PROGRESS_H);
     let (rect, _) = ui.allocate_exact_size(bar, egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 2.0, Theme::INSET);
+    painter.rect_filled(rect, 2.0, palette.inset);
     let mut fill = rect;
     fill.set_width(rect.width() * progress.fraction());
-    painter.rect_filled(fill, 2.0, Theme::STATE_RUN);
+    painter.rect_filled(fill, 2.0, palette.state_run);
   }
-  dock_progress_separator(ui);
+  dock_progress_separator(ui, palette);
   ui.label(RichText::new(format!("{} / {}", progress.acked, progress.total)).monospace().size(10.5)
-    .color(Theme::TEXT_DIM));
+    .color(palette.text_dim));
 }
 
 /// Draw the dim middot that separates the dock progress fields (the design's `·`). Pulled out so every gap in
 /// [`dock_progress`] uses one consistent glyph and colour instead of repeating the `RichText` at each call site.
-fn dock_progress_separator(ui: &mut egui::Ui) {
-  ui.label(RichText::new("·").size(11.0).color(Theme::TEXT_DISABLED));
+fn dock_progress_separator(ui: &mut egui::Ui, palette: Palette) {
+  ui.label(RichText::new("·").size(11.0).color(palette.text_disabled));
 }
 
 /// Render the simulation's caveats beside the dock clock: a dim "(default settings)" flag when the estimate used
@@ -1851,9 +1908,9 @@ fn dock_progress_separator(ui: &mut egui::Ui) {
 /// note when the timeline modeled unbounded operator waits (`M0`/`M1`/`M6`) that are excluded from the timed
 /// total. Each part is its own label so the strip degrades gracefully; both are omitted when neither applies. The
 /// qualifier text is built by the pure [`eta_qualifier_text`] so the copy is unit-tested without a window.
-fn dock_eta_qualifier(ui: &mut egui::Ui, qualifier: EtaQualifier) {
+fn dock_eta_qualifier(ui: &mut egui::Ui, palette: Palette, qualifier: EtaQualifier) {
   if let Some(text) = eta_qualifier_text(qualifier) {
-    ui.label(RichText::new(text).size(10.0).color(Theme::TEXT_DISABLED));
+    ui.label(RichText::new(text).size(10.0).color(palette.text_disabled));
   }
 }
 
@@ -1898,6 +1955,7 @@ fn program_follow_target(
 /// large program stays cheap to render. While streaming, the listing auto-scrolls to keep the executing line in
 /// view (gated on the shared `auto-scroll` toggle), mirroring the console's stick-to-bottom follow.
 fn program_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
+  let palette = state.style.palette;
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
   let current = view.progress.acked;
   // Resolve the follow target before drawing so we can scroll the area to the executing row even when row
@@ -1931,16 +1989,16 @@ fn program_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
       // Executed lines dim out; the current line is emphasised with the accent and an inset highlight; pending
       // lines sit at the default text colour.
       let color = if is_current {
-        Theme::ACCENT
+        palette.accent
       } else if index < current {
-        Theme::TEXT_DISABLED
+        palette.text_disabled
       } else {
-        Theme::TEXT
+        palette.text
       };
       let row = RichText::new(format!("{:>5}  {line}", index + 1)).monospace().color(color);
       if is_current {
         // Highlight the executing line with the accent-tinted inset the design uses (bg + left accent border).
-        egui::Frame::new().fill(Theme::ACCENT.gamma_multiply(0.12)).inner_margin(egui::Margin {
+        egui::Frame::new().fill(palette.accent.gamma_multiply(0.12)).inner_margin(egui::Margin {
           left: 4,
           right: 0,
           top: 0,
@@ -1964,6 +2022,7 @@ fn program_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
 /// auto-scroll toggle and the manual-command entry line with a Send button (design §03). The dock's shared tab
 /// strip (see [`dock`]) carries the tab labels and the progress readout; this draws only the tab's content.
 fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   // The auto-scroll toggle sits above the log within the Console body (the mock's strip is now shared by both
   // tabs, so the toggle moves into the body where it only applies to the console).
   ui.horizontal(|ui| {
@@ -1991,11 +2050,11 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     |ui, range| {
       for row in range {
         if let Some(entry) = visible.get(row).and_then(|&index| view.console.get(index)) {
-          let (chevron, color) = console_line_style(entry.source, &entry.text);
+          let (chevron, color) = console_line_style(palette, entry.source, &entry.text);
           ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             ui.label(RichText::new(chevron).monospace().color(color));
-            ui.label(RichText::new(&entry.text).monospace().color(Theme::TEXT));
+            ui.label(RichText::new(&entry.text).monospace().color(palette.text));
           });
         }
       }
@@ -2043,19 +2102,19 @@ fn is_ok_noise(entry: &LogLine) -> bool {
 
 /// Decide the chevron glyph and colour for one console line, distinguishing status (`<…>`) and info (`[…]`)
 /// firmware lines from a plain response, per the design's console line types. Pure so it is unit-tested.
-fn console_line_style(source: LogSource, text: &str) -> (&'static str, Color32) {
+fn console_line_style(palette: Palette, source: LogSource, text: &str) -> (&'static str, Color32) {
   match source {
-    LogSource::Sent => ("›", Theme::LOG_SENT),
-    LogSource::Notice => ("·", Theme::LOG_NOTICE),
+    LogSource::Sent => ("›", palette.log_sent),
+    LogSource::Notice => ("·", palette.log_notice),
     LogSource::Received => {
       if text.starts_with('<') {
-        ("‹", Theme::LOG_STATUS)
+        ("‹", palette.log_status)
       } else if text.starts_with('[') {
-        ("‹", Theme::LOG_INFO)
+        ("‹", palette.log_info)
       } else if text.starts_with("error") || text.starts_with("ALARM") {
-        ("‹", Theme::DANGER)
+        ("‹", palette.state_alarm)
       } else {
-        ("‹", Theme::LOG_RECV)
+        ("‹", palette.log_recv)
       }
     }
   }
@@ -2063,6 +2122,7 @@ fn console_line_style(source: LogSource, text: &str) -> (&'static str, Color32) 
 
 /// Render the bottom status bar: the design's mono info strip (port dot · state · WCO · `Ln a/b · NN%` · F·S).
 pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
+  let palette = state.style.palette;
   // Fabulous mode: a matching Pride band along the strip's top edge, bookending the toolbar's. Painted before
   // the content so the mono text sits above it; the band is thin enough not to crowd the row.
   if state.fabulous {
@@ -2075,25 +2135,25 @@ pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
   }
   ui.horizontal(|ui| {
     let badge = view.badge_state();
-    dot(ui, Theme::badge_color(badge), Metrics::STATUS_DOT);
+    dot(ui, palette.badge_color(badge), Metrics::STATUS_DOT);
     let port = if state.selected_port.is_empty() { "—" } else { &state.selected_port };
-    ui.label(RichText::new(port).monospace().size(10.5).color(Theme::TEXT_DIM));
-    ui.label(RichText::new("·").color(Theme::TEXT_DISABLED));
-    ui.label(RichText::new(badge.label()).monospace().size(10.5).color(Theme::TEXT));
+    ui.label(RichText::new(port).monospace().size(10.5).color(palette.text_dim));
+    ui.label(RichText::new("·").color(palette.text_disabled));
+    ui.label(RichText::new(badge.label()).monospace().size(10.5).color(palette.text));
 
     if !view.last_wco.is_empty() {
-      ui.label(RichText::new("·").color(Theme::TEXT_DISABLED));
-      ui.label(RichText::new("WCO set").monospace().size(10.5).color(Theme::TEXT_DIM));
+      ui.label(RichText::new("·").color(palette.text_disabled));
+      ui.label(RichText::new("WCO set").monospace().size(10.5).color(palette.text_dim));
     }
     if view.progress.total > 0 {
-      ui.label(RichText::new("·").color(Theme::TEXT_DISABLED));
+      ui.label(RichText::new("·").color(palette.text_disabled));
       let pct = (view.progress.fraction() * 100.0).round() as u32;
       ui.label(RichText::new(format!("Ln {} / {} · {pct}%", view.progress.acked, view.progress.total))
-        .monospace().size(10.5).color(Theme::TEXT_DIM));
+        .monospace().size(10.5).color(palette.text_dim));
     }
     if let Some((feed, rpm, _)) = view.status.as_ref().and_then(|s| s.feed_speed) {
-      ui.label(RichText::new("·").color(Theme::TEXT_DISABLED));
-      ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5).color(Theme::TEXT_DIM));
+      ui.label(RichText::new("·").color(palette.text_disabled));
+      ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5).color(palette.text_dim));
     }
   });
 }
@@ -2101,7 +2161,7 @@ pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
 /// Render the alarm/error banner: a full-width strip under the toolbar (design §04). An alarm shows the code, a
 /// human gloss, and the Unlock-$X / Soft-reset recovery actions; a stream error shows the code, gloss, and a
 /// reset/dismiss. The copy comes from the pure [`super::badge`] detail tables.
-pub fn alarm_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
+pub fn alarm_banner(ui: &mut egui::Ui, palette: Palette, view: &ViewState, sink: &mut IntentSink) {
   let Some(banner) = &view.banner else {
     return;
   };
@@ -2117,20 +2177,20 @@ pub fn alarm_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) 
     }
   };
   egui::Frame::new()
-    .fill(Theme::ALARM_BG)
-    .stroke(egui::Stroke::new(1.0, Theme::ALARM_BORDER))
+    .fill(palette.alarm_bg)
+    .stroke(egui::Stroke::new(1.0, palette.alarm_border))
     .inner_margin(egui::Margin::symmetric(14, 10))
     .show(ui, |ui| {
       ui.horizontal(|ui| {
         ui.vertical(|ui| {
-          ui.label(RichText::new(&headline).color(Theme::ALARM_TEXT).strong());
-          ui.label(RichText::new(detail).size(11.5).color(Theme::TEXT_DIM));
+          ui.label(RichText::new(&headline).color(palette.alarm_text).strong());
+          ui.label(RichText::new(detail).size(11.5).color(palette.text_dim));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
           if ui.button("Dismiss").clicked() {
             sink.push(Intent::DismissBanner);
           }
-          let reset = egui::Button::new(RichText::new("Soft reset").color(Color32::WHITE)).fill(Theme::DANGER);
+          let reset = egui::Button::new(RichText::new("Soft reset").color(Color32::WHITE)).fill(palette.state_alarm);
           if ui.add(reset).on_hover_text("Soft reset (0x18)").clicked() {
             sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
           }
@@ -2160,23 +2220,23 @@ pub(crate) fn tool_change_headline(current_tool: Option<u32>) -> String {
 /// offers a Resume that issues the cycle-start (`~`) through the existing run/resume path, never a second pathway.
 /// Drawn in the banner slot, distinct from the alarm surface: violet (attention), not red, so it never reads as a
 /// fault. A fault banner, if latched, takes precedence (the shell shows this only when none is).
-pub fn tool_change_banner(ui: &mut egui::Ui, view: &ViewState, sink: &mut IntentSink) {
+pub fn tool_change_banner(ui: &mut egui::Ui, palette: Palette, view: &ViewState, sink: &mut IntentSink) {
   let headline = tool_change_headline(view.current_tool);
   egui::Frame::new()
-    .fill(Theme::INSET)
-    .stroke(egui::Stroke::new(1.0, Theme::STATE_CHECK))
+    .fill(palette.inset)
+    .stroke(egui::Stroke::new(1.0, palette.state_check))
     .inner_margin(egui::Margin::symmetric(14, 10))
     .show(ui, |ui| {
       ui.horizontal(|ui| {
         ui.vertical(|ui| {
-          ui.label(RichText::new(&headline).color(Theme::STATE_CHECK).strong());
+          ui.label(RichText::new(&headline).color(palette.state_check).strong());
           ui.label(RichText::new("The machine is paused for a manual tool change (M6). Insert the tool and press \
-            Resume (cycle-start) to continue.").size(11.5).color(Theme::TEXT_DIM));
+            Resume (cycle-start) to continue.").size(11.5).color(palette.text_dim));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
           // Resume reuses the single run/resume intent — the same `~` cycle-start the toolbar's Resume segment and
           // the keyboard hotkey issue — so there is exactly one resume pathway.
-          let resume = egui::Button::new(RichText::new("▶ Resume").color(Color32::WHITE)).fill(Theme::STATE_RUN);
+          let resume = egui::Button::new(RichText::new("▶ Resume").color(Color32::WHITE)).fill(palette.state_run);
           if ui.add(resume).on_hover_text("Resume after the tool change (cycle-start, ~)").clicked() {
             sink.push(Intent::RunOrResume);
           }
@@ -2200,11 +2260,6 @@ const MARKER_SNAP_SPAN_FRACTION: f32 = 0.25;
 /// and rejects sub-step jitter; small enough to keep fine detail, large enough that a stationary tool does not
 /// pile up points.
 const TRAIL_MIN_STEP_FRACTION: f32 = 0.002;
-
-/// Maximum gap between two consecutive trail points that is still drawn as a connected line, as a fraction of the
-/// span diagonal. A larger gap is a jump — a rapid reposition between moves, or a reconnect — and is left broken
-/// rather than drawn as a spurious streak across uncut work.
-const TRAIL_BREAK_FRACTION: f32 = 0.12;
 
 /// Rolling cap on trail length. Past this the oldest points are dropped (like AXIS's limited live-plot history),
 /// bounding memory and per-frame draw cost on a long job; the decimating step gate keeps a typical job well under.
@@ -2271,21 +2326,25 @@ fn max_programmed_feed(lines: &[String]) -> f64 {
 /// "cut so far" colouring track the real machine position (smoothed against the status sample rate); with no
 /// live status they fall back to the acknowledged-line position. Parsing is a cheap single pass done at load.
 pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
+  let palette = state.style.palette;
+  // Snapshot the resolved toolpath render style (stroke widths, trail-break, grid, marker radius) before the
+  // mutable `update_live_overlay` borrow below. `Copy`, so this is free and side-steps the borrow conflict.
+  let tp = state.style.toolpath;
   // The viewport header carries the filename/line-count on the right, inside the 30px strip (design §03).
   let progress = view.progress;
   let name = state.program_path.as_deref().map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string());
   header_bar(
-    ui,
+    ui, palette,
     |ui| {
-      header_title(ui, "Toolpath");
+      header_title(ui, palette, "Toolpath");
       if let Some(name) = &name {
-        ui.label(RichText::new(name).monospace().size(10.5).color(Theme::TEXT_DISABLED));
+        ui.label(RichText::new(name).monospace().size(10.5).color(palette.text_disabled));
       }
     },
     |ui| {
       if progress.total > 0 {
         ui.label(RichText::new(format!("{} / {}", progress.acked, progress.total))
-          .monospace().size(10.5).color(Theme::TEXT_DISABLED));
+          .monospace().size(10.5).color(palette.text_disabled));
       }
     },
   );
@@ -2293,12 +2352,12 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   let available = ui.available_size();
   let (response, painter) = ui.allocate_painter(available, egui::Sense::hover());
   let rect = response.rect;
-  painter.rect_filled(rect, 0.0, Theme::INSET);
-  draw_grid(&painter, rect);
+  painter.rect_filled(rect, 0.0, palette.inset);
+  draw_grid(&painter, palette, tp, rect);
 
   let Some((min, max)) = state.toolpath_bounds else {
     painter.text(rect.center(), egui::Align2::CENTER_CENTER, "no program loaded",
-      egui::FontId::proportional(14.0), Theme::TEXT_DIM);
+      egui::FontId::proportional(14.0), palette.text_dim);
     return;
   };
 
@@ -2320,7 +2379,7 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   // The program preview underneath is drawn uniformly DIM (cuts neutral, rapids dimmer) — it is the reference
   // geometry, not the progress. Progress is shown by the trail drawn over it, so there is no per-segment cut state.
   for seg in &state.toolpath {
-    let color = if seg.rapid { Theme::BORDER_RAISED } else { Theme::TEXT_DIM };
+    let color = if seg.rapid { palette.border_raised } else { palette.text_dim };
     painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(1.0, color));
   }
 
@@ -2329,14 +2388,19 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   // two read apart. Consecutive points are joined only when close enough — a large gap is a reconnect/teleport and
   // is left broken rather than streaked across uncut work (see [`preview::trail_connects`]). The move INTO a point
   // carries that point's rapid flag, so the drawn segment is coloured by `cur`.
-  let break_gap = span_diagonal(span) * TRAIL_BREAK_FRACTION;
+  let break_gap = span_diagonal(span) * tp.trail_break_fraction;
   let mut prev: Option<&TrailPoint> = None;
   for cur in &state.trail {
     if let Some(a) = prev
       && preview::trail_connects((a.pos.x, a.pos.y), (cur.pos.x, cur.pos.y), break_gap)
     {
-      let (color, width) =
-        if cur.rapid { (Theme::ACCENT, 1.0) } else { (Theme::ACCENT_MOTION, 1.6) };
+      // Cut/rapid colours and stroke widths come from the resolved config style: rapids take the rapid (control)
+      // colour at the thinner width, cuts take the cut (motion) colour at the thicker width.
+      let (color, width) = if cur.rapid {
+        (palette.toolpath_rapid, tp.rapid_stroke_px)
+      } else {
+        (palette.toolpath_cut, tp.cut_stroke_px)
+      };
       painter.line_segment([to_screen(a.pos), to_screen(cur.pos)], egui::Stroke::new(width, color));
     }
     prev = Some(cur);
@@ -2344,10 +2408,11 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
 
   // The tool dot (warm motion accent) marks where the machine is now: the smoothed live position, projected
   // through the same fit transform so it sits on the geometry. Suppressed (no dot) when there is no live position.
+  // The dot radius comes from the config style; the outer ring scales with it so the two stay proportional.
   if let Some(model) = live_marker {
     let pos = to_screen(model);
-    painter.circle_filled(pos, 4.0, Theme::ACCENT_MOTION);
-    painter.circle_stroke(pos, 8.0, egui::Stroke::new(1.0, Theme::ACCENT_MOTION.gamma_multiply(0.5)));
+    painter.circle_filled(pos, tp.marker_radius_px, palette.toolpath_cut);
+    painter.circle_stroke(pos, tp.marker_radius_px * 2.0, egui::Stroke::new(1.0, palette.toolpath_cut.gamma_multiply(0.5)));
   }
 }
 
@@ -2414,24 +2479,28 @@ fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec
   }
 }
 
-/// Paint the viewport's major/minor reference grid, matching the design's two-tone grid over the inset canvas.
-fn draw_grid(painter: &egui::Painter, rect: egui::Rect) {
-  let minor = Theme::PANEL.gamma_multiply(0.5);
-  let major = Theme::PANEL;
+/// Paint the viewport's major/minor reference grid, matching the design's two-tone grid over the inset canvas. The
+/// minor-line spacing and how many minor cells make a major line come from the config's [`ToolpathStyle`]; the two
+/// line colours come from the active palette's `grid_major`/`grid_minor` tokens.
+fn draw_grid(painter: &egui::Painter, palette: Palette, tp: ToolpathStyle, rect: egui::Rect) {
+  let minor = palette.grid_minor;
+  let major = palette.grid_major;
+  let step = tp.grid_minor_px;
+  let every = tp.grid_major_every as usize;
   let mut x = rect.left();
   let mut i = 0;
   while x <= rect.right() {
-    let color = if i % 5 == 0 { major } else { minor };
+    let color = if i % every == 0 { major } else { minor };
     painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, color));
-    x += 16.0;
+    x += step;
     i += 1;
   }
   let mut y = rect.top();
   let mut j = 0;
   while y <= rect.bottom() {
-    let color = if j % 5 == 0 { major } else { minor };
+    let color = if j % every == 0 { major } else { minor };
     painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0, color));
-    y += 16.0;
+    y += step;
     j += 1;
   }
 }
@@ -2456,7 +2525,7 @@ struct Segment {
 /// I/J centre offset (XY plane / G17 assumed — the firmware's only arc plane). This makes the preview draw the
 /// real curve rather than a single start→end chord. An arc with neither I/J nor a usable centre degrades to a
 /// single straight chord, so a malformed or R-form arc never breaks the parse.
-fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
+fn parse_xy_path(lines: &[String], arc_step_rad: f32) -> Vec<Segment> {
   let mut segments = Vec::new();
   let mut pos = egui::vec2(0.0, 0.0);
   // Modal motion mode: 0 == G0 rapid, 1 == G1 cut, 2 == G2 CW arc, 3 == G3 CCW arc.
@@ -2520,7 +2589,7 @@ fn parse_xy_path(lines: &[String]) -> Vec<Segment> {
         // An arc with a usable I/J centre: flatten it into chords. I/J are offsets from the START position.
         let center = (pos.x + arc_i, pos.y + arc_j);
         let mut from = (pos.x, pos.y);
-        for point in super::preview::flatten_arc(from, (next.x, next.y), center, motion == 2) {
+        for point in super::preview::flatten_arc(from, (next.x, next.y), center, motion == 2, arc_step_rad) {
           segments.push(Segment { from: egui::vec2(from.0, from.1), to: egui::vec2(point.0, point.1), rapid });
           from = point;
         }
@@ -2604,6 +2673,7 @@ pub fn settings_action_needs_confirm(staging: &super::settings_staging::Settings
 /// right-column panel shows, in a roomier form. The list is driven by [`ViewState::settings`], populated from
 /// the firmware's `$$`/`$ES` replies; editing a value writes it back via [`Intent::WriteSetting`].
 pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   ui.label("Connection");
   ui.horizontal(|ui| {
     ui.label("Baud");
@@ -2611,14 +2681,14 @@ pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   });
   ui.separator();
   ui.horizontal(|ui| {
-    ui.label(RichText::new("Firmware settings").color(Theme::TEXT));
+    ui.label(RichText::new("Firmware settings").color(palette.text));
     settings_save_button(ui, view, state, sink);
     settings_refresh_button(ui, view, state, sink);
   });
   // The explicit-Save model: edits stage locally and only reach the controller on Save. The note also flags that
   // some settings (e.g. `$22` homing) take effect only after the next reset, so a saved value may look inert.
   ui.label(RichText::new("Edits stage locally — Save writes them. Some settings (e.g. $22 homing) apply on the \
-    next reset.").size(10.0).color(Theme::TEXT_DIM));
+    next reset.").size(10.0).color(palette.text_dim));
   ui.add_space(4.0);
   settings_list(ui, view, state);
 }
@@ -2690,6 +2760,7 @@ pub fn setting_tooltip_meta(row: &SettingRow) -> Vec<String> {
 /// [`setting_tooltip_meta`] and [`super::setting_help`].
 pub fn settings_tooltip_ui(
   ui: &mut egui::Ui,
+  palette: Palette,
   number: u32,
   heading_name: &str,
   meta_lines: &[String],
@@ -2703,15 +2774,15 @@ pub fn settings_tooltip_ui(
   } else {
     format!("${number} · {heading_name}")
   };
-  ui.label(RichText::new(heading).size(11.5).color(Theme::TEXT).strong());
+  ui.label(RichText::new(heading).size(11.5).color(palette.text).strong());
   for line in meta_lines {
-    ui.label(RichText::new(line).size(11.0).color(Theme::TEXT_DIM));
+    ui.label(RichText::new(line).size(11.0).color(palette.text_dim));
   }
   // The curated explanation, when the number is in the loaded set. Separated from the metadata by a thin rule so
   // the "what it does" prose reads distinctly from the "$ES says" facts above it.
   if let Some(desc) = descriptions.description(number) {
     ui.separator();
-    ui.label(RichText::new(desc).size(11.0).color(Theme::TEXT_DIM));
+    ui.label(RichText::new(desc).size(11.0).color(palette.text_dim));
   }
 }
 
@@ -2722,9 +2793,10 @@ pub fn settings_tooltip_ui(
 /// value, until Save writes it or a confirmed Discard clears it. When no settings are known the section prompts
 /// a refresh.
 fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
+  let palette = state.style.palette;
   if view.settings.is_empty() {
     ui.label(RichText::new("No settings loaded — Refresh to fetch the controller's $$ / $ES.").size(11.0)
-      .color(Theme::TEXT_DIM));
+      .color(palette.text_dim));
     return;
   }
   // The staged edit (if any) is applied after the row loop so we never mutate `editing_setting` mid-borrow.
@@ -2737,7 +2809,7 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
         let dirty = state.settings_staging.is_dirty(row.number);
         // The `$<n>` key turns to the accent-motion colour while the row has a staged edit, so a glance down the
         // list shows exactly which settings are modified and unsaved.
-        let key_color = if dirty { Theme::ACCENT_MOTION } else { Theme::LOG_STATUS };
+        let key_color = if dirty { palette.accent_motion } else { palette.log_status };
         ui.label(RichText::new(format!("${}", row.number)).monospace().size(11.0).color(key_color));
         // The label disambiguates grblHAL's per-axis settings (e.g. `$150/$151/$152` all named "Microsteps")
         // by appending the axis letter; a setting with a unique name is shown verbatim. A modified row prefixes a
@@ -2746,7 +2818,7 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
         let unit = row.unit();
         let base = if unit.is_empty() { label.clone() } else { format!("{label} ({unit})") };
         let label_text = if dirty { format!("• {base}") } else { base };
-        let label_color = if dirty { Theme::TEXT } else { Theme::TEXT_DIM };
+        let label_color = if dirty { palette.text } else { palette.text_dim };
         // Hovering the label cell explains the setting: the `$ES`-learned name/unit/range (PRIMARY, always
         // accurate per-firmware) plus the curated prose from [`super::setting_help`] when the number is known. A
         // row with neither still degrades to a bare `$<n>` line — never an empty box.
@@ -2755,7 +2827,7 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
         let meta_lines = setting_tooltip_meta(row);
         let descriptions = &state.setting_descriptions;
         ui.label(RichText::new(label_text).size(11.0).color(label_color)).on_hover_ui(|ui| {
-          settings_tooltip_ui(ui, number, &heading_name, &meta_lines, descriptions);
+          settings_tooltip_ui(ui, palette, number, &heading_name, &meta_lines, descriptions);
         });
 
         // The value cell: an in-edit row binds the transient buffer; an idle row shows the staged value when
@@ -2776,9 +2848,9 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
           // Show the staged value while dirty (the pending edit), else the live value, else an em-dash placeholder.
           let shown = state.settings_staging.staged_value(row.number).map(str::to_string)
             .or_else(|| row.value.clone()).unwrap_or_else(|| "—".to_string());
-          let value_color = if dirty { Theme::ACCENT_MOTION } else { Theme::TEXT };
+          let value_color = if dirty { palette.accent_motion } else { palette.text };
           if ui.add(egui::Button::new(RichText::new(shown).monospace().size(11.0).color(value_color))
-            .fill(Theme::INSET)).on_hover_text("Click to edit").clicked()
+            .fill(palette.inset)).on_hover_text("Click to edit").clicked()
           {
             // Seed the buffer from what the row currently shows (staged value if dirty, else live).
             let seed = state.settings_staging.staged_value(row.number).map(str::to_string)
@@ -3085,14 +3157,15 @@ mod tests {
 
   #[test]
   fn console_line_style_distinguishes_status_info_and_errors() {
+    let palette = Palette::default_dark();
     // Sent and notice are fixed by source.
-    assert_eq!(console_line_style(LogSource::Sent, "$H").1, Theme::LOG_SENT);
-    assert_eq!(console_line_style(LogSource::Notice, "connect").1, Theme::LOG_NOTICE);
+    assert_eq!(console_line_style(palette, LogSource::Sent, "$H").1, palette.log_sent);
+    assert_eq!(console_line_style(palette, LogSource::Notice, "connect").1, palette.log_notice);
     // Received lines are typed by their leading glyph: status `<…>`, info `[…]`, error/alarm, else plain ok.
-    assert_eq!(console_line_style(LogSource::Received, "<Idle|MPos:0,0,0>").1, Theme::LOG_STATUS);
-    assert_eq!(console_line_style(LogSource::Received, "[MSG:hi]").1, Theme::LOG_INFO);
-    assert_eq!(console_line_style(LogSource::Received, "error:9").1, Theme::DANGER);
-    assert_eq!(console_line_style(LogSource::Received, "ok").1, Theme::LOG_RECV);
+    assert_eq!(console_line_style(palette, LogSource::Received, "<Idle|MPos:0,0,0>").1, palette.log_status);
+    assert_eq!(console_line_style(palette, LogSource::Received, "[MSG:hi]").1, palette.log_info);
+    assert_eq!(console_line_style(palette, LogSource::Received, "error:9").1, palette.state_alarm);
+    assert_eq!(console_line_style(palette, LogSource::Received, "ok").1, palette.log_recv);
   }
 
   #[test]
@@ -3165,7 +3238,7 @@ mod tests {
       "; a comment line".to_string(),
       "G0 X0 Y0".to_string(),
     ];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     // Four segments: the initial `G0 X0 Y0` carries motion words so it is a (zero-length) rapid; the two G1
     // cuts; then the final G0 travel back to origin. The comment line contributes nothing.
     assert_eq!(segments.len(), 4);
@@ -3181,7 +3254,7 @@ mod tests {
   #[test]
   fn toolpath_parser_ignores_lines_without_xy_motion() {
     let program = vec!["M3 S1000".to_string(), "F500".to_string(), "G1 X5".to_string()];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].to, egui::vec2(5.0, 0.0));
   }
@@ -3198,7 +3271,7 @@ mod tests {
       "G28 X0 Y0".to_string(),        // go-home via — not a normal segment
       "G4 P0.5".to_string(),          // dwell — no XY anyway
     ];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     // Only the leading G1 is a segment; every non-motion line is suppressed.
     assert_eq!(segments.len(), 1, "non-motion G-codes must not draw segments");
     assert_eq!(segments[0].to, egui::vec2(1.0, 1.0));
@@ -3208,7 +3281,7 @@ mod tests {
   fn toolpath_parser_handles_compact_spaceless_gcode() {
     // Standard CAM post output packs words with no spaces: `G1X10.0Y5.0`.
     let program = vec!["G0X0Y0".to_string(), "G1X10.0Y5.0".to_string(), "X20.5".to_string()];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     assert_eq!(segments.len(), 3);
     assert!(segments[0].rapid, "G0 is a rapid");
     assert!(!segments[1].rapid, "G1 is a cut");
@@ -3224,7 +3297,7 @@ mod tests {
     // flatten into many short chord segments on the unit radius, not a single start→end chord — so the preview
     // draws the curve.
     let program = vec!["G0 X1 Y0".to_string(), "G2 X0 Y1 I-1 J0".to_string()];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     // One rapid to the start, then several arc chords (a quarter circle subdivides into multiple segments).
     let arc: Vec<&Segment> = segments.iter().filter(|s| !s.rapid).collect();
     assert!(arc.len() >= 3, "the arc must flatten into several chords, got {}", arc.len());
@@ -3245,7 +3318,7 @@ mod tests {
     // An arc with no I/J (e.g. an R-form arc, which this preview does not resolve) must not break the parse — it
     // degrades to a single straight chord to the endpoint rather than guessing a centre or panicking.
     let program = vec!["G0 X1 Y0".to_string(), "G3 X0 Y1".to_string()];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     let arc: Vec<&Segment> = segments.iter().filter(|s| !s.rapid).collect();
     assert_eq!(arc.len(), 1, "an arc with no centre offset degrades to one chord");
     assert_eq!(arc[0].from, egui::vec2(1.0, 0.0));
@@ -3262,7 +3335,7 @@ mod tests {
       "G1 X0 Y-3".to_string(),      // -3 in Y -> (15,7)
       "G90 X0 Y0".to_string(),      // back to absolute and to the origin
     ];
-    let segments = parse_xy_path(&program);
+    let segments = parse_xy_path(&program, super::preview::DEFAULT_ARC_STEP_RAD);
     assert_eq!(segments.len(), 4);
     assert_eq!(segments[0].to, egui::vec2(10.0, 10.0));
     assert_eq!(segments[1].to, egui::vec2(15.0, 10.0));

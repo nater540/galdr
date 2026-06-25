@@ -50,13 +50,14 @@ const STATUS_POLL_IDLE: Duration = Duration::from_millis(200);
 /// we step down to [`STATUS_POLL_IDLE`] the moment the run ends so idle links never poll faster than 5 Hz.
 const STATUS_POLL_RUN: Duration = Duration::from_millis(100);
 
-/// Choose the status-poll interval for a run state. Only an actively executing machine (`Run`) earns the faster
-/// 10 Hz feed; every other state (Idle/Hold/Jog/Alarm/Door/Check/Home/Sleep/Tool, or none reported yet) stays at
-/// the conservative 5 Hz idle rate. Pure so the gating — "idle never polls faster than 5 Hz" — is unit-tested.
-fn poll_interval_for(run_state: Option<crate::protocol::RunState>) -> Duration {
+/// Choose the status-poll interval for a run state, given the configured `idle` cadence. Only an actively executing
+/// machine (`Run`) earns the faster feed; every other state (Idle/Hold/Jog/Alarm/Door/Check/Home/Sleep/Tool, or none
+/// reported yet) polls at `idle`. The run rate is the faster of the 10 Hz cap and `idle`, so a config that already
+/// polls faster than 10 Hz while idle does not slow down for a run. Pure so the gating is unit-tested.
+fn poll_interval_for(run_state: Option<crate::protocol::RunState>, idle: Duration) -> Duration {
   match run_state {
-    Some(crate::protocol::RunState::Run) => STATUS_POLL_RUN,
-    _ => STATUS_POLL_IDLE,
+    Some(crate::protocol::RunState::Run) => STATUS_POLL_RUN.min(idle),
+    _ => idle,
   }
 }
 
@@ -162,22 +163,61 @@ impl EngineHandle {
   }
 }
 
+/// Tunables the host applies to a fresh engine, sourced from the app config's `connection` section. Defaults
+/// reproduce the engine's built-in behaviour exactly, so `Engine::connect` (which uses [`EngineConfig::default`])
+/// behaves as before this was added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngineConfig {
+  /// The idle status-poll interval — how often a `?` is sent while the machine is NOT actively running. Held to a
+  /// sane floor at apply time so a tiny value cannot flood the link. `None`-equivalent is the built-in default.
+  pub idle_poll: Duration,
+  /// An optional host-side RX-window override (bytes) for character-counting flow control. `Some` PINS the window to
+  /// this value and the engine ignores the controller's advertised `[OPT:...]` buffer (for a controller that does not
+  /// advertise, or to deliberately throttle); `None` learns the window from the advertised value as before.
+  pub rx_window: Option<usize>,
+}
+
+impl Default for EngineConfig {
+  fn default() -> Self {
+    EngineConfig { idle_poll: STATUS_POLL_IDLE, rx_window: None }
+  }
+}
+
 /// The streaming engine. [`Engine::connect`] is the only constructor: it takes an already-open transport and
 /// spawns the driver task, handing back an [`EngineHandle`].
 pub struct Engine;
 
 impl Engine {
-  /// Spawn the engine task over `transport` and return the UI handle. Must be called from within a Tokio
-  /// runtime (the binary's `#[tokio::main]`, or a `#[tokio::test]`); it uses `tokio::spawn` internally.
+  /// Spawn the engine task over `transport` with the built-in defaults and return the UI handle. Must be called
+  /// from within a Tokio runtime (the binary's `#[tokio::main]`, or a `#[tokio::test]`); it uses `tokio::spawn`.
   pub fn connect<T>(transport: T) -> EngineHandle
+  where
+    T: Transport + 'static,
+  {
+    Self::connect_with(transport, EngineConfig::default())
+  }
+
+  /// Spawn the engine task over `transport` with explicit [`EngineConfig`] tunables (idle poll cadence + optional
+  /// RX-window pin) and return the UI handle. The shell builds the config from `config.json`'s `connection` section.
+  /// Same runtime requirement as [`Self::connect`].
+  pub fn connect_with<T>(transport: T, config: EngineConfig) -> EngineHandle
   where
     T: Transport + 'static,
   {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    // Hold the idle poll to a 5 Hz..50 Hz band: never slower than the 200 ms norm that keeps the DRO live, never
+    // faster than 20 ms so a hand-edited tiny value cannot flood the controller.
+    let idle_poll = config.idle_poll.clamp(Duration::from_millis(20), Duration::from_millis(200));
+    let mut core = ProtocolCore::new();
+    // A config RX-window override PINS the flow window now and is re-pinned after each reset, so the advertised
+    // `[OPT:...]` value never overrides the operator's deliberate choice.
+    if let Some(window) = config.rx_window {
+      core.pin_rx_window(window);
+    }
     let driver = Driver {
       transport,
-      core: ProtocolCore::new(),
+      core,
       reassembler: LineReassembler::new(),
       event_tx,
       realtime_out: VecDeque::new(),
@@ -185,7 +225,8 @@ impl Engine {
       realtime_in_flight: None,
       line_in_flight: None,
       run_state: None,
-      poll_interval: STATUS_POLL_IDLE,
+      idle_poll,
+      poll_interval: idle_poll,
     };
     let task = tokio::spawn(driver.run(command_rx));
     EngineHandle { command_tx, event_rx, task }
@@ -221,8 +262,12 @@ struct Driver<T: Transport> {
   /// full structured decode still happens in the reducer; this is the one bit of report content the engine reads
   /// itself, to drive the 5↔10 Hz poll. See [`poll_interval_for`].
   run_state: Option<crate::protocol::RunState>,
+  /// The configured IDLE status-poll interval (from [`EngineConfig`], clamped at connect). The poller ticks at this
+  /// rate in every non-`Run` state; a `Run` state polls faster (see [`poll_interval_for`]). Held so a config-tuned
+  /// cadence is honoured rather than the hard-coded [`STATUS_POLL_IDLE`].
+  idle_poll: Duration,
   /// The interval the status poller is currently ticking at, so the loop rebuilds the timer only when the
-  /// desired rate (a pure function of [`Self::run_state`]) actually changes — never thrashing it per report.
+  /// desired rate (a pure function of [`Self::run_state`] and [`Self::idle_poll`]) actually changes.
   poll_interval: Duration,
 }
 
@@ -446,7 +491,7 @@ impl<T: Transport> Driver<T> {
   /// fired, freezing the DRO/badge/marker. Bounding to the shorter period guarantees a poll fires within that
   /// bound regardless of flapping, while steady-state idle still ticks at the full 5 Hz period thereafter.
   fn refresh_poll_interval(&mut self, status_poll: &mut tokio::time::Interval) {
-    let desired = poll_interval_for(self.run_state);
+    let desired = poll_interval_for(self.run_state, self.idle_poll);
     if desired == self.poll_interval {
       return;
     }
@@ -585,10 +630,10 @@ mod tests {
   fn poll_interval_is_faster_only_while_running() {
     use crate::protocol::RunState;
     // A live cut earns the 10 Hz feed so the toolpath marker tracks the cutter closely.
-    assert_eq!(poll_interval_for(Some(RunState::Run)), STATUS_POLL_RUN);
+    assert_eq!(poll_interval_for(Some(RunState::Run), STATUS_POLL_IDLE), STATUS_POLL_RUN);
     // Every other state — and the pre-report `None` — stays at the conservative 5 Hz idle rate, so an idle or
     // held link never polls faster than 5 Hz.
-    assert_eq!(poll_interval_for(None), STATUS_POLL_IDLE);
+    assert_eq!(poll_interval_for(None, STATUS_POLL_IDLE), STATUS_POLL_IDLE);
     for state in [
       RunState::Idle,
       RunState::Hold,
@@ -601,8 +646,21 @@ mod tests {
       RunState::Tool,
       RunState::Unknown,
     ] {
-      assert_eq!(poll_interval_for(Some(state)), STATUS_POLL_IDLE, "{state:?} must poll at the idle rate");
+      assert_eq!(poll_interval_for(Some(state), STATUS_POLL_IDLE), STATUS_POLL_IDLE, "{state:?} polls at idle");
     }
+  }
+
+  #[test]
+  fn a_configured_idle_cadence_drives_the_idle_poll_and_caps_the_run_rate_at_it() {
+    use crate::protocol::RunState;
+    // A config that polls SLOWER than the default idle: idle uses the config rate; run still earns the 10 Hz cap.
+    let slow = Duration::from_millis(500);
+    assert_eq!(poll_interval_for(None, slow), slow, "the idle rate follows the configured cadence");
+    assert_eq!(poll_interval_for(Some(RunState::Run), slow), STATUS_POLL_RUN, "run keeps the 10 Hz cap");
+    // A config that already polls FASTER than 10 Hz while idle: a run must not SLOW DOWN to 10 Hz — it stays at the
+    // faster idle rate (the run rate is the faster of the cap and idle).
+    let fast = Duration::from_millis(50);
+    assert_eq!(poll_interval_for(Some(RunState::Run), fast), fast, "run never slows below a faster idle cadence");
   }
 
   #[test]

@@ -101,11 +101,10 @@ pub fn marker_is_on_path(point: ModelPoint, min: ModelPoint, max: ModelPoint, ma
     && point.1 <= max.1 + margin
 }
 
-/// The maximum angular step (radians) of a flattened arc chord. An arc swept by more than this per chord is
-/// subdivided further, so even a large-radius arc renders as a smooth polyline and the live-progress projection
-/// (above) walks it chord-by-chord. ~9° (20 chords for a full circle) is visually smooth at preview scale while
-/// keeping the segment count modest.
-const MAX_ARC_STEP_RAD: f32 = std::f32::consts::PI / 20.0;
+/// The default maximum angular step (radians) of a flattened arc chord, used by [`flatten_arc`] when the caller
+/// passes a non-positive step. ~9° (20 chords for a full circle) is visually smooth at preview scale while keeping
+/// the segment count modest; this is the value the config's `toolpath.arc_step_deg` mirrors as its default.
+pub const DEFAULT_ARC_STEP_RAD: f32 = std::f32::consts::PI / 20.0;
 
 /// Flatten one G2/G3 arc (XY plane, G17) into a list of straight chord END points, in path order, EXCLUDING the
 /// start point and INCLUDING the exact `end`. `start`/`end` are the arc's endpoints and `center` its centre (the
@@ -114,11 +113,15 @@ const MAX_ARC_STEP_RAD: f32 = std::f32::consts::PI / 20.0;
 /// preview draw the real curve and the live-progress projection colour it smoothly as the tool sweeps it, rather
 /// than a single start→end chord the swept point never lies on (finding #2).
 ///
-/// The sweep angle is taken the short way consistent with the direction: we walk from the start angle toward the
-/// end angle in the sense `clockwise` dictates, normalising to a positive sweep in `0..=2π` (a start == end is a
-/// full revolution). The chord count is chosen so no chord subtends more than [`MAX_ARC_STEP_RAD`]. Pure geometry,
+/// `max_step_rad` is the maximum angle any one chord may subtend — the config-resolved
+/// [`crate::config::ToolpathStyle::arc_step_rad`]; a non-positive value falls back to [`DEFAULT_ARC_STEP_RAD`] so a
+/// degenerate config cannot divide by zero or produce an infinite chord count. The sweep angle is taken the short
+/// way consistent with the direction: we walk from the start angle toward the end angle in the sense `clockwise`
+/// dictates, normalising to a positive sweep in `0..=2π` (a start == end is a full revolution). Pure geometry,
 /// unit-tested without a window. A degenerate (near-zero-radius) arc yields just the end point.
-pub fn flatten_arc(start: ModelPoint, end: ModelPoint, center: ModelPoint, clockwise: bool) -> Vec<ModelPoint> {
+pub fn flatten_arc(
+  start: ModelPoint, end: ModelPoint, center: ModelPoint, clockwise: bool, max_step_rad: f32,
+) -> Vec<ModelPoint> {
   let radius = (dist_sq(center, start)).sqrt();
   if radius <= f32::EPSILON {
     return vec![end];
@@ -132,7 +135,9 @@ pub fn flatten_arc(start: ModelPoint, end: ModelPoint, center: ModelPoint, clock
   while sweep <= 0.0 {
     sweep += two_pi;
   }
-  let steps = (sweep / MAX_ARC_STEP_RAD).ceil().max(1.0) as usize;
+  // A non-positive config step is degenerate; fall back to the default so the chord count stays finite.
+  let step = if max_step_rad > 0.0 { max_step_rad } else { DEFAULT_ARC_STEP_RAD };
+  let steps = (sweep / step).ceil().max(1.0) as usize;
   let dir = if clockwise { -1.0 } else { 1.0 };
   let mut points = Vec::with_capacity(steps);
   for i in 1..steps {
@@ -243,7 +248,7 @@ mod tests {
     // A G3 (CCW) quarter circle from (1,0) to (0,1) about the origin. The result must be many short chords (not a
     // single start→end chord), every intermediate point must lie on the unit radius, and it must end exactly at
     // the commanded endpoint.
-    let pts = flatten_arc((1.0, 0.0), (0.0, 1.0), (0.0, 0.0), false);
+    let pts = flatten_arc((1.0, 0.0), (0.0, 1.0), (0.0, 0.0), false, DEFAULT_ARC_STEP_RAD);
     assert!(pts.len() >= 3, "a quarter circle must flatten into several chords, got {}", pts.len());
     for p in &pts {
       let r = (p.0 * p.0 + p.1 * p.1).sqrt();
@@ -258,8 +263,8 @@ mod tests {
   fn flatten_arc_directions_sweep_opposite_ways() {
     // The SAME endpoints with opposite directions must sweep opposite ways. From (1,0) to (-1,0) about the origin:
     // CCW (G3) goes over the top (+Y), CW (G2) goes under the bottom (−Y).
-    let ccw = flatten_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), false);
-    let cw = flatten_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), true);
+    let ccw = flatten_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), false, DEFAULT_ARC_STEP_RAD);
+    let cw = flatten_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), true, DEFAULT_ARC_STEP_RAD);
     assert!(ccw[0].1 > 0.0, "G3 sweeps over the top: {:?}", ccw[0]);
     assert!(cw[0].1 < 0.0, "G2 sweeps under the bottom: {:?}", cw[0]);
   }
@@ -268,7 +273,7 @@ mod tests {
   fn flatten_arc_treats_coincident_endpoints_as_a_full_circle() {
     // A G2 arc whose start == end is a full revolution (a common bore/contour pattern), not a zero-length move; it
     // must produce a closed loop of chords, not collapse to a single point.
-    let pts = flatten_arc((1.0, 0.0), (1.0, 0.0), (0.0, 0.0), true);
+    let pts = flatten_arc((1.0, 0.0), (1.0, 0.0), (0.0, 0.0), true, DEFAULT_ARC_STEP_RAD);
     assert!(pts.len() > 8, "a full circle must flatten into many chords, got {}", pts.len());
     assert_eq!(*pts.last().unwrap(), (1.0, 0.0), "a full circle returns to its start");
   }
@@ -276,6 +281,6 @@ mod tests {
   #[test]
   fn flatten_arc_degenerate_radius_yields_just_the_endpoint() {
     // A near-zero-radius arc (start == center) cannot define a sweep; it degrades to a single chord to the end.
-    assert_eq!(flatten_arc((0.0, 0.0), (2.0, 3.0), (0.0, 0.0), false), vec![(2.0, 3.0)]);
+    assert_eq!(flatten_arc((0.0, 0.0), (2.0, 3.0), (0.0, 0.0), false, DEFAULT_ARC_STEP_RAD), vec![(2.0, 3.0)]);
   }
 }

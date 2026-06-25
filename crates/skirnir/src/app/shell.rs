@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use super::intent::{Axis, Dir, Intent};
+use super::theme::Palette;
 use super::views::{self, UiState};
 use super::view_state::ViewState;
 use crate::engine::{Command, EngineHandle};
@@ -158,6 +159,16 @@ pub struct SkirnirApp {
   /// (the OS path is used); set in tests so they round-trip through a temp file instead of the operator's real
   /// `~/.config/skirnir/profile.ron`. The single seam that keeps the persistence wiring hermetically testable.
   profile_path_override: Option<std::path::PathBuf>,
+  /// The startup-loaded app config (appearance/themes, UI defaults, connection/streaming, toolpath tuning). Loaded
+  /// once in [`Self::new`] (seeding the resolved palette/toolpath style into [`UiState`] and the UI/connection
+  /// defaults), and re-loadable on demand via [`Self::reload_config`] so an operator can iterate on `config.json`
+  /// without restarting. The in-memory copy is the source of truth for a session; the file is the durable mirror.
+  config: crate::config::Config,
+  /// An explicit path to load/persist the config from, overriding the default OS location. `None` in production;
+  /// set in tests so a config reload round-trips through a temp file rather than the operator's real
+  /// `~/.config/skirnir/config.json`. The seam that keeps the config wiring hermetically testable, like
+  /// [`Self::profile_path_override`].
+  config_path_override: Option<std::path::PathBuf>,
 }
 
 /// Which probe-flow "slot" owns the shared latch, for the mutual-cancel guard. Exactly one may be armed at a
@@ -230,7 +241,7 @@ struct PendingZeroZProbe {
 impl SkirnirApp {
   /// Build the app, enumerating serial ports once up front so the connect dropdown is populated immediately.
   /// The `runtime` hosts the engine task; it is only retained when the `serial` connect path can use it.
-  pub fn new(runtime: tokio::runtime::Runtime) -> Self {
+  pub fn new(runtime: tokio::runtime::Runtime, config: crate::config::Config, config_notices: Vec<String>) -> Self {
     #[cfg(not(feature = "serial"))]
     let _ = runtime; // a gui-only build never opens a port, so the runtime has nothing to host.
     // Load the persisted profile before building the UI state so the connect dropdown and the rotary inputs come
@@ -240,6 +251,19 @@ impl SkirnirApp {
     // Load the curated per-setting tooltip descriptions once (seeding the on-disk file on first run); the optional
     // reason is surfaced as a console notice below, like the profile load. Never fails — falls back to bundled.
     let (descriptions, descriptions_notice) = crate::app::setting_help::load();
+    // The app config (appearance/themes, UI defaults, connection/streaming, toolpath tuning) is loaded ONCE in
+    // `run()` and handed in, so the normal startup path does a single read/parse/resolve (no duplicate load). Tests
+    // build it directly (or via `config::load_from` against a temp file) and pass it here — the test seam.
+    // Build the transient UI state from the profile's last-used values, then layer the config's from-scratch
+    // defaults and the resolved appearance over it. The profile still wins for genuinely remembered values (the
+    // last port/baud, rotary inputs) — `apply_config_to_ui` only touches the from-scratch knobs and the style.
+    let mut ui = UiState::from_prefs(&profile.prefs);
+    // At startup apply BOTH the resolved appearance and the from-scratch UI defaults. (A live F5 reload re-applies
+    // ONLY the appearance, so it never clobbers the operator's in-session jog/DRO/console changes.)
+    apply_appearance(&mut ui, &config);
+    apply_ui_defaults(&mut ui, &config);
+    #[cfg(feature = "serial")]
+    let reconnect = crate::reconnect::ReconnectPolicy::new(config.connection.reconnect.to_policy_config());
     let mut app = SkirnirApp {
       #[cfg(feature = "serial")]
       runtime,
@@ -249,11 +273,11 @@ impl SkirnirApp {
       #[cfg(feature = "serial")]
       auto_reconnect: false,
       #[cfg(feature = "serial")]
-      reconnect: crate::reconnect::ReconnectPolicy::new(crate::reconnect::ReconnectConfig::default()),
+      reconnect,
       #[cfg(feature = "serial")]
       reconnect_at: None,
       view: ViewState::default(),
-      ui: UiState::from_prefs(&profile.prefs),
+      ui,
       override_tracker: super::overrides::OverrideTracker::default(),
       stream_started: None,
       simulated: None,
@@ -268,6 +292,8 @@ impl SkirnirApp {
       sweep: None,
       profile,
       profile_path_override: None,
+      config,
+      config_path_override: None,
     };
     // Install the loaded tooltip descriptions over the bundled default the `from_prefs` UI came up with.
     app.ui.setting_descriptions = descriptions;
@@ -281,6 +307,27 @@ impl SkirnirApp {
     // config dir), if they did. A first-run seed reports nothing.
     if let Some(reason) = descriptions_notice {
       app.notice(reason);
+    }
+    // Surface every config load notice (corrupt file, bad colour, unknown active_theme, too-new version), if any.
+    // A first-run seed reports none. These tell the operator the config fell back to defaults and why.
+    for reason in config_notices {
+      app.notice(reason);
+    }
+    // Tell the operator exactly which file the app reads its config from, so "which file do I edit?" is answered on
+    // sight (the OS config path varies by platform: `~/.config/skirnir` on Linux, `~/Library/Application Support/
+    // skirnir` on macOS). `None` only when no per-user config base exists — then config edits cannot persist anyway.
+    match crate::config::config_path() {
+      Some(path) => app.notice(format!("config: {}", path.display())),
+      None => app.notice("config: no per-user config directory on this platform — using built-in defaults".to_string()),
+    }
+    // On a true first run (no remembered port) seed the connect baud from the config's `default_baud` so an operator
+    // who pins a non-standard baud in config.json sees it pre-filled. Route it through `sanitize_baud` so a
+    // hand-edited out-of-range value (e.g. `0`) is clamped to the accepted range rather than reaching
+    // `SerialTransport::open` and failing the port open — the same clamp `from_prefs` applies to a remembered baud.
+    // When the profile remembers a port it also remembers that session's baud, which wins (already applied), so
+    // leave it untouched.
+    if app.profile.prefs.last_port.is_none() {
+      app.ui.baud = super::views::sanitize_baud(app.config.connection.default_baud);
     }
     // If the saved port is still present in the freshly-enumerated list, prefer it as the dropdown selection so a
     // reconnect lands on last session's board; otherwise the Galdr-ranked first port (set by `refresh_ports`) stands.
@@ -588,7 +635,13 @@ impl SkirnirApp {
     let _guard = self.runtime.enter();
     match SerialTransport::open(path, baud) {
       Ok(transport) => {
-        let handle = Engine::connect(transport);
+        // Build the engine with the config's connection tunables: the idle status-poll cadence and any RX-window
+        // override. Defaults reproduce the engine's built-in behaviour, so an unconfigured connection is unchanged.
+        let engine_config = crate::engine::EngineConfig {
+          idle_poll: std::time::Duration::from_millis(self.config.connection.status_poll_ms),
+          rx_window: self.config.connection.rx_window,
+        };
+        let handle = Engine::connect_with(transport, engine_config);
         self.engine = Some(handle);
         self.view.note_sent(format!("connect {path} @ {baud}"));
       }
@@ -1535,6 +1588,35 @@ impl SkirnirApp {
     self.view.note(text);
   }
 
+  /// Re-load the app config from disk and re-apply the APPEARANCE only: re-resolve the palette/toolpath style and
+  /// re-skin the live egui visuals so a theme/colour edit takes effect without a restart. The from-scratch UI
+  /// defaults (jog/DRO/console knobs) are deliberately NOT re-applied — a reload must preserve the operator's
+  /// in-session changes to those (the reported F5 bug where reload wiped a hand-set jog step). The
+  /// connection/reconnect knobs are likewise not re-applied to a live session (they bind at connect time). If a
+  /// program is loaded, its cached toolpath is re-flattened at the new arc density so an `arc_step_deg` edit takes
+  /// effect immediately rather than waiting for a GCode reload. Load failures fall back to defaults with notices,
+  /// like the startup load. `ctx` is the live egui context whose visuals are re-skinned; notices surface in the console.
+  fn reload_config(&mut self, ctx: &egui::Context) {
+    let (config, notices) = match &self.config_path_override {
+      Some(path) => crate::config::load_from(path),
+      None => crate::config::load(),
+    };
+    // Appearance ONLY — leave the operator's session-modified UI knobs untouched.
+    apply_appearance(&mut self.ui, &config);
+    // The toolpath render STYLE just changed (strokes/grid/marker/colours update on next paint), but the cached arc
+    // geometry was flattened at the OLD chord density. Re-flatten the loaded program at the new resolution so an
+    // `arc_step_deg` edit is visible without reloading the GCode. A no-op when no program is loaded.
+    self.ui.reflow_toolpath();
+    // Re-skin the live window from the freshly-resolved palette + font scale so the reload is visible immediately.
+    let (palette, _) = config.palette();
+    apply_theme(ctx, &palette, config.appearance.font_scale);
+    self.config = config;
+    self.notice("reloaded config.json".to_string());
+    for reason in notices {
+      self.notice(reason);
+    }
+  }
+
   /// Fold the current connection/UI prefs into the in-memory profile, then persist the whole thing to disk. The
   /// rotary `RotarySetup` is written separately at the moment a center is found/saved ([`Self::save_rotary_center`])
   /// — here we only refresh the prefs from the live [`UiState`] so the last port/baud and rotary input defaults
@@ -1665,7 +1747,9 @@ impl eframe::App for SkirnirApp {
     let mut sink = super::intent::IntentSink::new();
     let ctx = ui.ctx().clone();
     use super::metrics::Metrics;
-    use super::theme::Theme;
+    // The active palette resolved from the config (or the default). `Palette` is `Copy`, so snapshot it once for
+    // this frame's panel-frame fills and the banner views, rather than re-borrowing `self.ui` under each closure.
+    let palette = self.ui.style.palette;
 
     // Lift global hotkeys out of egui's per-frame input and turn them into intents (jog by arrows/PageUp-Down,
     // Escape to cancel/abort, hold/resume). Only fire when no text field has keyboard focus, so typing a line
@@ -1673,18 +1757,25 @@ impl eframe::App for SkirnirApp {
     // shell only does the thin egui→Hotkey translation and the focus guard.
     self.pump_hotkeys(&ctx, &mut sink);
 
+    // F5 hot-reloads config.json: re-resolve the palette/toolpath style and re-skin the live visuals so an operator
+    // can iterate on the file without restarting. Gated on no text field holding focus, so typing F5 into a field
+    // (it has no text effect, but be consistent with the jog hotkeys) never reloads. A cheap per-frame key check.
+    if ctx.input(|i| i.key_pressed(egui::Key::F5)) && !ctx.egui_wants_keyboard_input() {
+      self.reload_config(&ctx);
+    }
+
     // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content. It
     // carries the `panelAlt` (#222222) surface — a shade lighter than the panels below — so the toolbar reads as
     // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
     egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
-      .frame(egui::Frame::NONE.fill(Theme::PANEL_ALT))
+      .frame(egui::Frame::NONE.fill(palette.panel_alt))
       .show_inside(ui, |ui| {
         views::toolbar(ui, &self.view, &mut self.ui, &mut sink);
       });
 
     if self.view.banner.is_some() {
       egui::Panel::top("banner").show_inside(ui, |ui| {
-        views::alarm_banner(ui, &self.view, &mut sink);
+        views::alarm_banner(ui, palette, &self.view, &mut sink);
       });
     } else if self.view.badge_state() == super::badge::BadgeState::Tool {
       // No fault is latched, but the firmware is held for an M6 manual tool change: surface the prominent
@@ -1692,7 +1783,7 @@ impl eframe::App for SkirnirApp {
       // action routes through the existing cycle-start path, not a second control. The banner names the tool from
       // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
       egui::Panel::top("tool_change").show_inside(ui, |ui| {
-        views::tool_change_banner(ui, &self.view, &mut sink);
+        views::tool_change_banner(ui, palette, &self.view, &mut sink);
       });
     }
 
@@ -1728,7 +1819,7 @@ impl eframe::App for SkirnirApp {
     // section headers and DRO/Jog bodies already own their padding (`HEADER_PAD_X`, `DRO_PAD`, `JOG_PAD`), so the
     // content overran the clipped 252px and the rightmost controls ("Zero XYZ", the Z± column) were cut off. With
     // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
-    let column_frame = egui::Frame::NONE.fill(Theme::PANEL);
+    let column_frame = egui::Frame::NONE.fill(palette.panel);
     egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
       .show_inside(ui, |ui| {
         // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
@@ -1769,7 +1860,7 @@ impl eframe::App for SkirnirApp {
     // viewport (the user-flagged band). With no margin the viewport sits flush against both columns — exactly the
     // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
     // its own `INSET` canvas over the rect, so the frame fill never shows through.
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Theme::INSET)).show_inside(ui, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
       views::toolpath(ui, &self.view, &mut self.ui);
     });
 
@@ -1870,8 +1961,19 @@ pub fn run() -> eframe::Result<()> {
     .build()
     .expect("failed to build the tokio runtime");
 
+  // Load the app config ONCE here: it sets the initial window size and the palette the very first frame paints, so
+  // it must be resolved before the viewport and the visuals are built. Load failures fall back to defaults with
+  // notices. The parsed config + its notices are handed to `SkirnirApp::new`, so the normal path reads/parses/
+  // resolves exactly once (no duplicate load) and the notices still reach the console.
+  let (config, config_notices) = crate::config::load();
+  let (palette, _palette_notice) = config.palette();
+  // Clamp the window size to sane positive dimensions (a hand-edited 0/negative would make the window unusable).
+  let (window_w, window_h) = config.ui.window_size();
+
   let options = eframe::NativeOptions {
-    viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]).with_min_inner_size([800.0, 500.0]),
+    viewport: egui::ViewportBuilder::default()
+      .with_inner_size([window_w, window_h])
+      .with_min_inner_size([800.0, 500.0]),
     ..Default::default()
   };
 
@@ -1879,18 +1981,194 @@ pub fn run() -> eframe::Result<()> {
     // Install the vendored Roboto + JetBrains Mono faces before the theme so the first frame already renders in
     // the design's typefaces — Roboto for UI text, JetBrains Mono (tabular) for the DRO digits and console.
     super::fonts::install(&cc.egui_ctx);
-    apply_theme(&cc.egui_ctx);
-    Ok(Box::new(SkirnirApp::new(runtime)))
+    apply_theme(&cc.egui_ctx, &palette, config.appearance.font_scale);
+    Ok(Box::new(SkirnirApp::new(runtime, config, config_notices)))
   }))
 }
 
-/// Apply the dark visuals so the app matches the [`super::theme::Theme`] palette, mapping the design tokens
-/// onto egui's `Visuals.widgets.{noninteractive,inactive,hovered,active}` plus the panel/window/inset fills,
-/// 2px control rounding, and the 1px divider stroke. The design maps 1:1 onto these fields.
-fn apply_theme(ctx: &egui::Context) {
+/// Apply the config's resolved APPEARANCE onto a [`UiState`]: the palette (active theme) + the toolpath render style,
+/// threaded into the views. This is the only part safe to re-apply on a live reload — it is pure presentation and
+/// carries no operator session state. Pure (no I/O, no egui context) so the config→style mapping is unit-tested
+/// without a window. Re-applied on BOTH startup and `reload_config`.
+fn apply_appearance(ui: &mut UiState, config: &crate::config::Config) {
+  let (palette, _theme_notice) = config.palette();
+  ui.style = super::views::RuntimeStyle { palette, toolpath: config.toolpath_style() };
+}
+
+/// Apply the config's from-scratch UI DEFAULTS onto a [`UiState`]: the jog/DRO/console knobs an operator would
+/// otherwise re-set each launch. Applied ONLY at startup (in `SkirnirApp::new`), never on a live reload — a reload
+/// must not wipe the operator's in-session changes to these (the reported F5 bug). Deliberately does NOT touch the
+/// profile-seeded "remembered last entry" fields (port/baud/rotary inputs) — those are restored from `profile.ron`
+/// and must win over a config default. Pure so the mapping is unit-tested without a window.
+fn apply_ui_defaults(ui: &mut UiState, config: &crate::config::Config) {
+  ui.jog_step = config.ui.jog_step_mm;
+  ui.jog_feed = config.ui.jog_feed;
+  ui.jog_continuous = config.ui.jog_continuous;
+  ui.show_machine_pos = config.ui.dro_show_machine;
+  ui.verbose = config.ui.console_verbose;
+  ui.auto_scroll = config.ui.console_auto_scroll;
+}
+
+#[cfg(test)]
+mod config_wiring_tests {
+  use super::*;
+
+  #[test]
+  fn startup_apply_sets_the_ui_defaults_and_resolved_appearance() {
+    // The startup config→UI mapping: a non-default config must drive the from-scratch UI knobs AND resolve the
+    // active theme's palette + toolpath style into `UiState.style`. (Startup applies both halves; reload only the
+    // appearance — see the reload test below.)
+    let mut config = crate::config::Config::default();
+    config.ui.jog_step_mm = 0.05;
+    config.ui.jog_feed = 250.0;
+    config.ui.jog_continuous = true;
+    config.ui.dro_show_machine = true;
+    config.ui.console_verbose = true;
+    config.ui.console_auto_scroll = false;
+    config.appearance.active_theme = "midnight".to_string();
+    config.toolpath.cut_stroke_px = 4.0;
+
+    let mut ui = UiState::default();
+    apply_appearance(&mut ui, &config);
+    apply_ui_defaults(&mut ui, &config);
+
+    assert_eq!(ui.jog_step, 0.05, "the jog step comes from config");
+    assert_eq!(ui.jog_feed, 250.0);
+    assert!(ui.jog_continuous, "continuous jog default comes from config");
+    assert!(ui.show_machine_pos, "DRO machine-pos default comes from config");
+    assert!(ui.verbose, "console verbose default comes from config");
+    assert!(!ui.auto_scroll, "console auto-scroll default comes from config");
+    assert_eq!(ui.style.palette, Palette::midnight(), "the resolved palette is the active theme's");
+    assert!((ui.style.toolpath.cut_stroke_px - 4.0).abs() < 1e-6, "the toolpath style is resolved from config");
+  }
+
+  #[test]
+  fn startup_apply_leaves_the_profile_seeded_fields_untouched() {
+    // The profile owns the "remembered last entry" fields (port/baud/rotary); the config mapping must NOT clobber
+    // them, so a remembered port/baud survives applying the config defaults over a `from_prefs` UI.
+    let prefs = crate::profile::Prefs {
+      last_port: Some("/dev/ttyACM0".to_string()),
+      baud: 250_000,
+      ..crate::profile::Prefs::default()
+    };
+    let mut ui = UiState::from_prefs(&prefs);
+    apply_appearance(&mut ui, &crate::config::Config::default());
+    apply_ui_defaults(&mut ui, &crate::config::Config::default());
+    assert_eq!(ui.selected_port, "/dev/ttyACM0", "the remembered port must survive the config apply");
+    assert_eq!(ui.baud, 250_000, "the remembered baud must survive the config apply");
+  }
+
+  #[test]
+  fn reload_applies_appearance_but_preserves_operator_modified_ui_state() {
+    // The reported F5 bug: a reload must update the palette/toolpath style WITHOUT wiping the operator's in-session
+    // jog/console changes. We simulate startup (defaults), then the operator changes jog_step + verbose, then a
+    // reload with a different active theme. The split functions model the two code paths: reload calls
+    // `apply_appearance` only, NOT `apply_ui_defaults`.
+    let config = crate::config::Config::default();
+    let mut ui = UiState::default();
+    apply_appearance(&mut ui, &config);
+    apply_ui_defaults(&mut ui, &config);
+
+    // Operator changes session knobs away from the config defaults.
+    ui.jog_step = 0.123;
+    ui.verbose = !config.ui.console_verbose;
+    let operator_jog = ui.jog_step;
+    let operator_verbose = ui.verbose;
+
+    // A reload with a new theme: appearance ONLY.
+    let mut reloaded = config.clone();
+    reloaded.appearance.active_theme = "midnight".to_string();
+    apply_appearance(&mut ui, &reloaded);
+
+    assert_eq!(ui.style.palette, Palette::midnight(), "the reload must update the palette");
+    assert_eq!(ui.jog_step, operator_jog, "the reload must NOT reset the operator's jog step (the F5 bug)");
+    assert_eq!(ui.verbose, operator_verbose, "the reload must NOT reset the operator's console verbose toggle");
+  }
+
+  #[test]
+  fn reflow_toolpath_re_flattens_the_loaded_program_at_a_new_arc_density() {
+    // F5 with a changed `arc_step_deg` must re-flatten the cached arcs. Load a program with a G2 arc at a coarse
+    // step, capture the chord count, then tighten the step and `reflow_toolpath` — the arc must subdivide into more
+    // chords, proving the cached geometry tracked the new resolution without a GCode reload.
+    let program = vec!["G0 X10 Y0".to_string(), "G2 X0 Y10 I-10 J0".to_string()];
+
+    let mut coarse = UiState::default();
+    coarse.style.toolpath = crate::config::ToolpathConfig { arc_step_deg: 45.0, ..Default::default() }.resolve();
+    coarse.set_program(program.clone(), None);
+    let coarse_segments = coarse.toolpath_segment_count();
+
+    let mut fine = UiState::default();
+    fine.style.toolpath = crate::config::ToolpathConfig { arc_step_deg: 45.0, ..Default::default() }.resolve();
+    fine.set_program(program, None);
+    // Now tighten the arc step and re-flow (the reload path) — no new `set_program`.
+    fine.style.toolpath = crate::config::ToolpathConfig { arc_step_deg: 3.0, ..Default::default() }.resolve();
+    fine.reflow_toolpath();
+
+    assert!(
+      fine.toolpath_segment_count() > coarse_segments,
+      "a finer arc step must re-flatten the arc into MORE chords ({} vs {})",
+      fine.toolpath_segment_count(),
+      coarse_segments,
+    );
+  }
+
+  #[test]
+  fn the_config_reconnect_section_round_trips_to_the_engine_policy() {
+    // The connection wiring: the config's reconnect knobs must convert back to the exact engine `ReconnectConfig`
+    // the shell builds its policy from, so a config-tuned backoff is honoured.
+    let mut config = crate::config::Config::default();
+    config.connection.reconnect.base_ms = 750;
+    config.connection.reconnect.max_attempts = 9;
+    let policy_config = config.connection.reconnect.to_policy_config();
+    assert_eq!(policy_config.base, std::time::Duration::from_millis(750));
+    assert_eq!(policy_config.max_attempts, 9);
+  }
+
+  #[test]
+  fn an_out_of_range_config_default_baud_is_sanitized_before_it_can_reach_the_port_open() {
+    // The startup baud-seed path runs the config's `default_baud` through `sanitize_baud` (the same clamp every
+    // other baud path uses), so a hand-edited `0`/absurd value is held to the accepted range rather than reaching
+    // `SerialTransport::open` and failing the port open. This pins that contract on the function the shell calls.
+    assert_eq!(crate::app::views::sanitize_baud(0), 115_200, "a zero default_baud must clamp to the fallback");
+    assert_eq!(
+      crate::app::views::sanitize_baud(9_999_999), 115_200,
+      "an above-range default_baud must clamp to the fallback",
+    );
+    assert_eq!(crate::app::views::sanitize_baud(250_000), 250_000, "an in-range default_baud passes through");
+  }
+
+  #[test]
+  fn apply_theme_wires_the_hover_and_active_accent_edges_so_those_tokens_have_effect() {
+    // `accent_hover`/`accent_active` must reach a real egui surface (the hovered/active widget edge strokes),
+    // otherwise they are inert config knobs. Apply a palette with sentinel hover/active accents and read them back
+    // out of the resolved visuals to prove the wiring.
+    let mut palette = Palette::default_dark();
+    palette.accent_hover = egui::Color32::from_rgb(0x11, 0x22, 0x33);
+    palette.accent_active = egui::Color32::from_rgb(0x44, 0x55, 0x66);
+
+    let ctx = egui::Context::default();
+    apply_theme(&ctx, &palette, 1.0);
+
+    let visuals = ctx.global_style().visuals.clone();
+    assert_eq!(
+      visuals.widgets.hovered.bg_stroke.color, palette.accent_hover,
+      "accent_hover must drive the hovered widget edge",
+    );
+    assert_eq!(
+      visuals.widgets.active.bg_stroke.color, palette.accent_active,
+      "accent_active must drive the active/pressed widget edge",
+    );
+  }
+}
+
+/// Apply the visuals so the app matches the active [`Palette`], mapping the design tokens onto egui's
+/// `Visuals.widgets.{noninteractive,inactive,hovered,active,open}` plus the panel/window/inset fills, 2px control
+/// rounding, and the 1px divider stroke. The design maps 1:1 onto these fields. `font_scale` (1.0 = the design's
+/// sizes) is applied as the global zoom, held to a sane range so a config typo cannot make the UI unreadable.
+/// Driven by the config-resolved palette so a theme change re-skins the whole window from one call.
+fn apply_theme(ctx: &egui::Context, palette: &Palette, font_scale: f32) {
   use eframe::egui::{CornerRadius, Stroke};
   use super::metrics::Metrics;
-  use super::theme::Theme;
 
   // Spacing first, so every default-sized button/field matches the design's component sheet rather than egui's
   // larger defaults. The design's controls are 6×14 padding, ~22px tall in panels, 2px corners.
@@ -1900,49 +2178,51 @@ fn apply_theme(ctx: &egui::Context) {
   spacing.item_spacing = egui::vec2(6.0, 6.0); // §01 default cluster pad.
   spacing.interact_size.y = Metrics::PANEL_CONTROL_H; // §01 spacing legend: 22px control row.
   ctx.set_global_style(style);
+  // Apply the UI font scale as the global zoom; clamp so a hand-edited extreme cannot shrink/blow up the UI.
+  ctx.set_zoom_factor(font_scale.clamp(0.5, 2.5));
 
   let mut visuals = egui::Visuals::dark();
-  visuals.panel_fill = Theme::PANEL;
-  visuals.window_fill = Theme::BG;
-  visuals.extreme_bg_color = Theme::INSET; // text edits / inset fields.
-  visuals.faint_bg_color = Theme::PANEL_ALT; // striped rows / faint surfaces.
-  visuals.override_text_color = Some(Theme::TEXT);
-  visuals.hyperlink_color = Theme::ACCENT;
-  visuals.selection.bg_fill = Theme::ACCENT.gamma_multiply(0.4);
-  visuals.selection.stroke = Stroke::new(1.0, Theme::ACCENT);
-  visuals.window_stroke = Stroke::new(1.0, Theme::DIVIDER);
+  visuals.panel_fill = palette.panel;
+  visuals.window_fill = palette.bg;
+  visuals.extreme_bg_color = palette.inset; // text edits / inset fields.
+  visuals.faint_bg_color = palette.panel_alt; // striped rows / faint surfaces.
+  visuals.override_text_color = Some(palette.text);
+  visuals.hyperlink_color = palette.accent;
+  visuals.selection.bg_fill = palette.accent.gamma_multiply(0.4);
+  visuals.selection.stroke = Stroke::new(1.0, palette.accent);
+  visuals.window_stroke = Stroke::new(1.0, palette.divider);
 
   let radius = CornerRadius::same(2);
   let widgets = &mut visuals.widgets;
   // Non-interactive surfaces (labels, separators): panel fill, divider stroke.
-  widgets.noninteractive.bg_fill = Theme::PANEL;
-  widgets.noninteractive.weak_bg_fill = Theme::PANEL;
-  widgets.noninteractive.bg_stroke = Stroke::new(1.0, Theme::DIVIDER);
-  widgets.noninteractive.fg_stroke = Stroke::new(1.0, Theme::TEXT_DIM);
+  widgets.noninteractive.bg_fill = palette.panel;
+  widgets.noninteractive.weak_bg_fill = palette.panel;
+  widgets.noninteractive.bg_stroke = Stroke::new(1.0, palette.divider);
+  widgets.noninteractive.fg_stroke = Stroke::new(1.0, palette.text_dim);
   widgets.noninteractive.corner_radius = radius;
   // Inactive (control at rest): widget fill, raised edge.
-  widgets.inactive.bg_fill = Theme::WIDGET;
-  widgets.inactive.weak_bg_fill = Theme::WIDGET;
-  widgets.inactive.bg_stroke = Stroke::new(1.0, Theme::BORDER_RAISED);
-  widgets.inactive.fg_stroke = Stroke::new(1.0, Theme::TEXT);
+  widgets.inactive.bg_fill = palette.widget;
+  widgets.inactive.weak_bg_fill = palette.widget;
+  widgets.inactive.bg_stroke = Stroke::new(1.0, palette.border_raised);
+  widgets.inactive.fg_stroke = Stroke::new(1.0, palette.text);
   widgets.inactive.corner_radius = radius;
-  // Hovered.
-  widgets.hovered.bg_fill = Theme::WIDGET_HOVER;
-  widgets.hovered.weak_bg_fill = Theme::WIDGET_HOVER;
-  widgets.hovered.bg_stroke = Stroke::new(1.0, Theme::BORDER_RAISED);
-  widgets.hovered.fg_stroke = Stroke::new(1.0, Theme::TEXT);
+  // Hovered: the hover-accent edge highlight (`accent_hover`) so a pointed-at control lifts toward the accent.
+  widgets.hovered.bg_fill = palette.widget_hover;
+  widgets.hovered.weak_bg_fill = palette.widget_hover;
+  widgets.hovered.bg_stroke = Stroke::new(1.0, palette.accent_hover);
+  widgets.hovered.fg_stroke = Stroke::new(1.0, palette.text);
   widgets.hovered.corner_radius = radius;
-  // Active / pressed.
-  widgets.active.bg_fill = Theme::WIDGET_ACTIVE;
-  widgets.active.weak_bg_fill = Theme::WIDGET_ACTIVE;
-  widgets.active.bg_stroke = Stroke::new(1.0, Theme::ACCENT);
-  widgets.active.fg_stroke = Stroke::new(1.0, Theme::TEXT);
+  // Active / pressed: the pressed-accent edge (`accent_active`), a notch deeper than the hover accent.
+  widgets.active.bg_fill = palette.widget_active;
+  widgets.active.weak_bg_fill = palette.widget_active;
+  widgets.active.bg_stroke = Stroke::new(1.0, palette.accent_active);
+  widgets.active.fg_stroke = Stroke::new(1.0, palette.text);
   widgets.active.corner_radius = radius;
   // Open (combo box popups): match active.
-  widgets.open.bg_fill = Theme::WIDGET_ACTIVE;
-  widgets.open.weak_bg_fill = Theme::WIDGET_ACTIVE;
-  widgets.open.bg_stroke = Stroke::new(1.0, Theme::BORDER_RAISED);
-  widgets.open.fg_stroke = Stroke::new(1.0, Theme::TEXT);
+  widgets.open.bg_fill = palette.widget_active;
+  widgets.open.weak_bg_fill = palette.widget_active;
+  widgets.open.bg_stroke = Stroke::new(1.0, palette.border_raised);
+  widgets.open.fg_stroke = Stroke::new(1.0, palette.text);
   widgets.open.corner_radius = radius;
 
   ctx.set_visuals(visuals);
@@ -1965,7 +2245,7 @@ mod tests {
       let _guard = runtime.enter();
       Engine::connect(transport)
     };
-    let mut app = SkirnirApp::new(runtime);
+    let mut app = SkirnirApp::new(runtime, crate::config::Config::default(), Vec::new());
     app.engine = Some(handle);
     // Keep these tests hermetic: `new` reads the real OS profile, so reset to a clean default and redirect every
     // save to a unique temp file so no test ever touches the operator's config dir. A persistence test reads this
@@ -2989,7 +3269,7 @@ mod tests {
   /// a pure host calc that touches no engine, so it needs no transport — the point is to prove it works disconnected.
   fn app_disconnected() -> SkirnirApp {
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
-    let mut app = SkirnirApp::new(runtime);
+    let mut app = SkirnirApp::new(runtime, crate::config::Config::default(), Vec::new());
     app.profile = crate::profile::Profile::default();
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let temp = std::env::temp_dir().join(format!("skirnir-test-profile-{}-{stamp}", std::process::id()));
@@ -3014,6 +3294,22 @@ mod tests {
       app.simulated_default_settings,
       "with no `$$` snapshot loaded, the estimate used default settings and must flag it",
     );
+  }
+
+  /// Startup must announce WHICH config file the app reads, so an operator asking "which file do I edit?" sees the
+  /// path in the console on launch. The notice is prefixed `config:`; on a platform with a config dir it carries the
+  /// resolved path, otherwise it explains there is none. Either way a `config:` line must be present.
+  #[test]
+  fn startup_announces_the_config_file_path_in_the_console() {
+    let app = app_disconnected();
+    let announced = app.view.console.iter().any(|l| l.text.starts_with("config:"));
+    assert!(announced, "startup must push a `config:` notice naming the file the app reads");
+    // When a per-user config base exists (the usual case in CI/dev), the notice must carry the resolved path so it
+    // is directly actionable; the path ends at the app's `config.json`.
+    if let Some(path) = crate::config::config_path() {
+      let said_path = app.view.console.iter().any(|l| l.text.contains(&path.display().to_string()));
+      assert!(said_path, "the config notice must carry the actual resolved path when one exists");
+    }
   }
 
   /// Simulate with no program loaded is a quiet no-op (a notice, no stored timeline) rather than building an empty

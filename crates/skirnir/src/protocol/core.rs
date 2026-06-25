@@ -116,6 +116,11 @@ pub struct ProtocolCore {
   /// window. That keeps the genuine-bug guard intact: a spurious double-ok during ACTIVE streaming still faults,
   /// because by then the latch is long cleared.
   ignore_stray_acks: bool,
+  /// An operator-pinned RX-window override (bytes) from `config.json`'s `connection.rx_window`, or `None` to learn
+  /// the window from the controller's advertised `[OPT:...]` buffer. When `Some`, the pin takes precedence: the
+  /// advertised value is IGNORED in [`Self::on_response`], and the window is re-pinned after every reset so a
+  /// re-connect/soft-reset cannot silently revert to the default. Set once at connect via [`Self::pin_rx_window`].
+  pinned_rx_window: Option<usize>,
 }
 
 impl Default for ProtocolCore {
@@ -137,7 +142,17 @@ impl ProtocolCore {
       program_acked: 0,
       trailing_acks: 0,
       ignore_stray_acks: false,
+      pinned_rx_window: None,
     }
+  }
+
+  /// Pin the RX-window budget to `bytes` (clamped to ≥1 by [`FlowWindow`]), overriding the default and any value the
+  /// controller advertises via `[OPT:...]`. Called once at connect from the engine when `config.json` sets
+  /// `connection.rx_window`. The pin survives resets — [`Self::reset_window`] re-applies it — so a soft-reset or
+  /// re-enumeration cannot silently revert to the default window the operator deliberately overrode.
+  pub fn pin_rx_window(&mut self, bytes: usize) {
+    self.pinned_rx_window = Some(bytes);
+    self.flow.set_rx_buffer(bytes);
   }
 
   /// The current lifecycle state.
@@ -332,9 +347,11 @@ impl ProtocolCore {
   pub fn on_response(&mut self, response: Response) -> Vec<Effect> {
     let mut out = vec![Effect::Response(response.clone())];
 
-    // Always learn the RX buffer size from `[OPT:...]`, regardless of lifecycle phase — the handshake's `$I`
-    // reply carries it and we want the send-ahead window sized before the first program line is released.
-    if let Response::Message(body) = &response
+    // Learn the RX buffer size from `[OPT:...]` (the handshake's `$I` reply carries it) so the send-ahead window is
+    // sized before the first program line is released — UNLESS the operator pinned `connection.rx_window`, in which
+    // case the deliberate override wins and the advertised value is ignored.
+    if self.pinned_rx_window.is_none()
+      && let Response::Message(body) = &response
       && let Some(rx) = rx_buffer_from_opt(body)
     {
       self.flow.set_rx_buffer(rx);
@@ -503,7 +520,10 @@ impl ProtocolCore {
     if tolerate_trailing_acks {
       self.trailing_acks = self.trailing_acks.saturating_add(self.inflight_kinds.len());
     }
-    self.flow = FlowWindow::new(self.flow.rx_buffer());
+    // Rebuild on the operator's pinned window if one is set, else carry the currently-learned/default budget. The
+    // explicit re-pin keeps the override honoured across resets even if a future path changes the live budget.
+    let budget = self.pinned_rx_window.unwrap_or_else(|| self.flow.rx_buffer());
+    self.flow = FlowWindow::new(budget);
     self.inflight_kinds.clear();
   }
 
@@ -600,6 +620,37 @@ mod tests {
     core.on_response(Response::Banner("GrblHAL 1.1f".to_string()));
     assert_eq!(core.state(), ConnectionState::Idle);
     core
+  }
+
+  #[test]
+  fn a_pinned_rx_window_overrides_the_advertised_opt_buffer() {
+    // `config.json`'s `connection.rx_window` PINS the flow window; the controller's advertised `[OPT:...]` value
+    // must then be ignored so the operator's deliberate override stands.
+    let mut core = ProtocolCore::new();
+    core.pin_rx_window(64);
+    assert_eq!(core.flow().rx_buffer(), 64, "the pin takes effect immediately");
+    // A handshake `[OPT:...]` advertising 1024 must NOT change the pinned window.
+    core.on_response(Response::Message("OPT:VNMGPH,15,1024".to_string()));
+    assert_eq!(core.flow().rx_buffer(), 64, "the advertised OPT buffer must be ignored while pinned");
+  }
+
+  #[test]
+  fn without_a_pin_the_advertised_opt_buffer_is_still_learned() {
+    // Regression guard: the default (unpinned) path must still adopt the advertised RX buffer, as before.
+    let mut core = ProtocolCore::new();
+    core.on_response(Response::Message("OPT:VNMGPH,15,1024".to_string()));
+    assert_eq!(core.flow().rx_buffer(), 1024, "an unpinned core learns the advertised buffer");
+  }
+
+  #[test]
+  fn a_pinned_window_survives_a_reset() {
+    // The pin must persist across a window reset (soft-reset / banner / re-enumeration), so a re-connect cannot
+    // silently revert to the default window the operator overrode.
+    let mut core = ProtocolCore::new();
+    core.pin_rx_window(48);
+    // A boot banner resets the window; the pinned budget must be re-applied, not the default.
+    core.on_response(Response::Banner("GrblHAL 1.1f".to_string()));
+    assert_eq!(core.flow().rx_buffer(), 48, "the pinned window must survive a reset");
   }
 
   #[test]

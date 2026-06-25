@@ -16,6 +16,11 @@
 //! - [`profile`] — the cross-session project/profile store: the rotary-A center and connection/UI defaults
 //!   persisted as a versioned RON file under the OS config dir (DOC-11 §1.3). Framework-agnostic, so the GUI
 //!   and the headless `--cli` path share one store; read failures fall back to defaults rather than panicking.
+//! - [`config`] — the startup-loaded JSON app config: appearance/themes, UI defaults, connection/streaming and
+//!   toolpath-render tuning, resolved into a runtime [`config::Palette`]/[`config::ToolpathStyle`] for the views.
+//!   The appearance sibling of [`profile`], with the same never-panic, versioned, atomic-write contract.
+//! - [`store`] — shared host-side persistence primitives (the OS config dir + an atomic file write) the config
+//!   store builds on.
 //!
 //! The intended boundary: a UI calls [`engine::Engine::connect`] with a transport, then sends
 //! [`engine::Command`]s and drains [`engine::Event`]s over the returned [`engine::EngineHandle`] — never
@@ -24,12 +29,17 @@
 #![deny(unsafe_code)]
 
 pub mod app;
+// The app config resolves an egui `Palette`/`ToolpathStyle`, so it depends on eframe and is gui-gated like the
+// theme/views/shell layers it feeds. The headless `--cli` path renders nothing and has no use for it.
+#[cfg(feature = "gui")]
+pub mod config;
 pub mod engine;
 pub mod error;
 pub mod eta;
 pub mod profile;
 pub mod protocol;
 pub mod reconnect;
+pub mod store;
 pub mod transport;
 
 // The engine API the UI drives.
@@ -44,3 +54,8 @@ pub use reconnect::{ReconnectConfig, ReconnectPolicy};
 pub use error::{EngineError, TransportError};
 // The cross-session profile/project store.
 pub use profile::{Prefs, Profile, ProfileError, RotarySetup};
+// The startup-loaded app config and the runtime appearance it resolves into (gui-gated, like the views it feeds).
+#[cfg(feature = "gui")]
+pub use app::theme::Palette;
+#[cfg(feature = "gui")]
+pub use config::{Config, ToolpathStyle};
