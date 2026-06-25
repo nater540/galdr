@@ -39,6 +39,17 @@ pub enum RunState {
   Unknown,
 }
 
+/// Cheaply peek just the leading run-state token of a status-report body, without the full structural decode of
+/// [`parse_status`]. The state element is always first (`State{:substate}|MPos:…`), so this splits off the first
+/// field and the optional substate and maps only that — no position/`Pn:`/override parsing. The engine uses this
+/// at the poll rate to adapt the 5↔10 Hz status cadence, leaving the full decode to the reducer's single pass so
+/// the body is not parsed twice per report (finding #9).
+pub fn peek_run_state(body: &str) -> RunState {
+  let token = body.split('|').next().unwrap_or("");
+  let state = token.split_once(':').map(|(state, _sub)| state).unwrap_or(token);
+  RunState::from_token(state)
+}
+
 impl RunState {
   /// Map the leading state token (already split off any `:substate`) to a [`RunState`].
   fn from_token(token: &str) -> Self {
@@ -347,6 +358,18 @@ mod tests {
     assert_eq!(report.position, vec![-1.5, 2.25, -0.1]);
     assert_eq!(report.feed_speed, Some((500.0, 12000.0, None)));
     assert_eq!(report.overrides, Some((110, 100, 90)));
+  }
+
+  #[test]
+  fn peek_run_state_matches_the_full_decode_without_parsing_the_body() {
+    // The cheap leading-token peek (finding #9) must produce exactly the state the full `parse_status` would, for
+    // bodies with and without a substate and trailing fields, so the engine's poll-rate gating never disagrees
+    // with the reducer's decode. An empty / malformed leading token is `Unknown`, same as the full path.
+    for body in ["Run|MPos:0,0,0|FS:500,0", "Hold:0|WPos:0,0,0", "Idle", "Jog:1|MPos:1,2,3", "Bogus|MPos:0,0,0",
+      ""]
+    {
+      assert_eq!(peek_run_state(body), parse_status(body).machine_state.state, "peek must match full decode: {body:?}");
+    }
   }
 
   #[test]

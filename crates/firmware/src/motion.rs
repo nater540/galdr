@@ -66,8 +66,8 @@ use firmware_core::planner::{Block, Planner, A_AXIS, AXES};
 use crate::comms::{
   overrides, ProbeRequest, ProbeResult, BLOCK_AVAILABLE, EXECUTOR_RUNNING, HARD_LIMITS_ENABLED,
   HARD_LIMIT_TRIPPED, HOLD_REQUESTED, HOLD_WAKE, HOMING_ACTIVE, HOME_REQUEST, HOME_RESULT, LIMIT_LEVELS,
-  LIMIT_TRIGGERED, LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_PARKED, MOTION_RESET,
-  MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT, SLOT_FREED,
+  LIMIT_TRIGGERED, LIVE_BLOCK_IS_RAPID, LIVE_POSITION, LIVE_PROGRAMMED_FEED_MM_MIN, MOTION_LIVENESS, MOTION_PARKED,
+  MOTION_RESET, MOTION_RESET_PENDING, PLANNER, PROBE_ASSERTED, PROBE_REQUEST, PROBE_RESULT, SLOT_FREED,
 };
 
 /// Core-1 motion-executor trace point. Expands to a `defmt::trace!` only under the `defmt` feature and to
@@ -123,6 +123,9 @@ pub struct RmtStepSink {
   /// Scratch per-channel PulseCode buffer reused across bursts to keep the sink allocation-free. Sized to
   /// the burst cap plus one for the mandatory `end_marker`. Indexed `[channel][symbol]`.
   scratch: [[PulseCode; MAX_SYMBOLS_PER_BURST + 1]; AXES],
+  /// Monotonic count of bursts emitted since boot — captured into the crash breadcrumb on an RMT `wait()` timeout
+  /// so the boot dump reports WHICH transmission (since boot) wedged. Wraps harmlessly (diagnostic only).
+  burst_seq: u32,
 }
 
 impl RmtStepSink {
@@ -138,6 +141,7 @@ impl RmtStepSink {
       delay: Delay::new(),
       last_dir: None,
       scratch: [[PulseCode::end_marker(); MAX_SYMBOLS_PER_BURST + 1]; AXES],
+      burst_seq: 0,
     }
   }
 
@@ -285,6 +289,14 @@ impl StepSink for RmtStepSink {
     if ticks.is_empty() {
       return Ok(());
     }
+    // Liveness beat (diagnostic): advance the core-1 progress counter per BURST as well as per loop turn, so a long
+    // single block (seconds of bursts without returning to the drain loop) still shows core 1 as ADVANCING to the
+    // core-0 watchdog sampler — otherwise a legitimate long move would read as a false "stall". `Relaxed` single
+    // store; see [`MOTION_LIVENESS`](crate::comms::MOTION_LIVENESS). A frozen counter mid-burst now unambiguously
+    // means core 1 wedged inside the RMT transmit/wait below — exactly the suspected lockup site.
+    MOTION_LIVENESS.store(MOTION_LIVENESS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    // Count this transmission so an RMT `wait()` timeout can record WHICH burst since boot wedged.
+    self.burst_seq = self.burst_seq.wrapping_add(1);
     // Encode all three channels into their scratch buffers up front; `len` is the same for every channel
     // (events + end marker), keeping the three transmits identical in length.
     let len = self.encode_channel(0, ticks);
@@ -294,6 +306,7 @@ impl StepSink for RmtStepSink {
     // transmitted to each RMT channel). If "emit_burst" prints but a following "wait ok" for some axis never
     // does, THAT axis's blocking `wait()` is spinning forever (the RMT TX-END never fired) — the RMT path stall.
     mtrace!("motion: emit_burst (events={=usize}, symbols={=usize})", ticks.len(), len);
+    crate::crash::record_stage(crate::crash::Stage::EmitBurst, 0);
 
     // Start all three transmits before waiting any, so the three channels fire together. `transmit`
     // consumes the channel; we take it out of its slot and restore it from the transaction's `wait()`.
@@ -305,6 +318,9 @@ impl StepSink for RmtStepSink {
       let Some(channel) = self.channels[axis].take() else {
         return Err(StepError::Transport);
       };
+      // Breadcrumb: about to start this axis's RMT transmit. A reboot frozen here pins the wedge to the transmit
+      // START of this channel (rarer than a wait wedge, but distinguishable). `axis` is small; the cast is exact.
+      crate::crash::record_stage(crate::crash::Stage::AxisTransmit, axis as u8);
       match channel.transmit(&self.scratch[axis][..len]) {
         Ok(txn) => {
           mtrace!("motion: axis {=usize} transmit Ok", axis);
@@ -326,22 +342,67 @@ impl StepSink for RmtStepSink {
       }
     }
 
-    // Now block-wait every channel. The hardware ran them concurrently; waiting them in sequence only blocks
-    // until the longest finishes. `wait` returns the channel back on success (and inside the error tuple on
-    // failure), so we restore each one for the next burst either way.
+    // Now complete every channel with a BOUNDED poll-loop (was an unbounded blocking `wait()`). The hardware ran
+    // the channels concurrently; polling them in sequence only spins until the longest finishes. `TxTransaction::
+    // poll()` is non-blocking and returns `true` on completion (End or Error), after which `wait()` returns
+    // immediately and hands the channel back — so the HAPPY PATH is byte-for-byte the same busy-poll-then-recover
+    // the old `wait()` did, with no extra awaits and no perturbation to step timing. The ONLY new behavior is the
+    // TIMEOUT branch: if a channel's TX-END never fires (the confirmed `axis0:wait_begin` hang), the poll-loop
+    // gives up after `RMT_WAIT_TIMEOUT_CYCLES`, snapshots the channel's RMT hardware registers into the breadcrumb
+    // (so the next boot's `[MSG:CRASH ...]` shows whether TX-END was actually set), drops the transaction (which on
+    // the S3 does an immediate `stop_tx` — `rmt_has_tx_immediate_stop` — with no drop-hang), and forces a software
+    // reset so the breadcrumb is deterministically read on the next boot.
     let mut result = Ok(());
     for (axis, slot) in txns.iter_mut().enumerate() {
-      if let Some(txn) = slot.take() {
-        // The blocking `wait()` spins on the raw RMT TX-END/threshold status. If "wait begin" prints for an axis
-        // but "wait ok"/"wait err" never does, this is the deadlock: that channel's TX-END never fired.
+      if let Some(mut txn) = slot.take() {
         mtrace!("motion: axis {=usize} wait begin", axis);
+        // Breadcrumb: about to wait on this axis's RMT TX-END — the prime core-1-wedge suspect. A reboot frozen at
+        // `axisN:wait_begin` means channel N's TX-END never fired; the RMT-hang capture below records WHY.
+        crate::crash::record_stage(crate::crash::Stage::AxisWaitBegin, axis as u8);
+        // Bound the wait by the Xtensa CPU CYCLE COUNTER, NOT embassy `Instant`. This loop is a non-yielding
+        // busy-spin on the high-priority core-1 InterruptExecutor; spinning here masks the timer interrupt that
+        // advances esp-rtos/embassy time, so `Instant::now()` FREEZES mid-spin and an Instant deadline never trips
+        // (the first cut at this bug — the RWDT caught the hang instead). `get_cycle_count()` is a per-core CCOUNT
+        // read that increments every CPU cycle regardless of interrupts, so it always advances here.
+        let start = esp_hal::xtensa_lx::timer::get_cycle_count();
+        // Poll until done or the cycle budget elapses. `poll()` is the same volatile status read the old `wait()`
+        // spun on, so a completing burst exits here in the same number of reads — no slower on the happy path.
+        let timed_out = loop {
+          if txn.poll() {
+            break false;
+          }
+          if esp_hal::xtensa_lx::timer::get_cycle_count().wrapping_sub(start) >= RMT_WAIT_TIMEOUT_CYCLES {
+            break true;
+          }
+        };
+        if timed_out {
+          // THE HANG. Capture channel `axis`'s RMT hardware state into the breadcrumb FIRST (while the channel is
+          // still in its hung state — before stop_tx perturbs it), then DETERMINISTICALLY reset. `len` is this
+          // burst's symbol count (events + end marker).
+          mtrace!("motion: axis {=usize} wait TIMEOUT -> capturing RMT state + resetting", axis);
+          capture_rmt_hang(axis as u8, len as u16, self.burst_seq);
+          // Drop the transaction so the S3's immediate `stop_tx` halts the runaway channel (no drop-hang, since
+          // `rmt_has_tx_immediate_stop`), then force a full software reset. We reset DIRECTLY rather than abandoning
+          // the channel and falling through to the watchdog because the post-abort state is ambiguous — the
+          // executor would resume erroring fast (re-advancing `MOTION_LIVENESS`), so the core-1-stall watchdog might
+          // NOT fire and the captured breadcrumb might never be read. A software reset (`RTC_CNTL_SW_SYS_RST` =
+          // `CoreSw`) preserves the RTC_FAST breadcrumb (it does not reset the RTC domain) and is classified as a
+          // fault reset by `main`'s `reset_was_watchdog_or_fault`, so the next boot reads and emits the `[MSG:CRASH
+          // rmt0: ...]` line. This is the FRONT HALF of the eventual timeout-backstop; for now it is purely the
+          // diagnostic reset (a real backstop would feed-hold + ALARM + require re-home — DOC-06, deferred).
+          drop(txn);
+          esp_hal::system::software_reset();
+        }
+        // Completed: `wait()` returns immediately now that `poll()` reported done, handing the channel back.
         match txn.wait() {
           Ok(channel) => {
             mtrace!("motion: axis {=usize} wait ok", axis);
+            crate::crash::record_stage(crate::crash::Stage::AxisWaitDone, axis as u8);
             self.channels[axis] = Some(channel);
           }
           Err((_, channel)) => {
             mtrace!("motion: axis {=usize} wait err", axis);
+            crate::crash::record_stage(crate::crash::Stage::AxisWaitDone, axis as u8);
             self.channels[axis] = Some(channel);
             result = Err(StepError::Transport);
           }
@@ -350,6 +411,42 @@ impl StepSink for RmtStepSink {
     }
     result
   }
+}
+
+/// How long the bounded RMT `wait()` poll-loop ([`RmtStepSink::emit_burst`]) spins for a channel's TX-END before
+/// declaring a hang, capturing the RMT hardware state, and abandoning the burst — expressed in CPU CYCLES, because
+/// the loop must time itself off the cycle counter (embassy `Instant` freezes in this busy-spin; see the loop).
+/// 480M cycles = 2 s at the S3's 240 MHz `CpuClock::max()` (set in `main`). Well above the ~1.5 s worst-case
+/// LEGITIMATE single burst, below the 8 s RWDT, and within one u32 CCOUNT wrap (~17.9 s) so `wrapping_sub` is
+/// exact. The exact wall-clock is non-critical — anything between the ~tens-of-µs legit burst and the 8 s RWDT
+/// works — so even a clock-frequency mismatch stays safely in range.
+const RMT_WAIT_TIMEOUT_CYCLES: u32 = 480_000_000;
+
+/// Snapshot RMT channel `axis`'s hardware status registers into the crash breadcrumb at a `wait()` timeout (the
+/// hang), so the next boot's `[MSG:CRASH ...]` reports the BIFURCATING fact: was TX-END actually asserted (the
+/// transmission finished but our wait missed it) or not (it genuinely never completed)? All reads are plain,
+/// side-effect-free volatile loads of the memory-mapped RMT register block (`int_raw`/`int_st` are raw,
+/// non-clearing status; `ch_tx_status`/`ch_tx_conf0` are plain config/status) — verified against the installed
+/// esp-hal 1.1.1 / esp32s3 PAC. No `unsafe` at the call site (`RMT::regs()` wraps it); safe from the core-1
+/// InterruptExecutor (a peripheral register read needs no lock). The interrupt-field channel index is `u8`; the
+/// `ch_tx_*(usize)` register index is `usize` — matched here exactly as esp-hal does.
+fn capture_rmt_hang(axis: u8, nsym: u16, burst_seq: u32) {
+  let rmt = esp_hal::peripherals::RMT::regs();
+  let int_raw_r = rmt.int_raw().read();
+  let int_st_r = rmt.int_st().read();
+  let hang = crate::crash::RmtHang {
+    axis,
+    tx_end: int_raw_r.ch_tx_end(axis).bit(),
+    tx_thr: int_raw_r.ch_tx_thr_event(axis).bit(),
+    tx_err: int_raw_r.ch_tx_err(axis).bit(),
+    nsym,
+    int_raw: int_raw_r.bits(),
+    int_st: int_st_r.bits(),
+    tx_status: rmt.ch_tx_status(axis as usize).read().bits(),
+    tx_conf0: rmt.ch_tx_conf0(axis as usize).read().bits(),
+    burst_seq,
+  };
+  crate::crash::record_rmt_hang(&hang);
 }
 
 /// The core-1 motion executor (DOC-01 / DOC-02): the single task on the high-priority interrupt executor.
@@ -419,7 +516,16 @@ pub async fn run(
   // The executor task is alive and entering its drain loop on core 1. If THIS line never appears over RTT, the
   // core-1 InterruptExecutor / second-core bring-up never reached the task (look at main's start_second_core).
   mtrace!("motion: executor loop entered");
+  crate::crash::record_stage(crate::crash::Stage::LoopEntered, 0);
   loop {
+    // Liveness beat (diagnostic), per drain-loop turn: bump the cross-core progress counter so the core-0
+    // watchdog-feed task can tell whether core 1 is still scheduling at the block level (this site covers the
+    // empty-queue idle wait + block-pop cadence; `emit_burst` bumps it again per burst so a long single block also
+    // reads as advancing). `Relaxed` + `wrapping_add` is a single native store with no synchronization cost; a wrap
+    // is harmless (the sampler tests for inequality, not magnitude). It NEVER gates the watchdog feed, so it cannot
+    // starve the dog if it misbehaves.
+    MOTION_LIVENESS.store(MOTION_LIVENESS.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+
     // Service a pending soft reset at the top of the loop: RETAIN the live position (Change A) rather than zero
     // it, matching grbl — a `0x18` abort keeps MPos so `$X` unlocks at the same coordinates. The consumer's
     // `reset_pipeline` rebuilds the planner and SYNCS it to this retained position, so the two stay consistent.
@@ -458,6 +564,7 @@ pub async fn run(
     let popped = {
       let mut guard = PLANNER.lock().await;
       mtrace!("motion: PLANNER lock acquired");
+      crate::crash::record_stage(crate::crash::Stage::LockAcquired, 0);
       match guard.as_mut() {
         Some(planner) => take_block(planner),
         None => None,
@@ -481,6 +588,7 @@ pub async fn run(
           block.rapid,
           exit_speed_sq
         );
+        crate::crash::record_stage(crate::crash::Stage::BlockPopped, 0);
         // Publish "a block is in flight" so `status_responder` reports `Run` for the whole duration of this
         // block — including the tail after the queue drained but the last burst is still emitting. Cleared
         // when the block finishes (or aborts). `AcqRel`/`Acquire` publishes the flag to the core-0 reporter.
@@ -511,6 +619,7 @@ pub async fn run(
         // `?` shows a queued block, the wake/enqueue handshake is racing (block enqueued without signaling, or
         // the signal consumed elsewhere) — not the RMT path.
         mtrace!("motion: queue empty -> awaiting block/reset/hold/probe/home");
+        crate::crash::record_stage(crate::crash::Stage::IdleWaiting, 0);
         // Race the existing four idle wakes against a `$H` homing request (DOC-06). Homing, like a probe, is a
         // synchronized boundary serviced only from the empty-queue branch — the consumer flushes look-ahead and
         // blocks on the result, so no block ever follows it out of order. The outer `select` consumes the homing
@@ -651,6 +760,7 @@ fn run_block(
   // this line but the wire still reports `FS:0`, the stall is BEFORE this point (the feed was never published) —
   // which means the executor never reached run_block, contradicting an "emit_burst hang" and pointing upstream.
   mtrace!("motion: feed published ({=f32} mm/min) -> running generator", block.nominal_speed() * 60.0);
+  crate::crash::record_stage(crate::crash::Stage::FeedPublished, 0);
 
   // Latch the live counter's direction from the same step signs the generator latches onto the sink, so the
   // counter advances each axis the correct way. A zero-length block never steps, so this is harmless then.

@@ -3311,4 +3311,225 @@ mod tests {
       "proactive refill ({interior_stops}) must strictly improve on the drain-all cadence ({old_interior_stops})",
     );
   }
+
+  // ---- T1_Test.tap line-401 stall reproduction (real parse→plan→segment pipeline) ----------------
+
+  /// The exact program region around the on-hardware stall at `T1_Test.tap` line 401: a dense contour with a
+  /// G2 arc, several short G1 segments, a revisited/identical coordinate, and the 400→401→402 near-reversal.
+  /// Fed verbatim through the REAL parser so the reproduction exercises the actual wire path, not a hand-built
+  /// `PlannerCommand`. The leading `G21`/`G90`/`G94` modal set mirrors the file header so units/distance/feed
+  /// mode match the device. Line 397 (`F2500.0`) is the active modal feed reached before this region.
+  const STALL_REGION: &[&str] = &[
+    "G21",
+    "G90",
+    "G94",
+    "G1X41.188Y63.866Z-3.000F2500.0",
+    "G2X35.219Y59.541I-7.086J3.497",
+    "G1X15.534Y56.680Z-3.000",
+    "G1X29.792Y42.782Z-3.000",
+    "G2X32.070Y35.820I-5.516J-5.659",
+    "G1X28.699Y16.163Z-3.000",
+    "G1X27.193Y14.090Z-3.000", // <- the line the device stalls on (401).
+    "G1X46.851Y24.425Z-3.000", // <- sharp reversal back up/right (402).
+    "G2X50.000Y25.203I3.149J-5.991F2500.0",
+  ];
+
+  /// A faithful host stand-in for the firmware consumer's drive of ONE parsed line into the planner, mirroring
+  /// `comms_consumer`: a `Move`/`Arc` is planned, and on `QueueFull` the line is RETRIED after the executor has
+  /// drained a block (block-and-retry back-pressure), while an `ArcPending` line is driven with `resume_arc`
+  /// until the whole arc is enqueued. Every retry/resume drains the queue through the REAL segment generator
+  /// first (the executor's job), asserting each realized block actually completes — emits a finite, bounded
+  /// step train with no NaN/Inf period and the exact `step_event_count` ticks. A global iteration budget turns a
+  /// hypothetical hang (a never-completing block, a permanent `QueueFull`, a never-draining arc) into a test
+  /// FAILURE instead of an infinite loop, which is precisely the on-hardware symptom we are hunting.
+  fn drive_line_through_pipeline(
+    planner: &mut Planner,
+    generator: &crate::motion::SegmentGenerator,
+    command: &PlannerCommand,
+    budget: &mut u32,
+  ) {
+    // Plan the command, retrying QueueFull after draining a block, exactly like the consumer's back-pressure.
+    loop {
+      spend(budget);
+      match planner.plan_command(command) {
+        Ok(PlannerOutcome::ArcPending { .. }) => {
+          // Drive the resumable arc to completion, draining between chunks so a free slot always appears.
+          drive_arc(planner, generator, budget);
+          break;
+        }
+        Ok(_) => break,
+        Err(PlannerError::QueueFull) => {
+          // The look-ahead buffer is full: the executor must drain a block before the line can be retried.
+          // If nothing drains, the retry can never succeed — the exact deadlock we want surfaced as a failure.
+          let drained = drain_one_block(planner, generator, budget);
+          assert!(drained, "QueueFull with NO drainable block ⇒ permanent stall (the hardware symptom)");
+        }
+        Err(other) => panic!("unexpected planner error in the stall region: {other:?}"),
+      }
+    }
+  }
+
+  /// Drive a pending arc to completion the way the consumer does: drain queued blocks through the generator,
+  /// then `resume_arc`, repeating until the arc reports complete. A resume into a drained queue MUST enqueue at
+  /// least one segment or the arc could never finish (a starvation stall).
+  fn drive_arc(
+    planner: &mut Planner,
+    generator: &crate::motion::SegmentGenerator,
+    budget: &mut u32,
+  ) {
+    loop {
+      spend(budget);
+      while drain_one_block(planner, generator, budget) {}
+      match planner.resume_arc().expect("resume must not error on this geometry") {
+        PlannerOutcome::ArcPending { enqueued } => {
+          assert!(enqueued > 0, "a resume into a drained queue must make progress or the arc never completes");
+        }
+        PlannerOutcome::Queued { .. } => break,
+        other => panic!("expected an arc outcome from resume, got {other:?}"),
+      }
+    }
+  }
+
+  /// Pop ONE block (if any) and realize it through the real segment generator, asserting it completes: a finite,
+  /// bounded step train with a sane period and the exact `step_event_count` ticks — i.e. the block actually
+  /// signals completion (returns) and never NaNs/hangs. Returns whether a block was drained. The next block's
+  /// entry speed is the exit speed, exactly as the executor supplies it.
+  fn drain_one_block(
+    planner: &mut Planner,
+    generator: &crate::motion::SegmentGenerator,
+    budget: &mut u32,
+  ) -> bool {
+    let block = match planner.pop_block() {
+      Some(block) => block,
+      None => return false,
+    };
+    spend(budget);
+    let exit_sq = planner.peek_block().map_or(0.0, |next| next.entry_speed_sq);
+    let mut sink = CountingSink::new();
+    let emitted = generator
+      .run_block(&block, exit_sq, &mut sink)
+      .expect("run_block must not error realizing a program block");
+    // The load-bearing completion invariant: a moving block emits EXACTLY its dominant-step count of ticks and
+    // returns — a block that yielded zero ticks (when it has motion) or never returned would be the stall.
+    assert_eq!(emitted, block.step_event_count, "a block must emit exactly its step_event_count ticks");
+    assert!(emitted > 0, "a queued program block must carry motion (non-zero step_event_count)");
+    assert!(sink.saw_no_garbage, "every emitted period must be finite and within the representable bound");
+    true
+  }
+
+  /// Decrement a shared iteration budget, panicking if it is exhausted — so any unbounded loop in the pipeline
+  /// (a never-completing block, a permanent QueueFull, a non-progressing arc) fails the test deterministically
+  /// instead of hanging the test runner, reproducing the hardware "no more `ok`" symptom as an assertion.
+  fn spend(budget: &mut u32) {
+    assert!(*budget > 0, "iteration budget exhausted — the pipeline is not making forward progress (a stall)");
+    *budget -= 1;
+  }
+
+  /// A minimal [`StepSink`](crate::hal_traits::StepSink) that only checks each emitted period is finite and within
+  /// the representable RMT field, so a NaN/Inf period (the suspected blow-up vector) is caught at the sink. It
+  /// keeps no per-tick history, so it stays allocation-light for the long step trains this region produces.
+  struct CountingSink {
+    saw_no_garbage: bool,
+  }
+
+  impl CountingSink {
+    fn new() -> Self {
+      CountingSink { saw_no_garbage: true }
+    }
+  }
+
+  impl crate::hal_traits::StepSink for CountingSink {
+    fn set_direction(&mut self, _dir: crate::hal_traits::DirState) -> Result<(), crate::hal_traits::StepError> {
+      Ok(())
+    }
+
+    fn emit_burst(&mut self, ticks: &[crate::hal_traits::StepEvent]) -> Result<(), crate::hal_traits::StepError> {
+      for ev in ticks {
+        // A period of 0, or one above the representable field, would mean the timing math produced garbage (a
+        // NaN/Inf cast, a divide-by-zero) — the kind of blow-up that would wedge the on-target RMT path.
+        if ev.period_ticks == 0 || ev.period_ticks > crate::motion::RMT_MAX_FIELD_LEN + 64 {
+          self.saw_no_garbage = false;
+        }
+      }
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn t1_test_line_401_region_streams_without_stalling() {
+    // Reproduce the on-hardware stall off-target: stream the line ~398–402 region through the REAL
+    // parse→plan→segment pipeline with the REAL device default settings, draining every block through the
+    // segment generator exactly as the core-1 executor does. If the firmware-side logic is the culprit, the
+    // bounded iteration budget trips (a hang) or an assert fires (a never-completing/NaN block). If the pipeline
+    // is innocent, every line plans, every block completes, and the program finishes within budget.
+    let mut planner = Planner::new(PlannerConfig::default());
+    let generator = crate::motion::SegmentGenerator::new(crate::motion::MotionConfig::default());
+    let mut parser = crate::gcode::Parser::new();
+    // Generous but FINITE: this short region needs only a few hundred plan/drain/resume steps; 1e6 cannot be
+    // reached by correct forward progress, so hitting it proves an unbounded loop (the stall).
+    let mut budget: u32 = 1_000_000;
+
+    for line in STALL_REGION {
+      let command = parser
+        .parse_line(line.as_bytes())
+        .unwrap_or_else(|err| panic!("the region must parse cleanly: {line:?} → {err:?}"));
+      if let Some(command) = command {
+        drive_line_through_pipeline(&mut planner, &generator, &command, &mut budget);
+      }
+    }
+
+    // Drain whatever look-ahead remains so the final blocks (including the line-401/402 reversal) are realized
+    // and proven to complete — the program reaching here at all means no stall occurred.
+    let generator_ref = &generator;
+    let mut tail = 0u32;
+    while drain_one_block(&mut planner, generator_ref, &mut budget) {
+      tail += 1;
+      assert!(tail < 100_000, "tail drain did not terminate — a never-completing block");
+    }
+    assert!(planner.is_empty(), "the whole region must drain to an empty queue with no block left wedged");
+  }
+
+  #[test]
+  fn t1_test_full_file_streams_without_stalling() {
+    // The strongest reproduction: stream the ENTIRE real `T1_Test.tap` (all 500 lines, reached after 400 prior
+    // moves that set the live position/modal state) through the real parse→plan→segment pipeline at the device
+    // default settings, draining every block through the segment generator. This rules out any ACCUMULATING
+    // defect (a position drift, a modal-state issue, an arc that only degenerates after many prior moves) that a
+    // focused 12-line slice could miss. Spindle/coordinate/program-flow outcomes are passed through like the
+    // consumer; only `Move`/`Arc` drive the planner+generator. The finite budget still surfaces any hang.
+    let tap = include_str!("../tests/fixtures/T1_Test.tap");
+    let mut planner = Planner::new(PlannerConfig::default());
+    let generator = crate::motion::SegmentGenerator::new(crate::motion::MotionConfig::default());
+    let mut parser = crate::gcode::Parser::new();
+    let mut budget: u32 = 50_000_000;
+
+    for (lineno, raw) in tap.lines().enumerate() {
+      let line = raw.trim();
+      if line.is_empty() {
+        continue;
+      }
+      // The parser surfaces unsupported codes as an error; the host stream would `error:N` and (per the grblHAL
+      // contract) hold, but for THIS reproduction we only care about motion stalls, so skip a parse error rather
+      // than fail — a parse error is a host-protocol concern, not the core-1 motion hang under investigation.
+      let command = match parser.parse_line(line.as_bytes()) {
+        Ok(Some(command)) => command,
+        Ok(None) => continue,
+        Err(_) => continue,
+      };
+      // Only motion commands enter the planner+generator; non-motion outcomes (spindle, program end) are no-ops
+      // for the stall hunt. `drive_line_through_pipeline` itself plans and realizes the motion within budget.
+      if matches!(command, PlannerCommand::Move { .. } | PlannerCommand::Arc { .. }) {
+        drive_line_through_pipeline(&mut planner, &generator, &command, &mut budget);
+      } else {
+        let _ = planner.plan_command(&command);
+      }
+      assert!(budget > 0, "stalled while streaming {raw:?} (file line {})", lineno + 1);
+    }
+
+    let mut tail = 0u32;
+    while drain_one_block(&mut planner, &generator, &mut budget) {
+      tail += 1;
+      assert!(tail < 1_000_000, "tail drain did not terminate — a never-completing block");
+    }
+  }
 }

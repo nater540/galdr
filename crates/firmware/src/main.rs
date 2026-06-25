@@ -41,7 +41,9 @@
 //! - Feed-hold deceleration is per-block (Stage 1): a hold pauses at the next block boundary and resumes on
 //!   cycle-start; smooth ramp-down within a block is a later refinement.
 
-// esp-backtrace installs the panic handler and exception/backtrace reporting (panic-handler feature).
+// esp-backtrace is pulled in (its `panic-handler` feature is OFF — we install our own `#[panic_handler]` below
+// that records a breadcrumb + `software_reset()`s; see Cargo.toml). Kept linked for its `println` integration; the
+// CPU exception vector lives in esp-hal and routes faults into our handler, so faults are still captured.
 use esp_backtrace as _;
 // esp-println routes `print!`/`println!` to the host; pulled in for early-boot diagnostics before the
 // USB CDC link is up. Linked unconditionally so its initializer runs even when unused here.
@@ -52,7 +54,9 @@ use embassy_sync::mutex::Mutex;
 use esp_hal::clock::CpuClock;
 use esp_hal::interrupt::Priority;
 use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::system::Stack;
+use esp_hal::rtc_cntl::{reset_reason, Rtc, RwdtStage};
+use esp_hal::system::{Cpu, Stack};
+use esp_hal::time::Duration;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use esp_rtos::embassy::InterruptExecutor;
@@ -63,12 +67,44 @@ use firmware_core::motion::MotionConfig;
 
 mod comms;
 mod coolant;
+mod crash;
 mod motion;
 mod spindle;
 mod storage;
 mod tmc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+/// Custom panic handler (replacing esp-backtrace's default `interrupt_free(|| loop {})`, which halts FOREVER with
+/// no breadcrumb — making EVERY panic a silent, unrecoverable hard wedge). This records a PANIC breadcrumb into
+/// RTC_FAST and then `software_reset()`s, so a panic — including a core-1 stack overflow, the prime suspect for the
+/// hard wedge — becomes VISIBLE (the next boot emits `[MSG:CRASH panic <file>:<line> core=<N>]`) and RECOVERABLE
+/// (the chip resets itself instead of needing a physical EN press).
+///
+/// ## MINIMAL STACK — this may run after a STACK OVERFLOW
+/// A core-1 main-stack overflow panics, and this handler then runs on that SAME nearly-exhausted stack (there is no
+/// separate Xtensa interrupt/panic stack). So it MUST be allocation-, lock-, and format-FREE: it does only a
+/// handful of raw `Relaxed` stores (via [`crash::record_panic`], `#[inline(never)]` to keep one flat frame) and one
+/// ROM `software_reset()` call. The source-file string is NOT formatted here — only its `.rodata` POINTER + length
+/// are stored as raw words and re-read at BOOT (full stack). No `esp_println` here: it allocates a format buffer /
+/// takes a UART lock, neither safe on a blown stack.
+///
+/// `software_reset()` (ROM `RTC_CNTL_SW_SYS_RST`, reset reason `CoreSw`) is a full-chip reset safe from a panic
+/// context on EITHER core, and it PRESERVES the RTC_FAST breadcrumb (verified: the RTC domain is not cleared by a
+/// CoreSw reset — only a power-cycle/brown-out clears it), so the breadcrumb survives to the next boot.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+  // `Cpu::current()` is a single CPU-register read (no peripheral, no lock) — safe here. 0 = ProCpu, 1 = AppCpu.
+  let core = Cpu::current() as u8;
+  // Pull the raw location words WITHOUT formatting. The file `&str` is a `.rodata` literal; store its pointer+len.
+  if let Some(loc) = info.location() {
+    let file = loc.file();
+    crash::record_panic(core, file.as_ptr() as u32, file.len() as u32, loc.line(), true);
+  } else {
+    crash::record_panic(core, 0, 0, 0, false);
+  }
+  esp_hal::system::software_reset();
+}
 
 /// The step-generator timer tick rate, Hz. A fixed firmware constant (the RMT channels are clocked to 1 MHz
 /// = 1 tick/µs by `motion::init`'s clock divider); the persisted `$0` step-pulse time is converted to ticks
@@ -80,17 +116,49 @@ const MOTION_TICK_HZ: f32 = 1_000_000.0;
 /// (`FROM_CPU_INTR2` — SWI 0/1 are claimed by the esp-rtos SMP scheduler) to a CPU interrupt at this level.
 const MOTION_EXECUTOR_PRIORITY: Priority = Priority::Priority3;
 
+/// RTC watchdog stage-0 timeout: how long the core-0 thread-mode executor may go WITHOUT running the
+/// [`comms::watchdog_feed`] task before the RWDT resets the chip. Chosen at 8 s — comfortably above every
+/// legitimate core-0 stall so it can NEVER false-trip during normal streaming, yet short enough that a genuine
+/// wedge auto-recovers in seconds instead of needing a hard power-cycle:
+/// - The feed task pets the dog every `WATCHDOG_FEED_INTERVAL` (500 ms), so 16 feeds fall inside one window — a
+///   single late wake from a brief quiesce (a flash write parks core 0 for tens of ms via `multicore_auto_park`,
+///   a `?`/banner burst, a back-pressure retry) is dwarfed by the margin.
+/// - The longest legitimate core-0 stall is a flash erase/write (tens of ms) and the consumer's coalesced persist;
+///   none approaches a second, let alone 8. Feed-hold / `$SLP` park the MOTION core, not the core-0 feed task.
+///
+/// Only a true core-0 hang/deadlock/fault — the reported lockup's core-0 symptom — keeps the task from running for
+/// 8 s, which is exactly when we WANT the reset. The RWDT runs off the slow RTC clock, so multi-second timeouts are
+/// well within range. Stage 0's default action on expiry is a system reset (we do not reconfigure the stage action).
+const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(8);
+
 // Provide the defmt timestamp source required to link a defmt logging build (the `defmt` feature wires
 // esp-println as the global logger; defmt still requires the application to supply a timestamp). Uses the
 // embassy-time monotonic clock so log lines carry a microsecond stamp. Compiled out of the default build.
 #[cfg(feature = "defmt")]
 defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
 
-/// Size of the core-1 main-thread stack arena (the esp-rtos second-core scheduler thread), in bytes. Must be a
-/// multiple of 16 (`Stack::new` const-asserts this). 16 KiB is comfortable headroom for the esp-rtos core-1 main
-/// task plus the deep bring-up closure; the over-top corruption bug fixed by [`AppCoreStackArena`] was NOT a
-/// depth overflow (8 KiB and 32 KiB corrupted identically), so this depth is chosen for comfort, not safety.
-const APP_CORE_STACK_SIZE: usize = 16 * 1024;
+/// Size of the core-1 stack arena, in bytes. Must be a multiple of 16 (`Stack::new` const-asserts this).
+///
+/// ## This stack backs the WHOLE core-1 call chain, including the real-time motion task
+/// On Xtensa there is NO separate interrupt stack: a software-interrupt handler runs on the interrupted thread's
+/// stack, and on core 1 the current thread at idle is the esp-rtos second-core MAIN thread backed by THIS arena.
+/// So the SWI-2 [`InterruptExecutor`] poll — and therefore the entire `motion_executor` call chain (the drain loop
+/// → `run_block` → the segment generator → `RmtStepSink::emit_burst` → esp-hal RMT `transmit`/`poll`/`wait` → the
+/// CCOUNT-bounded timeout + the crash-breadcrumb stores) — executes ON THIS STACK, charged ON TOP of the scheduler
+/// thread's frames. esp-rtos plants a stack guard at `bottom + ESP_HAL_CONFIG_STACK_GUARD_OFFSET` and asserts
+/// (panics) on overflow, and ALSO panics on core 0 if the second-core main task fails to init from a bring-up
+/// overflow — so a deep-enough core-1 frame trips a panic (now visible via the custom `#[panic_handler]`, the prime
+/// hard-wedge suspect).
+///
+/// ## Sizing: 32 KiB (was 16 KiB) — depth headroom under sustained streaming
+/// Bumped 16→32 KiB as cheap insurance against a streaming-load stack overflow in the motion task. The usable depth
+/// is `SIZE − guard_offset`; doubling it gives comfortable margin for the deepest core-1 frame (the RMT
+/// transmit/wait path under the Xtensa windowed ABI, which is stack-hungry on window-overflow spills) plus the
+/// breadcrumb/CCOUNT code added to that path, with room for any `core::fmt` the panic machinery itself pulls in.
+/// 32 KiB of RTC/internal RAM is a negligible cost on the S3. Note the over-top corruption bug fixed by
+/// [`AppCoreStackArena`]'s `_abi_headroom` was NOT a depth overflow (it reproduced identically at any size), so the
+/// trailing-padding/canary fix remains independent and load-bearing — growing the stack does not replace it.
+const APP_CORE_STACK_SIZE: usize = 32 * 1024;
 
 /// Xtensa windowed-ABI base register save area, in bytes. Every call spills the caller's saved registers into a
 /// 16-byte area at `[SP, SP+16)` (the four words holding the return address and the caller's a0..a3 window slot).
@@ -248,6 +316,11 @@ static COOLANT: StaticCell<coolant::Coolant> = StaticCell::new();
 /// constructed twice, so there is exactly one, created here.
 static FLASH: StaticCell<storage::SharedFlash> = StaticCell::new();
 
+/// The RTC controller, parked in a `StaticCell` so it lives for the program: the [`comms::watchdog_feed`] task
+/// borrows it `&'static mut` to pet the RWDT (`Rwdt::feed` takes `&mut self`). It is the SOLE owner/feeder of the
+/// dog, so no lock is needed. Parked here (not dropped) because dropping `Rtc` would disable the watchdog.
+static RTC: StaticCell<Rtc<'static>> = StaticCell::new();
+
 /// The core-1 `motion_executor` task: the single task on the high-priority interrupt executor. It borrows
 /// the `'static` RMT step sink and runs the real-time step-generation loop forever (DOC-02). Defined here
 /// (not in `motion`) because `#[embassy_executor::task]` must own its `'static` argument; the loop body
@@ -263,6 +336,71 @@ async fn motion_executor(
   motion::run(sink, probe, limits, config, max_rate_mm_min).await
 }
 
+/// Map a [`SocResetReason`](esp_hal::rtc_cntl::SocResetReason) to a short, stable label for logging. Returning a
+/// `&'static str` (rather than relying on a `Debug`/`defmt::Format` impl that may differ across esp-hal patch
+/// versions) keeps the log line identical on both the default (`esp-println`) and `defmt` builds and makes the
+/// lockup-relevant reasons unmistakable in the monitor. The watchdog reset we are hunting for is `CpuRtcWdt` /
+/// `CoreRtcWdt`; a panic-handler software reset is `CpuSw` / `CoreSw`; a clean boot is `ChipPowerOn`. Unlisted
+/// variants fall through to `"other"` so a future esp-hal addition never fails to compile this map.
+fn reset_reason_label(reason: esp_hal::rtc_cntl::SocResetReason) -> &'static str {
+  use esp_hal::rtc_cntl::SocResetReason::*;
+  match reason {
+    ChipPowerOn => "power-on",
+    CoreSw => "core-sw-reset",
+    CpuSw => "cpu0-sw-reset (panic/soft-reset)",
+    CoreRtcWdt => "core-rtc-WDT (auto-recovered from a wedge)",
+    CpuRtcWdt => "cpu0-rtc-WDT (auto-recovered from a wedge)",
+    SysBrownOut => "brown-out (power)",
+    CoreMwdt0 | CpuMwdt0 => "MWDT0 (timer watchdog)",
+    CoreMwdt1 | CpuMwdt1 => "MWDT1 (timer watchdog)",
+    SysSuperWdt => "super-WDT",
+    SysRtcWdt => "sys-rtc-WDT",
+    CoreDeepSleep => "deep-sleep wake",
+    _ => "other",
+  }
+}
+
+/// Read and log WHY the chip last reset, for the lockup hunt (see step 1b in `main`). Reads the PRO_CPU (core 0)
+/// reason and, on this dual-core S3, the APP_CPU (core 1) reason too — a core-1 fault can show a distinct reason,
+/// helping pin which core died. `reset_reason` returns `None` when the cause is not decodable; we report that as
+/// `"unknown"` rather than guessing.
+///
+/// The log sink is chosen by build: a `defmt` build routes through `defmt::info!` (the RTT sink esp-println's
+/// `defmt-espflash` feature installs — plain `println!` is taken over by that logger under `defmt`), while the
+/// default build uses esp-println's `println!` so a plain serial monitor still sees the reason on the next boot.
+/// Gating the two avoids any interaction between esp-println's plain and defmt back-ends.
+/// Returns `true` when this reset reason is a WATCHDOG or FAULT reset — i.e. an unexpected, possibly-wedge-driven
+/// reset whose crash breadcrumb is worth dumping — as opposed to a clean power-on / brown-out / deliberate
+/// soft-reset. A clean power-on or brown-out also CLEARS RTC_FAST (so a valid breadcrumb could not survive one
+/// anyway), but classifying here keeps the emit decision explicit and lets a defmt build label the cause.
+fn reset_was_watchdog_or_fault(reason: Option<esp_hal::rtc_cntl::SocResetReason>) -> bool {
+  use esp_hal::rtc_cntl::SocResetReason::*;
+  matches!(
+    reason,
+    // RTC / timer / super watchdogs (the auto-recover path this firmware arms), plus a software/CPU reset (an
+    // esp-backtrace panic handler issues one — the fault-handler-hang hypothesis), plus efuse-CRC / clock-glitch
+    // faults. Variant names are the esp-hal 1.1.1 esp32s3 set (`CpuRtcWdt`/`CpuSw`/`CpuMwdt0`, NOT the generic-doc
+    // `Cpu0*` names) — verified against the installed source.
+    Some(
+      CoreRtcWdt | CpuRtcWdt | SysRtcWdt | SysSuperWdt | CoreMwdt0 | CpuMwdt0 | CoreMwdt1 | CpuMwdt1 | CoreSw | CpuSw
+        | CoreEfuseCrc | SysClkGlitch
+    )
+  )
+}
+
+fn log_reset_reason() -> bool {
+  let pro_reason = reset_reason(Cpu::ProCpu);
+  let pro = pro_reason.map(reset_reason_label).unwrap_or("unknown");
+  let app = reset_reason(Cpu::AppCpu).map(reset_reason_label).unwrap_or("unknown");
+  #[cfg(feature = "defmt")]
+  defmt::info!("boot: reset reason PRO_CPU={=str}, APP_CPU={=str}", pro, app);
+  #[cfg(not(feature = "defmt"))]
+  esp_println::println!("[boot] reset reason: PRO_CPU={}, APP_CPU={}", pro, app);
+  // The crash-report emit decision keys off the PRO_CPU (core 0) reason — the RWDT this firmware arms resets the
+  // whole system and reports there. Returned so `main` can pass it to `maybe_emit_crash_report`.
+  reset_was_watchdog_or_fault(pro_reason)
+}
+
 /// Async entry point. `#[esp_rtos::main]` expands to an `#[esp_hal::main]` reset handler that builds the
 /// core-0 thread-mode `esp_rtos::embassy::Executor` and runs this function as its first task. We start
 /// the esp-rtos scheduler/time-driver before spawning so `embassy-time` and channel awaits work.
@@ -272,6 +410,30 @@ async fn main(spawner: Spawner) {
   //    unrecoverable at the very first init step (CLAUDE.md allows `expect` in init).
   let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
   let peripherals = esp_hal::init(config);
+
+  // 1b. Capture WHY the chip last reset, BEFORE arming the new watchdog, and log it. This is the whole point of the
+  //     watchdog for the lockup hunt: after the dog auto-resets a wedged board, the next boot reports
+  //     `Cpu0RtcWdt`/`CoreRtcWdt` here instead of leaving us with only "it needed a hard power-cycle". A clean
+  //     power-on reads `ChipPowerOn`; a brown-out reads `SysBrownOut`; a panic-driven software reset reads
+  //     `Cpu0Sw`/`CoreSw`. Logged on a default build too via esp-println. Returns whether it was a watchdog/fault
+  //     reset, which (with a valid breadcrumb) gates the post-mortem crash report emitted after the banner.
+  let reset_was_watchdog = log_reset_reason();
+
+  // 1b-ii. Read the previous run's crash breadcrumb out of RTC_FAST and CONSUME it (clear the magic), THEN stamp
+  //     the magic for THIS run. The breadcrumb survives a watchdog reset but NOT a power-cycle (see `crash`). It is
+  //     read before arming/spawning anything so the read reflects the wedged run, not this one; the formatted
+  //     `[MSG:CRASH ...]` line is emitted after the banner (step 8) over the normal grbl TX.
+  let breadcrumb = crash::take_breadcrumb();
+  crash::init_magic();
+
+  // 1c. Arm the RTC watchdog as early as possible (before the slower settings/coordinate flash loads below) so a
+  //     hang anywhere in bring-up is also caught. Stage 0's default action is a system reset; we set only its
+  //     timeout (`WATCHDOG_TIMEOUT`, 8 s — see its doc for the false-trip-margin rationale) and enable it. The
+  //     `Rtc` is parked in a `StaticCell` and handed to the `watchdog_feed` task, which is the sole feeder. `Rtc`
+  //     must stay alive for the dog to keep running, hence the `'static` park.
+  let rtc: &'static mut Rtc<'static> = RTC.init(Rtc::new(peripherals.LPWR));
+  rtc.rwdt.set_timeout(RwdtStage::Stage0, WATCHDOG_TIMEOUT);
+  rtc.rwdt.enable();
 
   // 2. Start the esp-rtos scheduler with the TIMG0 timer as the time source. This also installs the
   //    Embassy time-driver, so `embassy-time` and channel/Signal awaits operate from here on. As of
@@ -507,11 +669,21 @@ async fn main(spawner: Spawner) {
   // signal (ALARM / soft-reset / sleep), drives the `SpindleController`, and runs the `$393` reverse dwell.
   spawner.spawn(comms::spindle(spindle).expect("spawn spindle"));
   spawner.spawn(comms::coolant(coolant).expect("spawn coolant"));
+  // The watchdog-feed task pets the RWDT every 500 ms so a healthy board never resets, while a core-0 wedge stops
+  // the feed and lets the dog auto-reset (recorded, so the next boot logs the reason). It owns the `Rtc` `'static`
+  // (the sole feeder). It also samples the core-1 `MOTION_LIVENESS` beat under defmt to show which core froze first.
+  spawner.spawn(comms::watchdog_feed(rtc).expect("spawn watchdog_feed"));
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
   //    pipeline reset, with a best-effort copy from the reader half).
   comms::send_banner().await;
+  // Post-mortem crash report: if the previous run left a valid RTC_FAST breadcrumb AND this was a watchdog/fault
+  // reset, emit a `[MSG:CRASH ...]` line over the normal grbl TX right after the banner so a connected sender logs
+  // where the firmware wedged (e.g. `stage=axis1:wait_begin core1-froze-first`). It is ALSO stashed for one replay
+  // on the first `$I`/`?` after connect, so a host that reconnected late across the USB re-enumeration still gets
+  // it. A no-op on a clean boot (no valid breadcrumb).
+  comms::maybe_emit_crash_report(&breadcrumb, reset_was_watchdog).await;
   // If homing is enabled the machine booted locked in `ALARM:11`; push the boot alarm + `[MSG:'$H'|'$X' to
   // unlock]` right after the banner so a sender detects the locked state on connect (DOC-08 §5). When homing
   // is disabled this is a no-op and the machine comes up Idle.

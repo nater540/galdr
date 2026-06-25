@@ -23,6 +23,9 @@ impl Metrics {
   pub const TOOLBAR_H: f32 = 40.0;
   /// Status bar height (`height:24px`, design §03).
   pub const STATUS_BAR_H: f32 = 24.0;
+  /// Thickness of the "fabulous" Pride rainbow band laid along the toolbar/status-bar edges (the June easter
+  /// egg). A restrained 3px so it reads as a tasteful accent stripe, not a redecoration of the dark chrome.
+  pub const PRIDE_STRIPE_H: f32 = 3.0;
   /// Toolbar horizontal inner padding (`padding:0 10px`, design §03).
   pub const TOOLBAR_PAD_X: f32 = 10.0;
   /// Gap between toolbar items (`gap:6px`, design §03).

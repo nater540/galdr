@@ -15,3 +15,4 @@
 - [Graceful program-stop](graceful-program-stop.md) — 0x86 ProgramStop (clean Stop) vs 0x18 SoftReset (Abort/E-stop); two-control split, abort_enabled gating, re-Run
 - [Program panel auto-scroll](program-panel-autoscroll.md) — follow executing line in virtualized show_rows via scroll_to_rect (not stick-to-bottom); pure program_follow_target + program_followed_line gate
 - [Tool-change state](tool-change-state.md) — grblHAL Tool machine-state + active tool: parser_state.rs [GC:] T<n>, ViewState.current_tool, BadgeState::Tool resume-via-~, $G requested on Tool transition
+- [Toolpath live-motion](toolpath-live-motion.md) — preview dot/colour driven by live WPos not acked: pure preview.rs (live_work_xy/smooth_marker/progressed_segment), model-space lerp, monotonic progress, adaptive 5/10 Hz poll

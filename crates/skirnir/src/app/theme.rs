@@ -122,6 +122,36 @@ impl Theme {
     }
   }
 
+  // ── Fabulous mode (the June easter egg) ─────────────────────────────────────────────────────────────────
+  /// The six-stripe rainbow pride palette, top-of-flag (red) → bottom (violet). Used *only* by the hidden
+  /// "fabulous" accent ([`Self::pride_at`]); it deliberately sits apart from the semantic state colours so the
+  /// dashboard's meaning never depends on it. Values are the canonical 1979 six-stripe flag hexes.
+  pub const PRIDE: [Color32; 6] = [
+    rgb(0xE40303), // red
+    rgb(0xFF8C00), // orange
+    rgb(0xFFED00), // yellow
+    rgb(0x008026), // green
+    rgb(0x004DFF), // blue
+    rgb(0x750787), // violet
+  ];
+
+  /// Sample the [`Self::PRIDE`] rainbow as a smooth left-to-right gradient at `t` in `[0, 1]`, linearly
+  /// interpolating between the two nearest stripe stops. `t` is clamped, so out-of-range inputs saturate to the
+  /// end colours rather than wrapping. This is what paints the thin fabulous-mode accent band so it blends
+  /// rather than showing six hard bands.
+  pub fn pride_at(t: f32) -> Color32 {
+    let stops = Self::PRIDE.len();
+    let t = t.clamp(0.0, 1.0);
+    // Position along the (stops − 1) segments; `seg` is the lower stop, `frac` the blend into the next.
+    let scaled = t * (stops - 1) as f32;
+    let seg = (scaled as usize).min(stops - 2);
+    let frac = scaled - seg as f32;
+    let lo = Self::PRIDE[seg];
+    let hi = Self::PRIDE[seg + 1];
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * frac).round() as u8;
+    Color32::from_rgb(lerp(lo.r(), hi.r()), lerp(lo.g(), hi.g()), lerp(lo.b(), hi.b()))
+  }
+
   /// The axis-letter colour used in the DRO and the viewport HUD: X green, Y blue, Z amber (design §03).
   pub fn axis_color(axis: Axis) -> Color32 {
     match axis {
@@ -164,5 +194,24 @@ mod tests {
   #[test]
   fn rgb_helper_unpacks_channels() {
     assert_eq!(rgb(0x102030), Color32::from_rgb(0x10, 0x20, 0x30));
+  }
+
+  #[test]
+  fn pride_gradient_pins_its_endpoints_and_clamps() {
+    // The ends land exactly on the first/last stripe, and out-of-range inputs saturate rather than wrap.
+    assert_eq!(Theme::pride_at(0.0), Theme::PRIDE[0]);
+    assert_eq!(Theme::pride_at(1.0), Theme::PRIDE[5]);
+    assert_eq!(Theme::pride_at(-1.0), Theme::PRIDE[0]);
+    assert_eq!(Theme::pride_at(2.0), Theme::PRIDE[5]);
+  }
+
+  #[test]
+  fn pride_gradient_blends_between_stops() {
+    // A midpoint between two stops is each channel's average, never one of the raw stops (it interpolates).
+    let mid = Theme::pride_at(0.1); // 0.1 * 5 = 0.5 of the way from red into orange.
+    let (red, orange) = (Theme::PRIDE[0], Theme::PRIDE[1]);
+    assert_eq!(mid.r(), ((red.r() as f32 + orange.r() as f32) / 2.0).round() as u8);
+    assert_ne!(mid, red);
+    assert_ne!(mid, orange);
   }
 }

@@ -20,6 +20,7 @@ pub mod badge;
 pub mod flip_verify;
 pub mod intent;
 pub mod overrides;
+pub mod preview;
 pub mod probe_flow;
 pub mod progress;
 pub mod rotary_center;

@@ -882,12 +882,13 @@ mod tests {
     assert!(ticks.iter().all(|ev| ev.step[0] && ev.step[1]), "1:1 diagonal steps both axes each tick");
   }
 
-  // ---- Burst sizing / ≤48-symbol cap ------------------------------------------------------------
+  // ---- Burst sizing / one-block (never-completely-full) cap -------------------------------------
 
   #[test]
   fn long_block_splits_into_capped_bursts() {
-    // 500 dominant steps must fan out into ceil(500/48) = 11 bursts, none exceeding the 48-symbol cap, and
-    // the tick total must still equal the step count exactly.
+    // 500 dominant steps must fan out into ceil(500 / MAX_SYMBOLS_PER_BURST) bursts, none exceeding the cap
+    // (46 events + 1 marker = 47 symbols, one short of the 48-slot block), and the tick total must still equal
+    // the step count exactly.
     let generator = SegmentGenerator::new(test_config());
     let block = make_block([500, 0, 0, 0], 5.0, 100.0, 0.0, 400.0);
     let mut sink = RecordingSink::new();
@@ -901,7 +902,7 @@ mod tests {
 
   #[test]
   fn exactly_one_full_burst_emits_single_burst() {
-    // Precisely 48 steps must produce one full burst, no empty trailing burst.
+    // Precisely MAX_SYMBOLS_PER_BURST steps must produce one full burst, no empty trailing burst.
     let generator = SegmentGenerator::new(test_config());
     let block = make_block([MAX_SYMBOLS_PER_BURST as i32, 0, 0, 0], 1.0, 100.0, 200.0, 200.0);
     let mut sink = RecordingSink::new();

@@ -129,9 +129,14 @@ pub enum Intent {
   SetWorkZero { axes: Vec<Axis> },
 
   /// Start a fresh rotary center-finder run for a dowel of `dowel_diameter` (mm) indexed at `index_angle_deg`
-  /// (DOC-11 §1.2). The shell builds the [`crate::app::rotary_center::WizardState`] and waits for the operator to
-  /// position and trigger each touch. Replaces any wizard already in progress.
-  RotaryCenterStart { dowel_diameter: f64, index_angle_deg: f64 },
+  /// (DOC-11 §1.2), using the operator-tuned `params` for every rotary-safe touch (retract clearance, side-probe
+  /// descent height, settle, feed, depth). The shell builds the [`crate::app::rotary_center::WizardState`] and
+  /// waits for the operator to position and trigger each touch. Replaces any wizard already in progress.
+  RotaryCenterStart {
+    dowel_diameter: f64,
+    index_angle_deg: f64,
+    params: crate::app::rotary_probe::RotaryProbeParams,
+  },
   /// Trigger the wizard's next touch (the operator has jogged to the approach): the shell asks the wizard which
   /// touch is due, emits the rotary-safe probe lines, and arms the Phase 0 latch. Inert if no wizard is running
   /// or one is already probing.

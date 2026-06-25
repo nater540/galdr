@@ -1,0 +1,281 @@
+//! Pure geometry helpers backing the toolpath preview's live-motion overlay.
+//!
+//! The overlay is driven by the live machine position carried in the `<...>` status report, not by GCode line
+//! acknowledgements (`ok` arrives when a line enters the planner buffer, not when the move finishes, so it leads
+//! the real tool). Two things are drawn from the live work position: a smoothed marker dot showing where the
+//! tool is now, and a **position trail** — a LinuxCNC-AXIS-style "backplot" polyline accumulating where the tool
+//! has actually been. The trail replaced an earlier attempt to recolour the preview's own segments by progress,
+//! which was hopelessly ambiguous on self-intersecting paths (a spiral's parallel rings, a star tip's near-
+//! touching edges); plotting the real positions sidesteps that entirely — it draws where the tool went rather
+//! than guessing which preview segment it is on.
+//!
+//! Everything here is pure and framework-agnostic — plain `(f32, f32)` model-space points, no egui and no
+//! `ViewState`/UI types — so the marker derivation, the per-frame smoothing step, and the trail accumulation/break
+//! rules are unit-tested without a window or a real status feed. The view layer adapts these tuples to
+//! `egui::Vec2`/`Pos2` and projects them through its fit transform.
+
+/// A point in toolpath model space (work-coordinate XY, millimetres). The toolpath segments live in this same
+/// space, so the live marker and the segment geometry share one coordinate frame.
+pub type ModelPoint = (f32, f32);
+
+/// Squared Euclidean distance between two model points. Squared to avoid the `sqrt` in the hot per-frame
+/// smoothing and progress paths; callers compare against squared thresholds.
+fn dist_sq(a: ModelPoint, b: ModelPoint) -> f32 {
+  let dx = a.0 - b.0;
+  let dy = a.1 - b.1;
+  dx * dx + dy * dy
+}
+
+/// Advance a smoothed marker one frame toward the latest live sample. The status feed arrives at 5–10 Hz while
+/// the UI repaints up to 20 Hz, so lerping the held marker toward each fresh sample hides the sample-rate step
+/// without extrapolating (we never dead-reckon past the latest sample, so the marker cannot overshoot the real
+/// tool). `t` is the per-frame lerp fraction in `0..=1`. On first acquisition (`current` is `None`) or a jump
+/// larger than `snap_dist` — a new program, a `$X`/teleport, a coordinate-system change — we snap to the target
+/// instead of crawling across the canvas. Returns the new marker position.
+pub fn smooth_marker(current: Option<ModelPoint>, target: ModelPoint, snap_dist: f32, t: f32) -> ModelPoint {
+  let Some(current) = current else {
+    return target; // First sample: nothing to lerp from, adopt the live position immediately.
+  };
+  if dist_sq(current, target) >= snap_dist * snap_dist {
+    return target; // A large jump is a teleport, not motion to animate — snap so we never crawl across the bed.
+  }
+  let t = t.clamp(0.0, 1.0);
+  (current.0 + (target.0 - current.0) * t, current.1 + (target.1 - current.1) * t)
+}
+
+/// Decide whether a fresh live work position should be appended to the position trail (the LinuxCNC-AXIS-style
+/// "backplot" of where the tool has actually been). Appends when there is no prior trail point, or when the
+/// candidate has moved at least `min_step` from the last appended point. The step gate decimates the 5–10 Hz
+/// status feed and rejects sub-step status jitter, so a stationary tool does not pile up coincident points. Pure
+/// so the accumulation rule is unit-tested; the caller owns the trail buffer and the cap on its length.
+pub fn trail_should_append(last: Option<ModelPoint>, candidate: ModelPoint, min_step: f32) -> bool {
+  match last {
+    None => true,
+    Some(last) => dist_sq(last, candidate) >= min_step * min_step,
+  }
+}
+
+/// Whether two consecutive trail points should be JOINED by a drawn line, i.e. they are within `max_gap` of each
+/// other. A larger gap means the tool jumped — a rapid reposition between moves, a reconnect, or a teleport — and
+/// joining it would draw a spurious straight streak across the work that the tool never cut, so the trail is left
+/// broken there instead. Pure so the break rule is unit-tested.
+pub fn trail_connects(a: ModelPoint, b: ModelPoint, max_gap: f32) -> bool {
+  dist_sq(a, b) <= max_gap * max_gap
+}
+
+/// Classify a trail point as a rapid (non-cutting travel) move from the live realized feed rate, so the trail can
+/// colour rapids apart from cuts. The firmware reports the REALIZED feed (`FS:`), which for a G0 is the machine's
+/// rapid traverse rate — faster than any programmed cutting feed. So a realized feed above the program's maximum
+/// programmed feed (scaled by the live feed-override fraction, with `margin` of headroom) is a rapid; at or below
+/// it is a cut. Returns `false` (cut) when the feed is unknown or the program declares no cutting feed
+/// (`max_programmed_feed <= 0`), so an unclassifiable point takes the cut colour rather than mislabelling travel.
+/// Pure so the classification is unit-tested. (Edge case: an extreme feed-override-up combined with a programmed
+/// cut feed near the rapid rate can misclassify; the common cases — modest overrides, rapid rate well above cut
+/// feeds — are robust.)
+pub fn is_rapid_feed(feed: Option<f64>, max_programmed_feed: f64, feed_override_frac: f64, margin: f64) -> bool {
+  let Some(feed) = feed else {
+    return false;
+  };
+  if max_programmed_feed <= 0.0 {
+    return false;
+  }
+  feed > max_programmed_feed * feed_override_frac.max(0.01) * margin
+}
+
+/// Decide whether the live tool marker should be drawn this frame, given the live work point, the toolpath's
+/// model-space `(min, max)` bounds, the margin to allow outside them, and whether the machine is in an active
+/// motion state (Run/Jog/Hold). The marker is shown when the point lies within the bounds expanded by `margin`,
+/// OR unconditionally while the machine is actively moving (so a cut that legitimately runs just outside the
+/// drawn extents still shows the tool). It is SUPPRESSED for an idle/parked machine whose reported point is far
+/// off the path — the after-homing-at-machine-origin case (finding #4), a units mismatch that displaces the
+/// point 25.4× (finding #3), or an active-WCS mismatch that floats it off the authored origin (finding #5). In
+/// all three the safe behaviour is to draw nothing rather than a confident-but-wrong dot clipped to the rect
+/// edge. Pure so the gate is unit-tested without a window.
+pub fn marker_is_on_path(point: ModelPoint, min: ModelPoint, max: ModelPoint, margin: f32, moving: bool) -> bool {
+  if moving {
+    return true;
+  }
+  point.0 >= min.0 - margin
+    && point.0 <= max.0 + margin
+    && point.1 >= min.1 - margin
+    && point.1 <= max.1 + margin
+}
+
+/// The maximum angular step (radians) of a flattened arc chord. An arc swept by more than this per chord is
+/// subdivided further, so even a large-radius arc renders as a smooth polyline and the live-progress projection
+/// (above) walks it chord-by-chord. ~9° (20 chords for a full circle) is visually smooth at preview scale while
+/// keeping the segment count modest.
+const MAX_ARC_STEP_RAD: f32 = std::f32::consts::PI / 20.0;
+
+/// Flatten one G2/G3 arc (XY plane, G17) into a list of straight chord END points, in path order, EXCLUDING the
+/// start point and INCLUDING the exact `end`. `start`/`end` are the arc's endpoints and `center` its centre (the
+/// I/J offset applied to the start); `clockwise` is true for G2, false for G3. The caller appends one segment per
+/// returned point (`from` = the previous point), so an arc becomes many short chords — which is what makes the
+/// preview draw the real curve and the live-progress projection colour it smoothly as the tool sweeps it, rather
+/// than a single start→end chord the swept point never lies on (finding #2).
+///
+/// The sweep angle is taken the short way consistent with the direction: we walk from the start angle toward the
+/// end angle in the sense `clockwise` dictates, normalising to a positive sweep in `0..=2π` (a start == end is a
+/// full revolution). The chord count is chosen so no chord subtends more than [`MAX_ARC_STEP_RAD`]. Pure geometry,
+/// unit-tested without a window. A degenerate (near-zero-radius) arc yields just the end point.
+pub fn flatten_arc(start: ModelPoint, end: ModelPoint, center: ModelPoint, clockwise: bool) -> Vec<ModelPoint> {
+  let radius = (dist_sq(center, start)).sqrt();
+  if radius <= f32::EPSILON {
+    return vec![end];
+  }
+  let start_angle = (start.1 - center.1).atan2(start.0 - center.0);
+  let end_angle = (end.1 - center.1).atan2(end.0 - center.0);
+  let two_pi = std::f32::consts::TAU;
+  // Signed sweep, positive in the direction of travel. CCW (G3) increases the angle; CW (G2) decreases it. We
+  // normalise the magnitude into (0, 2π]: a start == end angle is a full circle, not a zero-length arc.
+  let mut sweep = if clockwise { start_angle - end_angle } else { end_angle - start_angle };
+  while sweep <= 0.0 {
+    sweep += two_pi;
+  }
+  let steps = (sweep / MAX_ARC_STEP_RAD).ceil().max(1.0) as usize;
+  let dir = if clockwise { -1.0 } else { 1.0 };
+  let mut points = Vec::with_capacity(steps);
+  for i in 1..steps {
+    let theta = start_angle + dir * sweep * (i as f32) / (steps as f32);
+    points.push((center.0 + radius * theta.cos(), center.1 + radius * theta.sin()));
+  }
+  // End exactly on the commanded endpoint rather than a recomputed point, so floating-point drift never leaves a
+  // tiny gap between the arc and the next move.
+  points.push(end);
+  points
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn smooth_marker_snaps_on_first_acquisition() {
+    // The very first sample has nothing to lerp from, so the marker adopts it exactly rather than easing in
+    // from an arbitrary origin (which would draw a phantom sweep across the bed on connect).
+    assert_eq!(smooth_marker(None, (10.0, 20.0), 50.0, 0.3), (10.0, 20.0));
+  }
+
+  #[test]
+  fn smooth_marker_lerps_toward_a_nearby_sample() {
+    // A small move eases part-way toward the target (here 50% of the way), smoothing the sample-rate step.
+    let next = smooth_marker(Some((0.0, 0.0)), (10.0, 0.0), 50.0, 0.5);
+    assert!((next.0 - 5.0).abs() < 1e-4, "x should ease half-way: {next:?}");
+    assert!((next.1 - 0.0).abs() < 1e-4, "y unchanged: {next:?}");
+  }
+
+  #[test]
+  fn smooth_marker_snaps_on_a_large_jump() {
+    // A jump beyond the snap threshold (a new program / teleport) snaps rather than crawling across the canvas.
+    let next = smooth_marker(Some((0.0, 0.0)), (100.0, 100.0), 50.0, 0.3);
+    assert_eq!(next, (100.0, 100.0), "a jump past snap_dist must snap, not lerp");
+  }
+
+  #[test]
+  fn smooth_marker_clamps_t_outside_unit_range() {
+    // A degenerate `t` outside `0..=1` is clamped so it can neither overshoot nor reverse.
+    assert_eq!(smooth_marker(Some((0.0, 0.0)), (10.0, 0.0), 50.0, 5.0), (10.0, 0.0));
+    assert_eq!(smooth_marker(Some((4.0, 0.0)), (10.0, 0.0), 50.0, -5.0), (4.0, 0.0));
+  }
+
+  #[test]
+  fn trail_should_append_takes_the_first_point_unconditionally() {
+    // With no prior trail point there is nothing to compare against, so the first live position is always taken.
+    assert!(trail_should_append(None, (3.0, 4.0), 1.0));
+  }
+
+  #[test]
+  fn trail_should_append_decimates_sub_step_jitter_and_takes_real_moves() {
+    // A move shorter than `min_step` (status jitter / a near-stationary tool) is rejected so coincident points do
+    // not pile up; a move that clears the step is appended.
+    assert!(!trail_should_append(Some((0.0, 0.0)), (0.3, 0.0), 1.0), "a sub-step wiggle must not append");
+    assert!(trail_should_append(Some((0.0, 0.0)), (1.5, 0.0), 1.0), "a move past the step must append");
+    // Exactly at the step threshold counts as a move (>=).
+    assert!(trail_should_append(Some((0.0, 0.0)), (1.0, 0.0), 1.0));
+  }
+
+  #[test]
+  fn trail_connects_joins_near_points_and_breaks_across_a_jump() {
+    // Consecutive trail points within the gap are joined into the drawn trail; a large jump (a rapid reposition, a
+    // reconnect) is left broken so no spurious streak is drawn across work the tool never cut.
+    assert!(trail_connects((0.0, 0.0), (2.0, 0.0), 5.0), "a small step joins");
+    assert!(!trail_connects((0.0, 0.0), (50.0, 0.0), 5.0), "a large jump breaks the trail");
+  }
+
+  #[test]
+  fn is_rapid_feed_separates_rapids_from_cuts_around_the_max_programmed_feed() {
+    // Program tops out at F1000; rapids run faster than any cut. At 100% override with a 1.2 margin the threshold
+    // is 1200: a 3000 mm/min rapid is over it (rapid), an 800 mm/min cut is under it (cut), and a cut at the
+    // programmed max is still a cut.
+    assert!(is_rapid_feed(Some(3000.0), 1000.0, 1.0, 1.2), "a fast move is a rapid");
+    assert!(!is_rapid_feed(Some(800.0), 1000.0, 1.0, 1.2), "a slow move is a cut");
+    assert!(!is_rapid_feed(Some(1000.0), 1000.0, 1.0, 1.2), "a cut at the programmed max is still a cut");
+    // The threshold scales with the live feed override: at 200% a 1900 mm/min reading is still a cut (a 1000 cut
+    // run at 2× override), not a rapid.
+    assert!(!is_rapid_feed(Some(1900.0), 1000.0, 2.0, 1.2), "an overridden cut is not a rapid");
+    // Unknown feed, or a program with no cutting feed at all, defaults to cut (never paints travel-colour blindly).
+    assert!(!is_rapid_feed(None, 1000.0, 1.0, 1.2));
+    assert!(!is_rapid_feed(Some(5000.0), 0.0, 1.0, 1.2));
+  }
+
+  #[test]
+  fn marker_is_on_path_suppresses_a_parked_point_far_off_the_path() {
+    let (min, max) = ((0.0, 0.0), (10.0, 10.0));
+    // An idle machine sitting on the path (or just inside the margin) shows the marker.
+    assert!(marker_is_on_path((5.0, 5.0), min, max, 2.0, false));
+    assert!(marker_is_on_path((-1.0, 11.0), min, max, 2.0, false), "within the margin still shows");
+    // An idle machine parked far off the path — homed to machine origin (#4), a 25.4× units displacement (#3), or
+    // a WCS-mismatch float (#5) — suppresses the marker rather than drawing a misleading dot.
+    assert!(!marker_is_on_path((-50.0, -50.0), min, max, 2.0, false), "far off + idle must suppress");
+    assert!(!marker_is_on_path((254.0, 254.0), min, max, 2.0, false), "a 25.4x displacement must suppress");
+  }
+
+  #[test]
+  fn marker_is_on_path_always_shows_while_moving() {
+    let (min, max) = ((0.0, 0.0), (10.0, 10.0));
+    // While the machine is actively moving (Run/Jog/Hold) the marker shows even outside the bounds — a cut that
+    // legitimately runs just past the drawn extents must still track the tool.
+    assert!(marker_is_on_path((-100.0, -100.0), min, max, 2.0, true), "a moving machine always shows the marker");
+  }
+
+  #[test]
+  fn flatten_arc_subdivides_a_quarter_circle_into_many_chords_on_the_radius() {
+    // A G3 (CCW) quarter circle from (1,0) to (0,1) about the origin. The result must be many short chords (not a
+    // single start→end chord), every intermediate point must lie on the unit radius, and it must end exactly at
+    // the commanded endpoint.
+    let pts = flatten_arc((1.0, 0.0), (0.0, 1.0), (0.0, 0.0), false);
+    assert!(pts.len() >= 3, "a quarter circle must flatten into several chords, got {}", pts.len());
+    for p in &pts {
+      let r = (p.0 * p.0 + p.1 * p.1).sqrt();
+      assert!((r - 1.0).abs() < 1e-3, "every chord point must sit on the radius: {p:?} r={r}");
+    }
+    assert_eq!(*pts.last().unwrap(), (0.0, 1.0), "the arc must end on the commanded endpoint");
+    // The chords must sweep CCW: the first intermediate point is above-and-left of the start (y increases).
+    assert!(pts[0].1 > 0.0, "a CCW sweep raises Y first: {:?}", pts[0]);
+  }
+
+  #[test]
+  fn flatten_arc_directions_sweep_opposite_ways() {
+    // The SAME endpoints with opposite directions must sweep opposite ways. From (1,0) to (-1,0) about the origin:
+    // CCW (G3) goes over the top (+Y), CW (G2) goes under the bottom (−Y).
+    let ccw = flatten_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), false);
+    let cw = flatten_arc((1.0, 0.0), (-1.0, 0.0), (0.0, 0.0), true);
+    assert!(ccw[0].1 > 0.0, "G3 sweeps over the top: {:?}", ccw[0]);
+    assert!(cw[0].1 < 0.0, "G2 sweeps under the bottom: {:?}", cw[0]);
+  }
+
+  #[test]
+  fn flatten_arc_treats_coincident_endpoints_as_a_full_circle() {
+    // A G2 arc whose start == end is a full revolution (a common bore/contour pattern), not a zero-length move; it
+    // must produce a closed loop of chords, not collapse to a single point.
+    let pts = flatten_arc((1.0, 0.0), (1.0, 0.0), (0.0, 0.0), true);
+    assert!(pts.len() > 8, "a full circle must flatten into many chords, got {}", pts.len());
+    assert_eq!(*pts.last().unwrap(), (1.0, 0.0), "a full circle returns to its start");
+  }
+
+  #[test]
+  fn flatten_arc_degenerate_radius_yields_just_the_endpoint() {
+    // A near-zero-radius arc (start == center) cannot define a sweep; it degrades to a single chord to the end.
+    assert_eq!(flatten_arc((0.0, 0.0), (2.0, 3.0), (0.0, 0.0), false), vec![(2.0, 3.0)]);
+  }
+}

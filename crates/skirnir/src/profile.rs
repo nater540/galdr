@@ -114,12 +114,24 @@ pub struct Prefs {
   pub rotary_dowel_diameter: f64,
   /// The rotary center-finder's index-angle input default (degrees).
   pub rotary_index_angle: f64,
+  /// The rotary-safe touch's bench-tuned parameters (retract clearance, side-probe height, settle, feed, depth) —
+  /// remembered so the per-bench values an operator dials in once survive a session. `#[serde(default)]` so a
+  /// profile written before this block existed still loads, defaulting the whole struct rather than failing to
+  /// parse on the missing field.
+  #[serde(default)]
+  pub rotary_bench: crate::app::rotary_probe::RotaryProbeParams,
 }
 
 impl Default for Prefs {
   fn default() -> Self {
     // These mirror the live `UiState` defaults so a fresh profile and a fresh UI agree out of the box.
-    Prefs { last_port: None, baud: 115_200, rotary_dowel_diameter: 6.0, rotary_index_angle: 0.0 }
+    Prefs {
+      last_port: None,
+      baud: 115_200,
+      rotary_dowel_diameter: 6.0,
+      rotary_index_angle: 0.0,
+      rotary_bench: crate::app::rotary_probe::RotaryProbeParams::default(),
+    }
   }
 }
 
@@ -264,6 +276,13 @@ mod tests {
         baud: 250_000,
         rotary_dowel_diameter: 10.0,
         rotary_index_angle: 45.0,
+        rotary_bench: crate::app::rotary_probe::RotaryProbeParams {
+          clearance_mm: -3.0,
+          settle_secs: 0.75,
+          feed: 40.0,
+          depth_mm: 12.0,
+          side_probe_z: -9.0,
+        },
       },
     }
   }
@@ -383,6 +402,25 @@ mod tests {
     let parsed = Profile::from_ron(&minimal).expect("a version-only profile must parse via serde defaults");
     assert_eq!(parsed.rotary, None);
     assert_eq!(parsed.prefs, Prefs::default());
+  }
+
+  #[test]
+  fn a_prefs_block_without_the_bench_params_loads_with_them_defaulted() {
+    // The exact backward-compat case for adding `rotary_bench`: a profile written before that block existed
+    // carries a full `prefs` minus the new field. `#[serde(default)]` on `rotary_bench` must let it parse, with
+    // the bench params filled from `RotaryProbeParams::default()` rather than failing the whole load.
+    let pre = format!(
+      "(version:{},rotary:None,prefs:(last_port:Some(\"/dev/ttyACM0\"),baud:115200,rotary_dowel_diameter:8.0,rotary_index_angle:30.0))",
+      PROFILE_VERSION,
+    );
+    let parsed = Profile::from_ron(&pre).expect("a pre-bench prefs block must still parse");
+    assert_eq!(parsed.prefs.rotary_dowel_diameter, 8.0, "the existing prefs fields must survive");
+    assert_eq!(parsed.prefs.rotary_index_angle, 30.0);
+    assert_eq!(
+      parsed.prefs.rotary_bench,
+      crate::app::rotary_probe::RotaryProbeParams::default(),
+      "the absent bench block must default, not fail the load",
+    );
   }
 
   #[test]
