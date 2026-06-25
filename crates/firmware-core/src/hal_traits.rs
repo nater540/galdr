@@ -15,11 +15,27 @@ use crate::planner::AXES;
 /// The maximum number of [`StepEvent`]s (RMT PulseCode symbols) a single burst may carry. The ESP32-S3 RMT
 /// memory block holds 48 symbols (`SOC_RMT_MEM_WORDS_PER_CHANNEL`), but the firmware bin appends one
 /// mandatory `end_marker` symbol after the events, so an N-event burst encodes to N+1 symbols. Capping at
-/// 47 events makes a full burst exactly 47 + 1 = 48 symbols — precisely one memory block (`memsize = 1`).
-/// This keeps every burst inside a single block so the driver never borrows the adjacent channel's memory
-/// and the interrupt-priority streaming-refill (ping-pong) path is never relied upon (DOC-02). A burst
-/// larger than this is rejected with [`StepError::BurstTooLong`].
-pub const MAX_SYMBOLS_PER_BURST: usize = 47;
+/// **46** events makes a full burst 46 + 1 = 47 symbols — one symbol SHORT of the 48-slot block, so slot 47
+/// is ALWAYS left free. This is deliberate and load-bearing (see below); it keeps every burst inside a single
+/// block so the driver never borrows the adjacent channel's memory and the interrupt-priority streaming-refill
+/// (ping-pong) path is never relied upon (DOC-02). A burst larger than this is rejected with
+/// [`StepError::BurstTooLong`].
+///
+/// ## Why 46, not 47 — the never-completely-full-block rule (RMT TX-completion hang fix)
+/// A confirmed real-board lockup (`stage=axis0:wait_begin` with no `wait_done` in the crash breadcrumb) was the
+/// core-1 RMT TX-completion `wait()` spinning forever on channel 0 (X) — TX-END never asserted. Reading the
+/// esp-hal 1.1.1 RMT writer (`rmt/writer.rs`): on the blocking one-shot path the whole buffer is written into the
+/// 48-slot block and `mem_tx_wrap_en` is set. If the buffer EXACTLY fills the block (48 symbols) and the writer's
+/// last-written code is NOT a length-zero end marker — which can arise from any off-by-one or truncation
+/// (`count = data.len().min(48)` silently drops a 49th marker) — the writer stays in `WriterState::Active`, there
+/// is no free slot for esp-hal to inject its own terminating marker, the hardware read pointer WRAPS slot-47 → 0
+/// and re-transmits, and `wait()` busy-polls `Event::End` forever. Capping at 46 events guarantees the encoded
+/// buffer is at most 47 symbols, so `data.len() < 48` is ALWAYS true: esp-hal then either reaches `Done` (our
+/// marker in slot ≤46) or, on any malformed buffer, injects a marker into the free slot and returns a CLEAN
+/// `Error` from `transmit` BEFORE starting TX — the `Active`/wrap/hang path becomes structurally unreachable.
+/// The cost is negligible: a 47-event dominant-axis move now spans two bursts instead of one (one extra
+/// transmit), which on the dedicated core-1 executor is a sub-microsecond overhead. Do NOT raise this back to 47.
+pub const MAX_SYMBOLS_PER_BURST: usize = 46;
 
 /// The direction state latched onto the three axis DIR outputs before a burst. One `bool` per axis,
 /// indexed `[X, Y, Z]`: `true` is the positive (increasing-step) direction, `false` is negative. The
@@ -339,14 +355,20 @@ pub trait RecordStore {
 mod tests {
   use super::*;
 
-  /// The ESP32-S3 RMT memory block holds 48 symbols. The firmware bin appends one `end_marker` after the
-  /// events of a burst, so a full burst of [`MAX_SYMBOLS_PER_BURST`] events encodes to
-  /// `MAX_SYMBOLS_PER_BURST + 1` symbols, which must fit one block exactly — otherwise the burst spills into
-  /// the adjacent channel's memory or relies on the interrupt-priority streaming refill (Finding #7).
+  /// The ESP32-S3 RMT memory block holds 48 symbols. The firmware bin appends one `end_marker` after the events
+  /// of a burst, so a full burst of [`MAX_SYMBOLS_PER_BURST`] events encodes to `MAX_SYMBOLS_PER_BURST + 1`
+  /// symbols. That total must be STRICTLY LESS than one block, so slot 47 is always free: a completely-full block
+  /// can trip the esp-hal 1.1.1 RMT writer into `WriterState::Active` + wrap-around re-transmit when the last code
+  /// is not a marker, hanging `wait()` forever (the confirmed `axis0:wait_begin` lockup — see
+  /// [`MAX_SYMBOLS_PER_BURST`]). Leaving a free slot keeps the burst in one block AND makes that wrap-trap
+  /// unreachable (esp-hal injects a terminating marker into the spare slot and errors cleanly instead).
   #[test]
-  fn full_burst_plus_end_marker_fits_one_rmt_block() {
+  fn full_burst_plus_end_marker_leaves_a_free_slot_in_the_rmt_block() {
     const RMT_BLOCK_SYMBOLS: usize = 48;
-    assert_eq!(MAX_SYMBOLS_PER_BURST + 1, RMT_BLOCK_SYMBOLS, "events + end marker must equal one RMT block");
+    assert!(
+      MAX_SYMBOLS_PER_BURST + 1 < RMT_BLOCK_SYMBOLS,
+      "events + end marker must be strictly less than one RMT block so slot 47 stays free (never a full block)"
+    );
   }
 
   // ---- Probe input: `$6` invert / `$19` pull-up semantics ----------------------------------------

@@ -1,8 +1,60 @@
 ---
 name: project-firmware-lockup-investigation
-description: 2026-06-24 investigation of the intermittent both-cores-dead T1_Test.tap firmware lockup (hard-reboot, no WDT) — what was ruled OUT, the two real latent defects found (no watchdog; esp-storage auto-park cache-window vs cached-flash motion code), and the bench-instrumentation plan since source review can't pin it.
+description: 2026-06-24 streaming-lockup investigation — ROOT CAUSE FOUND via the RTC crash breadcrumb (core-1 RMT TX wait() hung on ch0/X) + the FIX (cap bursts to 46 events so the 48-slot RMT block is never completely full). Also: the watchdog/breadcrumb/task-watchdog build, and what was ruled out.
 metadata:
   type: project
+---
+
+**ROOT CAUSE FOUND + FIXED 2026-06-24 (the streaming lockup).** The RTC crash breadcrumb (built earlier this session)
+captured a Pikachu wedge: `[MSG:CRASH core0-comms-wedge stage=axis0:wait_begin comms-froze-first beats comms=41898
+motion=60943 (RWDT-reset)]`. Decisive: `stage=axis0:wait_begin` with NO `wait_done` ⇒ the core-1 motion executor hung
+in esp-hal's blocking RMT TX-completion `wait()` for CHANNEL 0 (X) — TX-END never fired, the busy-poll `wait()` spun
+forever. (`core0-comms-wedge` is COLLATERAL: executor hung → planner queue filled → comms_consumer parked → status froze;
+the 3 s comms detector tripped ~1 s before the 4 s motion detector. Trust the stuck `wait_begin`.) Non-deterministic line
+(835/1387/~1500), only on the big file (4474-line Pikachu, ~all short fast G1 → vastly more X step-bursts/sec), wedged
+mid-detail during cutting. T1_Test (500 lines, arc-heavy) ran clean twice.
+
+**MECHANISM (verified against INSTALLED esp-hal 1.1.1 `rmt.rs` + `rmt/writer.rs`, S3 `channel_ram_size`=48):** the
+blocking one-shot `transmit` writes the whole buffer into the 48-slot block and `start_send` sets `mem_tx_wrap_en=1` +
+threshold=24. RULED OUT: the refill/threshold path (writer is `Done` for a ≤block buffer → refill is a no-op) and any
+cross-channel int-clear race (`clear_tx_interrupts`/`get_tx_status` are per-channel, int_raw W1C, TX_END latches). The
+REAL hazard is the COMPLETELY-FULL block: if the buffer is exactly 48 symbols and the writer's last-written code is NOT a
+length-zero end marker (any off-by-one, or a 49th-marker truncated by `count=data.len().min(48)`), the writer stays
+`WriterState::Active`, there's NO free slot for esp-hal to inject a terminating marker, the HW read pointer WRAPS slot-47
+→ 0 and re-transmits, and `wait()` polls `Event::End` forever (writer.rs:146). Our encoder normally puts the marker in
+slot 47 (→ `Done`, should be safe), so this is the full-block BOUNDARY being fragile on the busiest channel; the rare/
+timing/burst-density/ch0 signature fits the full-block edge. No post-1.1.1 esp-hal fix exists for this (issues #2115/
+#3477 are the missing/embedded-marker cases, already handled).
+
+**THE FIX (landed, both configs compiled, 522 host tests green):** `firmware-core/src/hal_traits.rs` —
+`MAX_SYMBOLS_PER_BURST: 47 → 46`. Now a max burst = 46 events + 1 marker = 47 symbols, ALWAYS one slot short of the
+48-slot block. With `data.len() < 48` guaranteed, the `Active`/wrap/hang path (writer.rs:146) is STRUCTURALLY
+UNREACHABLE: esp-hal either reaches `Done` (our marker) or injects a marker into the free slot and returns a clean
+`Error` from `transmit` BEFORE TX starts — never a silent hang. Cost: a 47-event move now spans 2 bursts (one extra
+sub-µs transmit on the dedicated core). Updated the `full_burst_plus_end_marker_*` test to assert `+1 < 48` (free slot),
+and the two burst-sizing tests (symbolic, auto-adapt). Regression comment on the const documents "do NOT raise to 47".
+DO-NOT-RAISE is load-bearing.
+
+**CONFIDENCE: high that this is the right fix, honest caveat:** the writer-state analysis says our NORMAL 48-symbol
+encoding (marker in slot 47) should reach `Done` and be safe — so I could NOT prove our encoder hits the exact `Active`
+trap. But the empirical breadcrumb (ch0, rare, burst-density-correlated) points squarely at the full-block boundary, and
+the fix eliminates the ENTIRE full-block hazard class (writer-state AND any HW wrap-at-full-block quirk) regardless of
+the exact sub-mechanism. Low-risk, provably removes the boundary. CONFIRM on the bench: re-flash, stream Pikachu to
+completion (it wedged ~1-in-a-few before); if it ever recurs, the breadcrumb still captures it and the timeout backstop
+(below) becomes the next step.
+
+**PROPOSED (NOT yet landed) defense-in-depth — timeout-bounded RMT wait → safe ALARM:** esp-hal exposes
+`TxTransaction::poll(&mut self)->bool` (non-blocking; true=done). Feasible backstop: loop `poll()` against an
+`embassy_time::Instant` deadline (~3 s, >> the ~1.5 s worst-case legit burst); on done → `wait()` (returns at once); on
+TIMEOUT → DROP the txn (S3 has `rmt_has_tx_immediate_stop=true`, so `TxGuard::drop` does `stop_tx`+`update` and SKIPS the
+`#[cfg(not(immediate_stop))]` busy-wait → clean immediate stop, no drop-hang) then raise a SAFE ALARM. CNC-SAFETY NUANCE:
+aborting a burst mid-cut LOSES step sync → must feed-hold + ALARM + disable steppers + REQUIRE re-home, NEVER silently
+retry. Needs the alarm state machine wired (DOC-06). Defense-in-depth regardless of root cause; left for a decision.
+
+**RULED OUT as the ch0 cause:** the known axis-3 (A) encode gap (`emit_burst` encodes axes 0,1,2 but transmits `0..AXES`
+=4, so ch3 transmits stale `scratch[3]`=all-end-markers → instant TX_END, harmless; A never steps — a separate DOC-10
+latent bug, NOT corrupting ch0). We're hung on ch0 which IS encoded.
+
 ---
 
 **Investigation 2026-06-24.** Streaming `T1_Test.tap` (repo root, 500 lines: 252 G1, 123 G2, 21 G3 arcs, 95 G0, M3/M5;
