@@ -291,7 +291,7 @@ pub enum PlannerOutcome {
   /// move the machine), matching grbl — exactly like the spindle command.
   Coolant(crate::gcode::CoolantState),
   /// A coordinate-system / offset op (G10, G54-G59, G92, G28.1/G30.1, G43.1/G49) passed through for the caller
-  /// to apply to the shared [`crate::coords::CoordinateSystems`]. No motion is produced and look-ahead is
+  /// to apply to the shared `CoordinateSystems` model (in `firmware-core`). No motion is produced and look-ahead is
   /// preserved (these do not move the machine), matching grbl; the caller then pushes the recomputed WCO back
   /// into the planner via [`Planner::set_work_offset`].
   Coordinate(CoordinateOp),
@@ -508,7 +508,7 @@ pub struct Planner {
   position_steps: [i32; AXES],
   /// The active Work Coordinate Offset (WCO) in mm per axis, added to commanded WORK coordinates to get
   /// MACHINE coordinates (`MPos = WPos + WCO`). The full grbl WCO — `G54..59[active] + G92 + TLO` — is computed
-  /// by [`crate::coords::CoordinateSystems`] in the consumer, which pushes it here via [`set_work_offset`] on
+  /// by the `CoordinateSystems` model (in `firmware-core`) in the consumer, which pushes it here via [`set_work_offset`] on
   /// every coordinate-system change. The planner applies it only to ABSOLUTE work moves; an incremental move
   /// (offset already baked into the current machine position) and a G53 machine-coordinate move bypass it.
   work_offset_mm: [f32; AXES],
@@ -582,7 +582,7 @@ impl Planner {
 
   /// Set the active Work Coordinate Offset (WCO) in mm per axis. The consumer calls this after applying any
   /// coordinate-system change (G10 / G54-G59 / G92 / G43.1 / G49) to the shared
-  /// [`crate::coords::CoordinateSystems`], so the planner's absolute work→machine transform always uses the
+  /// `CoordinateSystems` model (in `firmware-core`), so the planner's absolute work→machine transform always uses the
   /// live WCO. It does NOT move the machine or touch look-ahead — only the offset future absolute moves resolve
   /// against changes. Non-finite components are ignored per axis so a degenerate offset cannot poison geometry.
   pub fn set_work_offset(&mut self, wco: [f32; AXES]) {
@@ -3425,7 +3425,7 @@ mod tests {
     *budget -= 1;
   }
 
-  /// A minimal [`StepSink`](crate::hal_traits::StepSink) that only checks each emitted period is finite and within
+  /// A minimal [`StepSink`](crate::step::StepSink) that only checks each emitted period is finite and within
   /// the representable RMT field, so a NaN/Inf period (the suspected blow-up vector) is caught at the sink. It
   /// keeps no per-tick history, so it stays allocation-light for the long step trains this region produces.
   struct CountingSink {
@@ -3438,12 +3438,12 @@ mod tests {
     }
   }
 
-  impl crate::hal_traits::StepSink for CountingSink {
-    fn set_direction(&mut self, _dir: crate::hal_traits::DirState) -> Result<(), crate::hal_traits::StepError> {
+  impl crate::step::StepSink for CountingSink {
+    fn set_direction(&mut self, _dir: crate::step::DirState) -> Result<(), crate::step::StepError> {
       Ok(())
     }
 
-    fn emit_burst(&mut self, ticks: &[crate::hal_traits::StepEvent]) -> Result<(), crate::hal_traits::StepError> {
+    fn emit_burst(&mut self, ticks: &[crate::step::StepEvent]) -> Result<(), crate::step::StepError> {
       for ev in ticks {
         // A period of 0, or one above the representable field, would mean the timing math produced garbage (a
         // NaN/Inf cast, a divide-by-zero) — the kind of blow-up that would wedge the on-target RMT path.

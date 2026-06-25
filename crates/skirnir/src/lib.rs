@@ -26,6 +26,7 @@
 pub mod app;
 pub mod engine;
 pub mod error;
+pub mod eta;
 pub mod profile;
 pub mod protocol;
 pub mod reconnect;

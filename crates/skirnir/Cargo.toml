@@ -26,6 +26,11 @@ gui = ["dep:eframe", "dep:rfd"]
 serial = ["dep:tokio-serial"]
 
 [dependencies]
+# The shared CNC kinematics core (GCode parser + planner + motion timing). Skirnir drives the SAME planner
+# the firmware runs, offline, to estimate job time — so the ETA cannot drift from the board's motion. The
+# `sim` feature pulls in the host-side `simulate` driver (it allocates); `default-features = false` skips the
+# firmware-only `defmt`.
+cnc-kinematics = { path = "../cnc-kinematics", default-features = false, features = ["sim"] }
 # Async runtime + primitives for the engine's driver task and the UI<->engine channels. We keep the feature
 # set tight: the multi-threaded runtime, the proc-macros, async I/O helpers, sync channels, timers, and the
 # `signal` handler the headless `--cli` harness uses for a clean Ctrl-C (soft-reset + disconnect) abort.

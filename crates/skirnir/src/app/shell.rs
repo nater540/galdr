@@ -105,6 +105,16 @@ pub struct SkirnirApp {
   /// `Streaming` and cleared when it leaves; `None` means no stream is timing. Held in the shell (not the pure
   /// reducer) because it is wall-clock state the egui frame owns — the reducer stays free of `Instant::now()`.
   stream_started: Option<Instant>,
+  /// The most recent physics-based job-time estimate ([`crate::eta::EtaTimeline`]) the operator computed with the
+  /// Simulate button, or `None` until they run one (cleared when a new program is opened). When present it drives
+  /// the dock's ETA: the upfront total before a stream starts, and the live remaining (drained by completed line
+  /// and rescaled by the live overrides) during one. A pure host calc — built once on the click, not per frame —
+  /// so it costs only the per-frame `remaining_seconds` sum to read. `None` falls back to the acked-rate estimate.
+  simulated: Option<crate::eta::EtaTimeline>,
+  /// Whether the last simulation fell back to the firmware's DEFAULT machine settings because no `$$` snapshot was
+  /// loaded (the operator simulated while disconnected, or before fetching settings). Surfaced as a small "(default
+  /// settings)" qualifier near the ETA so the figure is not mistaken for one grounded in the board's real config.
+  simulated_default_settings: bool,
   /// The continuous jog currently being streamed while the operator holds a jog control, or `None`. Owned by the
   /// shell (not the reducer) because pacing the increments is wall-clock work the egui frame drives.
   jog_stream: Option<JogStream>,
@@ -246,6 +256,8 @@ impl SkirnirApp {
       ui: UiState::from_prefs(&profile.prefs),
       override_tracker: super::overrides::OverrideTracker::default(),
       stream_started: None,
+      simulated: None,
+      simulated_default_settings: false,
       jog_stream: None,
       last_status_at: None,
       last_badge: super::badge::BadgeState::Disconnected,
@@ -492,6 +504,7 @@ impl SkirnirApp {
       Intent::IdentifyPort { path } => self.identify_port(&path),
       Intent::OpenProgram(path) => self.open_program(&path),
       Intent::StartStream => self.start_stream(),
+      Intent::Simulate => self.simulate(),
       Intent::SendLine(line) => {
         self.send_line(line);
       }
@@ -696,6 +709,9 @@ impl SkirnirApp {
         let lines: Vec<String> = body.lines().map(str::to_string).collect();
         let count = lines.len();
         self.ui.set_program(lines, Some(path.display().to_string()));
+        // A fresh program invalidates any prior simulation: the estimate belongs to the file that just closed, so
+        // drop it (and its default-settings flag) until the operator re-simulates against the newly loaded lines.
+        self.clear_simulation();
         self.notice(format!("loaded {count} lines from {}", path.display()));
       }
       Err(err) => self.notice(format!("open failed: {err}")),
@@ -712,6 +728,47 @@ impl SkirnirApp {
     let lines = self.ui.program.clone();
     self.notice(format!("streaming {} lines", lines.len()));
     self.send_command(Command::StreamProgram(lines));
+  }
+
+  /// Simulate the loaded program: build a physics-based job-time estimate ([`crate::eta::EtaTimeline`]) over the
+  /// loaded lines and stash it on the shell so the dock surfaces an upfront ETA (and a physical live remaining
+  /// once streaming). This is a PURE host computation — it parses + runs the shared motion model, sends no engine
+  /// command, and needs no live link, so it works while disconnected. The motion configs come from the firmware's
+  /// `$$` snapshot in the live [`ViewState::settings`] via [`crate::eta::configs_from_settings`]; every field
+  /// falls back to its firmware default when absent, so an empty/partial snapshot still estimates — we flag that
+  /// case so the UI can qualify the figure with "(default settings)". A no-op (with a notice) when no program is
+  /// loaded, since there is nothing to estimate.
+  fn simulate(&mut self) {
+    if self.ui.program.is_empty() {
+      self.notice("no program to simulate".to_string());
+      return;
+    }
+    // Whether the live settings model carries any `$$` values: with none, every config field defaults, so the
+    // estimate is grounded in the firmware's default machine model rather than this board's real config. We flag
+    // that so the UI qualifies the ETA rather than presenting a defaulted figure as authoritative.
+    let settings = &self.view.settings;
+    self.simulated_default_settings = settings.is_empty();
+    // Build the planner/motion configs from the snapshot, reading each `$<n>` as an `f64` and letting absent or
+    // unparseable values fall back to the firmware default inside `configs_from_settings`.
+    let (planner, motion) =
+      crate::eta::configs_from_settings(|n| settings.value_of(n).and_then(|s| s.trim().parse::<f64>().ok()));
+    let timeline = crate::eta::EtaTimeline::build(&self.ui.program, &planner, &motion);
+    let total = timeline.total_seconds;
+    let pauses = timeline.pauses.len();
+    self.simulated = Some(timeline);
+    // Echo a one-line summary so the operator has a record of the simulated total (and any unbounded pauses),
+    // using the same `m:ss`/`h:mm:ss` grammar the dock clock shows.
+    let clock = super::progress::format_mmss(Some(std::time::Duration::from_secs_f64(total.max(0.0))));
+    let qualifier = if self.simulated_default_settings { " (default settings)" } else { "" };
+    let pause_note = if pauses > 0 { format!(", {pauses} operator pause(s)") } else { String::new() };
+    self.notice(format!("simulated job time ~{clock}{qualifier}{pause_note}"));
+  }
+
+  /// Drop any stored simulation and its default-settings flag. Called when a new program is opened, so a stale
+  /// estimate from the previous file never drives the dock ETA against the freshly loaded lines.
+  fn clear_simulation(&mut self) {
+    self.simulated = None;
+    self.simulated_default_settings = false;
   }
 
   /// The toolbar Run/Resume segment: resume from a feed hold with a cycle-start, else start streaming the
@@ -1519,16 +1576,59 @@ impl SkirnirApp {
     self.save_profile();
   }
 
-  /// The current stream's elapsed/ETA estimate, or the empty estimate when no stream is timing. The wall-clock
-  /// elapsed comes from [`Self::stream_started`]; the projection math lives in the pure [`super::progress`].
+  /// The current stream's elapsed/ETA estimate. When a simulation exists it is the authoritative source — the
+  /// physics-based total shows upfront (before any stream) and a physical remaining drains during one; otherwise
+  /// the legacy acked-rate projection stands, exactly as before. The wall-clock elapsed comes from
+  /// [`Self::stream_started`]; all the projection math lives in the pure [`super::progress`].
+  ///
+  /// With a simulation, `completed_lines` prefers the firmware-reported current line (`Ln:`) when present, else
+  /// the host's acked-line count — both index the source-line-indexed timeline directly. The live feed/rapid
+  /// override fractions come from the `Ov:` percentages (defaulting to 100 % when absent), so a slowed-down run
+  /// stretches the remaining estimate the way the machine actually will.
   fn stream_time(&self) -> super::progress::TimeEstimate {
+    let elapsed = self.stream_started.map(|start| start.elapsed()).unwrap_or_default();
+    if let Some(timeline) = &self.simulated {
+      let progress = self.view.progress;
+      // Prefer the firmware's reported current line over the host ack count: `Ln:` is the line the controller is
+      // actually executing, which leads the host ack cursor during the send-ahead window. Both index the
+      // source-line timeline (`lines.len() == program.len()`), so either maps directly to "lines completed".
+      let completed = self
+        .view
+        .status
+        .as_ref()
+        .and_then(|s| s.line)
+        .map(|line| line as usize)
+        .unwrap_or(progress.acked);
+      // Live override fractions from the `Ov:` percentages (e.g. 100 → 1.0); default to 100 % when no report has
+      // carried overrides yet. Only feed and rapid rescale motion time; the spindle override does not change it.
+      let (feed_frac, rapid_frac) = self
+        .view
+        .status
+        .as_ref()
+        .and_then(|s| s.overrides)
+        .map(|(feed, rapid, _spindle)| (feed as f64 / 100.0, rapid as f64 / 100.0))
+        .unwrap_or((1.0, 1.0));
+      let remaining = timeline.remaining_seconds(completed, feed_frac, rapid_frac);
+      return super::progress::physics_estimate(elapsed, timeline.total_seconds, remaining);
+    }
+    // No simulation: keep the acked-rate behaviour exactly — only project once a stream is timing.
     match self.stream_started {
-      Some(start) => {
+      Some(_) => {
         let progress = self.view.progress;
-        super::progress::estimate(start.elapsed(), progress.acked, progress.total)
+        super::progress::estimate(elapsed, progress.acked, progress.total)
       }
       None => super::progress::TimeEstimate::default(),
     }
+  }
+
+  /// The dock-ETA qualifier the view renders beside the clock: whether the active simulation fell back to default
+  /// machine settings, and how many unbounded operator pauses it modeled. `None` when no simulation is stored, so
+  /// the dock shows no qualifier and the legacy acked-rate clock stands alone.
+  fn eta_qualifier(&self) -> Option<super::views::EtaQualifier> {
+    self.simulated.as_ref().map(|timeline| super::views::EtaQualifier {
+      default_settings: self.simulated_default_settings,
+      pauses: timeline.pauses.len(),
+    })
   }
 }
 
@@ -1612,8 +1712,11 @@ impl eframe::App for SkirnirApp {
     // Project the stream's elapsed/ETA from the start stamp and the live acked/total, so the dock can show the
     // design's `m:ss / m:ss` clock. When no stream is timing this is the zero estimate (both times absent).
     let time = self.stream_time();
+    // The ETA qualifier — "(default settings)" and any modeled operator pauses — rides alongside the clock when a
+    // simulation is stored, so the operator can read the figure with its caveats. `None` falls back to no qualifier.
+    let eta_qualifier = self.eta_qualifier();
     egui::Panel::bottom("dock").resizable(false).exact_size(dock_h).show_inside(ui, |ui| {
-      views::dock(ui, &self.view, &mut self.ui, time, &mut sink);
+      views::dock(ui, &self.view, &mut self.ui, time, eta_qualifier, &mut sink);
     });
 
     // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
@@ -2877,5 +2980,219 @@ mod tests {
     }
     let text = String::from_utf8_lossy(&written);
     assert!(!text.contains('$'), "an empty Save must send no settings traffic at all; saw {text:?}");
+  }
+
+  // ---- Simulate / physics-based ETA ----------------------------------------------------------------------------
+
+  /// Build a disconnected app (no engine) for the host-only Simulate path, with the OS profile reset to a hermetic
+  /// default and its saves redirected to a unique temp file (mirroring `app_with_engine`'s isolation). Simulate is
+  /// a pure host calc that touches no engine, so it needs no transport — the point is to prove it works disconnected.
+  fn app_disconnected() -> SkirnirApp {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let mut app = SkirnirApp::new(runtime);
+    app.profile = crate::profile::Profile::default();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let temp = std::env::temp_dir().join(format!("skirnir-test-profile-{}-{stamp}", std::process::id()));
+    app.profile_path_override = Some(temp.join("profile.ron"));
+    app
+  }
+
+  /// Simulate on a loaded program (while disconnected, with no settings) yields a stored timeline with a positive
+  /// total, and flags that it fell back to default machine settings.
+  #[test]
+  fn simulate_on_a_loaded_program_builds_a_timeline_and_flags_default_settings() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X50".to_string(), "G1 X100 F500".to_string()], None);
+    assert!(app.simulated.is_none(), "no simulation exists until the operator runs one");
+
+    app.handle_intent(Intent::Simulate);
+
+    let timeline = app.simulated.as_ref().expect("Simulate must store a timeline");
+    assert!(timeline.total_seconds > 0.0, "a program with real moves has a positive modeled time");
+    assert_eq!(timeline.lines.len(), 2, "one LineEta per source line");
+    assert!(
+      app.simulated_default_settings,
+      "with no `$$` snapshot loaded, the estimate used default settings and must flag it",
+    );
+  }
+
+  /// Simulate with no program loaded is a quiet no-op (a notice, no stored timeline) rather than building an empty
+  /// estimate or panicking.
+  #[test]
+  fn simulate_with_no_program_is_a_noop() {
+    let mut app = app_disconnected();
+    assert!(app.ui.program.is_empty(), "the test starts with no program");
+    app.handle_intent(Intent::Simulate);
+    assert!(app.simulated.is_none(), "Simulate with no program must store nothing");
+  }
+
+  /// When a `$$` snapshot IS present in the view settings, Simulate uses it (no default-settings flag) and the
+  /// configs are read from it — a faster max-rate produces a shorter modeled total than the firmware default.
+  #[test]
+  fn simulate_uses_loaded_settings_and_does_not_flag_defaults() {
+    use crate::protocol::SettingValue;
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X100".to_string()], None);
+
+    // Baseline against defaults.
+    app.handle_intent(Intent::Simulate);
+    let default_total = app.simulated.as_ref().expect("a timeline").total_seconds;
+    assert!(app.simulated_default_settings, "the baseline used defaults");
+
+    // Load a generous X max-rate (`$110`) and X accel (`$120`) so the rapid completes faster than the default.
+    app.view.settings.apply_value(SettingValue { number: 110, value: "100000".to_string() });
+    app.view.settings.apply_value(SettingValue { number: 120, value: "100000".to_string() });
+    app.handle_intent(Intent::Simulate);
+    let fast_total = app.simulated.as_ref().expect("a timeline").total_seconds;
+    assert!(!app.simulated_default_settings, "with a `$$` snapshot present, the default-settings flag must clear");
+    assert!(fast_total < default_total, "a faster max-rate must shorten the modeled total ({fast_total} < {default_total})");
+  }
+
+  /// Opening a new program clears a stale simulation so the dock ETA never reflects the previous file's lines.
+  #[test]
+  fn opening_a_new_program_clears_a_stale_simulation() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G1 X10 F500".to_string()], None);
+    app.handle_intent(Intent::Simulate);
+    assert!(app.simulated.is_some(), "a simulation is stored");
+
+    // Open a fresh program from a temp file: the open path must drop the prior simulation.
+    let dir = std::env::temp_dir().join(format!("skirnir-sim-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("fresh.gcode");
+    std::fs::write(&path, "G1 X20 F500\n").expect("write program");
+    app.open_program(&path);
+    assert!(app.simulated.is_none(), "opening a new program must clear the stale simulation");
+    let _ = std::fs::remove_file(&path);
+  }
+
+  /// `stream_time` returns the physics-based UPFRONT total the moment a simulation exists, before any stream — the
+  /// acked-rate `estimate` could not (it needs elapsed + acks). Elapsed is zero, remaining is the whole job.
+  #[test]
+  fn the_upfront_eta_shows_the_simulated_total_before_streaming() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G1 X100 F500".to_string()], None);
+    app.handle_intent(Intent::Simulate);
+    let modeled = app.simulated.as_ref().expect("a timeline").total_seconds;
+
+    // No stream is timing (`stream_started` is None), yet the estimate must carry the modeled total immediately.
+    assert!(app.stream_started.is_none());
+    let time = app.stream_time();
+    assert_eq!(time.elapsed, std::time::Duration::ZERO, "no stream means zero elapsed");
+    let total = time.total.expect("the upfront total is populated from the simulation");
+    assert!(
+      (total.as_secs_f64() - modeled).abs() < 0.01,
+      "the upfront total must equal the simulated job time ({} vs {modeled})",
+      total.as_secs_f64(),
+    );
+    let remaining = time.remaining.expect("the upfront remaining is the whole job");
+    assert!((remaining.as_secs_f64() - modeled).abs() < 0.01, "before streaming the whole job remains");
+  }
+
+  /// The live remaining drains as completed lines advance and rescales when a feed override slows the run. Drives
+  /// `stream_time` directly by setting `stream_started` plus a status report carrying `Ln:` and `Ov:`.
+  #[test]
+  fn the_live_remaining_drains_with_progress_and_rescales_with_a_feed_override() {
+    use crate::protocol::status::{MachineState, PositionKind, RunState, StatusReport};
+    let mut app = app_disconnected();
+    // Three equal feed moves so completing lines drains the remaining in thirds.
+    app.ui.set_program(
+      vec!["G1 X20 F500".to_string(), "G1 X40 F500".to_string(), "G1 X60 F500".to_string()],
+      None,
+    );
+    app.handle_intent(Intent::Simulate);
+    let total = app.simulated.as_ref().expect("a timeline").total_seconds;
+
+    // Pretend a stream is timing so elapsed is populated; the exact elapsed does not matter to the remaining math.
+    app.stream_started = Some(Instant::now());
+
+    /// Build a status report with the given current line and feed-override percent (rapid/spindle at 100 %).
+    fn status(line: u32, feed_ov: u32) -> StatusReport {
+      StatusReport {
+        machine_state: MachineState { state: RunState::Run, substate: None },
+        position_kind: PositionKind::Machine,
+        position: Vec::new(),
+        wco: None,
+        feed_speed: None,
+        overrides: Some((feed_ov, 100, 100)),
+        pins: Vec::new(),
+        buffer: None,
+        line: Some(line),
+      }
+    }
+
+    // At line 0 (nothing completed), the full job remains.
+    app.view.status = Some(status(0, 100));
+    let at_start = app.stream_time().remaining.expect("remaining").as_secs_f64();
+    assert!((at_start - total).abs() < 0.01, "at the start the whole job remains ({at_start} vs {total})");
+
+    // After one of three equal lines, the remaining drops below the whole.
+    app.view.status = Some(status(1, 100));
+    let after_one = app.stream_time().remaining.expect("remaining").as_secs_f64();
+    assert!(after_one < at_start, "completing a line drains the remaining ({after_one} < {at_start})");
+
+    // A 50 % feed override doubles the remaining feed time relative to 100 % at the same completed line.
+    app.view.status = Some(status(1, 50));
+    let slowed = app.stream_time().remaining.expect("remaining").as_secs_f64();
+    assert!(
+      (slowed - after_one * 2.0).abs() < 0.01,
+      "a 50 % feed override must double the remaining feed time ({slowed} vs {after_one})",
+    );
+  }
+
+  /// With NO simulation stored, `stream_time` keeps the legacy acked-rate behaviour exactly: no projection before a
+  /// stream is timing, and the acked-rate projection once one is.
+  #[test]
+  fn without_a_simulation_the_eta_falls_back_to_the_acked_rate_estimate() {
+    let mut app = app_disconnected();
+    assert!(app.simulated.is_none());
+    // No stream timing and no simulation: the empty estimate, exactly as before.
+    assert_eq!(app.stream_time(), super::super::progress::TimeEstimate::default());
+
+    // A timing stream with acks projects from the acked rate (the unchanged fallback path).
+    app.stream_started = Some(Instant::now() - Duration::from_secs(10));
+    app.view.progress = super::super::view_state::Progress { sent: 10, acked: 10, total: 40 };
+    let time = app.stream_time();
+    assert!(time.remaining.is_some(), "the acked-rate fallback projects once a stream is timing with acks");
+  }
+
+  /// The live `completed_lines` prefers the firmware-reported `Ln:` over the host ack count, since `Ln:` is the
+  /// line the controller is actually executing (it leads the ack cursor). When no `Ln:` is present it falls back to
+  /// the acked count.
+  #[test]
+  fn the_live_completed_lines_prefer_the_firmware_reported_line_over_acks() {
+    use crate::protocol::status::{MachineState, PositionKind, RunState, StatusReport};
+    let mut app = app_disconnected();
+    app.ui.set_program(
+      vec!["G1 X20 F500".to_string(), "G1 X40 F500".to_string(), "G1 X60 F500".to_string()],
+      None,
+    );
+    app.handle_intent(Intent::Simulate);
+    app.stream_started = Some(Instant::now());
+    // Acks say 1 line done, but the firmware reports it is on line 2 (`Ln:`): the remaining must reflect 2 done.
+    app.view.progress = super::super::view_state::Progress { sent: 3, acked: 1, total: 3 };
+    let report = StatusReport {
+      machine_state: MachineState { state: RunState::Run, substate: None },
+      position_kind: PositionKind::Machine,
+      position: Vec::new(),
+      wco: None,
+      feed_speed: None,
+      overrides: None,
+      pins: Vec::new(),
+      buffer: None,
+      line: Some(2),
+    };
+    app.view.status = Some(report);
+    let with_ln = app.stream_time().remaining.expect("remaining").as_secs_f64();
+
+    // Drop the `Ln:` field: now the ack count (1) drives, leaving MORE remaining than the `Ln:`-led case (2).
+    if let Some(s) = app.view.status.as_mut() {
+      s.line = None;
+    }
+    let with_acks = app.stream_time().remaining.expect("remaining").as_secs_f64();
+    assert!(
+      with_acks > with_ln,
+      "the `Ln:`-led case completes more lines, so it has less remaining than the ack-led fallback ({with_ln} < {with_acks})",
+    );
   }
 }

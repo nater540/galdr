@@ -78,6 +78,11 @@ pub enum Intent {
   OpenProgram(std::path::PathBuf),
   /// Begin streaming the currently loaded program.
   StartStream,
+  /// Simulate the loaded program: build a physics-based job-time estimate ([`crate::eta::EtaTimeline`]) from the
+  /// firmware `$$` settings (falling back to machine defaults when none are loaded) over the loaded file. A PURE
+  /// host computation — it sends no engine command and needs no live link — so it works while disconnected. The
+  /// shell stores the timeline so the upfront ETA shows before a stream and the live remaining drains physically.
+  Simulate,
 
   /// Send a single manual G-code/`$` line entered in the console.
   SendLine(String),

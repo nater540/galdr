@@ -50,6 +50,25 @@ pub fn estimate(elapsed: Duration, acked: usize, total: usize) -> TimeEstimate {
   }
 }
 
+/// Build a [`TimeEstimate`] from a pre-computed physics-based remaining time (see [`crate::eta::EtaTimeline`])
+/// rather than the acked-rate projection of [`estimate`]. The caller supplies the wall-clock `elapsed`, the
+/// `total_seconds` the timeline modeled at 100 % overrides, and the live `remaining_seconds` the timeline drains
+/// to for the current completed-line count and override fractions. Unlike [`estimate`], the projection exists
+/// from the very first frame — even with zero elapsed and no acks — because the timeline is computed from the
+/// machine's motion model, not learned from the run. So the upfront ETA (before streaming) and the live remaining
+/// (during streaming) both surface immediately. Kept pure (no `Instant::now()`) so the elapsed→clock grammar is
+/// unit-tested deterministically; the shell owns the wall clock and passes `elapsed` in.
+pub fn physics_estimate(elapsed: Duration, total_seconds: f64, remaining_seconds: f64) -> TimeEstimate {
+  // Guard against a NaN/negative remaining from a degenerate timeline; clamp to a non-negative finite value so
+  // `Duration::from_secs_f64` cannot panic on a bad input.
+  let remaining = Duration::from_secs_f64(remaining_seconds.max(0.0));
+  // The displayed total is the modeled job time, floored at `elapsed + remaining` so a run that overshoots the
+  // estimate (slower than modeled, or a paused operator wait) still shows a total that is at least what is left.
+  let modeled = Duration::from_secs_f64(total_seconds.max(0.0));
+  let total = modeled.max(elapsed + remaining);
+  TimeEstimate { elapsed, remaining: Some(remaining), total: Some(total) }
+}
+
 /// Format a [`Duration`] as the design's compact `m:ss` clock (minutes:seconds, zero-padded seconds). Hours
 /// roll into the minutes field (`75:09` for 1h15m9s) since a PCB job rarely runs that long and the design
 /// reserves no hours slot. A `None` renders as the dim placeholder `--:--`.
@@ -119,6 +138,42 @@ mod tests {
   fn a_late_overshooting_ack_never_projects_negative_remaining() {
     // A miscount where acked > total must clamp, not underflow into a negative/huge remaining.
     let est = estimate(Duration::from_secs(10), 60, 50);
+    assert_eq!(est.remaining, Some(Duration::ZERO));
+  }
+
+  #[test]
+  fn physics_estimate_surfaces_a_total_and_remaining_from_the_first_frame() {
+    // Unlike the acked-rate `estimate`, the physics estimate projects immediately — zero elapsed, no acks — since
+    // the timeline is modeled, not learned. Upfront (before streaming) elapsed is 0 and remaining is the whole job.
+    let est = physics_estimate(Duration::ZERO, 600.0, 600.0);
+    assert_eq!(est.elapsed, Duration::ZERO);
+    assert_eq!(est.remaining, Some(Duration::from_secs(600)));
+    assert_eq!(est.total, Some(Duration::from_secs(600)), "the upfront total is the modeled job time");
+  }
+
+  #[test]
+  fn physics_estimate_keeps_the_modeled_total_while_remaining_drains() {
+    // Mid-stream: 120s elapsed, the timeline says 480s remain. The total stays the modeled 600s (not elapsed+remaining,
+    // which would also be 600 here) and the remaining is the physical figure, not an acked-rate guess.
+    let est = physics_estimate(Duration::from_secs(120), 600.0, 480.0);
+    assert_eq!(est.remaining, Some(Duration::from_secs(480)));
+    assert_eq!(est.total, Some(Duration::from_secs(600)));
+  }
+
+  #[test]
+  fn physics_estimate_floors_the_total_at_elapsed_plus_remaining_on_an_overrun() {
+    // A run slower than modeled (or an operator pause) can push elapsed+remaining past the modeled total; the
+    // displayed total must then grow to at least what is actually left so the clock never shows a total below now.
+    let est = physics_estimate(Duration::from_secs(700), 600.0, 50.0);
+    assert_eq!(est.total, Some(Duration::from_secs(750)), "the total floors at elapsed + remaining on an overrun");
+  }
+
+  #[test]
+  fn physics_estimate_clamps_a_degenerate_remaining_without_panicking() {
+    // A NaN/negative remaining from a degenerate timeline must clamp to zero rather than panic in `from_secs_f64`.
+    let est = physics_estimate(Duration::from_secs(10), 0.0, f64::NAN);
+    assert_eq!(est.remaining, Some(Duration::ZERO));
+    let est = physics_estimate(Duration::from_secs(10), 0.0, -5.0);
     assert_eq!(est.remaining, Some(Duration::ZERO));
   }
 

@@ -5,11 +5,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 **Galdr** is a compact desktop CNC milling system (general-purpose 2.5D/3-axis milling; PCB isolation milling is a
-first-class use case, not the only one). The workspace has four crates:
+first-class use case, not the only one). The workspace has five crates:
 
-- `crates/firmware-core` — pure, `no_std`, **host-tested** logic: the GCode parser, motion planner, segment
-  generator, grblHAL protocol/state machine, the homing state machine (DOC-06), coordinate systems, settings model,
-  and the TMC2209 codec. No esp-hal dependency, so it compiles and unit-tests on the host with stock Rust.
+- `crates/cnc-kinematics` — the shared, pure, `no_std`, **host-tested** motion core: the GCode parser (`gcode`), the
+  motion planner with bounded look-ahead + junction-deviation cornering (`planner`), the step-generation/trapezoid
+  timing model (`motion`), and the coordinated step-output traits (`step`: `StepSink`/`StepEvent`/`DirState`). No
+  esp-hal dependency. It is consumed by `firmware-core` (which re-exports `gcode`/`planner`/`motion` and the
+  `step` traits, so `firmware_core::{gcode,planner,motion}` and `firmware_core::hal_traits::StepSink` still resolve)
+  **and** by `skirnir` (via the host-only `sim` feature), which drives the same planner offline for job-time
+  estimation — so there is no second motion model that could drift. The host estimator is
+  `cnc_kinematics::motion::estimate_block_time` + the `cnc_kinematics::sim` driver, with the per-line timeline glue
+  in `skirnir/src/eta.rs` (see `docs/skirnir-eta-design.md`). `WCS_COUNT`/`PREDEFINED_COUNT` are owned by
+  `cnc_kinematics::gcode` and re-exported by `firmware-core`'s `coords`.
+- `crates/firmware-core` — pure, `no_std`, **host-tested** logic layered ON cnc-kinematics: grblHAL protocol/state
+  machine, the homing state machine (DOC-06), coordinate systems, settings model, the TMC2209 codec, and the
+  remaining hardware traits in `hal_traits` (probe/limit/PWM/TMC/store). No esp-hal dependency, so it compiles and
+  unit-tests on the host with stock Rust. (The GCode parser / planner / segment generator now live in
+  `cnc-kinematics` and are re-exported — older docs that place them "in firmware-core" mean the re-export.)
 - `crates/firmware` — the **ESP32-S3** binary wiring `firmware-core` to the hardware (esp-hal 1.0 + Embassy on the
   esp-rtos host): USB CDC comms, the dual-core task split, RMT step generation, the TMC UART bus, flash persistence,
   and the limit-switch inputs.
