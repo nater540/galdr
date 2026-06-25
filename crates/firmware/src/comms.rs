@@ -48,7 +48,7 @@ use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use embassy_futures::select::{select, select4, Either, Either4};
 use embedded_io_async::{Read, Write};
 use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
@@ -1333,6 +1333,14 @@ pub static AUTO_REPORT_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new()
 /// The single USB writer: drain the [`RESPONSE`] channel and write each formatted response to the USB
 /// endpoint. Centralizing writes here means status reports, `ok`s, errors, and `$`-report lines never
 /// interleave on the wire (DOC-08).
+/// How long a single USB-Serial-JTAG write/flush may await the host draining the TX FIFO before the response is
+/// abandoned. A reading host completes a write in well under a millisecond, so this only trips when the host has
+/// stopped draining (disconnect / stalled read). Kept SHORTER than the watchdog's comms-stall window (~3 s) so a
+/// non-draining host degrades usb_tx gracefully (a dropped response per timeout, `COMMS_PROGRESS` still advancing)
+/// rather than wedging the comms path or tripping a watchdog reset; kept comfortably ABOVE normal write latency so
+/// a healthy stream never drops a response (which would desync the host's character-count flow control).
+const USB_TX_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[embassy_executor::task]
 pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
   loop {
@@ -1344,13 +1352,26 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
     // signal the watchdog needs. Bumped BEFORE the write so even a write that the host-closed-port path drops still
     // counts as "the firmware produced a response" (the wedge is upstream of the writer, not in the USB write).
     COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
-    // A write error on native USB means the host closed the port; drop the byte and continue, since the
-    // connection re-establishes on host reopen without a controller reset. The breadcrumb marks the WRITE await —
-    // a stuck `write_all`/`flush` here is the prime "host-facing output never completes" suspect: it backs up the
-    // `RESPONSE` channel and blocks every producer (the consumer's `ack`/`error`, the status reporter) at once.
+    // BOUND the USB write/flush. esp-hal's async USB-Serial-JTAG write/flush awaits the `serial_in_empty`
+    // (TX-FIFO-drained) event, which fires only when the HOST reads; if the host stops draining (it disconnected,
+    // or its read lagged) the await NEVER returns, parking usb_tx forever. That backs up `RESPONSE` and
+    // cascade-wedges the whole comms path — confirmed on the board by the comms-stage breadcrumb (`tx=tx-write`
+    // with every producer — the consumer's `ack`/`error`, the line assembler, the status reporter — blocked at
+    // once). A timeout converts that hang into the drop-and-continue the host-closed path already intended: the
+    // host re-syncs on reconnect (the banner resets flow control), so abandoning a response it is not reading is
+    // harmless, while a reading host always completes far within the bound (sub-ms). The bound is shorter than the
+    // watchdog's comms-stall window AND `COMMS_PROGRESS` is bumped each iteration, so a non-draining host degrades
+    // usb_tx gracefully (one dropped response per timeout) instead of wedging or tripping a reset. usb_tx runs on
+    // the core-0 thread-mode executor (it yields), so embassy time advances here — no CCOUNT needed (cf. the
+    // core-1 RMT busy-spin, which froze `Instant`).
     crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWrite);
-    let _ = tx.write_all(resp.as_bytes()).await;
-    let _ = tx.flush().await;
+    let write = async {
+      tx.write_all(resp.as_bytes()).await?;
+      tx.flush().await
+    };
+    // Discards both a timeout (host not draining) and a write error (host closed) — both drop this response and
+    // continue, keeping the comms path alive.
+    let _ = with_timeout(USB_TX_TIMEOUT, write).await;
   }
 }
 
