@@ -108,6 +108,38 @@ pub(crate) fn build_transport_group_harness(state: HarnessState) -> Harness<'sta
     )
 }
 
+/// Build a kittest harness that renders just the [`views::toolpath`] viewport (with no program loaded, so it paints
+/// the inset background fill + the reference grid from the active palette) into a fixed-size window. Used to prove the
+/// views render the configured palette rather than the baked-in design constants: the test seeds a sentinel palette
+/// and then scans the tessellated mesh for its colours.
+pub(crate) fn build_toolpath_harness(state: HarnessState) -> Harness<'static, HarnessState> {
+  Harness::builder()
+    .with_size(egui::vec2(360.0, 240.0))
+    .build_ui_state(
+      |ui, state: &mut HarnessState| {
+        // The toolpath view draws no intents; it only paints. We still drain to keep the closure shape uniform.
+        views::toolpath(ui, &state.view, &mut state.ui);
+      },
+      state,
+    )
+}
+
+/// Every vertex colour in the last frame's tessellated meshes, so a test can assert a palette colour was actually
+/// painted. We tessellate the captured shapes (the harness runs glow-free, so there is no GPU image to read) and
+/// collect the mesh vertex colours — a hand-painted `rect_filled`/`line_segment` lands here as `Color32` vertices.
+pub(crate) fn painted_vertex_colors(harness: &Harness<'static, HarnessState>) -> Vec<egui::Color32> {
+  let shapes = harness.output().shapes.clone();
+  let pixels_per_point = harness.ctx.pixels_per_point();
+  let primitives = harness.ctx.tessellate(shapes, pixels_per_point);
+  let mut colors = Vec::new();
+  for primitive in primitives {
+    if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+      colors.extend(mesh.vertices.iter().map(|v| v.color));
+    }
+  }
+  colors
+}
+
 /// The screen-space point a pointer must be at to drive `axis`'s slider to `target` percent, derived from the
 /// slider's recorded rect (the view records it each render via [`slider_rect_probe`]). The slider maps pointer-x
 /// linearly across the track onto the `OVERRIDE_MIN..=OVERRIDE_MAX` span, so we invert that mapping. Returns
@@ -453,5 +485,36 @@ mod tests {
     harness.run();
     assert!(harness.query_by_label("■ Stop").is_some(), "the graceful Stop control must be present");
     assert!(harness.query_by_label("⏹ Abort").is_some(), "the separate Abort control must be present");
+  }
+
+  #[test]
+  fn the_toolpath_view_paints_the_configured_palette_not_the_baked_in_default() {
+    // The integration proof of the whole config wiring: a view must render the palette threaded through `UiState`,
+    // NOT the old baked-in `Theme::*` constants. We give the toolpath view a sentinel palette whose `inset`
+    // background fill is a colour found nowhere in the default palette, render it, and assert the tessellated mesh
+    // carries the sentinel — and does NOT carry the default `inset`. If the view had read a constant, the sentinel
+    // would be absent and the default present, failing the test.
+    use crate::app::theme::Palette;
+
+    let sentinel = egui::Color32::from_rgb(0x7A, 0x12, 0x9C); // a vivid purple, not in the design palette.
+    let default_inset = Palette::default_dark().inset;
+    assert_ne!(sentinel, default_inset, "the sentinel must differ from the default so the assertion is meaningful");
+
+    let mut ui = UiState::default();
+    ui.style.palette.inset = sentinel; // recolour only the toolpath background fill.
+
+    let state = HarnessState::new(ViewState::default(), ui);
+    let mut harness = build_toolpath_harness(state);
+    harness.run();
+
+    let colors = painted_vertex_colors(&harness);
+    assert!(
+      colors.contains(&sentinel),
+      "the toolpath view must paint the CONFIGURED inset colour (proves it reads the palette, not a constant)",
+    );
+    assert!(
+      !colors.contains(&default_inset),
+      "the default inset colour must be absent — the view must not fall back to the baked-in constant",
+    );
   }
 }

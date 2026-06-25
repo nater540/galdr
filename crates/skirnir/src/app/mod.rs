@@ -59,4 +59,4 @@ mod ui_test;
 #[cfg(feature = "gui")]
 pub use shell::{SkirnirApp, run};
 #[cfg(feature = "gui")]
-pub use theme::Theme;
+pub use theme::Palette;

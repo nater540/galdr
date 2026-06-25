@@ -33,8 +33,10 @@ pub const PROFILE_VERSION: u32 = 1;
 /// The file name written under the per-user config directory (e.g. `~/.config/skirnir/profile.ron` on Linux).
 const PROFILE_FILE: &str = "profile.ron";
 
-/// The application identifier used to locate the OS config directory via [`directories::ProjectDirs`]. The
-/// Linux/XDG resolution ignores the qualifier/organisation, yielding `~/.config/skirnir`.
+/// The application identifier the profile path is expected to live under (e.g. `~/.config/skirnir` on Linux,
+/// `~/Library/Application Support/skirnir` on macOS). The directory itself is resolved by [`crate::store::config_dir`]
+/// now; this constant is retained only for the path-shape assertion in the tests, hence `#[cfg(test)]`.
+#[cfg(test)]
 const APP_NAME: &str = "skirnir";
 
 /// A typed failure from the profile store. Read failures are NOT modelled here — [`load`] downgrades them to
@@ -188,11 +190,13 @@ impl Profile {
 }
 
 /// Resolve the absolute path of the profile file under the OS config directory (e.g.
-/// `~/.config/skirnir/profile.ron` on Linux), creating nothing. Returns [`ProfileError::NoConfigDir`] if no
-/// per-user config base exists on this platform. Public so the GUI can show the operator where the profile lives.
+/// `~/Library/Application Support/skirnir/profile.ron` on macOS, `~/.config/skirnir/profile.ron` on Linux), creating
+/// nothing. Returns [`ProfileError::NoConfigDir`] if no per-user config base exists on this platform. Public so the
+/// GUI can show the operator where the profile lives. Shares [`crate::store::config_dir`] with the other stores so
+/// all three resolve to the same directory from one place.
 pub fn profile_path() -> Result<PathBuf, ProfileError> {
-  let dirs = directories::ProjectDirs::from("", "", APP_NAME).ok_or(ProfileError::NoConfigDir)?;
-  Ok(dirs.config_dir().join(PROFILE_FILE))
+  let dir = crate::store::config_dir().map_err(|_| ProfileError::NoConfigDir)?;
+  Ok(dir.join(PROFILE_FILE))
 }
 
 /// Load the profile from the default OS location. NEVER fails for the common cases: a missing file (first run)
@@ -237,22 +241,14 @@ pub fn save(profile: &Profile) -> Result<(), ProfileError> {
   save_to(profile, &path)
 }
 
-/// Save the profile to a specific path — the testable core of [`save`]. Creates any missing parent directories,
-/// then writes the file. The write goes to a sibling temp file and is renamed into place so a crash mid-write
-/// cannot leave a truncated, unparseable profile behind (a torn profile would silently reset the operator's
-/// rotary center on the next launch). All failures surface as [`ProfileError`], never a panic.
+/// Save the profile to a specific path — the testable core of [`save`]. Delegates the crash-safe write to the
+/// shared [`crate::store::atomic_write`]: it creates any missing parent directories, writes to a per-process temp
+/// sibling, then atomically renames it into place, so an interrupted write never leaves a truncated, unparseable
+/// profile (a torn profile would silently reset the operator's rotary center on the next launch). All failures
+/// surface as [`ProfileError`], never a panic.
 pub fn save_to(profile: &Profile, path: &Path) -> Result<(), ProfileError> {
   let body = profile.to_ron()?;
-  if let Some(parent) = path.parent() {
-    std::fs::create_dir_all(parent).map_err(|err| ProfileError::Io(err.to_string()))?;
-  }
-  // Write to a temp sibling then atomically rename, so an interrupted write never corrupts the live profile.
-  // The temp lives in the same directory as the target so the rename stays on one filesystem (cross-device
-  // renames fail). A leftover temp from a crashed run is harmless — it is overwritten next save.
-  let tmp = path.with_extension("ron.tmp");
-  std::fs::write(&tmp, body).map_err(|err| ProfileError::Io(err.to_string()))?;
-  std::fs::rename(&tmp, path).map_err(|err| ProfileError::Io(err.to_string()))?;
-  Ok(())
+  crate::store::atomic_write(path, body.as_bytes()).map_err(|err| ProfileError::Io(err.to_string()))
 }
 
 #[cfg(test)]
@@ -439,16 +435,22 @@ mod tests {
   }
 
   #[test]
-  fn the_temp_file_is_a_sibling_so_the_rename_stays_on_one_filesystem() {
-    // The atomic-write temp must share the target's parent directory; otherwise the rename could cross a
-    // filesystem boundary and fail. This pins the sibling-temp invariant.
+  fn a_save_leaves_only_the_target_and_no_temp_behind() {
+    // The save delegates the crash-safe write to `crate::store::atomic_write` (the sibling-temp/rename invariant is
+    // pinned in `store.rs`'s own tests). Here we assert the profile-level outcome: after a successful save the
+    // target exists and no leftover temp litters the directory.
     let dir = std::env::temp_dir().join(format!("skirnir-profile-atomic-{}", std::process::id()));
     let path = dir.join("profile.ron");
     let _ = std::fs::remove_dir_all(&dir);
     save_to(&sample(), &path).expect("save succeeds");
-    // After a successful save the temp must be gone (renamed into place) and the target present.
     assert!(path.exists(), "the target profile must exist after save");
-    assert!(!path.with_extension("ron.tmp").exists(), "the temp sibling must be renamed away, not left behind");
+    // No sibling file other than the target should remain (the temp was renamed into place).
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+      .expect("the dir exists")
+      .filter_map(|e| e.ok().map(|e| e.file_name()))
+      .filter(|name| name != "profile.ron")
+      .collect();
+    assert!(leftovers.is_empty(), "no temp file must be left behind, found: {leftovers:?}");
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
