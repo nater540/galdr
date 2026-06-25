@@ -167,5 +167,47 @@ fragile — a watchdog reset re-enumerates the USB and the `/dev/cu.usbmodem*` n
    esp-rtos dual-core / InterruptExecutor interaction, and any esp-hal/esp-rtos multicore time/sync hazard. See the
    companion deep-research report.
 
+---
+
+## 7. Prior-art research (deep-research, 2026-06-24, adversarially verified)
+
+Searched esp-rs/esp-hal, esp-rtos, embassy, esp-idf issues/PRs/changelogs. Key verified findings:
+
+- **Mode C is almost certainly a PANIC.** esp-backtrace `0.19.0` default post-panic is `arch::interrupt_free(|| loop {})`
+  — no reset, no watchdog feed, hangs the core until physical reset (verified 3-0, confirmed 0.19.0 + main). So any
+  panic produces exactly Mode C's silent-dead-EN-only symptom.
+- **PRIME SUSPECT: core-1 (APP_CPU) stack overflow.** esp-rtos `0.3.0` explicitly panics if the second core's `main`
+  overflows its stack — its startup spins on the core-1 init flag then panics naming "main stack overflow" (verified
+  3-0 from source). Combined with the esp-backtrace halt = board dead. Ties directly to the project's prior
+  [[xtensa-stack-top-abi-headroom]] core-1 stack corruption history. **The core-1 stack arena has NOT been
+  re-validated under sustained streaming load — likely too small; deeper call stacks during sustained RMT generation
+  would overflow it.**
+- **`#[ram(rtc_fast, persistent)]` IS reliable across resets** — the "unreliable across deep-sleep" claim was REFUTED
+  (0-3). So the breadcrumb approach is sound.
+- **Mode 2 mechanism confirmed plausible:** a non-yielding high-priority Embassy InterruptExecutor task starves
+  Embassy and can stall `embassy_time` (driver owned by esp-rtos under the `embassy` feature). Validates the CCOUNT
+  timeout fix (`a829c8a`).
+- **Mode A has NO direct esp-hal Rust prior art.** Closest is ESP-IDF #10429 (S3 RMT silently stops, TX-done never
+  fires) — but triggered by LARGE-buffer memory-block wrap (256 symbols fails, 64 WORKS), not many short transmits;
+  our bursts are ≤48, which WEAKENS the wrap-race theory. esp-hal #2115 is a DIFFERENT bug (missing end marker, fixed
+  in 0.22.0). Mode A stays unexplained by prior art.
+- **RWDT should fire independent of CPU interrupt state** (verified): an interrupt-disabled panic loop does NOT mask
+  the hardware RWDT reset. So a non-recovering RWDT means it "was never armed or fed" — but we DID arm it and it DID
+  fire for Mode B, so the live question is whether a surviving core 0 keeps FEEDING it during a core-1-only panic.
+  Re-validate that the RWDT is armed/counting under esp-rtos and not fed across a core-1 panic.
+- **RTC reset-reason caveat:** a USB-Serial-JTAG / DTR-RTS-toggle reset (reason `0x15`) WIPES RTC (ESP-IDF #8889);
+  watchdog and `software_reset` (CoreSw) PRESERVE it. Do NOT read the breadcrumb with a tool that toggles DTR/RTS.
+
+Sources (primary): esp-rs/esp-hal #2115 #707 #633 #269 #2516 #10324, esp-rs/esp-wifi-sys #437, esp-rs/esp-backtrace,
+esp-rtos 0.3.0 lib.rs, esp-hal-embassy 0.8.1 time_driver, embassy #3758 #2603, esp-idf #10429 #8889.
+
+### Refined next step (highest value)
+1. **Custom panic handler:** on panic, record the panic location into RTC_FAST + `software_reset()` (RTC-preserving)
+   instead of esp-backtrace's halt. Catches Mode C, prints `[MSG:CRASH panic <file:line>]` on reboot, makes it
+   recoverable — and if it names "stack overflow" / a core-1 frame, confirms the prime suspect.
+2. **Re-validate / increase the core-1 InterruptExecutor stack arena** (the likely root of Mode C).
+
+---
+
 Companion notes: `.claude/agent-memory/firmware-engineer/project-firmware-lockup-investigation.md` (the
 firmware-engineer agent's working notes) and the user memory `project-firmware-streaming-lockup`.
