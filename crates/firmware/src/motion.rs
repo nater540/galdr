@@ -53,7 +53,7 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rmt::{Channel, PulseCode, Tx, TxChannelConfig, TxChannelCreator};
 use esp_hal::Blocking;
 use embassy_futures::select::{select, select4, Either, Either4};
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 
 use firmware_core::hal_traits::{
   probe_triggered, DigitalIn, DirState, ProbeConfig, ProbeInput, StepError, StepEvent, StepSink,
@@ -348,7 +348,7 @@ impl StepSink for RmtStepSink {
     // immediately and hands the channel back — so the HAPPY PATH is byte-for-byte the same busy-poll-then-recover
     // the old `wait()` did, with no extra awaits and no perturbation to step timing. The ONLY new behavior is the
     // TIMEOUT branch: if a channel's TX-END never fires (the confirmed `axis0:wait_begin` hang), the poll-loop
-    // gives up after `RMT_WAIT_TIMEOUT`, snapshots the channel's RMT hardware registers into the crash breadcrumb
+    // gives up after `RMT_WAIT_TIMEOUT_CYCLES`, snapshots the channel's RMT hardware registers into the breadcrumb
     // (so the next boot's `[MSG:CRASH ...]` shows whether TX-END was actually set), drops the transaction (which on
     // the S3 does an immediate `stop_tx` — `rmt_has_tx_immediate_stop` — with no drop-hang), and forces a software
     // reset so the breadcrumb is deterministically read on the next boot.
@@ -359,14 +359,19 @@ impl StepSink for RmtStepSink {
         // Breadcrumb: about to wait on this axis's RMT TX-END — the prime core-1-wedge suspect. A reboot frozen at
         // `axisN:wait_begin` means channel N's TX-END never fired; the RMT-hang capture below records WHY.
         crate::crash::record_stage(crate::crash::Stage::AxisWaitBegin, axis as u8);
-        let deadline = Instant::now() + RMT_WAIT_TIMEOUT;
-        // Poll until done or the deadline passes. `poll()` is the same volatile status read the old `wait()` spun
-        // on, so a completing burst exits here in the same number of reads — no slower on the happy path.
+        // Bound the wait by the Xtensa CPU CYCLE COUNTER, NOT embassy `Instant`. This loop is a non-yielding
+        // busy-spin on the high-priority core-1 InterruptExecutor; spinning here masks the timer interrupt that
+        // advances esp-rtos/embassy time, so `Instant::now()` FREEZES mid-spin and an Instant deadline never trips
+        // (the first cut at this bug — the RWDT caught the hang instead). `get_cycle_count()` is a per-core CCOUNT
+        // read that increments every CPU cycle regardless of interrupts, so it always advances here.
+        let start = esp_hal::xtensa_lx::timer::get_cycle_count();
+        // Poll until done or the cycle budget elapses. `poll()` is the same volatile status read the old `wait()`
+        // spun on, so a completing burst exits here in the same number of reads — no slower on the happy path.
         let timed_out = loop {
           if txn.poll() {
             break false;
           }
-          if Instant::now() >= deadline {
+          if esp_hal::xtensa_lx::timer::get_cycle_count().wrapping_sub(start) >= RMT_WAIT_TIMEOUT_CYCLES {
             break true;
           }
         };
@@ -409,11 +414,13 @@ impl StepSink for RmtStepSink {
 }
 
 /// How long the bounded RMT `wait()` poll-loop ([`RmtStepSink::emit_burst`]) spins for a channel's TX-END before
-/// declaring a hang, capturing the RMT hardware state, and abandoning the burst. 2 s is well above the ~1.5 s
-/// worst-case LEGITIMATE single burst (`MAX_SYMBOLS_PER_BURST` events × the max RMT period ≈ 0x7FFF ticks ≈ 33 µs
-/// at 1 MHz), so a real slow move never times out; only the genuine never-completing wedge does. Shorter than the
-/// 8 s RWDT timeout so the capture + abort happens, and then the motion core-1-stall watchdog or the RWDT resets.
-const RMT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// declaring a hang, capturing the RMT hardware state, and abandoning the burst — expressed in CPU CYCLES, because
+/// the loop must time itself off the cycle counter (embassy `Instant` freezes in this busy-spin; see the loop).
+/// 480M cycles = 2 s at the S3's 240 MHz `CpuClock::max()` (set in `main`). Well above the ~1.5 s worst-case
+/// LEGITIMATE single burst, below the 8 s RWDT, and within one u32 CCOUNT wrap (~17.9 s) so `wrapping_sub` is
+/// exact. The exact wall-clock is non-critical — anything between the ~tens-of-µs legit burst and the 8 s RWDT
+/// works — so even a clock-frequency mismatch stays safely in range.
+const RMT_WAIT_TIMEOUT_CYCLES: u32 = 480_000_000;
 
 /// Snapshot RMT channel `axis`'s hardware status registers into the crash breadcrumb at a `wait()` timeout (the
 /// hang), so the next boot's `[MSG:CRASH ...]` reports the BIFURCATING fact: was TX-END actually asserted (the
