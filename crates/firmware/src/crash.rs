@@ -62,9 +62,26 @@ mod idx {
   /// core-0 watchdog task just before it stops feeding, so the boot dump can name the wedge CLASS (core-1 RMT axis
   /// vs core-0 comms stall) independently of the core-1 executor's [`LAST_STAGE`] marker.
   pub const WITHHOLD: usize = 4;
+  /// RMT channel-0 hang snapshot — packed flags ([`super::RMT_SNAPSHOT_TAG`] in the high half, then `end`/`thr`/
+  /// `err`/`axis`/`nsym`). Written by [`super::record_rmt_hang`] when the core-1 motion executor's bounded RMT
+  /// `wait()` poll-loop TIMES OUT (the hang), capturing the hardware state BEFORE the reset. Untagged when no RMT
+  /// hang was captured this run. This is THE bifurcating datum: `end=1` means the transmission finished but our
+  /// wait missed it (driver/usage bug); `end=0` means it genuinely never completed (memory/encoding/start issue).
+  pub const RMT_FLAGS: usize = 5;
+  /// The whole RMT `int_raw` register word at the hang (raw, non-clearing per-channel interrupt status).
+  pub const RMT_INT_RAW: usize = 6;
+  /// The whole RMT `int_st` register word at the hang (masked interrupt status).
+  pub const RMT_INT_ST: usize = 7;
+  /// The whole RMT `ch_tx_status(0)` register word at the hang — its `state` field (bits 22:24) is the channel
+  /// FSM status (transmitting vs idle), the authoritative "is ch0 still running" signal.
+  pub const RMT_TX_STATUS: usize = 8;
+  /// The whole RMT `ch_tx_conf0(0)` register word at the hang (mem-size, wrap-en, continuous-mode, idle level...).
+  pub const RMT_TX_CONF0: usize = 9;
+  /// The monotonic burst (transmission) counter at the hang — which RMT transmission number since boot wedged.
+  pub const RMT_BURST_SEQ: usize = 10;
   /// First word of the snapshot ring. Each snapshot is [`super::SNAP_WORDS`] words: `[seq, core0_beat,
   /// core1_beat]`. The current stage is carried by the always-updated [`LAST_STAGE`] word, not per snapshot.
-  pub const RING_BASE: usize = 5;
+  pub const RING_BASE: usize = 11;
 }
 
 /// Words per snapshot in the ring: `[seq, core0_beat, core1_beat]`. The per-snapshot stage is omitted — the
@@ -173,6 +190,55 @@ pub fn withhold_label(packed: u32) -> Option<&'static str> {
   }
 }
 
+/// Tag in the high half of the [`idx::RMT_FLAGS`] word, marking a real RMT-hang capture vs cold-boot garbage.
+const RMT_SNAPSHOT_TAG: u32 = 0x524D_0000; // "RM".
+
+/// The raw RMT channel-0 hardware state captured at an RMT `wait()` timeout, plus the hung burst's identity. Passed
+/// to [`record_rmt_hang`] by the core-1 executor when its bounded poll-loop times out, and decoded by the boot dump.
+/// All the register words are whole-word reads (side-effect-free) so the boot report can re-derive any bit.
+#[derive(Clone, Copy)]
+pub struct RmtHang {
+  /// The hung channel index (0 = X). Carried so the report is unambiguous even though ch0 is the suspect.
+  pub axis: u8,
+  /// `int_raw.ch_tx_end(axis)` — TRUE means the transmission FINISHED (TX-END asserted) but our wait missed it.
+  pub tx_end: bool,
+  /// `int_raw.ch_tx_thr_event(axis)` — the half-block threshold event (refill request) is pending.
+  pub tx_thr: bool,
+  /// `int_raw.ch_tx_err(axis)` — a transmission error is latched.
+  pub tx_err: bool,
+  /// The symbol count of the hung burst (events + 1 end marker).
+  pub nsym: u16,
+  /// The whole `int_raw` register word.
+  pub int_raw: u32,
+  /// The whole `int_st` register word.
+  pub int_st: u32,
+  /// The whole `ch_tx_status(axis)` word (its `state` field, bits 22:24, is the channel FSM status).
+  pub tx_status: u32,
+  /// The whole `ch_tx_conf0(axis)` word.
+  pub tx_conf0: u32,
+  /// The monotonic transmission counter at the hang (which RMT transmission since boot wedged).
+  pub burst_seq: u32,
+}
+
+/// Record an RMT channel-0 hang snapshot into the breadcrumb (called from the core-1 executor on a `wait()`
+/// timeout, BEFORE the board resets). Packs the end/thr/err bits + axis + symbol count into [`idx::RMT_FLAGS`]
+/// (tagged), and stores the four whole register words + the burst counter in their dedicated slots. Relaxed
+/// stores — read only after the reset, no concurrent reader. This is the diagnostic half of the timeout backstop.
+pub fn record_rmt_hang(hang: &RmtHang) {
+  let flags = RMT_SNAPSHOT_TAG
+    | ((hang.tx_end as u32) << 15)
+    | ((hang.tx_thr as u32) << 14)
+    | ((hang.tx_err as u32) << 13)
+    | (((hang.axis & 0x7) as u32) << 8)
+    | (hang.nsym.min(0xFF) as u32);
+  BREADCRUMB[idx::RMT_FLAGS].store(flags, Ordering::Relaxed);
+  BREADCRUMB[idx::RMT_INT_RAW].store(hang.int_raw, Ordering::Relaxed);
+  BREADCRUMB[idx::RMT_INT_ST].store(hang.int_st, Ordering::Relaxed);
+  BREADCRUMB[idx::RMT_TX_STATUS].store(hang.tx_status, Ordering::Relaxed);
+  BREADCRUMB[idx::RMT_TX_CONF0].store(hang.tx_conf0, Ordering::Relaxed);
+  BREADCRUMB[idx::RMT_BURST_SEQ].store(hang.burst_seq, Ordering::Relaxed);
+}
+
 /// Stamp the validity [`MAGIC`] into the breadcrumb. Called once at boot AFTER the previous run's breadcrumb has
 /// been read back, so this run's markers/snapshots are recognized as valid on the NEXT boot. Idempotent.
 pub fn init_magic() {
@@ -218,6 +284,9 @@ pub struct Breadcrumb {
   /// The watchdog withhold reason (packed) — why the dog was deliberately starved to force this reset, if it was
   /// (a [`WithholdReason`], or untagged when the feed task simply stopped). Decoded via [`withhold_label`].
   pub withhold: u32,
+  /// The captured RMT channel-0 hardware state, IF the core-1 executor's bounded RMT `wait()` poll-loop timed out
+  /// this run (the hang). `None` when no RMT hang was captured. This is the decisive diagnostic for the ch0 wedge.
+  pub rmt_hang: Option<RmtHang>,
   /// The snapshots, NEWEST first (index 0 is the most recent). Empty-seq entries are filtered by the formatter.
   pub snapshots: [Snapshot; RING_LEN],
 }
@@ -238,6 +307,24 @@ pub fn take_breadcrumb() -> Breadcrumb {
   let valid = BREADCRUMB[idx::MAGIC].load(Ordering::Relaxed) == MAGIC;
   let last_stage = BREADCRUMB[idx::LAST_STAGE].load(Ordering::Relaxed);
   let withhold = BREADCRUMB[idx::WITHHOLD].load(Ordering::Relaxed);
+  // Decode the RMT-hang snapshot iff its tag is present (an RMT `wait()` timeout was captured this run).
+  let rmt_flags = BREADCRUMB[idx::RMT_FLAGS].load(Ordering::Relaxed);
+  let rmt_hang = if rmt_flags & 0xFFFF_0000 == RMT_SNAPSHOT_TAG {
+    Some(RmtHang {
+      axis: ((rmt_flags >> 8) & 0x7) as u8,
+      tx_end: rmt_flags & (1 << 15) != 0,
+      tx_thr: rmt_flags & (1 << 14) != 0,
+      tx_err: rmt_flags & (1 << 13) != 0,
+      nsym: (rmt_flags & 0xFF) as u16,
+      int_raw: BREADCRUMB[idx::RMT_INT_RAW].load(Ordering::Relaxed),
+      int_st: BREADCRUMB[idx::RMT_INT_ST].load(Ordering::Relaxed),
+      tx_status: BREADCRUMB[idx::RMT_TX_STATUS].load(Ordering::Relaxed),
+      tx_conf0: BREADCRUMB[idx::RMT_TX_CONF0].load(Ordering::Relaxed),
+      burst_seq: BREADCRUMB[idx::RMT_BURST_SEQ].load(Ordering::Relaxed),
+    })
+  } else {
+    None
+  };
   // The newest snapshot is at `(head + RING_LEN - 1) % RING_LEN`; walk backwards so index 0 is the most recent.
   let head = (BREADCRUMB[idx::HEAD].load(Ordering::Relaxed) as usize) % RING_LEN;
   let snapshots = core::array::from_fn(|i| {
@@ -249,11 +336,12 @@ pub fn take_breadcrumb() -> Breadcrumb {
       core1_beat: BREADCRUMB[base + 2].load(Ordering::Relaxed),
     }
   });
-  // Consume: clear the magic AND the withhold word so this crumb is reported exactly once and a stale withhold
-  // reason cannot bleed into a later, unrelated reset. `init_magic` re-stamps the magic for the new run.
+  // Consume: clear the magic, the withhold word, AND the RMT-flags tag so this crumb is reported exactly once and
+  // no stale withhold/RMT marker bleeds into a later, unrelated reset. `init_magic` re-stamps the magic.
   BREADCRUMB[idx::MAGIC].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::WITHHOLD].store(0, Ordering::Relaxed);
-  Breadcrumb { valid, last_stage, withhold, snapshots }
+  BREADCRUMB[idx::RMT_FLAGS].store(0, Ordering::Relaxed);
+  Breadcrumb { valid, last_stage, withhold, rmt_hang, snapshots }
 }
 
 /// Decode a packed last-stage marker into a short, stable label (e.g. `"axis1:wait_begin"`). Returns `"?"` for a

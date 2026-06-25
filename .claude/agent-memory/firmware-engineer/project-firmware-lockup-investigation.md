@@ -5,8 +5,48 @@ metadata:
   type: project
 ---
 
-**ROOT CAUSE FOUND + FIXED 2026-06-24 (the streaming lockup).** The RTC crash breadcrumb (built earlier this session)
-captured a Pikachu wedge: `[MSG:CRASH core0-comms-wedge stage=axis0:wait_begin comms-froze-first beats comms=41898
+**BURST-CAP FIX DID NOT WORK — RMT HARDWARE INSTRUMENTATION ADDED 2026-06-24 (compiled both configs, -D warnings + clippy
+clean, 522 host tests green).** Operator flashed the 47→46 burst-cap (commit c676a3d): SAME breadcrumb, now near-INSTANT
+(`comms=274 motion=942`, ~10 s in, was ~30 min). So the full-48-block-boundary theory was WRONG/incomplete — same core-1
+RMT ch0 `wait()` hang. KEEP the burst-cap (harmless, one real hazard removed — do NOT revert). GOOD news: a FAST
+(~seconds) repro now exists → instrument the HARDWARE instead of guessing from `rmt.rs`.
+- The bifurcating fact: WHEN `wait()` spins on ch0, is `TX_END` actually SET in HW? SET ⇒ TX finished but our wait missed
+  it (driver/usage bug). NOT set ⇒ TX genuinely never completed (memory/encoding/start).
+- IMPLEMENTED a BOUNDED RMT wait poll-loop + register capture. `firmware/src/motion.rs` `RmtStepSink::emit_burst`: the
+  per-axis blocking `txn.wait()` is replaced by `loop { if txn.poll() {break false} if Instant::now()>=deadline
+  {break true} }` (RMT_WAIT_TIMEOUT=2 s, >> the ~1.5 s worst-case legit burst, < 8 s RWDT). Happy path UNCHANGED:
+  `poll()` is the same volatile status read `wait()` spun on; on done → `wait()` returns immediately (esp-hal guarantees
+  it) → recover channel. NO timing perturbation (the burst plays in HW regardless of poll rate; only an extra cheap
+  `Instant::now()` per poll). On TIMEOUT (the hang): `capture_rmt_hang(axis,nsym,burst_seq)` reads ch0 registers, then
+  `drop(txn)` (S3 `rmt_has_tx_immediate_stop=true` → immediate stop_tx, NO drop-hang), then `esp_hal::system::
+  software_reset()` (deterministic — the post-abort state is ambiguous so the watchdog might not fire; `CoreSw` preserves
+  RTC_FAST + is a fault-reset → breadcrumb is read next boot).
+- REGISTERS captured (VERIFIED against installed esp-hal 1.1.1 + esp32s3-0.35.2 PAC; `esp_hal::peripherals::RMT::regs()`,
+  no unsafe at call site, side-effect-free reads, safe from core-1 InterruptExecutor): `int_raw.ch_tx_end(axis as u8)`
+  (TX_END bool — THE decider), `.ch_tx_thr_event` (thr), `.ch_tx_err` (err), whole `int_raw`/`int_st` words,
+  `ch_tx_status(axis as usize)` (FSM `state` = bits 22:24 → transmitting-vs-idle) and `ch_tx_conf0(axis as usize)`
+  words. NOTE the index-type split: int fields take `u8`, ch_tx_*(usize) take `usize` — matched exactly as esp-hal does.
+- BREADCRUMB layout extended (`firmware/src/crash.rs`): new words RMT_FLAGS(5, tagged 0x524D + end/thr/err/axis/nsym),
+  RMT_INT_RAW(6), RMT_INT_ST(7), RMT_TX_STATUS(8), RMT_TX_CONF0(9), RMT_BURST_SEQ(10); RING_BASE 5→11; LEN=23 words
+  (fits RTC_FAST easily). New `RmtHang` struct + `record_rmt_hang`/decode in `take_breadcrumb` (clears RMT_FLAGS on
+  consume). `RmtStepSink` gained a `burst_seq` counter bumped per burst.
+- BOOT DUMP: `format_rmt_hang_report` emits a SECOND `[MSG:CRASH rmt<axis>: end=<0/1> thr=<0/1> err=<0/1> fsm=<n>
+  nsym=<n> burst#=<n> ir=0x.. is=0x.. st=0x.. cf=0x..]` line (split from the summary so neither exceeds
+  RESPONSE_CAPACITY=160). The CRASH_REPORT stash is now `heapless::Vec<Response,2>` replayed on first `$I`/`?`.
+- HOW TO READ THE NEXT BREADCRUMB: `rmt0: end=1` ⇒ TX DID finish, our wait/poll missed completion → fix HOW we wait
+  (driver/usage; e.g. a poll/clear race, or `poll()`/`wait()` not seeing the latched bit). `end=0` + `fsm`≠0 ⇒ channel
+  STILL transmitting (never completed) → memory/encoding/start (e.g. a symbol the HW never terminates on, a clock/start
+  glitch, a mem-owner issue). `end=0` + `fsm`=0 (idle) but no End ⇒ HW went idle without raising End (a missed-event /
+  int-status anomaly). `thr=1` = a half-block refill was pending (shouldn't matter for ≤47-sym). `cf`/`st` raw words let
+  us re-derive wrap_en/mem_size/etc off-board. `burst#`/`nsym` characterize the hung transmission.
+- CAVEAT to bench-verify: `software_reset()` (`CoreSw`/`RTC_CNTL_SW_SYS_RST`) is documented to preserve the RTC domain
+  (so RTC_FAST/breadcrumb survives) — HIGH confidence but ROM-binding, not source-readable. If the `[MSG:CRASH rmt0:]`
+  line does NOT appear after a timeout-reset, the SW reset wiped RTC_FAST and we fall back to the RWDT path.
+- This is the FRONT HALF of the eventual timeout-backstop; the full backstop = feed-hold + ALARM + disable steppers +
+  REQUIRE RE-HOME (DOC-06, deferred). The current reset is purely diagnostic.
+
+**SUPERSEDED ROOT-CAUSE THEORY (kept for context — the full-block fix did NOT resolve it):** The RTC crash breadcrumb
+(built earlier this session) captured a Pikachu wedge: `[MSG:CRASH core0-comms-wedge stage=axis0:wait_begin comms-froze-first beats comms=41898
 motion=60943 (RWDT-reset)]`. Decisive: `stage=axis0:wait_begin` with NO `wait_done` ⇒ the core-1 motion executor hung
 in esp-hal's blocking RMT TX-completion `wait()` for CHANNEL 0 (X) — TX-END never fired, the busy-poll `wait()` spun
 forever. (`core0-comms-wedge` is COLLATERAL: executor hung → planner queue filled → comms_consumer parked → status froze;

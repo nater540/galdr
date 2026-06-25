@@ -852,19 +852,23 @@ pub async fn send_banner() {
   }
 }
 
-/// The formatted post-mortem crash report (`[MSG:CRASH ...]`), held after boot so it can be RE-EMITTED on the
-/// first `$I`/status request after a host connects. The native-USB link re-enumerates on the watchdog reset, so a
-/// host that reconnects a beat late would miss the boot-time emission; stashing the line here and replaying it on
-/// the first `$I`/`?` closes that race. `None` once there is nothing to report (a clean boot, or after a single
-/// replay — see [`take_pending_crash_report`]). A `Cell<Option<Response>>` behind the cross-core blocking mutex
-/// keeps it lock-free-ish and `Send`; `Response` is `heapless::String`, no allocation.
-static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<Option<Response>>> = BlockingMutex::new(Cell::new(None));
+/// The formatted post-mortem crash report lines (the `[MSG:CRASH ...]` summary plus, when an RMT hang was captured,
+/// a second `[MSG:CRASH rmt0: ...]` register-detail line), held after boot so they can be RE-EMITTED on the first
+/// `$I`/status request after a host connects. The native-USB link re-enumerates on the watchdog reset, so a host
+/// that reconnects a beat late would miss the boot-time emission; stashing the lines here and replaying them on the
+/// first `$I`/`?` closes that race. Empty once there is nothing left to replay. A `heapless::Vec<Response, 2>`
+/// behind the cross-core blocking mutex keeps it `Send` and allocation-free; each `Response` is far under
+/// [`RESPONSE_CAPACITY`], so splitting into two lines (rather than one over-long line) keeps every line in budget.
+static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 2>>> =
+  BlockingMutex::new(Cell::new(heapless::Vec::new()));
 
-/// Format the previous run's crash breadcrumb into a grbl `[MSG:CRASH ...]` line, emit it ONCE over the normal TX
-/// path right after the boot banner, AND stash it for one replay on the first `$I`/status after connect. Called
-/// from `main` after [`send_banner`], with the breadcrumb read from RTC_FAST and whether the reset was a
+/// Format the previous run's crash breadcrumb into grbl `[MSG:CRASH ...]` line(s), emit them ONCE over the normal
+/// TX path right after the boot banner, AND stash them for one replay on the first `$I`/status after connect.
+/// Called from `main` after [`send_banner`], with the breadcrumb read from RTC_FAST and whether the reset was a
 /// watchdog/fault reset (a clean power-on / brown-out clears RTC_FAST anyway, so a valid breadcrumb after one of
-/// those would be impossible — but we still gate on the reset reason for clarity and defence in depth).
+/// those would be impossible — but we still gate on the reset reason for clarity and defence in depth). When an RMT
+/// hang was captured, a SECOND line carries the channel-0 register detail (kept separate so neither line exceeds
+/// [`RESPONSE_CAPACITY`]).
 ///
 /// The breadcrumb survives a WATCHDOG reset, NOT a power-cycle (see [`crate::crash`]): the operator must let the
 /// dog bite (~8 s) and must not yank power, or the breadcrumb is lost. A no-op when the breadcrumb is invalid
@@ -873,18 +877,29 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
   if !breadcrumb.is_valid() || !reset_was_watchdog {
     return;
   }
-  let Some(report) = format_crash_report(breadcrumb) else {
+  let Some(summary) = format_crash_report(breadcrumb) else {
     return;
   };
+  // Build the line set: the summary always, plus the RMT register-detail line when a hang was captured.
+  let mut lines: heapless::Vec<Response, 2> = heapless::Vec::new();
+  let _ = lines.push(summary);
+  if let Some(hang) = breadcrumb.rmt_hang.as_ref()
+    && let Some(rmt_line) = format_rmt_hang_report(hang)
+  {
+    let _ = lines.push(rmt_line);
+  }
   // Stash a copy for the first-`$I`/`?` replay (reconnect race), then emit now over the guaranteed-delivery path.
-  CRASH_REPORT.lock(|c| c.set(Some(report.clone())));
-  enqueue(report).await;
+  CRASH_REPORT.lock(|c| c.set(lines.clone()));
+  for line in lines {
+    enqueue(line).await;
+  }
 }
 
-/// Take the stashed crash report for a one-shot replay (consumes it so it is sent at most once more after the boot
-/// emission). Returns `None` once nothing is pending. Called from the `$I` build-info handler and the status
-/// responder so a host that reconnected late after the watchdog reset still receives the `[MSG:CRASH ...]` line.
-fn take_pending_crash_report() -> Option<Response> {
+/// Take the stashed crash report lines for a one-shot replay (consumes them so they are sent at most once more after
+/// the boot emission). Returns an empty `Vec` once nothing is pending. Called from the `$I` build-info handler and
+/// the status responder so a host that reconnected late after the watchdog reset still receives the `[MSG:CRASH ...]`
+/// line(s).
+fn take_pending_crash_report() -> heapless::Vec<Response, 2> {
   CRASH_REPORT.lock(|c| c.take())
 }
 
@@ -920,6 +935,39 @@ fn format_crash_report(breadcrumb: &crate::crash::Breadcrumb) -> Option<Response
   let _ = write!(inner, " beats comms={} motion={}", newest.core0_beat, newest.core1_beat);
   // Remind that the breadcrumb is watchdog-survival only (so a power-cycle would have lost it — useful context).
   let _ = write!(inner, " (RWDT-reset; not power-cycle)");
+  let mut out = Response::new();
+  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
+  Some(out)
+}
+
+/// Format the captured RMT channel-hang hardware state into a second `[MSG:CRASH rmt<axis>: ...]` line. The DECISIVE
+/// field is `end`: `end=1` means TX-END WAS asserted (the transmission finished but our wait missed the completion
+/// — a driver/usage bug, fix how we wait); `end=0` means TX-END never fired (the transmission genuinely never
+/// completed — a memory/encoding/start issue, chase that). `fsm` is the channel TX FSM state (bits 22:24 of
+/// `ch_tx_status`): non-zero ⇒ the channel is still mid-transmission. `thr` = a pending half-block threshold
+/// (refill) event; `err` = a latched transmission error. The raw register words (`ir`/`is`/`st`/`cf`) are included
+/// so any other bit can be re-derived off-board. `nsym` is the hung burst's symbol count; `burst#` is which
+/// transmission since boot wedged. Kept as its own line so it stays under [`RESPONSE_CAPACITY`].
+fn format_rmt_hang_report(hang: &crate::crash::RmtHang) -> Option<Response> {
+  use core::fmt::Write as _;
+  // The TX FSM state is bits 22:24 of the ch_tx_status word; surface it decoded so the report reads at a glance.
+  let fsm = (hang.tx_status >> 22) & 0x7;
+  let mut inner: heapless::String<128> = heapless::String::new();
+  let _ = write!(
+    inner,
+    "CRASH rmt{}: end={} thr={} err={} fsm={} nsym={} burst#={} ir={:#010x} is={:#010x} st={:#010x} cf={:#010x}",
+    hang.axis,
+    hang.tx_end as u8,
+    hang.tx_thr as u8,
+    hang.tx_err as u8,
+    fsm,
+    hang.nsym,
+    hang.burst_seq,
+    hang.int_raw,
+    hang.int_st,
+    hang.tx_status,
+    hang.tx_conf0,
+  );
   let mut out = Response::new();
   ResponseWriter::message(&mut out, inner.as_str()).ok()?;
   Some(out)
@@ -4058,8 +4106,8 @@ async fn send_build_info(extended: bool) {
   if ResponseWriter::build_info(&mut s, extended).is_ok() {
     enqueue(s).await;
   }
-  if let Some(report) = take_pending_crash_report() {
-    enqueue(report).await;
+  for line in take_pending_crash_report() {
+    enqueue(line).await;
   }
 }
 
@@ -4247,10 +4295,10 @@ pub async fn status_responder() -> ! {
     if ResponseWriter::status_report(&mut s, &snap).is_ok() {
       enqueue(s).await;
     }
-    // Replay a pending crash report after the first status too (a host may poll `?` before `$I`). Consumed, so it
-    // is emitted at most once more total across the `$I` and `?` paths — whichever the host reaches first.
-    if let Some(report) = take_pending_crash_report() {
-      enqueue(report).await;
+    // Replay pending crash report lines after the first status too (a host may poll `?` before `$I`). Consumed, so
+    // they are emitted at most once more total across the `$I` and `?` paths — whichever the host reaches first.
+    for line in take_pending_crash_report() {
+      enqueue(line).await;
     }
   }
 }
