@@ -41,7 +41,9 @@
 //! - Feed-hold deceleration is per-block (Stage 1): a hold pauses at the next block boundary and resumes on
 //!   cycle-start; smooth ramp-down within a block is a later refinement.
 
-// esp-backtrace installs the panic handler and exception/backtrace reporting (panic-handler feature).
+// esp-backtrace is pulled in (its `panic-handler` feature is OFF — we install our own `#[panic_handler]` below
+// that records a breadcrumb + `software_reset()`s; see Cargo.toml). Kept linked for its `println` integration; the
+// CPU exception vector lives in esp-hal and routes faults into our handler, so faults are still captured.
 use esp_backtrace as _;
 // esp-println routes `print!`/`println!` to the host; pulled in for early-boot diagnostics before the
 // USB CDC link is up. Linked unconditionally so its initializer runs even when unused here.
@@ -72,6 +74,37 @@ mod storage;
 mod tmc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
+
+/// Custom panic handler (replacing esp-backtrace's default `interrupt_free(|| loop {})`, which halts FOREVER with
+/// no breadcrumb — making EVERY panic a silent, unrecoverable hard wedge). This records a PANIC breadcrumb into
+/// RTC_FAST and then `software_reset()`s, so a panic — including a core-1 stack overflow, the prime suspect for the
+/// hard wedge — becomes VISIBLE (the next boot emits `[MSG:CRASH panic <file>:<line> core=<N>]`) and RECOVERABLE
+/// (the chip resets itself instead of needing a physical EN press).
+///
+/// ## MINIMAL STACK — this may run after a STACK OVERFLOW
+/// A core-1 main-stack overflow panics, and this handler then runs on that SAME nearly-exhausted stack (there is no
+/// separate Xtensa interrupt/panic stack). So it MUST be allocation-, lock-, and format-FREE: it does only a
+/// handful of raw `Relaxed` stores (via [`crash::record_panic`], `#[inline(never)]` to keep one flat frame) and one
+/// ROM `software_reset()` call. The source-file string is NOT formatted here — only its `.rodata` POINTER + length
+/// are stored as raw words and re-read at BOOT (full stack). No `esp_println` here: it allocates a format buffer /
+/// takes a UART lock, neither safe on a blown stack.
+///
+/// `software_reset()` (ROM `RTC_CNTL_SW_SYS_RST`, reset reason `CoreSw`) is a full-chip reset safe from a panic
+/// context on EITHER core, and it PRESERVES the RTC_FAST breadcrumb (verified: the RTC domain is not cleared by a
+/// CoreSw reset — only a power-cycle/brown-out clears it), so the breadcrumb survives to the next boot.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+  // `Cpu::current()` is a single CPU-register read (no peripheral, no lock) — safe here. 0 = ProCpu, 1 = AppCpu.
+  let core = Cpu::current() as u8;
+  // Pull the raw location words WITHOUT formatting. The file `&str` is a `.rodata` literal; store its pointer+len.
+  if let Some(loc) = info.location() {
+    let file = loc.file();
+    crash::record_panic(core, file.as_ptr() as u32, file.len() as u32, loc.line(), true);
+  } else {
+    crash::record_panic(core, 0, 0, 0, false);
+  }
+  esp_hal::system::software_reset();
+}
 
 /// The step-generator timer tick rate, Hz. A fixed firmware constant (the RMT channels are clocked to 1 MHz
 /// = 1 tick/µs by `motion::init`'s clock divider); the persisted `$0` step-pulse time is converted to ticks
@@ -104,11 +137,28 @@ const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(feature = "defmt")]
 defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
 
-/// Size of the core-1 main-thread stack arena (the esp-rtos second-core scheduler thread), in bytes. Must be a
-/// multiple of 16 (`Stack::new` const-asserts this). 16 KiB is comfortable headroom for the esp-rtos core-1 main
-/// task plus the deep bring-up closure; the over-top corruption bug fixed by [`AppCoreStackArena`] was NOT a
-/// depth overflow (8 KiB and 32 KiB corrupted identically), so this depth is chosen for comfort, not safety.
-const APP_CORE_STACK_SIZE: usize = 16 * 1024;
+/// Size of the core-1 stack arena, in bytes. Must be a multiple of 16 (`Stack::new` const-asserts this).
+///
+/// ## This stack backs the WHOLE core-1 call chain, including the real-time motion task
+/// On Xtensa there is NO separate interrupt stack: a software-interrupt handler runs on the interrupted thread's
+/// stack, and on core 1 the current thread at idle is the esp-rtos second-core MAIN thread backed by THIS arena.
+/// So the SWI-2 [`InterruptExecutor`] poll — and therefore the entire `motion_executor` call chain (the drain loop
+/// → `run_block` → the segment generator → `RmtStepSink::emit_burst` → esp-hal RMT `transmit`/`poll`/`wait` → the
+/// CCOUNT-bounded timeout + the crash-breadcrumb stores) — executes ON THIS STACK, charged ON TOP of the scheduler
+/// thread's frames. esp-rtos plants a stack guard at `bottom + ESP_HAL_CONFIG_STACK_GUARD_OFFSET` and asserts
+/// (panics) on overflow, and ALSO panics on core 0 if the second-core main task fails to init from a bring-up
+/// overflow — so a deep-enough core-1 frame trips a panic (now visible via the custom `#[panic_handler]`, the prime
+/// hard-wedge suspect).
+///
+/// ## Sizing: 32 KiB (was 16 KiB) — depth headroom under sustained streaming
+/// Bumped 16→32 KiB as cheap insurance against a streaming-load stack overflow in the motion task. The usable depth
+/// is `SIZE − guard_offset`; doubling it gives comfortable margin for the deepest core-1 frame (the RMT
+/// transmit/wait path under the Xtensa windowed ABI, which is stack-hungry on window-overflow spills) plus the
+/// breadcrumb/CCOUNT code added to that path, with room for any `core::fmt` the panic machinery itself pulls in.
+/// 32 KiB of RTC/internal RAM is a negligible cost on the S3. Note the over-top corruption bug fixed by
+/// [`AppCoreStackArena`]'s `_abi_headroom` was NOT a depth overflow (it reproduced identically at any size), so the
+/// trailing-padding/canary fix remains independent and load-bearing — growing the stack does not replace it.
+const APP_CORE_STACK_SIZE: usize = 32 * 1024;
 
 /// Xtensa windowed-ABI base register save area, in bytes. Every call spills the caller's saved registers into a
 /// 16-byte area at `[SP, SP+16)` (the four words holding the return address and the caller's a0..a3 window slot).

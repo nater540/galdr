@@ -155,17 +155,27 @@ fragile — a watchdog reset re-enumerates the USB and the `/dev/cu.usbmodem*` n
 
 ## 6. Open questions / next steps
 
-1. **Catch Mode C (the hard wedge) — the frontier.** Nothing writes a breadcrumb for a panic/halt. Add a custom
-   panic handler (or esp-backtrace `custom-halt`) that records a panic breadcrumb (file/line/PC) into RTC_FAST and
-   forces a `software_reset()` (RTC-preserving). This converts the silent permanent hang into a recoverable reboot
-   with a `[MSG:CRASH panic …]` line.
-2. **Why didn't the RWDT recover Mode C?** A panic-halt should still time out the RWDT (~8 s). It didn't. Determine:
-   panic path masking the watchdog? silent boot-loop (re-wedge before serial)? non-panic hardware lockup?
-3. **Land the Mode A / Mode B captures.** The `rmt0:` and `comms:` lines have not yet been read on the board (Mode C
-   keeps intervening / the bench automation lost the port). A clean capture of each remains outstanding.
+1. **Catch Mode C (the hard wedge) — LANDED 2026-06-25 (compiled both configs).** A custom `#[panic_handler]` now
+   replaces esp-backtrace's silent `interrupt_free(|| loop {})` halt: it records a PANIC breadcrumb (file-string
+   `.rodata` pointer+len, line, panicking core, build id) into RTC_FAST with MINIMAL stack (a handful of raw stores,
+   no formatting/locks — safe even after a stack overflow), then `software_reset()`s (CoreSw, RTC-preserving). The
+   next boot recovers the file string via the stored pointer (guarded by a per-build `BUILD_ID` so a stale pointer
+   from a different image is not dereferenced) and emits `[MSG:CRASH panic <file>:<line> core=<N>]`. esp-backtrace's
+   `panic-handler` feature was dropped (kept `println`); esp-hal owns the exception vector and routes faults into our
+   handler, so hard-fault/illegal-instruction capture is not lost. **The core-1 stack arena was bumped 16→32 KiB**
+   (the likely Mode C root — see §7) — on Xtensa there is NO separate interrupt stack, so the `motion_executor` RMT
+   call chain runs on this arena; doubling it is cheap streaming-load-overflow insurance. The `_abi_headroom`
+   canary/padding fix is kept (independent of depth).
+2. **Why didn't the RWDT recover Mode C? — ANSWERED.** A core-1 panic into esp-backtrace's `interrupt_free(|| loop {})`
+   disables interrupts on CORE 1 only; **core 0 keeps running and keeps FEEDING the RWDT**, so the dog never fires →
+   hard wedge. (The RWDT is correctly armed and not touched by esp-rtos; it DID fire for Mode B, where core 0 itself
+   wedged.) The custom panic handler resolves this directly: it `software_reset()`s the WHOLE chip from the panicking
+   core regardless of which core panicked, so a core-1 panic no longer relies on core 0 stopping its feed.
+3. **Land the Mode A / Mode B / Mode C captures.** The `rmt0:`, `comms:`, and now `panic` lines are instrumented but
+   not all yet read on the board. A clean capture of each remains outstanding; the panic line is the new frontier.
 4. **Suspect surface for the underlying corruption/hang:** the esp-hal 1.1.1 RMT driver (TX-END never firing), the
-   esp-rtos dual-core / InterruptExecutor interaction, and any esp-hal/esp-rtos multicore time/sync hazard. See the
-   companion deep-research report.
+   esp-rtos dual-core / InterruptExecutor interaction, a core-1 stack overflow (now caught), and any esp-hal/esp-rtos
+   multicore time/sync hazard. See the companion deep-research report.
 
 ---
 
@@ -201,11 +211,25 @@ Searched esp-rs/esp-hal, esp-rtos, embassy, esp-idf issues/PRs/changelogs. Key v
 Sources (primary): esp-rs/esp-hal #2115 #707 #633 #269 #2516 #10324, esp-rs/esp-wifi-sys #437, esp-rs/esp-backtrace,
 esp-rtos 0.3.0 lib.rs, esp-hal-embassy 0.8.1 time_driver, embassy #3758 #2603, esp-idf #10429 #8889.
 
-### Refined next step (highest value)
-1. **Custom panic handler:** on panic, record the panic location into RTC_FAST + `software_reset()` (RTC-preserving)
-   instead of esp-backtrace's halt. Catches Mode C, prints `[MSG:CRASH panic <file:line>]` on reboot, makes it
-   recoverable — and if it names "stack overflow" / a core-1 frame, confirms the prime suspect.
-2. **Re-validate / increase the core-1 InterruptExecutor stack arena** (the likely root of Mode C).
+### Refined next step (highest value) — BOTH LANDED 2026-06-25
+1. **Custom panic handler — DONE.** On panic, records the panic location (file ptr+len, line, core, build id) into
+   RTC_FAST + `software_reset()` (CoreSw, verified RTC-preserving — esp-hal's `persistent` macro doc names
+   `software_reset()` first in its survivable list; S3 TRM: all resets except Chip Reset preserve internal memory).
+   Boot emits `[MSG:CRASH panic <file>:<line> core=<N>]`. `core=1` ⇒ a core-1 (APP_CPU) panic = the stack-overflow
+   prime suspect.
+2. **Increase the core-1 stack arena — DONE (16→32 KiB).** Verified against installed esp-rtos 0.3.0 + xtensa-lx-rt:
+   the Xtensa SWI handler runs on the interrupted thread's stack (no dedicated interrupt stack), so the
+   `motion_executor` deep RMT call chain is charged to the `start_second_core` `Stack<N>` arena — bumping it is the
+   correct (and only) lever for streaming-load depth headroom. esp-rtos guard-checks this stack and panics on
+   overflow (now visible via the handler), so if the next panic line names a core-1 frame, this is the confirmed fix.
+
+### Capture procedure for the panic line (Mode C)
+Flash (`just flash`, no defmt needed — the panic line is plain `[MSG:]` over the grbl TX), stream Pikachu. On a
+wedge, **wait ~12 s** (the panic handler resets near-instantly, but if the wedge is a non-panic hang the RWDT takes
+~8 s) — do NOT press EN / power-cycle (that wipes RTC_FAST). After the self-reset, the console shows the banner then
+`[MSG:CRASH panic <file>:<line> core=<N>]` (also replayed on the first `$I`/`?`). `core=1` + a `motion.rs`/esp-hal RMT
+file ⇒ core-1 stack overflow / a panic in the motion path; `core=0` ⇒ a panic in the comms path. The line/file pins
+the exact panic site.
 
 ---
 

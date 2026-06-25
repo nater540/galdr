@@ -860,7 +860,7 @@ pub async fn send_banner() {
 /// left to replay. A `heapless::Vec<Response, 3>` behind the cross-core blocking mutex keeps it `Send` and
 /// allocation-free; each `Response` is far under [`RESPONSE_CAPACITY`], so splitting into separate lines (rather
 /// than one over-long line) keeps every line in budget.
-static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 3>>> =
+static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 4>>> =
   BlockingMutex::new(Cell::new(heapless::Vec::new()));
 
 /// Format the previous run's crash breadcrumb into grbl `[MSG:CRASH ...]` line(s), emit them ONCE over the normal
@@ -881,9 +881,16 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
   let Some(summary) = format_crash_report(breadcrumb) else {
     return;
   };
-  // Build the line set: the summary always, plus (when present) the RMT register-detail line and the per-task
-  // comms-stage breakdown line — each kept separate so none exceeds RESPONSE_CAPACITY.
-  let mut lines: heapless::Vec<Response, 3> = heapless::Vec::new();
+  // Build the line set. The PANIC line (an independent class — a panic / CPU fault / core-1 stack overflow captured
+  // by the custom `#[panic_handler]`) goes FIRST when present, as it is the most decisive datum. Then the summary,
+  // and (when present) the RMT register-detail and the per-task comms-stage breakdown — each its own line so none
+  // exceeds RESPONSE_CAPACITY.
+  let mut lines: heapless::Vec<Response, 4> = heapless::Vec::new();
+  if let Some(panic) = breadcrumb.panic.as_ref()
+    && let Some(panic_line) = format_panic_report(panic)
+  {
+    let _ = lines.push(panic_line);
+  }
   let _ = lines.push(summary);
   if let Some(hang) = breadcrumb.rmt_hang.as_ref()
     && let Some(rmt_line) = format_rmt_hang_report(hang)
@@ -904,8 +911,29 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
 /// the boot emission). Returns an empty `Vec` once nothing is pending. Called from the `$I` build-info handler and
 /// the status responder so a host that reconnected late after the watchdog reset still receives the `[MSG:CRASH ...]`
 /// line(s).
-fn take_pending_crash_report() -> heapless::Vec<Response, 3> {
+fn take_pending_crash_report() -> heapless::Vec<Response, 4> {
   CRASH_REPORT.lock(|c| c.take())
+}
+
+/// Format a captured PANIC into a `[MSG:CRASH panic <file>:<line> core=<N>]` line for the boot dump. `core=1` is the
+/// core-1 (motion / APP_CPU) panic — the stack-overflow prime suspect; `core=0` is core-0 (comms / PRO_CPU). When
+/// the source file string could not be recovered (no location, or a stale pointer from a different flashed image —
+/// see [`crate::crash::BUILD_ID`]), it falls back to `?:<line>`. Pure formatting; no I/O. Kept under
+/// [`RESPONSE_CAPACITY`] (a worst-case file path is bounded by the recovered length cap in the decoder).
+fn format_panic_report(panic: &crate::crash::PanicReport) -> Option<Response> {
+  use core::fmt::Write as _;
+  let mut inner: heapless::String<128> = heapless::String::new();
+  match panic.file {
+    Some(file) => {
+      let _ = write!(inner, "panic {}:{} core={}", file, panic.line, panic.core);
+    }
+    None => {
+      let _ = write!(inner, "panic ?:{} core={}", panic.line, panic.core);
+    }
+  }
+  let mut out = Response::new();
+  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
+  Some(out)
 }
 
 /// Build the `[MSG:CRASH ...]` line from a decoded breadcrumb. Renders, in order: the WATCHDOG WITHHOLD CLASS when

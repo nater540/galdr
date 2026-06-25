@@ -5,6 +5,46 @@ metadata:
   type: project
 ---
 
+**MODE C (HARD WEDGE) = A PANIC — CUSTOM PANIC HANDLER + STACK BUMP ADDED 2026-06-25 (compiled both configs, -D warnings
++ clippy clean, 522 host tests green).** Deep-research (adversarially verified) on the hard, silent, EN-only wedge: (1)
+esp-backtrace 0.19's DEFAULT panic handler is `arch::interrupt_free(|| loop {})` — no reset, no breadcrumb, hangs the
+core forever → ANY panic = exactly Mode C. (2) esp-rtos 0.3 PANICS on a core-1 (APP_CPU) main STACK OVERFLOW (prime
+suspect, ties to [[xtensa-stack-top-abi-headroom]]). (3) `#[ram(rtc_fast, persistent)]` IS reliable across watchdog/SW
+resets (the "unreliable" claim refuted). NON-RECOVERY EXPLAINED: a core-1 panic into `interrupt_free(|| loop {})`
+disables interrupts on CORE 1 ONLY → core 0 keeps FEEDING the RWDT → dog never fires → hard wedge.
+- GOAL A (panic handler): dropped esp-backtrace's `panic-handler` feature (kept `esp32s3`+`println`; esp-backtrace 0.19
+  has NO exception-handler feature — esp-hal owns the exception vector and routes faults into OUR handler, so fault
+  capture not lost). Custom `#[panic_handler]` in main.rs: reads `Cpu::current() as u8` + `info.location()` (NO
+  formatting), calls `crash::record_panic(core, file.as_ptr() as u32, file.len() as u32, line, has_loc)` then
+  `esp_hal::system::software_reset()`. MINIMAL-STACK / overflow-safe: `record_panic` is `#[inline(never)]`, does ~6 raw
+  Relaxed stores to RTC_FAST, no struct/lock/format/println. VERIFIED (installed source): PanicInfo/Location/str API
+  const-stable; Cpu::current() is a register read (0=ProCpu,1=AppCpu); software_reset() is full-chip, both-core,
+  panic-safe, preserves RTC_FAST (CoreSw).
+- BUILD-ID GUARD: the file-string is stored as a `.rodata` POINTER+len (stable across SW reset of the SAME image) and
+  re-read at BOOT (full stack). `build.rs` emits `GALDR_BUILD_ID` (wall-clock nanos); `crash::BUILD_ID` (const decimal
+  parser) is stamped into the breadcrumb; boot dereferences the pointer ONLY when the stored build id matches → a stale
+  pointer from a DIFFERENT flashed image yields `panic ?:line` not garbage. Decoder caps file len ≤120 (fits
+  RESPONSE_CAPACITY).
+- BREADCRUMB layout (crash.rs): new words PANIC_FLAGS(tag 0x5041 + core + has-location bit), PANIC_FILE_PTR,
+  PANIC_FILE_LEN, PANIC_LINE, PANIC_BUILD_ID; RING_BASE→21, LEN→33 words. `record_panic` also stamps MAGIC (so a panic
+  before init_magic still reports). New `PanicReport{core,line,file:Option<&'static str>}` decoded in take_breadcrumb
+  (safe pointer deref guarded by build-id + null/len check), cleared on consume.
+- GOAL B (boot dump): `format_panic_report` → `[MSG:CRASH panic <file>:<line> core=<N>]` (or `panic ?:<line>` if no
+  location / stale image). Emitted FIRST (most decisive), independent class. CRASH_REPORT stash → Vec<Response,4>.
+  Replayed on first `$I`/`?` like the others.
+- GOAL C (stack bump): APP_CORE_STACK_SIZE 16→32 KiB. KEY VERIFIED FACT: on Xtensa there is NO separate interrupt
+  stack — the SWI2 InterruptExecutor poll + the WHOLE `motion_executor` RMT call chain run on the `start_second_core`
+  `Stack<N>` arena (charged on top of the scheduler thread). So bumping THIS arena IS the correct lever for
+  streaming-load overflow headroom (usable depth = SIZE − guard_offset). esp-rtos guard-checks it + panics on overflow
+  (now visible). `_abi_headroom` canary/padding kept (independent of depth — the over-top spill bug was size-independent).
+- NON-RECOVERY SANITY (cheap, confirmed): RWDT IS armed (esp-hal init disables it, our explicit enable() re-arms, esp-rtos
+  start never touches LPWR); the core-1-panic-leaves-core-0-feeding mechanism is THE non-recovery cause; the panic
+  handler fixes it by resetting the whole chip from the panicking core regardless.
+- CAPTURE: `just flash`, stream Pikachu, on a wedge WAIT ~12 s (panic handler resets near-instantly; a non-panic hang
+  takes the 8 s RWDT) — do NOT EN/power-cycle. Read `[MSG:CRASH panic <file>:<line> core=<N>]`. `core=1` + a
+  motion.rs/RMT file ⇒ core-1 stack overflow / motion-path panic (if so, the 32 KiB bump is the confirmed fix); `core=0`
+  ⇒ comms-path panic.
+
 **NEW SIGNATURE: CORE-0 COMMS WEDGE WITH MOTION IDLE — COMMS-STAGE BREADCRUMB ADDED 2026-06-24 (compiled both configs,
 -D warnings + clippy clean, 522 host tests green).** After the CCOUNT timeout fix (commit a829c8a — the coordinator
 switched my `Instant`-based RMT timeout to `esp_hal::xtensa_lx::timer::get_cycle_count` because `Instant::now()` was

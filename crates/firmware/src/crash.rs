@@ -38,6 +38,30 @@ use portable_atomic::{AtomicU32, Ordering};
 /// RTC_FAST garbage. Stamped by [`init_magic`] once at boot and required by [`Breadcrumb::is_valid`].
 pub const MAGIC: u32 = 0x6A1D_C2A5;
 
+/// Parse a decimal `&str` to a `u32` in const context (`u32::from_str_radix` is not const-stable here), wrapping on
+/// overflow. Used only to turn the `build.rs`-emitted [`BUILD_ID`] string into a constant; a non-digit yields the
+/// value parsed so far (the build script only ever emits digits).
+const fn parse_u32_decimal(s: &str) -> u32 {
+  let bytes = s.as_bytes();
+  let mut acc: u32 = 0;
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes[i];
+    if b < b'0' || b > b'9' {
+      break;
+    }
+    acc = acc.wrapping_mul(10).wrapping_add((b - b'0') as u32);
+    i += 1;
+  }
+  acc
+}
+
+/// Per-build identity word (emitted by `build.rs` as `GALDR_BUILD_ID`). The panic handler stores a `.rodata`
+/// file-string pointer into RTC_FAST; that pointer is only meaningful against the SAME flashed image. The boot
+/// decoder dereferences it ONLY when the breadcrumb's stored build id matches this constant, so a panic breadcrumb
+/// left by a DIFFERENT image is reported without its (now-stale) file string rather than reading garbage.
+pub const BUILD_ID: u32 = parse_u32_decimal(env!("GALDR_BUILD_ID"));
+
 /// Number of snapshots in the liveness ring. Four 500-ms snapshots cover the last ~2 s before a reset — enough to
 /// show which core stopped advancing FIRST (e.g. core 1's beat frozen across several snapshots while core 0's kept
 /// climbing) rather than only the final instant. Small so the whole breadcrumb fits comfortably in RTC_FAST.
@@ -86,8 +110,29 @@ mod idx {
   /// PER TASK, concurrent tasks never clobber each other's marker — the stuck task is unambiguous. Distinct from
   /// the core-1 [`LAST_STAGE`] (motion); the two cores are reported independently.
   pub const COMMS_STAGE_BASE: usize = 11;
-  /// First word of the snapshot ring (after the comms-stage slots). Each snapshot is [`super::SNAP_WORDS`] words.
-  pub const RING_BASE: usize = COMMS_STAGE_BASE + super::COMMS_TASK_COUNT;
+  /// PANIC breadcrumb flags: [`super::PANIC_TAG`] in the high half, the panicking core in bits 0..1, and a
+  /// "location present" bit. Written by the custom `#[panic_handler]` (see `main`) with MINIMAL stack — a handful
+  /// of raw stores, no formatting — then `software_reset()`. A panic is otherwise invisible (esp-backtrace 0.19's
+  /// default handler halts forever with no breadcrumb), so this turns ANY panic (incl. a core-1 stack overflow)
+  /// into a visible, recoverable, located report. Untagged when no panic was captured this run.
+  pub const PANIC_FLAGS: usize = COMMS_STAGE_BASE + super::COMMS_TASK_COUNT;
+  /// The panic location's file `&str` DATA POINTER (`Location::file().as_ptr() as u32`). The file literal lives in
+  /// `.rodata`/flash, so the pointer is stable across a software reset OF THE SAME IMAGE — re-read it at BOOT (full
+  /// stack) to format the report. Guarded by [`PANIC_BUILD_ID`] so a pointer from a DIFFERENT flashed image is not
+  /// dereferenced as garbage.
+  pub const PANIC_FILE_PTR: usize = PANIC_FLAGS + 1;
+  /// The panic location file string LENGTH (`Location::file().len() as u32`).
+  pub const PANIC_FILE_LEN: usize = PANIC_FLAGS + 2;
+  /// The panic location LINE number (`Location::line()`).
+  pub const PANIC_LINE: usize = PANIC_FLAGS + 3;
+  /// A build identity word, written by the panic handler from a per-build constant ([`super::BUILD_ID`]). The boot
+  /// decoder dereferences [`PANIC_FILE_PTR`] ONLY when this matches the running image's `BUILD_ID` — so a breadcrumb
+  /// left by a DIFFERENT flashed image (where the same flash address holds different bytes) is reported without its
+  /// (now-meaningless) file string rather than reading garbage.
+  pub const PANIC_BUILD_ID: usize = PANIC_FLAGS + 4;
+  /// First word of the snapshot ring (after the comms-stage + panic slots). Each snapshot is [`super::SNAP_WORDS`]
+  /// words.
+  pub const RING_BASE: usize = PANIC_BUILD_ID + 1;
 }
 
 /// Number of instrumented core-0 tasks, each with its own comms-stage breadcrumb slot. One per [`CommsTask`].
@@ -270,6 +315,38 @@ pub fn comms_stage_is_idle(packed: u32) -> bool {
   matches!((packed & 0xFF) as u8, 0 | 1 | 3 | 12 | 14)
 }
 
+/// Tag in the high half of the [`idx::PANIC_FLAGS`] word, marking a real panic capture vs cold-boot garbage.
+const PANIC_TAG: u32 = 0x5041_0000; // "PA".
+
+/// Bit in [`idx::PANIC_FLAGS`] set when the panic carried a source [`core::panic::Location`] (file + line).
+const PANIC_HAS_LOCATION: u32 = 1 << 8;
+
+/// Record a PANIC into the breadcrumb from the custom `#[panic_handler]`, then the caller `software_reset()`s. This
+/// MUST be minimal-stack and allocation/lock/format-free: the panic may be a STACK OVERFLOW, so the handler runs on
+/// a nearly-exhausted stack. It does only a handful of raw [`Ordering::Relaxed`] stores into the fixed RTC_FAST
+/// array — NO formatting (the file string is stored as a raw `.rodata` POINTER + length and re-read at BOOT where
+/// there is full stack), NO locks, NO `match` beyond the `Option`. `core` is `Cpu::current() as u8`. When
+/// `location` is `None`, the location bit stays clear and the pointer/len/line are zeroed. [`BUILD_ID`] is stamped
+/// so the boot decoder only dereferences the pointer against the same image.
+///
+/// Marked `#[inline(never)]` so it is one flat frame (minimizing the Xtensa windowed-ABI window-spill depth) and so
+/// the panic handler's frame stays small regardless of how `core::fmt`-heavy the surrounding panic machinery is.
+#[inline(never)]
+pub fn record_panic(core: u8, file_ptr: u32, file_len: u32, line: u32, has_location: bool) {
+  let flags = PANIC_TAG | (if has_location { PANIC_HAS_LOCATION } else { 0 }) | ((core & 0x3) as u32);
+  // Store fields individually (no struct on the stack). The order is irrelevant — the reset happens after all of
+  // them in the caller, and there is no concurrent reader (the read side runs only after the reset).
+  BREADCRUMB[idx::PANIC_FILE_PTR].store(file_ptr, Ordering::Relaxed);
+  BREADCRUMB[idx::PANIC_FILE_LEN].store(file_len, Ordering::Relaxed);
+  BREADCRUMB[idx::PANIC_LINE].store(line, Ordering::Relaxed);
+  BREADCRUMB[idx::PANIC_BUILD_ID].store(BUILD_ID, Ordering::Relaxed);
+  // Stamp the validity MAGIC too: normally it is already set from this boot's `init_magic`, but a panic in EARLY
+  // init (before `init_magic` ran) would otherwise leave the breadcrumb looking invalid. One more cheap store.
+  BREADCRUMB[idx::MAGIC].store(MAGIC, Ordering::Relaxed);
+  // Flags LAST so a reader that somehow saw a torn write still requires the tag (written here) to decode anything.
+  BREADCRUMB[idx::PANIC_FLAGS].store(flags, Ordering::Relaxed);
+}
+
 /// Why the core-0 watchdog task WITHHELD the feed to deliberately force a reset. Recorded in the breadcrumb so the
 /// boot dump can name the wedge CLASS, distinct from the core-1 executor's last [`Stage`]. Stable on-wire values
 /// (a reboot decodes them) — APPEND, never renumber.
@@ -391,6 +468,21 @@ pub struct Snapshot {
   pub core1_beat: u32,
 }
 
+/// A decoded PANIC capture from the breadcrumb. The file string is recovered at BOOT (full stack) from the stored
+/// `.rodata` pointer+len — but ONLY when the stored build id matched the running image (else `file` is `None`, the
+/// pointer being meaningless against a different image). `core` is the panicking CPU (0 = ProCpu, 1 = AppCpu).
+#[derive(Clone, Copy)]
+pub struct PanicReport {
+  /// The panicking core: 0 = ProCpu (core 0), 1 = AppCpu (core 1). A core-1 panic is the stack-overflow prime
+  /// suspect.
+  pub core: u8,
+  /// The source line number, or 0 when the panic carried no location.
+  pub line: u32,
+  /// The recovered source-file string, or `None` when the panic had no location OR the breadcrumb came from a
+  /// different flashed image (stale pointer — see [`BUILD_ID`]).
+  pub file: Option<&'static str>,
+}
+
 /// A decoded copy of the breadcrumb, read once at boot. Decoupled from the live RTC_FAST static so the boot path
 /// can consume + clear the magic immediately (avoiding a re-emit of a stale crumb on a later, unrelated boot) yet
 /// still hold the data to format the `[MSG:...]` line and re-emit it on the first `$I`/status after connect.
@@ -409,6 +501,9 @@ pub struct Breadcrumb {
   /// parked on at the reset (decode via [`comms_stage_label`]; idle-class via [`comms_stage_is_idle`]). The slot
   /// holding a NON-idle stage on a comms wedge is the stuck task.
   pub comms_stages: [u32; COMMS_TASK_COUNT],
+  /// The decoded PANIC capture, IF the custom panic handler ran this run (a panic / CPU fault / core-1 stack
+  /// overflow). `None` when no panic was captured. This is an INDEPENDENT class from the watchdog/RMT/comms dumps.
+  pub panic: Option<PanicReport>,
   /// The snapshots, NEWEST first (index 0 is the most recent). Empty-seq entries are filtered by the formatter.
   pub snapshots: [Snapshot; RING_LEN],
 }
@@ -450,6 +545,35 @@ pub fn take_breadcrumb() -> Breadcrumb {
   // The per-task comms-stage slots, in `CommsTask` order.
   let comms_stages: [u32; COMMS_TASK_COUNT] =
     core::array::from_fn(|i| BREADCRUMB[idx::COMMS_STAGE_BASE + i].load(Ordering::Relaxed));
+  // Decode the PANIC capture iff its tag is present. The file string is recovered from the stored `.rodata`
+  // pointer+len, but ONLY when the stored build id matches THIS image's `BUILD_ID` (else the pointer is a stale
+  // address from a different flashed image — report the panic without the file rather than reading garbage).
+  let panic_flags = BREADCRUMB[idx::PANIC_FLAGS].load(Ordering::Relaxed);
+  let panic = if panic_flags & 0xFFFF_0000 == PANIC_TAG {
+    let core = (panic_flags & 0x3) as u8;
+    let line = BREADCRUMB[idx::PANIC_LINE].load(Ordering::Relaxed);
+    let same_image = BREADCRUMB[idx::PANIC_BUILD_ID].load(Ordering::Relaxed) == BUILD_ID;
+    let file = if panic_flags & PANIC_HAS_LOCATION != 0 && same_image {
+      let ptr = BREADCRUMB[idx::PANIC_FILE_PTR].load(Ordering::Relaxed) as *const u8;
+      let len = BREADCRUMB[idx::PANIC_FILE_LEN].load(Ordering::Relaxed) as usize;
+      // SAFETY: `ptr`/`len` came from `Location::file()` of the SAME image (build id matched), which is a
+      // `&'static str` literal in `.rodata`/flash. Flash is not reloaded across a software reset, so the address
+      // and length are still valid and point at the same UTF-8 bytes. We read at BOOT, after flash cache is up.
+      // A sanity bound on `len` guards against a torn write yielding an absurd length AND keeps the recovered file
+      // string within the `[MSG:CRASH panic ...]` line's RESPONSE_CAPACITY budget (a real source path is far under).
+      if !ptr.is_null() && len > 0 && len <= 120 {
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        core::str::from_utf8(bytes).ok()
+      } else {
+        None
+      }
+    } else {
+      None
+    };
+    Some(PanicReport { core, line, file })
+  } else {
+    None
+  };
   // The newest snapshot is at `(head + RING_LEN - 1) % RING_LEN`; walk backwards so index 0 is the most recent.
   let head = (BREADCRUMB[idx::HEAD].load(Ordering::Relaxed) as usize) % RING_LEN;
   let snapshots = core::array::from_fn(|i| {
@@ -461,15 +585,17 @@ pub fn take_breadcrumb() -> Breadcrumb {
       core1_beat: BREADCRUMB[base + 2].load(Ordering::Relaxed),
     }
   });
-  // Consume: clear the magic, the withhold word, the RMT-flags tag, AND every comms-stage slot so this crumb is
-  // reported exactly once and no stale marker bleeds into a later, unrelated reset. `init_magic` re-stamps magic.
+  // Consume: clear the magic, the withhold word, the RMT-flags tag, the PANIC-flags tag, AND every comms-stage slot
+  // so this crumb is reported exactly once and no stale marker bleeds into a later, unrelated reset. `init_magic`
+  // re-stamps magic.
   BREADCRUMB[idx::MAGIC].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::WITHHOLD].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::RMT_FLAGS].store(0, Ordering::Relaxed);
+  BREADCRUMB[idx::PANIC_FLAGS].store(0, Ordering::Relaxed);
   for i in 0..COMMS_TASK_COUNT {
     BREADCRUMB[idx::COMMS_STAGE_BASE + i].store(0, Ordering::Relaxed);
   }
-  Breadcrumb { valid, last_stage, withhold, rmt_hang, comms_stages, snapshots }
+  Breadcrumb { valid, last_stage, withhold, rmt_hang, comms_stages, panic, snapshots }
 }
 
 /// Decode a packed last-stage marker into a short, stable label (e.g. `"axis1:wait_begin"`). Returns `"?"` for a
