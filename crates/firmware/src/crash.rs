@@ -130,9 +130,26 @@ mod idx {
   /// left by a DIFFERENT flashed image (where the same flash address holds different bytes) is reported without its
   /// (now-meaningless) file string rather than reading garbage.
   pub const PANIC_BUILD_ID: usize = PANIC_FLAGS + 4;
+  /// The USB-TX-stall discriminator (packed by `firmware_core::diag::pack_usb_tx_stall`, tagged). Written by the
+  /// `usb_tx` bounded-escape (after [`USB_TX_STALL_ESCAPE_K`](firmware_core::diag::USB_TX_STALL_ESCAPE_K)
+  /// consecutive write timeouts) just before its `software_reset()`, capturing the firmware-only signals that
+  /// distinguish a host-not-reading stall from a lost USB TX-done wake (H-A) or a downstream core-1 wedge (H-B) —
+  /// the §11 streaming-lockup discriminator, post-mortem over CDC. Untagged when no USB-TX stall fired this run.
+  pub const USB_TX_STALL: usize = PANIC_BUILD_ID + 1;
+  /// Monotonic count of RMT-wait-timeout firings this run (the `motion.rs` `emit_burst` bounded-wait timeout
+  /// branch). The RMT path STILL resets on its FIRST timeout (unchanged), so this is normally 0 or 1 — but
+  /// carrying it lets the boot dump POSITIVELY exclude the RMT theory: `usb_tx_timeouts >= K && rmt_wait_timeouts
+  /// == 0` nails the drumbeat as USB-TX, not RMT, by evidence rather than inference (§11.1). No tag — a plain
+  /// saturating count, valid only when the breadcrumb [`MAGIC`] is set.
+  pub const RMT_WAIT_COUNT: usize = PANIC_BUILD_ID + 2;
+  /// The last-seen runtime count of RECOVERED lost-wake writes (`USB_TX_LOST_WAKE_RECOVERED`), mirrored here on each
+  /// recovery bump so a partial-fix K-escape reset still surfaces the PRIOR run's recovered total at the next boot.
+  /// The §12 lost-wake bug is RARE/BURSTY, so a burst that recovers some wakes then still wedges (one slips through)
+  /// would otherwise lose the count on the reset — this preserves it. `0` means no recovery happened (or cold boot).
+  pub const RECOVERED_COUNT: usize = PANIC_BUILD_ID + 3;
   /// First word of the snapshot ring (after the comms-stage + panic slots). Each snapshot is [`super::SNAP_WORDS`]
   /// words.
-  pub const RING_BASE: usize = PANIC_BUILD_ID + 1;
+  pub const RING_BASE: usize = PANIC_BUILD_ID + 4;
 }
 
 /// Number of instrumented core-0 tasks, each with its own comms-stage breadcrumb slot. One per [`CommsTask`].
@@ -434,6 +451,35 @@ pub fn record_rmt_hang(hang: &RmtHang) {
   BREADCRUMB[idx::RMT_BURST_SEQ].store(hang.burst_seq, Ordering::Relaxed);
 }
 
+/// Record the USB-TX-stall discriminator into the breadcrumb (called from `usb_tx`'s bounded escape, BEFORE the
+/// board resets). The `word` is already packed by [`firmware_core::diag::pack_usb_tx_stall`] at the call site (the
+/// pure, host-tested encoder), so this is a SINGLE relaxed store of an opaque tagged word — keeping the bit layout
+/// owned by the tested module and crash.rs purely the RTC_FAST storage. Read only after the reset, no ordering.
+pub fn record_usb_tx_stall(word: u32) {
+  BREADCRUMB[idx::USB_TX_STALL].store(word, Ordering::Relaxed);
+}
+
+/// Bump the monotonic RMT-wait-timeout count (called from `motion.rs` `emit_burst`'s timeout branch, BEFORE its
+/// existing reset). The RMT path is UNCHANGED — it still resets on the first timeout — so this is normally 0 or 1;
+/// it exists so the boot dump can POSITIVELY show the RMT path did not fire while the USB-TX escape did (the §11.1
+/// clean exclusion). Saturating so a (single, pre-reset) bump can never wrap. A read-modify-write relaxed store is
+/// safe: the only writer is the single core-1 executor, read only after the reset.
+pub fn bump_rmt_wait_timeout() {
+  let n = BREADCRUMB[idx::RMT_WAIT_COUNT].load(Ordering::Relaxed).saturating_add(1);
+  BREADCRUMB[idx::RMT_WAIT_COUNT].store(n, Ordering::Relaxed);
+  // Stamp MAGIC so a timeout captured before this boot's `init_magic` (it runs early, but be safe) is still valid.
+  BREADCRUMB[idx::MAGIC].store(MAGIC, Ordering::Relaxed);
+}
+
+/// Mirror the runtime recovered-lost-wake count into the breadcrumb (called from `usb_tx` on each recovery). A
+/// single relaxed store of the already-incremented count, so a partial-fix K-escape reset surfaces the PRIOR run's
+/// recovered total at the next boot (the §12 bug is rare/bursty — a burst that recovers some wakes then still wedges
+/// would otherwise lose the count). Read only after a reset; no ordering. MAGIC is already set from this boot's
+/// `init_magic` by the time any write happens, so no extra stamp is needed here.
+pub fn record_recovered_count(count: u32) {
+  BREADCRUMB[idx::RECOVERED_COUNT].store(count, Ordering::Relaxed);
+}
+
 /// Stamp the validity [`MAGIC`] into the breadcrumb. Called once at boot AFTER the previous run's breadcrumb has
 /// been read back, so this run's markers/snapshots are recognized as valid on the NEXT boot. Idempotent.
 pub fn init_magic() {
@@ -504,6 +550,18 @@ pub struct Breadcrumb {
   /// The decoded PANIC capture, IF the custom panic handler ran this run (a panic / CPU fault / core-1 stack
   /// overflow). `None` when no panic was captured. This is an INDEPENDENT class from the watchdog/RMT/comms dumps.
   pub panic: Option<PanicReport>,
+  /// The decoded USB-TX-stall discriminator, IF `usb_tx`'s bounded escape fired this run (the §11 drumbeat
+  /// capture). `None` when no USB-TX stall was captured. Its [`UsbTxVerdict`](firmware_core::diag::UsbTxVerdict)
+  /// names host-not-reading vs lost-TX-wake (H-A) vs core-1-wedged (H-B).
+  pub usb_tx_stall: Option<firmware_core::diag::UsbTxStall>,
+  /// The monotonic RMT-wait-timeout count this run (normally 0; 1 if the RMT path reset on its first timeout). With
+  /// a captured [`usb_tx_stall`](Self::usb_tx_stall) whose `timeout_count >= K` and this `== 0`, the boot dump
+  /// POSITIVELY excludes the RMT theory for the drumbeat (§11.1).
+  pub rmt_wait_count: u32,
+  /// The PRIOR run's RECOVERED lost-wake count (mirrored from `USB_TX_LOST_WAKE_RECOVERED`). Non-zero on a boot that
+  /// followed a partial-fix K-escape reset where the poll-after-arm recovered some lost wakes before one still
+  /// wedged — the boot dump emits it as `[MSG:USBTX rec=N]` so the bursty bug's recovery activity is not lost.
+  pub recovered_count: u32,
   /// The snapshots, NEWEST first (index 0 is the most recent). Empty-seq entries are filtered by the formatter.
   pub snapshots: [Snapshot; RING_LEN],
 }
@@ -574,6 +632,11 @@ pub fn take_breadcrumb() -> Breadcrumb {
   } else {
     None
   };
+  // Decode the USB-TX-stall discriminator via the pure, host-tested decoder (returns `None` if untagged). The
+  // monotonic RMT-wait-timeout count is a plain word, meaningful only alongside a valid breadcrumb.
+  let usb_tx_stall = firmware_core::diag::decode_usb_tx_stall(BREADCRUMB[idx::USB_TX_STALL].load(Ordering::Relaxed));
+  let rmt_wait_count = BREADCRUMB[idx::RMT_WAIT_COUNT].load(Ordering::Relaxed);
+  let recovered_count = BREADCRUMB[idx::RECOVERED_COUNT].load(Ordering::Relaxed);
   // The newest snapshot is at `(head + RING_LEN - 1) % RING_LEN`; walk backwards so index 0 is the most recent.
   let head = (BREADCRUMB[idx::HEAD].load(Ordering::Relaxed) as usize) % RING_LEN;
   let snapshots = core::array::from_fn(|i| {
@@ -592,10 +655,24 @@ pub fn take_breadcrumb() -> Breadcrumb {
   BREADCRUMB[idx::WITHHOLD].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::RMT_FLAGS].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::PANIC_FLAGS].store(0, Ordering::Relaxed);
+  BREADCRUMB[idx::USB_TX_STALL].store(0, Ordering::Relaxed);
+  BREADCRUMB[idx::RMT_WAIT_COUNT].store(0, Ordering::Relaxed);
+  BREADCRUMB[idx::RECOVERED_COUNT].store(0, Ordering::Relaxed);
   for i in 0..COMMS_TASK_COUNT {
     BREADCRUMB[idx::COMMS_STAGE_BASE + i].store(0, Ordering::Relaxed);
   }
-  Breadcrumb { valid, last_stage, withhold, rmt_hang, comms_stages, panic, snapshots }
+  Breadcrumb {
+    valid,
+    last_stage,
+    withhold,
+    rmt_hang,
+    comms_stages,
+    panic,
+    usb_tx_stall,
+    rmt_wait_count,
+    recovered_count,
+    snapshots,
+  }
 }
 
 /// Decode a packed last-stage marker into a short, stable label (e.g. `"axis1:wait_begin"`). Returns `"?"` for a

@@ -380,6 +380,11 @@ impl StepSink for RmtStepSink {
           // still in its hung state — before stop_tx perturbs it), then DETERMINISTICALLY reset. `len` is this
           // burst's symbol count (events + end marker).
           mtrace!("motion: axis {=usize} wait TIMEOUT -> capturing RMT state + resetting", axis);
+          // Bump the monotonic RMT-wait-timeout count (the RMT path STILL resets on this first timeout — unchanged).
+          // Carrying the count lets the boot dump POSITIVELY exclude the RMT theory for the §11 drumbeat: a captured
+          // `usbtx:` discriminator with `n>=K` alongside `rmt_to=0` proves the drumbeat was the USB-TX path, not
+          // this RMT path firing repeatedly (which it cannot — one timeout here = one reset).
+          crate::crash::bump_rmt_wait_timeout();
           capture_rmt_hang(axis as u8, len as u16, self.burst_seq);
           // Drop the transaction so the S3's immediate `stop_tx` halts the runaway channel (no drop-hang, since
           // `rmt_has_tx_immediate_stop`), then force a full software reset. We reset DIRECTLY rather than abandoning
