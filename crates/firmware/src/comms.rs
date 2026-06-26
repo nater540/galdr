@@ -389,6 +389,16 @@ pub static MOTION_LIVENESS: AtomicU32 = AtomicU32::new(0);
 /// feed-task self-bump (removed). `Relaxed` lock-free; only advancement (not magnitude) is read.
 pub static COMMS_PROGRESS: AtomicU32 = AtomicU32::new(0);
 
+/// Count of LOST-WAKE writes the [`usb_tx`] poll-after-arm recheck RECOVERED this run (a 2 s write timeout where the
+/// host had in fact drained the FIFO — only esp-hal's completion wake was lost; the §12 root cause). A live "the
+/// lost-wake bug is still firing but is being recovered" signal: a non-zero, CLIMBING value while a stream RUNS TO
+/// COMPLETION proves the fix is doing real work on THIS hardware (vs the bug merely not firing — it is RARE/BURSTY,
+/// so a quiet run reads 0 and is INCONCLUSIVE, not a failure). Surfaced TWO ways: live on the `$I` build-info query
+/// as a `[MSG:USBTX rec=N]` line, AND — mirrored into the RTC_FAST breadcrumb on each bump — on the next boot after a
+/// partial-fix K-escape reset (so a burst that still wedged is not lost). `Relaxed`: a diagnostic counter, bumped
+/// only on the recovered path, read on demand.
+pub static USB_TX_LOST_WAKE_RECOVERED: AtomicU32 = AtomicU32::new(0);
+
 /// Host RX-activity counter: bumped by [`usb_rx`] on every received byte, so the watchdog can tell whether a HOST is
 /// actively driving the firmware (skirnir polls `?` ~5 Hz whenever connected, so bytes flow continuously while
 /// connected). This is the CRITICAL guard against a reset-loop on a quiescent or disconnected board: the comms-stall
@@ -857,10 +867,10 @@ pub async fn send_banner() {
 /// so they can be RE-EMITTED on the first `$I`/status request after a host connects. The native-USB link
 /// re-enumerates on the watchdog reset, so a host that reconnects a beat late would miss the boot-time emission;
 /// stashing the lines here and replaying them on the first `$I`/`?` closes that race. Empty once there is nothing
-/// left to replay. A `heapless::Vec<Response, 3>` behind the cross-core blocking mutex keeps it `Send` and
+/// left to replay. A `heapless::Vec<Response, 6>` behind the cross-core blocking mutex keeps it `Send` and
 /// allocation-free; each `Response` is far under [`RESPONSE_CAPACITY`], so splitting into separate lines (rather
-/// than one over-long line) keeps every line in budget.
-static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 4>>> =
+/// than one over-long line) keeps every line in budget. Capacity 6 = panic + summary + rmt + usbtx + comms + rec lines.
+static CRASH_REPORT: BlockingMutex<CriticalSectionRawMutex, Cell<heapless::Vec<Response, 6>>> =
   BlockingMutex::new(Cell::new(heapless::Vec::new()));
 
 /// Format the previous run's crash breadcrumb into grbl `[MSG:CRASH ...]` line(s), emit them ONCE over the normal
@@ -885,7 +895,7 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
   // by the custom `#[panic_handler]`) goes FIRST when present, as it is the most decisive datum. Then the summary,
   // and (when present) the RMT register-detail and the per-task comms-stage breakdown — each its own line so none
   // exceeds RESPONSE_CAPACITY.
-  let mut lines: heapless::Vec<Response, 4> = heapless::Vec::new();
+  let mut lines: heapless::Vec<Response, 6> = heapless::Vec::new();
   if let Some(panic) = breadcrumb.panic.as_ref()
     && let Some(panic_line) = format_panic_report(panic)
   {
@@ -897,8 +907,24 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
   {
     let _ = lines.push(rmt_line);
   }
+  // The USB-TX-stall discriminator line (the §11 drumbeat capture): present only when `usb_tx`'s bounded escape
+  // fired this run. Its verdict + the rmt-wait-count POSITIVELY classify the drumbeat (USB-TX vs RMT vs host-side).
+  if let Some(stall) = breadcrumb.usb_tx_stall.as_ref()
+    && let Some(usbtx_line) = format_usb_tx_stall_report(stall, breadcrumb.rmt_wait_count)
+  {
+    let _ = lines.push(usbtx_line);
+  }
   if let Some(comms_line) = format_comms_stage_report(&breadcrumb.comms_stages) {
     let _ = lines.push(comms_line);
+  }
+  // The PERSISTED lost-wake recovered count (the §12 fix readout, boot half): non-zero only after a partial-fix
+  // K-escape reset where the poll-after-arm recovered some wakes before one still wedged. Emitting it here means a
+  // bursty bug's recovery activity survives the reset and is read on the next boot (the live `$I` readout covers
+  // the no-reset case).
+  if breadcrumb.recovered_count > 0
+    && let Some(rec_line) = format_usb_tx_recovered(breadcrumb.recovered_count)
+  {
+    let _ = lines.push(rec_line);
   }
   // Stash a copy for the first-`$I`/`?` replay (reconnect race), then emit now over the guaranteed-delivery path.
   CRASH_REPORT.lock(|c| c.set(lines.clone()));
@@ -911,7 +937,7 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
 /// the boot emission). Returns an empty `Vec` once nothing is pending. Called from the `$I` build-info handler and
 /// the status responder so a host that reconnected late after the watchdog reset still receives the `[MSG:CRASH ...]`
 /// line(s).
-fn take_pending_crash_report() -> heapless::Vec<Response, 4> {
+fn take_pending_crash_report() -> heapless::Vec<Response, 6> {
   CRASH_REPORT.lock(|c| c.take())
 }
 
@@ -1006,6 +1032,39 @@ fn format_rmt_hang_report(hang: &crate::crash::RmtHang) -> Option<Response> {
     hang.int_st,
     hang.tx_status,
     hang.tx_conf0,
+  );
+  let mut out = Response::new();
+  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
+  Some(out)
+}
+
+/// Format the captured USB-TX-stall discriminator into a `[MSG:CRASH usbtx: ...]` line — the §11 drumbeat capture.
+/// The DECISIVE field is `verdict`, classified by the pure, host-tested [`firmware_core::diag::UsbTxStall::verdict`]:
+/// `host-not-reading` (the EP1 IN FIFO is full because the host stopped draining — host/skirnir side, peripheral
+/// healthy), `lost-tx-wake` (room in the FIFO + the TX-empty event asserted yet the write future never woke — an
+/// esp-hal-side lost USB TX-done wake, §11.4 H-A), `core1-wedged` (core 1 froze mid-block — the USB stall is
+/// downstream of a core-1 wedge, §11.4 H-B), or `ambiguous`. The raw signals back the verdict and split the H-A
+/// sub-flavor: `free` (host drained), `empty` (int_raw TX-empty event), `iena` (int_ena still armed ⇒ the ISR never
+/// ran; both `empty`/`iena` clear ⇒ the ISR ran but the embassy re-poll was lost), `mov`/`exec` (core-1 health),
+/// `rdepth` (RESPONSE backlog). `rmt_to` is the run's RMT-wait-timeout count: `n>=K && rmt_to=0` POSITIVELY excludes
+/// the RMT theory for the drumbeat (§11.1) by evidence, not inference. Its own line so it stays under
+/// [`RESPONSE_CAPACITY`].
+fn format_usb_tx_stall_report(stall: &firmware_core::diag::UsbTxStall, rmt_wait_count: u32) -> Option<Response> {
+  use core::fmt::Write as _;
+  let verdict = firmware_core::diag::usb_tx_verdict_label(stall.verdict());
+  let mut inner: heapless::String<128> = heapless::String::new();
+  let _ = write!(
+    inner,
+    "CRASH usbtx: {} free={} empty={} iena={} mov={} exec={} rdepth={} n={} rmt_to={}",
+    verdict,
+    stall.data_free as u8,
+    stall.serial_in_empty as u8,
+    stall.int_ena_armed as u8,
+    stall.motion_advancing as u8,
+    stall.executor_running as u8,
+    stall.response_depth,
+    stall.timeout_count,
+    rmt_wait_count,
   );
   let mut out = Response::new();
   ResponseWriter::message(&mut out, inner.as_str()).ok()?;
@@ -1343,36 +1402,130 @@ const USB_TX_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[embassy_executor::task]
 pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
+  // The bounded consecutive-timeout escape for the §11 streaming-lockup capture. A COMPLETED write resets it; a
+  // timeout increments it; at `USB_TX_STALL_ESCAPE_K` (= 3 ≈ 6 s) we capture the firmware-only discriminator and
+  // force a breadcrumb-preserving software reset, converting the observed ≈16 s "1 ok / 2 s" drumbeat into a clean
+  // ~6 s self-recover whose `[MSG:CRASH usbtx: ...]` boot dump says WHY the USB TX path stalled (host-not-reading
+  // vs a lost TX-done wake (H-A) vs a downstream core-1 wedge (H-B)). The counter lives across loop turns.
+  let mut stall = firmware_core::diag::UsbTxStallCounter::new();
   loop {
     crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWaitResponse);
     let resp = RESPONSE.receive().await;
-    // Comms-progress heartbeat: a response/ack/status line is leaving the firmware, which is the most direct
-    // evidence the core-0 comms path is making host-facing forward progress. Bumped here (the single writer) so the
-    // task-watchdog sees real output flow; a stuck pipeline produces no responses, so this counter freezes — the
-    // signal the watchdog needs. Bumped BEFORE the write so even a write that the host-closed-port path drops still
-    // counts as "the firmware produced a response" (the wedge is upstream of the writer, not in the USB write).
-    COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    // Sample the core-1 motion beat BEFORE the (possibly 2 s) write, so on a timeout we can tell whether core 1
+    // ADVANCED across the stall window (alive → favors a lost USB wake, H-A) or stayed frozen (favors a core-1
+    // wedge, H-B). A single relaxed load; compared after the write resolves.
+    let motion_before = MOTION_LIVENESS.load(Ordering::Relaxed);
     // BOUND the USB write/flush. esp-hal's async USB-Serial-JTAG write/flush awaits the `serial_in_empty`
     // (TX-FIFO-drained) event, which fires only when the HOST reads; if the host stops draining (it disconnected,
     // or its read lagged) the await NEVER returns, parking usb_tx forever. That backs up `RESPONSE` and
-    // cascade-wedges the whole comms path — confirmed on the board by the comms-stage breadcrumb (`tx=tx-write`
-    // with every producer — the consumer's `ack`/`error`, the line assembler, the status reporter — blocked at
-    // once). A timeout converts that hang into the drop-and-continue the host-closed path already intended: the
-    // host re-syncs on reconnect (the banner resets flow control), so abandoning a response it is not reading is
-    // harmless, while a reading host always completes far within the bound (sub-ms). The bound is shorter than the
-    // watchdog's comms-stall window AND `COMMS_PROGRESS` is bumped each iteration, so a non-draining host degrades
-    // usb_tx gracefully (one dropped response per timeout) instead of wedging or tripping a reset. usb_tx runs on
-    // the core-0 thread-mode executor (it yields), so embassy time advances here — no CCOUNT needed (cf. the
-    // core-1 RMT busy-spin, which froze `Instant`).
+    // cascade-wedges the whole comms path. A timeout converts that hang into the drop-and-continue the host-closed
+    // path already intended: the host re-syncs on reconnect (the banner resets flow control). usb_tx runs on the
+    // core-0 thread-mode executor (it yields), so embassy time advances here — no CCOUNT needed (cf. the core-1 RMT
+    // busy-spin, which froze `Instant`).
     crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWrite);
-    let write = async {
-      tx.write_all(resp.as_bytes()).await?;
-      tx.flush().await
+    // POLL-AFTER-ARM lost-wake recovery (the §12 root-cause fix), with the write and flush timed SEPARATELY so the
+    // recovery can NEVER truncate a >64 B response. esp-hal's async write future completes only when its
+    // `serial_in_empty` waker is delivered; the captured root cause (`[MSG:CRASH usbtx: lost-tx-wake free=1 empty=0
+    // iena=0 ...]`) is that this wake is LOST — the ISR ran (cleared `int_ena`+`int_raw`, woke `WAKER_TX`) but the
+    // embassy executor never re-polled, so a write whose bytes are ALREADY in the FIFO parks the full 2 s
+    // (`UsbSerialJtagWriteFuture::poll` returns Ready iff `int_ena` is clear — it WOULD have completed if re-polled).
+    // We cannot fix esp-hal's internal future, but we layer a polling backstop over its event-driven wait: on a
+    // timeout re-read the "host drained the FIFO" bit and, if set, treat the write as a recovered lost-wake (resets
+    // the stall run) instead of escalating — breaking the drumbeat WITHOUT a reset.
+    //
+    // ## Why write and flush are timed separately (truncation safety, team-lead review)
+    // `write_async` pushes the response in ≤64 B chunks and awaits the TX-empty wake BETWEEN chunks, so a lost-wake
+    // can strand `write_all` AFTER the first chunk — at which point `serial_in_ep_data_free` is `true` (the host
+    // drained chunk 1) yet the REMAINING bytes were never written. Recovering THAT would advance to the next response
+    // and emit a TRUNCATED line. So the recovery is sound ONLY once all bytes are provably in the FIFO — i.e. at the
+    // FLUSH stage. A `write_all` timeout is therefore always a genuine stall (possibly-unwritten bytes → it counts
+    // toward the K-escape; a clean reset beats a silent truncation); only a FLUSH timeout consults `data_free`.
+    // `classify_split` encodes exactly this (host-tested). usb_tx runs on the core-0 thread-mode executor (it
+    // yields), so embassy time advances here — no CCOUNT needed (cf. the core-1 RMT busy-spin, which froze `Instant`).
+    // The write stage has THREE dispositions, decided by the host-tested `classify_write_stage`: a TIMEOUT (`Err`)
+    // is a possibly-mid-write stall; a write ERROR (`Ok(Err)`) is the host having CLOSED the port — NOT a stall, a
+    // clean drop-and-continue that the reconnect / banner path re-syncs, so it must not flow into the flush or count
+    // toward the K-escape (matching the pre-split behavior, which discarded write errors); only `Ok(Ok)` (→ `None`)
+    // means all bytes reached the FIFO and we proceed to flush. (For USB-Serial-JTAG a host close usually surfaces
+    // as a write TIMEOUT, not `Ok(Err)`, so the error arm is rare — but handling it explicitly keeps "write-error ≠
+    // stall" unambiguous.)
+    let write_result = with_timeout(USB_TX_TIMEOUT, tx.write_all(resp.as_bytes())).await;
+    let write_timed_out = write_result.is_err();
+    let write_errored = matches!(write_result, Ok(Err(_)));
+    let outcome = match firmware_core::diag::WriteOutcome::classify_write_stage(write_timed_out, write_errored) {
+      // The write stage already decided it (a mid-write stall, or a host-closed clean drop).
+      Some(o) => o,
+      // Clean write — all bytes are in the FIFO; only the FLUSH stage can now strand on a lost-wake (the sole
+      // recoverable case). Bound the flush, recheck the host-drained bit on a flush timeout, and classify.
+      None => {
+        let flush_timed_out = with_timeout(USB_TX_TIMEOUT, tx.flush()).await.is_err();
+        let data_free_after = if flush_timed_out {
+          esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().serial_in_ep_data_free().bit_is_set()
+        } else {
+          true
+        };
+        // `write_timed_out = false` here (the write completed): `classify_split` defers to the flush-stage classify.
+        firmware_core::diag::WriteOutcome::classify_split(false, flush_timed_out, data_free_after)
+      }
     };
-    // Discards both a timeout (host not draining) and a write error (host closed) — both drop this response and
-    // continue, keeping the comms path alive.
-    let _ = with_timeout(USB_TX_TIMEOUT, write).await;
+    if outcome.is_recovered_lost_wake() {
+      // A recovered lost-wake: count it (a live "the §12 bug fired but we recovered" signal) but do NOT escalate.
+      // The host already has the bytes, so the next `RESPONSE` item proceeds and the comms path keeps flowing
+      // instead of limping at 1 ack / 2 s. The runtime counter is `$I`-readable live; mirror it into the RTC_FAST
+      // breadcrumb so a partial-fix K-escape reset still surfaces the prior run's recovered total at the next boot.
+      let n = USB_TX_LOST_WAKE_RECOVERED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+      crate::crash::record_recovered_count(n);
+    }
+    // Comms-progress heartbeat (the §11.6 watchdog-mask fix): bump ONLY on a non-stall outcome (a completed write OR
+    // a recovered lost-wake — both delivered bytes to the host). A GENUINE stall no longer advances the counter, so
+    // a stalled writer stops masking the 3 s comms-stall watchdog detector (the prior per-loop bump at the 2 s
+    // cadence kept the dog fed and let the wedge limp ~16 s). The other two bumpers (status_responder, comms_consumer)
+    // are unchanged, so a back-pressured-but-answering board still advances the counter.
+    if !outcome.is_stall() {
+      COMMS_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    }
+    if stall.record(outcome.is_stall()) {
+      // K consecutive GENUINE stalls (timeout + FIFO still full = host truly not reading / peripheral stuck): the
+      // lost-wake path now recovers above, so this K-escape is the backstop for a REAL host-not-draining wedge (or a
+      // PARTIAL fix where a wake still slips through). Capture the discriminator and software-reset so the next boot
+      // emits `[MSG:CRASH usbtx: ...]` (now reading `host-not-reading`, or `lost-tx-wake` if recovery missed a case).
+      capture_usb_tx_stall_and_reset(motion_before, stall.count());
+    }
   }
+}
+
+/// Capture the USB-TX-stall discriminator at the K-th consecutive `usb_tx` timeout, then force a software reset so
+/// the next boot emits the `[MSG:CRASH usbtx: ...]` line over CDC. Reads the firmware-only signals that split the
+/// §11.4 hypotheses without any RTT (which is transport-blocked on this board — the defmt sink shares the one
+/// USB-Serial-JTAG with the grbl CDC):
+/// - `ep1_conf.serial_in_ep_data_free` — `false` ⇒ the EP1 IN FIFO is full because the HOST is not draining.
+/// - `int_raw.serial_in_empty` — the raw TX-empty event the async write future waits on (asserted ⇒ the event
+///   fired); paired with `int_ena.serial_in_empty` (still ARMED?) to tell a lost-waker from a never-serviced ISR.
+/// - the core-1 [`MOTION_LIVENESS`] delta vs `motion_before` (did core 1 advance during the stall window?) plus
+///   [`EXECUTOR_RUNNING`] (was a block in flight?) — the H-A-vs-H-B core-1-health test.
+/// - the `RESPONSE` channel depth — confirms the writer is the head-of-line bottleneck.
+///
+/// The register reads are plain, side-effect-free volatile loads of the USB_DEVICE block (no lock, safe from this
+/// task), mirroring `motion.rs`'s `capture_rmt_hang`. `software_reset()` is `CoreSw`, which preserves RTC_FAST.
+/// `-> !`: this never returns (it resets the chip).
+fn capture_usb_tx_stall_and_reset(motion_before: u32, timeout_count: u16) -> ! {
+  let usb = esp_hal::peripherals::USB_DEVICE::regs();
+  let ep1 = usb.ep1_conf().read();
+  let int_raw = usb.int_raw().read();
+  let int_ena = usb.int_ena().read();
+  let stall = firmware_core::diag::UsbTxStall {
+    data_free: ep1.serial_in_ep_data_free().bit_is_set(),
+    serial_in_empty: int_raw.serial_in_empty().bit_is_set(),
+    int_ena_armed: int_ena.serial_in_empty().bit_is_set(),
+    // Core 1 advanced across the stall window ⇒ still scheduling (favors a lost USB wake, not a core-1 wedge).
+    motion_advancing: MOTION_LIVENESS.load(Ordering::Relaxed) != motion_before,
+    executor_running: EXECUTOR_RUNNING.load(Ordering::Acquire),
+    // The depth-8 RESPONSE channel's current occupancy; clamps into the nibble in the packer.
+    response_depth: RESPONSE.len().min(u8::MAX as usize) as u8,
+    timeout_count,
+  };
+  crate::crash::record_usb_tx_stall(firmware_core::diag::pack_usb_tx_stall(&stall));
+  esp_hal::system::software_reset();
 }
 
 /// The real parser → planner consumer (replaces the Stage-1 stub). It is the SINGLE, in-order consumer of
@@ -4235,9 +4388,31 @@ async fn send_build_info(extended: bool) {
   if ResponseWriter::build_info(&mut s, extended).is_ok() {
     enqueue(s).await;
   }
+  // Surface the live lost-wake recovery count (the §12 fix-confirmation signal) on `$I` so the host can read it on
+  // demand WITHOUT a wedge/reset: a climbing `rec=` while a stream runs to completion PROVES lost wakes occurred AND
+  // were recovered (not merely that the rare/bursty wedge didn't fire). Emitted only when non-zero so a clean run
+  // adds no line. A formatting/capacity failure simply skips it; the `ok` still terminates the response.
+  let recovered = USB_TX_LOST_WAKE_RECOVERED.load(Ordering::Relaxed);
+  if recovered > 0 {
+    if let Some(line) = format_usb_tx_recovered(recovered) {
+      enqueue(line).await;
+    }
+  }
   for line in take_pending_crash_report() {
     enqueue(line).await;
   }
+}
+
+/// Render the `[MSG:USBTX rec=N]` line for the live `$I` lost-wake-recovery readout (and reused by the boot dump for
+/// the persisted prior-run count). Returns `None` only on a formatting/capacity failure (never in practice — the
+/// line is tiny). Pure formatting; no I/O.
+fn format_usb_tx_recovered(recovered: u32) -> Option<Response> {
+  use core::fmt::Write as _;
+  let mut inner: heapless::String<32> = heapless::String::new();
+  write!(inner, "USBTX rec={recovered}").ok()?;
+  let mut out = Response::new();
+  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
+  Some(out)
 }
 
 /// Queue the `$G` parser-state line, rendered from the consumer's live parser modal state so the host sees

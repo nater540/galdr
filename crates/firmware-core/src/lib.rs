@@ -20,6 +20,7 @@ pub use cnc_kinematics::{gcode, motion, planner};
 
 pub mod coolant;
 pub mod coords;
+pub mod diag;
 pub mod drivers;
 pub mod hal_traits;
 pub mod homing;
