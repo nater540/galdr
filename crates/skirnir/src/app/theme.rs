@@ -154,9 +154,11 @@ impl Palette {
       log_status: rgb(0x9B7FE0),
       log_info: rgb(0xE0A33E),
       log_notice: rgb(0x5C5C5C),
-      // The toolpath cut/rapid trails reuse the motion/control accents; the grid is the panel fill at two
-      // intensities (major = panel, minor = panel dimmed). These match what `views.rs` hard-coded before.
-      toolpath_cut: rgb(0xFF7A1A),
+      // The cut trail/marker base colour is yellow; the live trail shades it darker by cut depth (the deeper the
+      // pass, the dimmer the line). The rapid token is retained for config compatibility but no longer drawn — the
+      // trail records only below-surface cuts now. The grid is the panel fill at two intensities (major = panel,
+      // minor = panel dimmed).
+      toolpath_cut: rgb(0xFFE000),
       toolpath_rapid: rgb(0x0E86D4),
       grid_major: rgb(0x1B1B1B),
       grid_minor: rgb(0x0D0D0D),

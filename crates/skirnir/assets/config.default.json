@@ -38,7 +38,7 @@
         "log_status": "#9B7FE0",
         "log_info": "#E0A33E",
         "log_notice": "#5C5C5C",
-        "toolpath_cut": "#FF7A1A",
+        "toolpath_cut": "#FFE000",
         "toolpath_rapid": "#0E86D4",
         "grid_major": "#1B1B1B",
         "grid_minor": "#0D0D0D"
