@@ -63,23 +63,54 @@ pub fn trail_connects(a: ModelPoint, b: ModelPoint, max_gap: f32) -> bool {
   dist_sq(a, b) <= max_gap * max_gap
 }
 
-/// Classify a trail point as a rapid (non-cutting travel) move from the live realized feed rate, so the trail can
-/// colour rapids apart from cuts. The firmware reports the REALIZED feed (`FS:`), which for a G0 is the machine's
-/// rapid traverse rate — faster than any programmed cutting feed. So a realized feed above the program's maximum
-/// programmed feed (scaled by the live feed-override fraction, with `margin` of headroom) is a rapid; at or below
-/// it is a cut. Returns `false` (cut) when the feed is unknown or the program declares no cutting feed
-/// (`max_programmed_feed <= 0`), so an unclassifiable point takes the cut colour rather than mislabelling travel.
-/// Pure so the classification is unit-tested. (Edge case: an extreme feed-override-up combined with a programmed
-/// cut feed near the rapid rate can misclassify; the common cases — modest overrides, rapid rate well above cut
-/// feeds — are robust.)
-pub fn is_rapid_feed(feed: Option<f64>, max_programmed_feed: f64, feed_override_frac: f64, margin: f64) -> bool {
-  let Some(feed) = feed else {
-    return false;
-  };
-  if max_programmed_feed <= 0.0 {
-    return false;
+/// Whether a drawn line segment should JOIN a trail point to its predecessor, combining the two break reasons. A
+/// segment is drawn only when BOTH hold: the point does NOT begin a fresh stroke (`!stroke_start`), and the two
+/// points are close enough to connect (`within_gap`, from [`trail_connects`]). A `stroke_start` point is the first
+/// cut after a pen-up lift (the tool rapided/retracted to Z >= 0 between cuts), so joining it to the previous cut
+/// would streak a line straight across the travel the tool never cut — exactly the cross-gap artefact this guards.
+/// The distance gate still breaks an in-stroke teleport/reconnect. Pure so the combined rule is unit-tested.
+pub fn connect_trail_segment(stroke_start: bool, within_gap: bool) -> bool {
+  !stroke_start && within_gap
+}
+
+/// The dimmest a depth-shaded cut line is drawn, as a fraction of the base cut colour's brightness — the value the
+/// deepest pass (the program's most negative Z) is darkened to. The shallowest cut (Z just below zero) draws at the
+/// full base colour (`1.0`); everything between interpolates linearly toward this floor. Kept here as one tunable so
+/// the depth-cue contrast is adjusted in a single place; ~0.35 keeps the deepest pass clearly visible (not black)
+/// while still reading as "deeper" against the bright shallow passes.
+pub const DEPTH_BRIGHTNESS_FLOOR: f32 = 0.35;
+
+/// Whether the live work-Z marks a CUT that should be drawn into the progress trail, returning the cut DEPTH (a
+/// negative Z) when so and `None` otherwise. The rule is purely the Z sign: at or above the work zero (`z >= 0`) the
+/// tool is at/above the surface — a rapid, a clearance/travel move, a retract — and draws nothing; below zero
+/// (`z < 0`) the tool is engaged in the work and the segment into this point is a cut. This replaces the earlier
+/// feed-rate rapid/cut classification: the Z sign is unambiguous where realized feed was not. An unknown Z (no
+/// derivable work position this frame) is `None` — no segment, rather than a guessed cut. Pure so the gate is
+/// unit-tested without a window.
+pub fn cut_segment_depth(z: Option<f32>) -> Option<f32> {
+  match z {
+    Some(z) if z < 0.0 => Some(z),
+    _ => None,
   }
-  feed > max_programmed_feed * feed_override_frac.max(0.01) * margin
+}
+
+/// Map a cut DEPTH (a negative work-Z) to a brightness fraction in `[DEPTH_BRIGHTNESS_FLOOR, 1.0]`, job-relative:
+/// the shallowest cut (`z` just below 0) is brightest (`1.0`, the full base colour) and the program's DEEPEST pass
+/// (`z == job_min_z`, the most negative programmed Z) is darkest (the floor). The caller multiplies the base cut
+/// colour by this fraction, so a single base colour shades by depth without a second theme token.
+///
+/// `job_min_z` is the program's minimum (most negative) Z, scanned once at load. The normalised depth is
+/// `t = z / job_min_z` clamped to `[0, 1]` (both `z` and `job_min_z` are negative, so the ratio is positive), and
+/// brightness eases linearly from `1.0` at `t == 0` to the floor at `t == 1`. When `job_min_z` is unknown or
+/// non-negative (`>= 0`: no negative Z scanned, a flat or XY-only program) there is no depth scale to normalise
+/// against, so every cut takes the full base colour (`1.0`) rather than dividing by zero. Pure so the mapping is
+/// unit-tested.
+pub fn depth_brightness(z: f32, job_min_z: f32) -> f32 {
+  if job_min_z >= 0.0 {
+    return 1.0; // No usable depth range (flat/positive-only program): no darkening, full base colour.
+  }
+  let t = (z / job_min_z).clamp(0.0, 1.0);
+  1.0 - t * (1.0 - DEPTH_BRIGHTNESS_FLOOR)
 }
 
 /// Decide whether the live tool marker should be drawn this frame, given the live work point, the toolpath's
@@ -208,19 +239,64 @@ mod tests {
   }
 
   #[test]
-  fn is_rapid_feed_separates_rapids_from_cuts_around_the_max_programmed_feed() {
-    // Program tops out at F1000; rapids run faster than any cut. At 100% override with a 1.2 margin the threshold
-    // is 1200: a 3000 mm/min rapid is over it (rapid), an 800 mm/min cut is under it (cut), and a cut at the
-    // programmed max is still a cut.
-    assert!(is_rapid_feed(Some(3000.0), 1000.0, 1.0, 1.2), "a fast move is a rapid");
-    assert!(!is_rapid_feed(Some(800.0), 1000.0, 1.0, 1.2), "a slow move is a cut");
-    assert!(!is_rapid_feed(Some(1000.0), 1000.0, 1.0, 1.2), "a cut at the programmed max is still a cut");
-    // The threshold scales with the live feed override: at 200% a 1900 mm/min reading is still a cut (a 1000 cut
-    // run at 2× override), not a rapid.
-    assert!(!is_rapid_feed(Some(1900.0), 1000.0, 2.0, 1.2), "an overridden cut is not a rapid");
-    // Unknown feed, or a program with no cutting feed at all, defaults to cut (never paints travel-colour blindly).
-    assert!(!is_rapid_feed(None, 1000.0, 1.0, 1.2));
-    assert!(!is_rapid_feed(Some(5000.0), 0.0, 1.0, 1.2));
+  fn connect_trail_segment_breaks_on_a_stroke_start_even_when_points_are_near() {
+    // A continuing cut (not a stroke start) within the gap draws a joining segment.
+    assert!(connect_trail_segment(false, true), "a near, continuing cut joins");
+    // A stroke start NEVER joins to the prior point, even when the two are spatially adjacent — this is the
+    // lift-then-plunge case: the tool retracted and plunged again near the last cut, and a line across that travel
+    // must NOT be drawn.
+    assert!(!connect_trail_segment(true, true), "a stroke start must not join, even when adjacent");
+    // An in-stroke teleport (not a stroke start, but beyond the gap) still breaks on distance.
+    assert!(!connect_trail_segment(false, false), "a far jump still breaks the stroke");
+    // A stroke start that is also far away: broken for both reasons.
+    assert!(!connect_trail_segment(true, false), "a far stroke start is broken");
+  }
+
+  #[test]
+  fn cut_segment_depth_draws_only_below_the_work_surface() {
+    // At or above the work zero the tool is travelling/retracted — no cut segment is drawn.
+    assert_eq!(cut_segment_depth(Some(0.0)), None, "Z == 0 is the surface, not a cut");
+    assert_eq!(cut_segment_depth(Some(5.0)), None, "Z above the surface is a rapid/clearance move");
+    // Below the work zero the tool is engaged: the segment is a cut and the depth (the negative Z) is returned.
+    assert_eq!(cut_segment_depth(Some(-0.1)), Some(-0.1), "a shallow plunge is a cut");
+    assert_eq!(cut_segment_depth(Some(-3.0)), Some(-3.0), "a deep pass is a cut at its depth");
+    // No derivable Z this frame draws nothing rather than guessing a cut.
+    assert_eq!(cut_segment_depth(None), None, "an unknown Z draws no segment");
+  }
+
+  #[test]
+  fn depth_brightness_is_full_at_the_surface_and_floors_at_the_deepest_pass() {
+    // A job whose deepest pass is −2 mm. The shallowest cut (z → 0) is full brightness; the deepest (z == job_min_z)
+    // floors; the midpoint sits exactly halfway between the floor and full.
+    let job = -2.0;
+    assert!((depth_brightness(0.0, job) - 1.0).abs() < 1e-6, "the surface is full brightness");
+    assert!((depth_brightness(job, job) - DEPTH_BRIGHTNESS_FLOOR).abs() < 1e-6, "the deepest pass floors");
+    let mid = depth_brightness(-1.0, job);
+    let expected_mid = 1.0 - 0.5 * (1.0 - DEPTH_BRIGHTNESS_FLOOR);
+    assert!((mid - expected_mid).abs() < 1e-6, "the midpoint is halfway to the floor: {mid}");
+  }
+
+  #[test]
+  fn depth_brightness_is_monotonic_and_clamps_beyond_the_deepest_pass() {
+    // Brightness must fall monotonically as the cut deepens, so a deeper line is never brighter than a shallower one.
+    let job = -4.0;
+    let mut last = depth_brightness(0.0, job);
+    for step in 1..=8 {
+      let z = -(step as f32) * 0.5; // 0 → −4 in 0.5 mm steps.
+      let b = depth_brightness(z, job);
+      assert!(b <= last + 1e-6, "brightness must not rise as depth increases: z={z} b={b} last={last}");
+      last = b;
+    }
+    // A Z beyond the scanned deepest pass (e.g. an override-driven overshoot) clamps at the floor, not below it.
+    assert!((depth_brightness(-10.0, job) - DEPTH_BRIGHTNESS_FLOOR).abs() < 1e-6, "past the deepest pass clamps");
+  }
+
+  #[test]
+  fn depth_brightness_falls_back_to_full_when_no_depth_range_is_known() {
+    // No usable job depth (a flat program, an XY-only program, or none scanned yet): every cut takes the full base
+    // colour rather than dividing by a zero/non-negative range.
+    assert_eq!(depth_brightness(-1.0, 0.0), 1.0, "a zero job_min_z has no range to normalise against");
+    assert_eq!(depth_brightness(-1.0, 5.0), 1.0, "a non-negative job_min_z is treated as no depth range");
   }
 
   #[test]

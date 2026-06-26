@@ -307,6 +307,30 @@ impl ViewState {
     }
   }
 
+  /// The live work-coordinate Z (millimetres) for the toolpath overlay's depth colouring, derived exactly as
+  /// [`Self::work_xy`] derives XY but for the third axis — and with the same no-allocation discipline (the overlay
+  /// runs at up to 20 Hz). A work report reads Z straight from index 2; a machine report derives the single Z
+  /// component from the cached WCO (`WPos = MPos − WCO`). `None` until a status with at least three axes (and, for a
+  /// machine report, a usable cached WCO) is available — so an XY-only report yields no depth and draws no cut.
+  pub fn work_z(&self) -> Option<f64> {
+    let status = self.status.as_ref()?;
+    if status.position.len() < 3 {
+      return None;
+    }
+    match status.position_kind {
+      // The report is already in work coordinates: read Z directly, no offset, no allocation.
+      PositionKind::Work => Some(status.position[2]),
+      // The report is in machine coordinates: derive only the Z work component from the cached WCO. A WCO of a
+      // different length than the position is a malformed mix; refuse it rather than mis-pairing axes.
+      PositionKind::Machine => {
+        if self.last_wco.len() != status.position.len() {
+          return None;
+        }
+        Some(status.position[2] - self.last_wco[2])
+      }
+    }
+  }
+
   /// Derive the position kind the current report omitted, from the cached WCO. `MPos` and `WPos` relate by
   /// `WPos = MPos − WCO`. Returns `None` if no WCO is known or the lengths disagree (a malformed mix).
   fn derive_other_position(&self, status: &StatusReport) -> Option<Vec<f64>> {
@@ -692,6 +716,31 @@ mod tests {
     feed_status(&mut view, "Run|MPos:10.000,20.000,5.000|WCO:1.000,2.000,3.000");
     feed_status(&mut view, "Run|MPos:11.000,22.000,8.000");
     assert_eq!(view.work_xy(), Some((10.0, 20.0))); // 11−1, 22−2
+  }
+
+  #[test]
+  fn work_z_returns_the_work_z_mirroring_work_xy() {
+    let mut view = ViewState::default();
+    // No status yet: no work Z.
+    assert_eq!(view.work_z(), None);
+    // A work report yields its Z directly (index 2, no offset).
+    feed_status(&mut view, "Run|WPos:-1.500,2.250,-0.100");
+    assert_eq!(view.work_z(), Some(-0.100));
+    // A machine report derives work Z from the cached WCO (WPos = MPos − WCO), only the one component.
+    feed_status(&mut view, "Run|MPos:10.000,20.000,5.000|WCO:1.000,2.000,3.000");
+    feed_status(&mut view, "Run|MPos:11.000,22.000,8.000");
+    assert_eq!(view.work_z(), Some(5.0)); // 8 − 3
+  }
+
+  #[test]
+  fn work_z_is_none_without_a_z_axis_or_usable_wco() {
+    let mut view = ViewState::default();
+    // A machine report with no cached WCO cannot derive work Z.
+    feed_status(&mut view, "Run|MPos:1.0,2.0,3.0");
+    assert_eq!(view.work_z(), None);
+    // A two-axis (XY-only) report has no Z component to read.
+    feed_status(&mut view, "Run|WPos:5.0,6.0");
+    assert_eq!(view.work_z(), None);
   }
 
   #[test]
