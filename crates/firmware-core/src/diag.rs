@@ -185,10 +185,24 @@ pub struct UsbTxStall {
   /// The `RESPONSE` channel occupancy at the timeout — non-zero confirms the writer is the bottleneck (responses
   /// are queued behind it), the head-of-line-blocking story that starves the status reporter.
   pub response_depth: u8,
-  /// The consecutive-timeout count when captured (≥ [`USB_TX_STALL_ESCAPE_K`]). Packed into 7 bits (saturates at
-  /// 127) — ample for a "reached K and kept timing out" diagnostic; the exact magnitude past K is not load-bearing.
+  /// Whether the final timeout that tripped the K-escape was at the `write_all` STAGE (`true`) rather than the flush
+  /// stage (`false`). This is the directly-recorded Signature-A discriminator: a write-stage stall is the lost wake
+  /// the deployed flush-stage-only recovery cannot catch (`classify_write_stage` returns `Stalled` unconditionally on
+  /// a write timeout, and `flush_tx_async` parks only when the FIFO is NOT free — so a `data_free=1` stall is
+  /// necessarily a `write_all` park). Recorded instead of inferred from `int_ena`, since the gap is STAGE not flavor.
+  pub write_stage_stall: bool,
+  /// The consecutive-timeout count when captured (≥ [`USB_TX_STALL_ESCAPE_K`]). Packed into 6 bits (saturates at
+  /// 63) — ample for a "reached K and kept timing out" diagnostic; the exact magnitude past K is not load-bearing.
   pub timeout_count: u16,
 }
+
+/// The byte length of the response whose write stalled at the K-escape — the load-bearing field for the single-chunk
+/// widening fix (sound ONLY for `len <= 64`: one `write_async` chunk → all bytes are pushed before the future parks,
+/// so dropping it cannot truncate). A 4-byte `ok` (Signature A) is `len=4`; a full `<...>` status is ~90 B. Kept a
+/// SIBLING of [`UsbTxStall`] (carried in its own RTC_FAST word by `crash.rs`, like `rmt_wait_count`/`recovered_count`),
+/// NOT a packed-word field, so the [`pack_usb_tx_stall`]/[`decode_usb_tx_stall`] round-trip stays a clean bijection.
+/// `0` means no stall captured this run (or a zero-length response, which never occurs on the wire).
+pub type UsbTxStallLen = u16;
 
 /// The post-mortem VERDICT the boot dump renders from a decoded [`UsbTxStall`], answering the §11.5 question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,21 +271,27 @@ pub const USB_TX_STALL_TAG: u32 = 0x5554_0000; // "UT".
 mod bits {
   // All packed fields MUST stay within the low 16 bits — the high half (`0xFFFF_0000`) is the tag, and any field
   // bleeding into bit 16 would corrupt the tag check on decode (a bug TDD caught: a byte-wide count at shift 9
-  // reached bit 16). Layout: five flag bits (0..5), a depth nibble (5..9), a 7-bit count (9..16).
+  // reached bit 16). Layout: six flag bits (0..6), a depth nibble (6..10), a 6-bit count (10..16).
   pub const DATA_FREE: u32 = 1 << 0;
   pub const SERIAL_IN_EMPTY: u32 = 1 << 1;
   pub const MOTION_ADVANCING: u32 = 1 << 2;
   pub const EXECUTOR_RUNNING: u32 = 1 << 3;
   pub const INT_ENA_ARMED: u32 = 1 << 4;
-  /// Response depth in bits 5..9 (a nibble; the depth-8 channel → 0..=8 fits, clamp at 15).
-  pub const RESPONSE_DEPTH_SHIFT: u32 = 5;
+  /// Whether the FINAL `usb_tx` timeout that tripped the K-escape was at the `write_all` STAGE (vs the flush stage).
+  /// Recorded directly rather than inferred from `int_ena`: a write-stage stall is the Signature-A lost wake the
+  /// deployed flush-stage-only recovery structurally cannot catch (`flush_tx_async` early-returns when the FIFO is
+  /// free, so a `data_free=1` stall is necessarily a `write_all` park — see `docs/streaming-lockup-investigation.md`).
+  pub const WRITE_STAGE_STALL: u32 = 1 << 5;
+  /// Response depth in bits 6..10 (a nibble; the depth-8 channel → 0..=8 fits, clamp at 15).
+  pub const RESPONSE_DEPTH_SHIFT: u32 = 6;
   pub const RESPONSE_DEPTH_MASK: u32 = 0xF << RESPONSE_DEPTH_SHIFT;
-  /// Timeout count in bits 9..16 (7 bits, saturated to [`TIMEOUT_COUNT_CLAMP`]). 7 bits is ample for a ≥K
-  /// diagnostic — the exact magnitude past the escape is not load-bearing, only "it reached K and kept timing out".
-  pub const TIMEOUT_COUNT_SHIFT: u32 = 9;
-  pub const TIMEOUT_COUNT_MASK: u32 = 0x7F << TIMEOUT_COUNT_SHIFT;
-  /// The saturation ceiling for the 7-bit packed timeout count.
-  pub const TIMEOUT_COUNT_CLAMP: u16 = 0x7F;
+  /// Timeout count in bits 10..16 (6 bits, saturated to [`TIMEOUT_COUNT_CLAMP`]). 6 bits is ample for a ≥K
+  /// diagnostic — the exact magnitude past the escape is not load-bearing, only "it reached K and kept timing out"
+  /// (`K = 3`, and 63 ≫ 3). The 7th bit was reclaimed for [`WRITE_STAGE_STALL`].
+  pub const TIMEOUT_COUNT_SHIFT: u32 = 10;
+  pub const TIMEOUT_COUNT_MASK: u32 = 0x3F << TIMEOUT_COUNT_SHIFT;
+  /// The saturation ceiling for the 6-bit packed timeout count.
+  pub const TIMEOUT_COUNT_CLAMP: u16 = 0x3F;
 }
 
 /// Pack a [`UsbTxStall`] capture into one tagged `u32` for the RTC_FAST breadcrumb. The four booleans become
@@ -294,6 +314,9 @@ pub fn pack_usb_tx_stall(stall: &UsbTxStall) -> u32 {
   if stall.int_ena_armed {
     word |= bits::INT_ENA_ARMED;
   }
+  if stall.write_stage_stall {
+    word |= bits::WRITE_STAGE_STALL;
+  }
   word |= (stall.response_depth.min(15) as u32) << bits::RESPONSE_DEPTH_SHIFT;
   word |= (stall.timeout_count.min(bits::TIMEOUT_COUNT_CLAMP) as u32) << bits::TIMEOUT_COUNT_SHIFT;
   word
@@ -312,6 +335,7 @@ pub fn decode_usb_tx_stall(word: u32) -> Option<UsbTxStall> {
     motion_advancing: word & bits::MOTION_ADVANCING != 0,
     executor_running: word & bits::EXECUTOR_RUNNING != 0,
     int_ena_armed: word & bits::INT_ENA_ARMED != 0,
+    write_stage_stall: word & bits::WRITE_STAGE_STALL != 0,
     response_depth: ((word & bits::RESPONSE_DEPTH_MASK) >> bits::RESPONSE_DEPTH_SHIFT) as u8,
     timeout_count: ((word & bits::TIMEOUT_COUNT_MASK) >> bits::TIMEOUT_COUNT_SHIFT) as u16,
   })
@@ -327,6 +351,30 @@ pub fn usb_tx_verdict_label(verdict: UsbTxVerdict) -> &'static str {
   }
 }
 
+/// How many consecutive `watchdog_feed` intervals `usb_tx` may produce NO completed write WHILE responses are queued
+/// before the dead-zone backstop withholds the RWDT feed (Signature-B instrumentation). At the 500 ms feed interval
+/// this is `16 * 500 ms = 8 s` — the same order as the RWDT itself, so a board genuinely emitting nothing for ≥8 s
+/// while lines are backed up is wedged by definition. Chosen well ABOVE the normal worst case (a single legitimate
+/// usb_tx write completes in sub-ms, and even the K-escape's own ≈6 s drumbeat self-resets before this), so this can
+/// only fire on a true silent lock — NOT on healthy streaming, back-pressure, or the normal recovery path.
+pub const DEAD_ZONE_STALL_TICKS: u32 = 16;
+
+/// The dead-zone backstop decision (Signature B): should `watchdog_feed` WITHHOLD the RWDT feed because the board is
+/// silently locked? This closes the gap where the existing withholds cannot fire — the comms-stall withhold needs
+/// `host_active` (recent RX) and the core-1 withhold needs `EXECUTOR_RUNNING`, so a board with the host gone quiet
+/// AND the executor idle (`exec=0`) is fed forever. This backstop is INDEPENDENT of both: it fires purely on "there
+/// are responses QUEUED to send (`response_depth > 0`) yet `usb_tx` has COMPLETED no write for
+/// [`DEAD_ZONE_STALL_TICKS`] intervals" — a board sitting on a non-empty `RESPONSE` backlog emitting nothing for ~8 s
+/// is wedged regardless of RX/executor state. Requiring `response_depth > 0` is the false-trip guard: a truly idle
+/// board (nothing to send) legitimately completes no writes and must NOT be reset.
+///
+/// `tx_complete_frozen_ticks` is how many consecutive feed intervals the `usb_tx`-completed-write counter has not
+/// advanced; the caller tracks it (resets to 0 whenever a write completes). Returns `true` to withhold (force a
+/// reset so the silent lock leaves a breadcrumb), `false` to keep feeding.
+pub fn dead_zone_withhold(response_depth: usize, tx_complete_frozen_ticks: u32) -> bool {
+  response_depth > 0 && tx_complete_frozen_ticks >= DEAD_ZONE_STALL_TICKS
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -340,6 +388,7 @@ mod tests {
       motion_advancing: true,
       executor_running: false,
       int_ena_armed: false,
+      write_stage_stall: false,
       response_depth: 8,
       timeout_count: 3,
     }
@@ -370,6 +419,20 @@ mod tests {
     assert!(!c.record(true));
     assert!(!c.record(true));
     assert!(c.record(true));
+  }
+
+  #[test]
+  fn dead_zone_withhold_fires_only_with_backlog_and_long_freeze() {
+    // The false-trip guard: an IDLE board (nothing queued) never withholds, no matter how long usb_tx has been
+    // quiet — it legitimately completes no writes.
+    assert!(!dead_zone_withhold(0, DEAD_ZONE_STALL_TICKS), "idle board (depth 0) must never withhold");
+    assert!(!dead_zone_withhold(0, DEAD_ZONE_STALL_TICKS + 100), "still no withhold with depth 0");
+    // With responses QUEUED but the freeze not yet long enough, keep feeding (healthy/back-pressured streaming).
+    assert!(!dead_zone_withhold(8, DEAD_ZONE_STALL_TICKS - 1), "short freeze with backlog still feeds");
+    assert!(!dead_zone_withhold(1, 0), "a single queued response with a fresh write does not withhold");
+    // The genuine silent lock: responses queued AND no completed write for the full window → withhold (force reset).
+    assert!(dead_zone_withhold(1, DEAD_ZONE_STALL_TICKS), "backlog + full freeze must withhold");
+    assert!(dead_zone_withhold(8, DEAD_ZONE_STALL_TICKS + 5), "and stays withholding past the threshold");
   }
 
   #[test]
@@ -505,8 +568,9 @@ mod tests {
       motion_advancing: false,
       executor_running: true,
       int_ena_armed: false,
+      write_stage_stall: true,
       response_depth: 0,
-      timeout_count: 100, // within the 7-bit packed width, so it round-trips exactly.
+      timeout_count: 50, // within the 6-bit packed width, so it round-trips exactly.
     };
     assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&stall)), Some(stall));
   }
@@ -522,6 +586,20 @@ mod tests {
   }
 
   #[test]
+  fn write_stage_stall_round_trips_independently() {
+    // The directly-recorded write-vs-flush stage bit must round-trip and must NOT collide with the depth/count
+    // fields it now sits just below (the count was narrowed 7→6 bits to free this bit). Worst case: both polarities
+    // with maxed neighbours.
+    let write = UsbTxStall { write_stage_stall: true, response_depth: 15, timeout_count: 63, ..base() };
+    let flush = UsbTxStall { write_stage_stall: false, response_depth: 15, timeout_count: 63, ..base() };
+    assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&write)), Some(write));
+    assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&flush)), Some(flush));
+    assert_ne!(pack_usb_tx_stall(&write), pack_usb_tx_stall(&flush), "the stage bit must change the word");
+    // And it must not perturb the neighbouring count: a write-stage stall with a known count decodes that count.
+    assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&write)).unwrap().timeout_count, 63);
+  }
+
+  #[test]
   fn decode_rejects_untagged_word() {
     assert_eq!(decode_usb_tx_stall(0), None, "cold-boot zero is not a stall");
     assert_eq!(decode_usb_tx_stall(0xFFFF_FFFF), None, "erased-flash garbage is not a stall");
@@ -532,8 +610,8 @@ mod tests {
   fn timeout_count_saturates_into_the_packed_width() {
     let stall = UsbTxStall { response_depth: 15, timeout_count: 5000, ..base() };
     let decoded = decode_usb_tx_stall(pack_usb_tx_stall(&stall)).unwrap();
-    // The count packs into 7 bits, so it saturates at 127 — and crucially must NOT bleed into bit 16 (the tag).
-    assert_eq!(decoded.timeout_count, 127, "count is clamped to the 7-bit packed width");
+    // The count packs into 6 bits, so it saturates at 63 — and crucially must NOT bleed into bit 16 (the tag).
+    assert_eq!(decoded.timeout_count, 63, "count is clamped to the 6-bit packed width");
     assert_eq!(decoded.response_depth, 15, "depth fills the nibble");
   }
 
@@ -547,8 +625,9 @@ mod tests {
       motion_advancing: true,
       executor_running: true,
       int_ena_armed: true,
+      write_stage_stall: true,
       response_depth: 15,
-      timeout_count: 127,
+      timeout_count: 63,
     };
     let word = pack_usb_tx_stall(&stall);
     assert_eq!(word & 0xFFFF_0000, USB_TX_STALL_TAG, "no field may bleed into the tag's high half");
@@ -600,6 +679,7 @@ mod tests {
       int_ena_armed: false,
       motion_advancing: true,
       executor_running: true,
+      write_stage_stall: false,
       response_depth: 8,
       timeout_count: 3,
     };
