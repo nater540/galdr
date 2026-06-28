@@ -21,6 +21,16 @@
 /// `COMMS_PROGRESS` bump at the 2 s cadence was evading the 3 s comms-stall detector).
 pub const USB_TX_STALL_ESCAPE_K: u16 = 3;
 
+/// The largest response (in bytes) that esp-hal's async USB-Serial-JTAG `write_async` pushes to the EP1 FIFO in a
+/// SINGLE chunk before its completion future can park. The driver writes in ≤64-byte chunks and awaits the TX-empty
+/// wake only BETWEEN chunks, so a response of `<= 64` bytes is whole-or-nothing: all its bytes are in the FIFO before
+/// the future ever parks. That is the load-bearing precondition for the TIER 1 / §13.1 single-chunk write-stage
+/// widening — on a write-stage lost wake (a timeout) for such a response, the host having drained the FIFO proves the
+/// bytes left, so dropping the response and continuing CANNOT truncate. A `> 64` byte response is multi-chunk and may
+/// have unwritten later chunks at a write timeout (even with the FIFO drained of an earlier chunk), so it stays a
+/// `Stalled` — the truncation guard. Matches the esp-hal EP1 IN endpoint FIFO depth (64 bytes).
+pub const SINGLE_CHUNK_MAX_BYTES: usize = 64;
+
 /// The bounded consecutive-timeout counter for the `usb_tx` write path. A COMPLETED write resets it to zero; a
 /// timeout increments it. When it reaches [`USB_TX_STALL_ESCAPE_K`] the caller captures the discriminator and
 /// resets the board. Saturating so a pathological run can never wrap the count back below the threshold.
@@ -112,9 +122,19 @@ impl WriteOutcome {
 
   /// Classify the WRITE stage of a `usb_tx` response, returning a terminal [`WriteOutcome`] when the write stage
   /// already decides it, or `None` when the write completed cleanly and the caller must proceed to the FLUSH stage.
-  /// The two terminal write-stage dispositions:
-  /// - `write_timed_out` ⇒ [`Stalled`](WriteOutcome::Stalled): a mid-`write_all` timeout with possibly-UNWRITTEN
-  ///   bytes — never recoverable (recovering would truncate), so it counts toward the K-escape.
+  /// The write-stage dispositions:
+  /// - `write_timed_out` AND the response is a SINGLE `write_async` chunk (`resp_len <= `[`SINGLE_CHUNK_MAX_BYTES`])
+  ///   AND the host has drained the FIFO (`data_free`) ⇒ [`CompletedLostWakeRecovered`](WriteOutcome::
+  ///   CompletedLostWakeRecovered): the TIER 1 / §13.1 single-chunk widening. A ≤64 B response is pushed to the
+  ///   FIFO in ONE chunk BEFORE the write future ever parks, so when the host has drained it the bytes are provably
+  ///   out — only esp-hal's completion wake was lost (the captured Signature-A `wstg=1 rlen=4 free=1`). Dropping and
+  ///   continuing CANNOT truncate, so we recover in place (reset the K-escape, no `software_reset()`), which is what
+  ///   stops the part-corrupting mid-cut reset on the common wedge.
+  /// - `write_timed_out` otherwise (a `> 64 B` MULTI-CHUNK response, OR the FIFO not drained) ⇒ [`Stalled`](
+  ///   WriteOutcome::Stalled): a multi-chunk write can have UNWRITTEN later chunks even with `data_free=1` (the host
+  ///   drained only an earlier chunk), so recovering would truncate — it counts toward the K-escape (a clean reset
+  ///   beats a silent truncation). A FIFO-not-drained timeout is the genuine host-not-reading stall. The truncation
+  ///   guard is fully intact.
   /// - `write_errored` (the embedded-io `Ok(Err)` host-closed-port case) ⇒ [`Completed`](WriteOutcome::Completed):
   ///   a clean drop-and-continue that the reconnect / banner path re-syncs — NOT a stall, so it must not flow to
   ///   the flush or count toward the escape (matching the pre-split behavior, which discarded write errors).
@@ -122,9 +142,17 @@ impl WriteOutcome {
   ///   for the flush-stage recovery decision.
   ///
   /// A timeout takes precedence over an error (a timed-out write never produced an `Ok(Err)` in the first place).
-  pub fn classify_write_stage(write_timed_out: bool, write_errored: bool) -> Option<WriteOutcome> {
+  /// `resp_len` is the response's byte length; `data_free` is `ep1_conf.serial_in_ep_data_free` re-read AFTER the
+  /// write timeout (both consulted ONLY on `write_timed_out`).
+  pub fn classify_write_stage(write_timed_out: bool, write_errored: bool, resp_len: usize, data_free: bool) -> Option<WriteOutcome> {
     if write_timed_out {
-      Some(WriteOutcome::Stalled)
+      if resp_len <= SINGLE_CHUNK_MAX_BYTES && data_free {
+        // TIER 1: a single-chunk response whose bytes the host has drained — a recoverable lost wake, not a stall.
+        Some(WriteOutcome::CompletedLostWakeRecovered)
+      } else {
+        // Multi-chunk (possible unwritten tail) or FIFO still full (host not reading): a genuine stall.
+        Some(WriteOutcome::Stalled)
+      }
     } else if write_errored {
       Some(WriteOutcome::Completed)
     } else {
@@ -481,24 +509,72 @@ mod tests {
   fn write_stage_error_is_a_clean_drop_not_a_stall() {
     // A write ERROR (host closed the port, embedded-io `Ok(Err)`) is NOT a stall — it's a clean drop-and-continue
     // (Completed), matching the pre-split behavior that discarded write errors. It must NOT count toward the escape
-    // and must NOT flow to the flush stage. (write_timed_out=false, write_errored=true → Some(Completed).)
-    let o = WriteOutcome::classify_write_stage(false, true);
+    // and must NOT flow to the flush stage. (write_timed_out=false, write_errored=true → Some(Completed).) The
+    // `resp_len`/`data_free` widening args are irrelevant when the write did not time out.
+    let o = WriteOutcome::classify_write_stage(false, true, 4, true);
     assert_eq!(o, Some(WriteOutcome::Completed));
     assert!(!o.unwrap().is_stall(), "a host-closed write error is not a stall");
     assert!(!o.unwrap().is_recovered_lost_wake());
   }
 
   #[test]
-  fn write_stage_timeout_is_a_stall_and_wins_over_error() {
-    // A write TIMEOUT is a possibly-mid-write stall and takes precedence (a timed-out write never produced Ok(Err)).
-    assert_eq!(WriteOutcome::classify_write_stage(true, false), Some(WriteOutcome::Stalled));
-    assert_eq!(WriteOutcome::classify_write_stage(true, true), Some(WriteOutcome::Stalled));
+  fn write_stage_timeout_wins_over_error() {
+    // A write TIMEOUT is a possibly-mid-write event and takes precedence (a timed-out write never produced Ok(Err)).
+    // With a >64 B response (multi-chunk, possibly-unwritten tail) it is a genuine stall regardless of `data_free`.
+    assert_eq!(WriteOutcome::classify_write_stage(true, false, 90, true), Some(WriteOutcome::Stalled));
+    assert_eq!(WriteOutcome::classify_write_stage(true, true, 90, true), Some(WriteOutcome::Stalled));
   }
 
   #[test]
   fn write_stage_clean_defers_to_the_flush_stage() {
     // A clean write (no timeout, no error) returns None → the caller proceeds to time + classify the flush stage.
-    assert_eq!(WriteOutcome::classify_write_stage(false, false), None);
+    // The widening args are irrelevant on the clean path.
+    assert_eq!(WriteOutcome::classify_write_stage(false, false, 4, true), None);
+    assert_eq!(WriteOutcome::classify_write_stage(false, false, 200, false), None);
+  }
+
+  #[test]
+  fn write_stage_recovers_single_chunk_lost_wake_when_fifo_drained() {
+    // TIER 1 (the §13.1 single-chunk widening) — THE captured Signature-A state `wstg=1 rlen=4 free=1`: a write-stage
+    // timeout on a ≤64 B response (one `write_async` chunk, fully pushed before the future parks) whose host HAS
+    // drained the FIFO is a recovered lost-wake, NOT a stall. The bytes are out; dropping + continuing cannot
+    // truncate. This is what stops the K-escape `software_reset()` firing on the common mid-cut Signature-A wedge.
+    let o = WriteOutcome::classify_write_stage(true, false, 4, true);
+    assert_eq!(o, Some(WriteOutcome::CompletedLostWakeRecovered));
+    assert!(!o.unwrap().is_stall(), "a recovered single-chunk lost-wake must NOT count toward the escape");
+    assert!(o.unwrap().is_recovered_lost_wake(), "and it IS countable as a recovered lost-wake for diagnostics");
+  }
+
+  #[test]
+  fn write_stage_recovers_at_the_64_byte_boundary_inclusive() {
+    // The boundary is INCLUSIVE: a 64-byte response is exactly one `write_async` chunk, so it is still whole-or-
+    // nothing and recoverable when the FIFO drained. 65 bytes is two chunks → not recoverable (the next test).
+    let o = WriteOutcome::classify_write_stage(true, false, 64, true);
+    assert_eq!(o, Some(WriteOutcome::CompletedLostWakeRecovered));
+  }
+
+  #[test]
+  fn write_stage_over_64_bytes_is_still_a_stall_even_when_fifo_drained() {
+    // THE TRUNCATION GUARD stays fully intact: a >64 B response is MULTI-CHUNK, so a write-stage timeout can have
+    // unwritten LATER chunks even though the host drained an EARLIER one (`data_free=1`). Recovering would truncate
+    // the line, so it MUST remain a stall (counts toward the K-escape; a clean reset beats a silent truncation).
+    let o = WriteOutcome::classify_write_stage(true, false, 65, true);
+    assert_eq!(o, Some(WriteOutcome::Stalled));
+    assert!(o.unwrap().is_stall());
+    assert!(!o.unwrap().is_recovered_lost_wake());
+    // A full ~90 B status report is the canonical multi-chunk case.
+    assert_eq!(WriteOutcome::classify_write_stage(true, false, 90, true), Some(WriteOutcome::Stalled));
+  }
+
+  #[test]
+  fn write_stage_single_chunk_is_still_a_stall_when_fifo_not_drained() {
+    // The other half of the guard: even a ≤64 B response is a genuine stall when the FIFO is NOT free — the host is
+    // not reading (or the peripheral is stuck), so the bytes are NOT confirmed out. Recovery requires BOTH ≤64 B
+    // AND `data_free`. This is the host-not-reading wedge that the K-escape correctly catches.
+    let o = WriteOutcome::classify_write_stage(true, false, 4, false);
+    assert_eq!(o, Some(WriteOutcome::Stalled));
+    assert!(o.unwrap().is_stall());
+    assert!(!o.unwrap().is_recovered_lost_wake());
   }
 
   #[test]

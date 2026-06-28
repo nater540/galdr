@@ -494,6 +494,11 @@ pub fn record_rmt_hang(hang: &RmtHang) {
 /// bit layout owned by the tested module and crash.rs purely the RTC_FAST storage. `response_len` is the byte length
 /// of the stalled response (the §13.1 single-chunk-widening discriminator), stored in its own word because the packed
 /// bit-word is full. Both are read only after the reset, no ordering.
+///
+/// DIAGNOSTIC-only (`capture-reset` build, §17): only the diagnostic K-escape WRITES this word (production raises
+/// `ALARM:17` without resetting, so there is no breadcrumb to write). The DECODE/boot-dump side stays unconditional so
+/// a production board still REPLAYS a breadcrumb left by a prior diagnostic run.
+#[cfg(feature = "capture-reset")]
 pub fn record_usb_tx_stall(word: u32, response_len: u16) {
   BREADCRUMB[idx::USB_TX_STALL].store(word, Ordering::Relaxed);
   BREADCRUMB[idx::USB_TX_STALL_LEN].store(response_len as u32, Ordering::Relaxed);

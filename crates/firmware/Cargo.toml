@@ -80,3 +80,19 @@ embedded-hal-mock = "0.11"
 # breadcrumb in `crash.rs`, emitted as a plain `[MSG:...]` over the normal grbl TX after the watchdog resets
 # the board — it works in the DEFAULT (no-defmt) build. defmt remains an optional extra for bench tracing.
 defmt = ["dep:defmt", "firmware-core/defmt", "esp-println/defmt-espflash"]
+
+# DIAGNOSTIC streaming-lockup capture build (TIER 3, docs/streaming-lockup-investigation.md §17). When ENABLED,
+# the residual unrecoverable-wedge paths (the `usb_tx` K-escape, and the dead-zone watchdog backstop) take a
+# `software_reset()` and leave an RTC_FAST breadcrumb that the next boot replays as `[MSG:CRASH usbtx: ...]` —
+# the ONLY way to read WHY a wedge happened on the next boot (RTC_FAST survives the CoreSw reset). This is the
+# capture channel the open Signature-A (#20) / Signature-B (#21) investigation depends on; an operator runs it
+# KNOWING the part is scrap (a mid-stream reset drops the in-flight gcode + the host aborts the stream).
+#
+# When DISABLED (the PRODUCTION DEFAULT), those same paths instead raise feed-hold + the LOCKED `ALARM:17`
+# (MotorFault) + require re-home — the grbl lost-step-sync contract (§14.3), the only safe response for a
+# first real cut: NEVER a silent `software_reset()` the host streams through (which would resume cutting in
+# the wrong place and silently corrupt the part). TIER 1 (the single-chunk write-stage widening) already stops
+# the K-escape firing on the COMMON Signature-A wedge in BOTH builds; this feature only governs what the
+# RESIDUAL unrecoverable wedge does. The split is compile-time so the safety default has zero runtime branch
+# and a diagnostic image can never accidentally ship armed.
+capture-reset = []

@@ -822,18 +822,30 @@ fn run_block(
   // block. The error is not surfaced upward because Stage 1 has no alarm state machine yet (DOC-06/Stage 2);
   // the abandoned block leaves the machine where the last published burst put it, which the live MPos shows.
   //
-  // OBSERVE-ONLY (task #22 §15): the §15 silent-skip mechanism is precisely THIS swallow — a mid-block `emit_burst`
-  // Err abandons the REST of the block's step bursts (a truncated cut), the program continues, and the host already
-  // acked the line at plan time, so the skip is invisible. We now CAPTURE the result and COUNT a truncation (split by
-  // source + axis) instead of discarding it — but the behavior is UNCHANGED (still abandon-and-continue; the ALARM fix
-  // is gated on this probe confirming `RUN_BLOCK_TRUNCATED > 0`). The `tracking` borrow of `sink` ends before we read
-  // `sink.take_last_error()`.
+  // The §15 silent-skip mechanism is precisely THIS swallow — a mid-block `emit_burst` Err abandons the REST of the
+  // block's step bursts (a truncated cut). The program would otherwise continue and the host already acked the line at
+  // plan time, so the skip is invisible. We CAPTURE the result, COUNT the truncation (split by source + axis), and —
+  // task #22 / §15.6 — route a genuine mid-block step-output Transport fault into the ALARM path: a broken step sync
+  // loses position certainty on open-loop steppers, so per the grbl lost-step-sync contract (§14.3) the correct
+  // response is feed-hold + `ALARM:17` (MotorFault) + require re-home, NEVER silent abandonment or a silent reset. The
+  // `tracking` borrow of `sink` ends before we read `sink.take_last_error()`.
   let outcome = {
     let mut tracking = CountingSink::live(sink, counter);
     generator.run_block_scaled(block, exit_speed_sq, override_scale, max_speed_sq, &mut tracking)
   };
   if outcome.is_err() {
-    record_block_truncation(sink.take_last_error());
+    let source = sink.take_last_error();
+    record_block_truncation(source);
+    if source.is_some() {
+      // A REAL mid-block step-output fault (any `emit_burst` Transport arm: a bounded-`wait()` error, a failed
+      // `transmit()` start, or a burst-too-long encoder bug) broke the step sync mid-cut. Raise the motion-fault
+      // alarm so the consumer halts the program, locks into `ALARM:17`, and forces a re-home. A `None` source is the
+      // generator's all-or-nothing `InvalidConfig` (a degenerate config that would reject EVERY block, not a mid-cut
+      // step-sync break) — it is counted above but does not raise the per-block motion fault. The alarm is
+      // source-agnostic; the faulting arm/axis is already recorded by `record_block_truncation` for the breadcrumb.
+      mtrace!("motion: run_block truncated -> MOTION_FAULT (raising ALARM:17)");
+      crate::comms::MOTION_FAULT.signal(());
+    }
   }
 }
 

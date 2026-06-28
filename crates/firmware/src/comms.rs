@@ -268,6 +268,16 @@ pub static LIMIT_TRIGGERED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// before the first is serviced is harmless.
 pub static HARD_LIMIT_TRIPPED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Executor → consumer: "an unrecoverable mid-block step-output Transport fault truncated a cutting move" (§15.6 /
+/// task #22). The core-1 executor raises this from [`run_block`](crate::motion) when [`SegmentGenerator::run_block`]
+/// returns an error sourced from an `emit_burst` arm (a bounded RMT `wait()` error, a failed `transmit()` start, or a
+/// burst-too-long) — a real step-sync break that abandons the rest of the block. The consumer enters the LOCKED
+/// `ALARM:17` ([`AlarmCode::MotorFault`](firmware_core::protocol::AlarmCode::MotorFault)) and runs the pipeline reset,
+/// halting the program and forcing a re-home — the grbl lost-step-sync contract (§14.3), NEVER silent abandonment or
+/// a silent reset that would cut a wrong part. A coalesced `Signal` suffices: the alarm latches, so a second fault
+/// before the first is serviced is harmless (the machine is already halted into the locked alarm).
+pub static MOTION_FAULT: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// A `G38.x` probe request handed from the core-0 consumer to the core-1 motion executor (Phase C, DOC-09). It
 /// carries everything the probe-watching execution path needs: the absolute MACHINE step `target` the probe
 /// seeks (the no-contact end of travel), the per-tick `step_period_ticks` derived from the probe feed, and the
@@ -1550,12 +1560,25 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
     let write_result = with_timeout(USB_TX_TIMEOUT, tx.write_all(resp.as_bytes())).await;
     let write_timed_out = write_result.is_err();
     let write_errored = matches!(write_result, Ok(Err(_)));
+    // TIER 1 (the §13.1 single-chunk write-stage widening): on a WRITE-stage timeout, re-read the host-drained bit
+    // so `classify_write_stage` can RECOVER a single-chunk (≤64 B) lost wake in place instead of K-escaping. The
+    // captured Signature A is exactly this — `wstg=1 rlen=4 free=1`: a 4-byte `ok` whose bytes the host drained but
+    // whose esp-hal completion wake was lost. A ≤64 B response is pushed to the FIFO in ONE chunk before the write
+    // future parks, so a drained FIFO proves the bytes left → dropping + continuing cannot truncate. This stops the
+    // K-escape `software_reset()` firing (and corrupting the part) on the common mid-cut wedge. The recheck is only
+    // meaningful on a write timeout; a clean write reads `true` (unused). A `>64 B` write timeout stays `Stalled`
+    // regardless (possible unwritten tail — the truncation guard), as does a `data_free=0` stall (host not reading).
+    let write_data_free = if write_timed_out {
+      esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().serial_in_ep_data_free().bit_is_set()
+    } else {
+      true
+    };
     // Record WHICH stage a genuine stall occurred at, for the breadcrumb's Signature-A discriminator. A write-stage
-    // timeout is the lost wake the deployed flush-stage-only recovery cannot catch (see the investigation doc); the
-    // breadcrumb records this bit directly instead of inferring write-vs-flush from `int_ena`. Only meaningful when
-    // the outcome below is `Stalled` (a clean write or a flush stall sets it false).
+    // timeout is the lost wake the FLUSH-stage-only recovery cannot catch; the breadcrumb records this bit directly
+    // instead of inferring write-vs-flush from `int_ena`. Only meaningful when the outcome below is `Stalled` (a
+    // clean write, a TIER-1 recovered single-chunk wake, or a flush stall sets it false in effect).
     let stall_at_write_stage = write_timed_out;
-    let outcome = match firmware_core::diag::WriteOutcome::classify_write_stage(write_timed_out, write_errored) {
+    let outcome = match firmware_core::diag::WriteOutcome::classify_write_stage(write_timed_out, write_errored, resp.len(), write_data_free) {
       // The write stage already decided it (a mid-write stall, or a host-closed clean drop).
       Some(o) => o,
       // Clean write — all bytes are in the FIFO; only the FLUSH stage can now strand on a lost-wake (the sole
@@ -1593,22 +1616,55 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
     }
     if stall.record(outcome.is_stall()) {
       // K consecutive GENUINE stalls (timeout + FIFO still full = host truly not reading / peripheral stuck): the
-      // lost-wake path now recovers above, so this K-escape is the backstop for a REAL host-not-draining wedge (or a
-      // PARTIAL fix where a wake still slips through). Capture the discriminator and software-reset so the next boot
-      // emits `[MSG:CRASH usbtx: ...]` (now reading `host-not-reading`, or `lost-tx-wake` if recovery missed a case).
-      // `stall_at_write_stage` records whether this final tripping stall was at `write_all` (the Signature-A flavor
-      // the flush-stage-only recovery cannot catch) vs the flush stage — a directly-recorded `wstg` breadcrumb bit.
-      // `resp.len()` is the stalled response's BYTE length (the §13.1 single-chunk-widening discriminator: a ≤64 B
-      // response is whole-or-nothing, the only case a future write-stage recovery could safely recover).
-      capture_usb_tx_stall_and_reset(motion_before, stall.count(), stall_at_write_stage, resp.len());
+      // lost-wake path now recovers above (TIER 1), so this K-escape is the residual backstop for a REAL
+      // host-not-draining wedge (or a PARTIAL fix where a wake still slips through). The TIER 2/3 split
+      // (`capture-reset`, §17) decides what happens here:
+      // - DIAGNOSTIC build (`--features capture-reset`): capture the discriminator + `software_reset()` so the next
+      //   boot emits `[MSG:CRASH usbtx: ...]` (RTC_FAST survives the CoreSw reset). `stall_at_write_stage` records
+      //   whether the final tripping stall was at `write_all` (the Signature-A flavor) vs flush; `resp.len()` is the
+      //   single-chunk-widening discriminator. This is the open-investigation capture channel (#20/#21).
+      // - PRODUCTION build (default): raise the LOCKED `ALARM:17` (MotorFault) — feed-hold + require re-home — and
+      //   reset the local stall run so usb_tx keeps serving the alarm/banner traffic. NEVER a silent reset the host
+      //   streams through (which would resume cutting in the wrong place, §14.3).
+      handle_usb_tx_wedge(motion_before, stall.count(), stall_at_write_stage, resp.len());
+      // Production only reaches here (the diagnostic `capture-reset` build resets the chip inside the helper, so the
+      // call diverges there). Clear the stall run so a single residual wedge does not immediately re-trip the alarm
+      // every K timeouts. Gated off the capture build where it would be unreachable after the diverging reset.
+      #[cfg(not(feature = "capture-reset"))]
+      {
+        stall = firmware_core::diag::UsbTxStallCounter::new();
+      }
     }
   }
 }
 
+/// Handle a K-consecutive-stall `usb_tx` wedge per the TIER 2/3 split (docs/streaming-lockup-investigation.md §17).
+///
+/// In the DIAGNOSTIC `capture-reset` build this captures the firmware-only discriminator into the RTC_FAST
+/// breadcrumb and forces a `software_reset()` (never returns — the open Signature-A/B capture channel). In the
+/// PRODUCTION default build it raises the LOCKED [`AlarmCode::MotorFault`] (`ALARM:17`) via [`MOTION_FAULT`] — the
+/// grbl lost-step-sync contract: feed-hold + require re-home, NEVER a silent reset the host streams through — and
+/// RETURNS so usb_tx keeps serving the alarm + banner traffic to the host.
+#[cfg(feature = "capture-reset")]
+fn handle_usb_tx_wedge(motion_before: u32, timeout_count: u16, write_stage_stall: bool, response_len: usize) -> ! {
+  capture_usb_tx_stall_and_reset(motion_before, timeout_count, write_stage_stall, response_len);
+}
+
+/// Production variant: raise the motion-fault alarm instead of resetting. See the `capture-reset` variant above.
+#[cfg(not(feature = "capture-reset"))]
+fn handle_usb_tx_wedge(_motion_before: u32, _timeout_count: u16, _write_stage_stall: bool, _response_len: usize) {
+  // A residual unrecoverable USB-TX wedge: the host is not draining (or a lost wake slipped past TIER 1). Halt the
+  // program into the LOCKED `ALARM:17` and force a re-home — the executor's motion-fault path and this share the one
+  // alarm. The consumer (the planner owner) services `MOTION_FAULT`, flushes the queue, and emits the alarm; usb_tx
+  // returns and keeps writing so the alarm line + any subsequent banner reach the host.
+  MOTION_FAULT.signal(());
+}
+
 /// Capture the USB-TX-stall discriminator at the K-th consecutive `usb_tx` timeout, then force a software reset so
-/// the next boot emits the `[MSG:CRASH usbtx: ...]` line over CDC. Reads the firmware-only signals that split the
-/// §11.4 hypotheses without any RTT (which is transport-blocked on this board — the defmt sink shares the one
-/// USB-Serial-JTAG with the grbl CDC):
+/// the next boot emits the `[MSG:CRASH usbtx: ...]` line over CDC. DIAGNOSTIC-only (`capture-reset` build, §17): in
+/// the production default the wedge raises `ALARM:17` instead (see [`handle_usb_tx_wedge`]). Reads the firmware-only
+/// signals that split the §11.4 hypotheses without any RTT (which is transport-blocked on this board — the defmt sink
+/// shares the one USB-Serial-JTAG with the grbl CDC):
 /// - `ep1_conf.serial_in_ep_data_free` — `false` ⇒ the EP1 IN FIFO is full because the HOST is not draining.
 /// - `int_raw.serial_in_empty` — the raw TX-empty event the async write future waits on (asserted ⇒ the event
 ///   fired); paired with `int_ena.serial_in_empty` (still ARMED?) to tell a lost-waker from a never-serviced ISR.
@@ -1619,6 +1675,7 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
 /// The register reads are plain, side-effect-free volatile loads of the USB_DEVICE block (no lock, safe from this
 /// task), mirroring `motion.rs`'s `capture_rmt_hang`. `software_reset()` is `CoreSw`, which preserves RTC_FAST.
 /// `-> !`: this never returns (it resets the chip).
+#[cfg(feature = "capture-reset")]
 fn capture_usb_tx_stall_and_reset(motion_before: u32, timeout_count: u16, write_stage_stall: bool, response_len: usize) -> ! {
   let usb = esp_hal::peripherals::USB_DEVICE::regs();
   let ep1 = usb.ep1_conf().read();
@@ -1716,8 +1773,11 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
     // Race the four primary events against a hard-limit trip from the core-1 executor (DOC-06): a limit pressed
     // during normal motion must halt the program and enter `ALARM:1` regardless of what the consumer is waiting on.
     // Also race a graceful program stop (`0x86`): a controlled decelerate-to-Idle + full flush that, unlike the
-    // hard-limit trip and the `0x18` reset, raises no alarm and retains position. Nested `select`s keep each arm typed.
-    match select(select(events, HARD_LIMIT_TRIPPED.wait()), PROGRAM_STOP.wait()).await {
+    // hard-limit trip and the `0x18` reset, raises no alarm and retains position; AND a motion fault (`MOTION_FAULT`,
+    // §15.6 / task #22): an unrecoverable mid-block step-output Transport error from the executor must halt the
+    // program and enter the LOCKED `ALARM:17` regardless of what the consumer is waiting on. Nested `select`s keep
+    // each arm typed.
+    match select(select(events, HARD_LIMIT_TRIPPED.wait()), select(PROGRAM_STOP.wait(), MOTION_FAULT.wait())).await {
       Either::First(Either::First(Either4::First(line))) => {
         // OBSERVE-ONLY probe (task #22 §15): a line is being CONSUMED. Counted BEFORE `handle_line` so it pairs with
         // the exactly-one terminal response that line will emit — `ACKS_EMITTED > LINES_CONSUMED` would then be a
@@ -1781,7 +1841,22 @@ pub async fn comms_consumer(flash: &'static SharedFlash) -> ! {
       // (the planner owner) so it is race-free with line handling; the reader half only signalled it after the
       // `program_stop_quiesces` gate held. Re-checks the live state inside the cycle so a state change between the
       // signal and here (e.g. a soft reset winning a tie) makes it a benign no-op.
-      Either::Second(()) => program_stop_cycle(&mut parser, &mut state).await,
+      Either::Second(Either::First(())) => program_stop_cycle(&mut parser, &mut state).await,
+      // Motion fault (`MOTION_FAULT`, §15.6 / task #22): the core-1 executor hit an unrecoverable mid-block
+      // step-output Transport error (a swallowed RMT `wait()`/`transmit()` fault) that truncated a cutting move. The
+      // step sync is broken, so on open-loop steppers position certainty is LOST — enter the LOCKED `ALARM:17`
+      // (MotorFault) and reset the pipeline so the queue is flushed and the machine sits in a clean, clearly-halted
+      // alarm requiring a re-home. This is the grbl lost-step-sync contract (§14.3): NEVER silent abandonment or a
+      // silent reset that would cut the rest of the part in the wrong place. The same stale-trip guard as the
+      // hard-limit path applies — only raise from a state where the machine could actually be MOVING, so a duplicate
+      // fault signalled after the machine already halted into the alarm cannot downgrade a more-specific lock.
+      Either::Second(Either::Second(())) => {
+        if control_state().hard_limit_alarm_applies() {
+          set_control_state(ControlState::Alarm(AlarmCode::MotorFault));
+          emit_alarm(AlarmCode::MotorFault).await;
+          reset_pipeline(&mut parser, &mut state).await;
+        }
+      }
     }
   }
 }
@@ -3077,13 +3152,24 @@ const COMMS_STALL_TICKS: u32 = 6;
 /// with no host present never spuriously counts as active before the first real RX byte.
 const RX_ACTIVE_TICKS: u32 = 12;
 
-/// Whether the §13.4 dead-zone backstop WITHHOLD is armed. The backstop is the one BEHAVIOR change in the
-/// Signature-B work (it resets the board on an absolute "responses queued + usb_tx idle ~8 s" deadline). For the
-/// Signature-A `wstg` re-capture it is deliberately HELD OUT — observe-before-perturb — so the wedge's failure
-/// dynamics stay unchanged (the backstop could pre-empt a `usb_tx` K-escape mid-capture, or flip a Signature-B
-/// silent lock into an auto-reset, muddying the read). The `dead_zone` condition is still COMPUTED (so the
-/// tracking + the host-tested decision stay exercised and warning-clean) but gated off here. Flip to `true` in the
-/// NEXT build, once the `wstg` capture is in hand, to arm the backstop.
+/// Whether the §13.4 dead-zone backstop WITHHOLD is armed. The backstop forces a `software_reset()` (via an RWDT
+/// withhold) on an absolute "responses queued + usb_tx idle ~8 s" deadline — it converts a Signature-B SILENT lock
+/// into a breadcrumb-bearing reset, which is the ONLY way that wedge leaves a trace. Per the TIER 2/3 split (§17) a
+/// silent reset the host streams through corrupts a real cut (it resumes cutting in the wrong place, §14.3), so the
+/// backstop is armed ONLY in the DIAGNOSTIC `capture-reset` build (operator-gated, scrap expected — the open
+/// Signature-B capture channel, #21). In the PRODUCTION default it is DISARMED: a genuinely dead task cannot raise an
+/// `ALARM` (the comms path is wedged), so the only recovery would be exactly the silent reset the redesign forbids —
+/// production accepts a fail-safe HALT over a part-corrupting auto-reset (the user's option-A decision). TIER 1 + the
+/// K-escape→`ALARM:17` conversion remove the COMMON wedges, so reaching a true dead zone in production is rare; if it
+/// happens the board halts (no reset) until the operator power-cycles, which is strictly safer than a wrong cut. The
+/// `dead_zone` condition is still COMPUTED in both builds so the tracking + the host-tested decision stay exercised
+/// and warning-clean; only this arming flag differs.
+#[cfg(feature = "capture-reset")]
+const DEAD_ZONE_BACKSTOP_ARMED: bool = true;
+
+/// Production default: the dead-zone backstop is DISARMED — see the `capture-reset` variant above for the rationale
+/// (a silent reset would corrupt a real cut; production fails safe instead).
+#[cfg(not(feature = "capture-reset"))]
 const DEAD_ZONE_BACKSTOP_ARMED: bool = false;
 
 /// The RTC watchdog feed task (core 0 / PRO_CPU, a plain thread-mode task) — a proper TASK-watchdog (revised after a
