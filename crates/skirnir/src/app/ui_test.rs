@@ -89,6 +89,34 @@ pub(crate) fn build_dock_harness(
     )
 }
 
+/// Build a kittest harness that hosts [`views::dock`] EXACTLY as the real app does: inside a bottom
+/// `Panel::bottom("dock").exact_size(dock_height)` of a window the size of the real layout, so the dock body is
+/// height-constrained to the pinned 200px just like in `SkirnirApp::update`. This is the faithful reproduction
+/// path: `build_dock_harness` renders `dock()` into an unconstrained root `Ui`, which masks any
+/// fill-the-remaining-height clipping of the input row beneath the log scroll area. Use THIS harness to assert
+/// what actually reaches the screen on the Console tab. `time` is fixed for a deterministic progress readout.
+pub(crate) fn build_docked_panel_harness(
+  state: HarnessState, time: super::progress::TimeEstimate,
+) -> Harness<'static, HarnessState> {
+  use crate::app::metrics::Metrics;
+  Harness::builder()
+    .with_size(egui::vec2(900.0, 600.0))
+    .build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        // Mirror the shell: a status bar then the dock panel pinned to its exact height, both bottom-anchored, so
+        // the dock body sees the same constrained height the real app gives it.
+        egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |_ui| {});
+        let dock_h = Metrics::dock_height(state.ui.dock_collapsed);
+        egui::Panel::bottom("dock").resizable(false).exact_size(dock_h).show_inside(ui, |ui| {
+          views::dock(ui, &state.view, &mut state.ui, time, None, &mut sink);
+        });
+        state.intents.extend(sink.drain());
+      },
+      state,
+    )
+}
+
 /// Build a kittest harness that renders just the [`views::transport_group`] (the Run/Hold/Stop segmented group plus
 /// the standalone Abort control) into a fixed-size window, folding each frame's intents into the [`HarnessState`].
 /// Isolating the group keeps the assertions about which intent each button fires independent of the rest of the
@@ -155,31 +183,24 @@ pub(crate) fn slider_point_for(axis: OverrideAxis, target: u32) -> Option<egui::
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::app::metrics::Metrics;
   use crate::app::overrides::OverrideFeedback;
   use crate::app::progress::TimeEstimate;
   use crate::app::view_state::Progress;
-  use crate::protocol::ConnectionState;
+  use crate::engine::Event;
   use crate::protocol::status::{MachineState, PositionKind, RunState, StatusReport};
+  use crate::protocol::{ConnectionState, Response};
   use egui_kittest::kittest::Queryable;
   use std::time::Duration;
 
   /// A minimal connected [`ViewState`] reporting the given `(feed, rapid, spindle)` overrides, so the override
   /// panel is enabled and seeds the sliders from a live `Ov:` value.
   fn view_with_overrides(feed: u32, rapid: u32, spindle: u32) -> ViewState {
-    let status = StatusReport {
-      machine_state: MachineState { state: RunState::Idle, substate: None },
-      position_kind: PositionKind::Machine,
-      position: Vec::new(),
-      wco: None,
-      feed_speed: None,
-      overrides: Some((feed, rapid, spindle)),
-      pins: Vec::new(),
-      buffer: None,
-      line: None,
-    };
     let mut view = ViewState::default();
     view.connection = ConnectionState::Idle;
-    view.status = Some(status);
+    // Feed the `Ov:` through the reducer exactly as the engine does, so the intermittent-override cache
+    // (`last_overrides`, read by `view.overrides()`) is seeded — the panel reads the cache, not the raw report.
+    view.apply(Event::Response(Response::Status(format!("Idle|MPos:0,0,0|Ov:{feed},{rapid},{spindle}"))));
     view
   }
 
@@ -516,5 +537,124 @@ mod tests {
       !colors.contains(&default_inset),
       "the default inset colour must be absent — the view must not fall back to the baked-in constant",
     );
+  }
+
+  /// A connected, idle [`ViewState`] — the link is up and no program is streaming, so the console's manual-command
+  /// (MDI) field is enabled and a typed line may be submitted.
+  fn view_idle() -> ViewState {
+    let mut view = ViewState::default();
+    view.connection = ConnectionState::Idle;
+    view
+  }
+
+  /// A fixed elapsed/ETA estimate for the dock progress clock so the rendered readout is deterministic.
+  fn zero_time() -> TimeEstimate {
+    TimeEstimate { elapsed: Duration::from_secs(0), remaining: None, total: None }
+  }
+
+  #[test]
+  fn the_console_mdi_field_renders_with_usable_size_through_the_real_docked_panel() {
+    // REGRESSION (the field vanished from the Console tab), in TWO parts — both blind spots of a directly-invoked
+    // widget harness, both caught here by rendering through the real `Panel::bottom().exact_size` dock path:
+    //   (height) the log `ScrollArea` (`auto_shrink([false, false])`) filled ALL remaining height of the pinned 200px
+    //     panel, pushing the input row below the panel floor where it was clipped away; and
+    //   (WIDTH) the Send button was laid out first inside a nested `with_layout(right_to_left)` child, which claims
+    //     the WHOLE remaining row width — so the field added afterward had zero width left and collapsed to an
+    //     invisible sliver (the empty dark gap beside Send the user reported).
+    // This asserts the TextInput exists AND has BOTH a usable height and a usable width, inside the visible panel.
+    let mut ui = UiState::default();
+    ui.active_tab = views::DockTab::Console;
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_docked_panel_harness(state, zero_time());
+    harness.run();
+    let field = harness
+      .query_by_role(egui::accesskit::Role::TextInput)
+      .expect("the MDI text input must render on the Console tab");
+    let rect = field.rect();
+    // The dock panel floor: window 600px tall minus the 24px status bar below it. A field laid out BELOW this floor
+    // is clipped away (the height half of the bug).
+    let dock_floor = 600.0 - Metrics::STATUS_BAR_H;
+    assert!(
+      rect.height() >= 16.0,
+      "the MDI field must have a usable height, got {}px — clipped by the greedy log scroll area", rect.height()
+    );
+    assert!(
+      rect.bottom() <= dock_floor + 1.0,
+      "the MDI field bottom ({}) must lie within the dock panel floor ({dock_floor}) — a field pushed below it is \
+       invisible (the vanished-MDI bug)", rect.bottom()
+    );
+    // The WIDTH half: in a 900px-wide dock the field must be a real, usable box, not a ~0px sliver beside Send. A
+    // zero-width field satisfies "has height" and "inside the panel" yet is invisible and unusable — exactly the
+    // blind spot that let the earlier test pass while the box was gone.
+    assert!(
+      rect.width() >= 100.0,
+      "the MDI field must have a usable width, got {}px — the Send button consumed the row and collapsed the field",
+      rect.width()
+    );
+  }
+
+  #[test]
+  fn the_console_mdi_send_button_submits_the_typed_line_and_clears_the_field() {
+    // The MDI field routes a typed G-code/`$` line through the engine's manual-send path (`Intent::SendLine`), the
+    // same path the jog/probe/override controls use. Pre-fill the field, click Send, and assert the intent carries
+    // the exact line and the field is cleared for the next command.
+    let mut ui = UiState::default();
+    ui.console_input = "G0 X1 Y2".to_string();
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_dock_harness(state, zero_time());
+    harness.run();
+    // Click via accesskit (the button sits in a nested right-to-left layout; the accesskit click action triggers it
+    // reliably regardless of the pointer-rect geometry, where a raw pointer click can miss).
+    harness.get_by_label("Send").click_accesskit();
+    harness.run();
+    assert!(
+      harness.state().intents.iter().any(|i| matches!(i, Intent::SendLine(line) if line == "G0 X1 Y2")),
+      "clicking Send must submit the typed line verbatim through Intent::SendLine: {:?}", harness.state().intents
+    );
+    assert!(harness.state().ui.console_input.is_empty(), "the field is cleared on send so the next command starts fresh");
+  }
+
+  #[test]
+  fn the_console_mdi_submits_on_enter() {
+    // Enter in the field submits exactly like the Send button (the design's command-line behaviour). Focus the
+    // single text input, press Enter, and assert the line went out through Intent::SendLine and the field cleared.
+    let mut ui = UiState::default();
+    ui.console_input = "$$".to_string();
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_dock_harness(state, zero_time());
+    harness.run();
+    // Focus the single text input, then press Enter at the harness level (the field node borrows the harness, so the
+    // key press is issued after that borrow ends). egui's TextEdit treats Enter as a submit, losing focus — exactly
+    // the `lost_focus() && Enter` the console body keys submission off.
+    harness.get_by_role(egui::accesskit::Role::TextInput).focus();
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert!(
+      harness.state().intents.iter().any(|i| matches!(i, Intent::SendLine(line) if line == "$$")),
+      "Enter must submit the typed `$` command through Intent::SendLine: {:?}", harness.state().intents
+    );
+    assert!(harness.state().ui.console_input.is_empty(), "the field is cleared after an Enter submit");
+  }
+
+  #[test]
+  fn the_console_mdi_is_inert_while_disconnected() {
+    // While disconnected the MDI field and Send button are disabled, and even a buffered line is never submitted —
+    // a manual line must reach the firmware only over a live link. The Send label is still present (disabled), so a
+    // click on it must produce no Intent::SendLine and must not clear the field.
+    let mut ui = UiState::default();
+    ui.console_input = "G0 X1".to_string();
+    let state = HarnessState::new(ViewState::default(), ui); // default connection == Disconnected.
+    let mut harness = build_dock_harness(state, zero_time());
+    harness.run();
+    if let Some(send) = harness.query_by_label("Send") {
+      send.click();
+      harness.run();
+    }
+    assert!(
+      !harness.state().intents.iter().any(|i| matches!(i, Intent::SendLine(_))),
+      "no manual line may be submitted while disconnected: {:?}", harness.state().intents
+    );
+    assert_eq!(harness.state().ui.console_input, "G0 X1", "a disconnected field keeps its text (nothing was sent)");
   }
 }

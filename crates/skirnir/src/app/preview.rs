@@ -1,13 +1,16 @@
-//! Pure geometry helpers backing the toolpath preview's live-motion marker and depth shading.
+//! Pure geometry helpers backing the toolpath preview's live-motion marker, position trail, and depth shading.
 //!
 //! The live marker dot is driven by the machine position carried in the `<...>` status report — a smoothed dot
-//! showing where the tool is right now. The PROGRESS BACKPLOT (the bright "what has been cut" path) is NOT drawn
-//! from status here: it is a deterministic executed-prefix of the parsed toolpath, gated by the streaming engine's
-//! acked-line count in the view layer. An earlier design accumulated a status-SAMPLED trail polyline instead, but
-//! at the ~10 Hz poll rate a move finishing between two samples left no segment — phantom gaps that differed run-to-
-//! run (the §16 render bug). Splitting the already-complete parsed geometry by acked-line index removes that under-
-//! sampling entirely; the marker still shows true position, so the two together give a gap-free path plus a live
-//! cursor. (`ok` leads the real tool by the planner-buffer depth, which is fine for a progress backplot.)
+//! showing where the tool is right now. The CUT TRAIL (the bright "what has been cut" path) is a LinuxCNC-AXIS-style
+//! BREADCRUMB polyline of the tool's ACTUAL reported positions, accumulated ONLY while the tool is cutting below the
+//! work surface (live work-Z < 0). A trail built from where the tool has actually, observably been cannot lead the
+//! cutter — and the Z < 0 gate is why a lead-in/rapid sample (which runs above the surface) never contaminates it.
+//! This is the ORIGINAL working model; it replaced — and was then itself regressed by — two failed alternatives that
+//! both COLOURED the planned path by some host-side progress signal and so led the cutter: the acked-line prefix (the
+//! engine `ok`s a line on planner ACCEPT, racing the planner-buffer depth ahead of true motion) and the single-point
+//! WPos-onto-path projection (ambiguous on self-crossing/parallel-contour parts — a lead-in near a far segment
+//! ratcheted the boundary ahead). Do NOT reintroduce a "colour the planned geometry by progress" approach. The gray
+//! planned geometry is drawn as a uniform dim reference underneath; the bright trail rides over it.
 //!
 //! Everything here is pure and framework-agnostic — plain `(f32, f32)` model-space points, no egui and no
 //! `ViewState`/UI types — so the marker derivation, the per-frame smoothing step, and the depth-shading mapping are
@@ -135,6 +138,49 @@ pub fn flatten_arc(
   // tiny gap between the arc and the next move.
   points.push(end);
   points
+}
+
+/// Decide whether a fresh live work position should be appended to the position trail (the LinuxCNC-AXIS-style
+/// "backplot" of where the tool has actually been). Appends when there is no prior trail point, or when the
+/// candidate has moved at least `min_step` from the last appended point. The step gate decimates the 5–10 Hz
+/// status feed and rejects sub-step status jitter, so a stationary tool does not pile up coincident points. Pure
+/// so the accumulation rule is unit-tested; the caller owns the trail buffer and the cap on its length.
+pub fn trail_should_append(last: Option<ModelPoint>, candidate: ModelPoint, min_step: f32) -> bool {
+  match last {
+    None => true,
+    Some(last) => dist_sq(last, candidate) >= min_step * min_step,
+  }
+}
+
+/// Whether two consecutive trail points should be JOINED by a drawn line, i.e. they are within `max_gap` of each
+/// other. A larger gap means the tool jumped — a rapid reposition between moves, a reconnect, or a teleport — and
+/// joining it would draw a spurious straight streak across the work that the tool never cut, so the trail is left
+/// broken there instead. Pure so the break rule is unit-tested.
+pub fn trail_connects(a: ModelPoint, b: ModelPoint, max_gap: f32) -> bool {
+  dist_sq(a, b) <= max_gap * max_gap
+}
+
+/// Whether a drawn line segment should JOIN a trail point to its predecessor, combining the two break reasons. A
+/// segment is drawn only when BOTH hold: the point does NOT begin a fresh stroke (`!stroke_start`), and the two
+/// points are close enough to connect (`within_gap`, from [`trail_connects`]). A `stroke_start` point is the first
+/// cut after a pen-up lift (the tool rapided/retracted to Z >= 0 between cuts), so joining it to the previous cut
+/// would streak a line straight across the travel the tool never cut — exactly the cross-gap artefact this guards.
+/// The distance gate still breaks an in-stroke teleport/reconnect. Pure so the combined rule is unit-tested.
+pub fn connect_trail_segment(stroke_start: bool, within_gap: bool) -> bool {
+  !stroke_start && within_gap
+}
+
+/// Whether the live work-Z marks a CUT that should be drawn into the progress trail, returning the cut DEPTH (a
+/// negative Z) when so and `None` otherwise. The rule is purely the Z sign: at or above the work zero (`z >= 0`) the
+/// tool is at/above the surface — a rapid, a clearance/travel move, a retract — and draws nothing; below zero
+/// (`z < 0`) the tool is engaged in the work and the segment into this point is a cut. The Z sign is unambiguous and
+/// is why a lead-in/rapid sample (above the surface) can never contaminate the trail. An unknown Z (no derivable
+/// work position this frame) is `None` — no segment, rather than a guessed cut. Pure so the gate is unit-tested.
+pub fn cut_segment_depth(z: Option<f32>) -> Option<f32> {
+  match z {
+    Some(z) if z < 0.0 => Some(z),
+    _ => None,
+  }
 }
 
 #[cfg(test)]
@@ -265,5 +311,50 @@ mod tests {
   fn flatten_arc_degenerate_radius_yields_just_the_endpoint() {
     // A near-zero-radius arc (start == center) cannot define a sweep; it degrades to a single chord to the end.
     assert_eq!(flatten_arc((0.0, 0.0), (2.0, 3.0), (0.0, 0.0), false, DEFAULT_ARC_STEP_RAD), vec![(2.0, 3.0)]);
+  }
+
+  #[test]
+  fn trail_should_append_takes_the_first_point_then_decimates_by_step() {
+    // The very first candidate is always appended (no prior point to measure against).
+    assert!(trail_should_append(None, (5.0, 5.0), 0.5), "the first point is always appended");
+    // A candidate that has not moved at least `min_step` from the last point is decimated (rejects status jitter and
+    // a stationary tool piling up coincident points).
+    assert!(!trail_should_append(Some((5.0, 5.0)), (5.1, 5.0), 0.5), "a sub-step move is decimated");
+    // A candidate that has moved at least `min_step` is appended.
+    assert!(trail_should_append(Some((5.0, 5.0)), (6.0, 5.0), 0.5), "a move past the step gate is appended");
+  }
+
+  #[test]
+  fn trail_connects_breaks_on_a_large_gap() {
+    // Two near points join. A jump beyond `max_gap` (a rapid reposition, a reconnect, a teleport) breaks the trail so
+    // no spurious streak is drawn across travel the tool never cut.
+    assert!(trail_connects((0.0, 0.0), (1.0, 0.0), 5.0), "near points join");
+    assert!(!trail_connects((0.0, 0.0), (50.0, 0.0), 5.0), "a far jump breaks the trail");
+  }
+
+  #[test]
+  fn connect_trail_segment_breaks_on_a_stroke_start_even_when_points_are_near() {
+    // A continuing cut (not a stroke start) within the gap draws a joining segment.
+    assert!(connect_trail_segment(false, true), "a near, continuing cut joins");
+    // A stroke start NEVER joins to the prior point, even when the two are spatially adjacent — this is the lift-
+    // then-plunge case: the tool retracted (Z >= 0) and plunged again near the last cut, and a line across that
+    // travel must NOT be drawn.
+    assert!(!connect_trail_segment(true, true), "a stroke start must not join, even when adjacent");
+    // An in-stroke teleport (not a stroke start, but beyond the gap) still breaks on distance.
+    assert!(!connect_trail_segment(false, false), "a far jump still breaks the stroke");
+    assert!(!connect_trail_segment(true, false), "a far stroke start is broken");
+  }
+
+  #[test]
+  fn cut_segment_depth_draws_only_below_the_work_surface() {
+    // At or above the work zero the tool is travelling/retracted — no cut point is recorded. This is the Z gate that
+    // keeps lead-ins and rapids (which run above the surface) out of the trail, so the trail can never lead the tool.
+    assert_eq!(cut_segment_depth(Some(0.0)), None, "Z == 0 is the surface, not a cut");
+    assert_eq!(cut_segment_depth(Some(5.0)), None, "Z above the surface is a rapid/clearance move");
+    // Below the work zero the tool is engaged: the point is a cut and the depth (the negative Z) is returned.
+    assert_eq!(cut_segment_depth(Some(-0.1)), Some(-0.1), "a shallow plunge is a cut");
+    assert_eq!(cut_segment_depth(Some(-3.0)), Some(-3.0), "a deep pass is a cut at its depth");
+    // No derivable Z this frame draws nothing rather than guessing a cut.
+    assert_eq!(cut_segment_depth(None), None, "an unknown Z draws no segment");
   }
 }
