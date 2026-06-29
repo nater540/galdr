@@ -31,6 +31,11 @@ const DEFAULT_BAUD: u32 = 115_200;
 /// double-click. The toggle policy lives in [`UiState::register_fabulous_click`].
 const FABULOUS_CLICKS: u8 = 6;
 
+/// The minimum width (px) the console's manual-command (MDI) text field is given when the row's available width,
+/// after reserving the Send button, would otherwise leave it too narrow to see or type into. A floor so the field
+/// can never collapse to an invisible sliver the way it did when the button consumed the whole row width first.
+const MDI_FIELD_MIN_W: f32 = 120.0;
+
 /// Hold a baud to [`BAUD_RANGE`], falling back to [`DEFAULT_BAUD`] when it is out of range (the settings knob
 /// clamps live edits, but a value loaded from a hand-edited/corrupt profile OR from the config's `default_baud`
 /// bypasses that — `0` would fail the port open). The widget's own range still clamps subsequent edits. `pub(crate)`
@@ -83,16 +88,29 @@ pub struct UiState {
   /// sample (see [`super::preview::smooth_marker`]); `None` until the first live work position is acquired or
   /// while no live status exists. Reset by [`Self::set_program`].
   marker_pos: Option<Vec2>,
+  /// The position trail: a LinuxCNC-AXIS-style "backplot" of where the tool has ACTUALLY been, in toolpath model
+  /// space (work-coordinate XY mm), oldest first. Live work positions are appended ONLY while running and cutting
+  /// (machine in Run with the tool below the work surface, live work-Z < 0), decimated by a step gate, and the trail
+  /// is drawn as a polyline over the dim preview — so it shows the real cut path rather than projecting/colouring
+  /// which planned segment the tool is on (both of which led the cutter — see the module doc). Each point carries the
+  /// live cut DEPTH so the draw step can shade it. Capped at [`MAX_TRAIL_POINTS`] (rolling, oldest dropped) and
+  /// cleared by [`Self::set_program`] and on each fresh run-entry.
+  trail: std::collections::VecDeque<TrailPoint>,
   /// The loaded program's minimum (most negative) work-Z — the deepest programmed cut — scanned once at load. The
-  /// executed-prefix cut render shades each drawn segment by depth job-relative against this: brightest at the
-  /// surface, darkest at this minimum (see [`super::preview::depth_brightness`]). Zero when no program is loaded or it
-  /// never cuts below the work zero, in which case the cut path takes the full base colour with no depth darkening.
+  /// cut trail shades each segment by depth job-relative against this: brightest at the surface, darkest at this
+  /// minimum (see [`super::preview::depth_brightness`]). Zero when no program is loaded or it never cuts below the
+  /// work zero, in which case the cut path takes the full base colour with no depth darkening.
   job_min_z: f32,
   /// The machine run state seen on the previous overlay frame, kept only to edge-detect the start of a run. The
-  /// rising edge into `Run` (see [`entered_run`]) drops the stale marker once, so a fresh job's marker snaps to the
-  /// new run's first sampled position rather than lerping in from the prior run's last. `None` until the first frame;
-  /// reset by [`Self::set_program`] so a freshly loaded file's first Run is treated as a clean entry.
+  /// rising edge into `Run` (see [`entered_run`]) wipes the prior run's trail and drops the stale marker once, so a
+  /// fresh job draws over the dim planned preview alone rather than under the last run's path. `None` until the first
+  /// frame; reset by [`Self::set_program`] so a freshly loaded file's first Run is treated as a clean entry.
   prev_run_state: Option<crate::protocol::RunState>,
+  /// Whether the previous overlay frame was a CUT frame (running with the tool engaged below the work surface).
+  /// Tracks the pen-up/pen-down state across frames: a cut point appended after this was `false` (a lift, a non-Run
+  /// frame, or the start of the trail) begins a fresh stroke, so the draw loop does not bridge a line across the
+  /// travel between cuts. Set `false` on any non-cut frame, on run-entry, and by [`Self::set_program`].
+  prev_frame_was_cut: bool,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
   /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
@@ -225,8 +243,10 @@ impl Default for UiState {
       toolpath: Vec::new(),
       toolpath_bounds: None,
       marker_pos: None,
+      trail: std::collections::VecDeque::new(),
       job_min_z: 0.0,
       prev_run_state: None,
+      prev_frame_was_cut: false,
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
@@ -320,12 +340,16 @@ impl UiState {
     // A fresh program starts unfollowed: the first streamed line of the new file must re-trigger an auto-scroll
     // even if the old program happened to leave us followed at the same row index.
     self.program_followed_line = None;
-    // The live marker is program-scoped: a new file starts with no acquired marker so it snaps to the first sample of
-    // the new run rather than lerping in from the old program's last position.
+    // The live marker and the cut trail are program-scoped: a new file starts with no acquired marker (so it snaps to
+    // the first sample of the new run) and an empty trail (so the new job draws over the dim planned preview alone,
+    // not under the old program's path).
     self.marker_pos = None;
+    self.trail.clear();
     // Forget the prior file's run state so the new program's first Run frame is treated as a clean run-entry rather
-    // than a continuation (a stale `Some(Run)` here would suppress the marker-snap on the next run).
+    // than a continuation (a stale `Some(Run)` here would suppress the entry-clear on the next run). Lift the
+    // pen-down tracker too, so the new file's first cut begins a fresh stroke.
     self.prev_run_state = None;
+    self.prev_frame_was_cut = false;
   }
 
   /// Re-flatten the CURRENTLY LOADED program's cached toolpath at the current `style.toolpath.arc_step_rad`, without
@@ -339,6 +363,8 @@ impl UiState {
     }
     self.toolpath = parse_xy_path(&self.program, self.style.toolpath.arc_step_rad);
     self.toolpath_bounds = toolpath_bounds(&self.toolpath);
+    // The cut trail is a polyline of real tool positions in model space — independent of the planned-segment chord
+    // density — so a re-flow leaves it untouched: only the dim planned geometry is rebuilt.
   }
 
   /// The number of cached toolpath segments (chords). Exposed so the reload/arc-density behaviour can be asserted
@@ -1134,7 +1160,9 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   let palette = state.style.palette;
   use super::overrides::OverrideAxis;
   section_header(ui, palette, "Overrides");
-  let (feed, rapid, spindle) = view.status.as_ref().and_then(|s| s.overrides).unwrap_or((100, 100, 100));
+  // The cached override survives reports that omit the intermittent `Ov:` field, so the handle/steppers do not
+  // snap to 100% on every Ov-less poll. See [`ViewState::overrides`].
+  let (feed, rapid, spindle) = view.overrides();
   // Overrides only do anything on a ready link — a relative ±10/±1/reset byte is a no-op with nothing connected
   // to act on it — so the whole panel is disabled until the board is connected and ready (Idle/Run/Hold/…).
   let enabled = view.connection.is_connected();
@@ -2043,7 +2071,19 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     .collect();
 
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-  let scroll = ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(state.auto_scroll).show_rows(
+  // Reserve the manual-command (MDI) row's height BEFORE the log scroll area, so the scroll area fills only the
+  // space ABOVE it rather than the whole panel. The log uses `auto_shrink([false, false])`, which expands to consume
+  // all remaining height of the parent `Ui`; inside the pinned 200px dock panel that left zero room for the input
+  // row laid out beneath it, pushing the MDI field below the panel floor where it was clipped away entirely (the
+  // "no text input on the Console tab" bug). Capping the scroll area's `max_height` to `available − input row`
+  // (plus the inter-row spacing) keeps the field on-screen with its full height. `max(0)` guards a panel too short
+  // to hold both — the input row then wins and the log collapses, which is the safer failure (the operator can
+  // still type) than the reverse. The input row itself is drawn after the scroll area, in the reserved gap.
+  let spacing_y = ui.spacing().item_spacing.y;
+  let input_row_h = Metrics::PANEL_CONTROL_H + spacing_y;
+  let log_max_h = (ui.available_height() - input_row_h).max(0.0);
+  let scroll = ScrollArea::vertical().auto_shrink([false, false]).max_height(log_max_h)
+    .stick_to_bottom(state.auto_scroll).show_rows(
     ui,
     row_height,
     visible.len(),
@@ -2071,26 +2111,46 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     }
   });
 
-  // Manual command entry: the input fills the row and Send sits flush to its right (design §03 command line),
-  // sending on Enter or the button, only while connected.
+  // Manual command entry: the input fills the row to the left of a fixed-width Send button (design §03 command
+  // line), sending on Enter or the button, only while connected.
   ui.horizontal(|ui| {
     let connected = view.connection.is_connected();
-    // Reserve the Send button's slot on the right first, then let the field claim the rest of the row.
     let send_w = Metrics::SEND_PAD_X * 2.0 + 32.0;
-    let send_clicked = ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      ui.add_enabled_ui(connected, |ui| {
-        ui.add_sized(Vec2::new(send_w, Metrics::PANEL_CONTROL_H), egui::Button::new("Send")).clicked()
-      }).inner
-    }).inner;
+    // Give the field an EXPLICIT width — the row's available width minus the Send button and one inter-widget gap —
+    // floored at a usable minimum. The previous layout drew the Send button first inside a nested
+    // `with_layout(right_to_left)` child, which claims the WHOLE remaining row width; the field added afterward with
+    // `desired_width(INFINITY)` then had zero width left and collapsed to an invisible sliver (the empty gap beside
+    // Send). Sizing the field first, left to right, and letting the button take the remainder keeps the box visible
+    // and usable even when empty. `MDI_FIELD_MIN_W` guards a narrow dock so the field never vanishes again.
+    let gap = ui.spacing().item_spacing.x;
+    let field_w = (ui.available_width() - send_w - gap).max(MDI_FIELD_MIN_W);
     let response = ui.add_enabled(connected, egui::TextEdit::singleline(&mut state.console_input)
-      .hint_text("$$, G0 X0, …").desired_width(f32::INFINITY));
-    let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    if connected && (submit || send_clicked) && !state.console_input.trim().is_empty() {
+      .hint_text("$$, G0 X0, …").desired_width(field_w));
+    let send_clicked = ui.add_enabled_ui(connected, |ui| {
+      ui.add_sized(Vec2::new(send_w, Metrics::PANEL_CONTROL_H), egui::Button::new("Send")).clicked()
+    }).inner;
+    // Submit on Enter (the field loses focus carrying the Enter press) or the Send button. The decision — gated on
+    // the link being up and the field holding a non-blank line — is the pure [`should_submit_mdi`] so it is unit-
+    // tested without a window; only the actual take/push/refocus side effects stay here.
+    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    if should_submit_mdi(connected, enter || send_clicked, &state.console_input) {
+      // Clear the field as we take the line so the next command starts fresh, and re-focus for the operator to keep
+      // typing. The line is a normal G-code/`$` command: it goes through the engine's LINE-BUFFERED send path
+      // (`Intent::SendLine` → `send_line` → `Command::SendLine`), counted against the RX buffer like any streamed
+      // line — NOT a real-time single byte (those are `Command::Realtime`, reserved for `?`/`!`/`~`/`0x18`/jog-cancel).
       let line = std::mem::take(&mut state.console_input);
       sink.push(Intent::SendLine(line));
       response.request_focus();
     }
   });
+}
+
+/// Whether a manual-command (MDI) line typed in the console should be submitted this frame: only when the link is
+/// connected, a submit gesture fired (Enter or the Send button), and the field holds a non-blank line. A blank or
+/// whitespace-only field never submits (so a stray Enter is a no-op), and nothing is sent while disconnected. Pure so
+/// the gate is unit-tested without a window; the caller owns the take/push/refocus side effects.
+fn should_submit_mdi(connected: bool, submit_gesture: bool, field: &str) -> bool {
+  connected && submit_gesture && !field.trim().is_empty()
 }
 
 /// Whether a console line is a bare `ok` acknowledgement — the per-line ack the firmware emits for every consumed
@@ -2261,8 +2321,17 @@ const MARKER_SNAP_SPAN_FRACTION: f32 = 0.25;
 /// machine-origin park (#4), or a WCS-mismatch float (#5) — falls outside and is suppressed.
 const MARKER_ON_PATH_MARGIN_FRACTION: f32 = 0.15;
 
-/// The model-space span diagonal used to scale the resolution-independent marker/progress tolerances. Clamped to
-/// a small floor so a degenerate (single-point) program cannot collapse the tolerances to zero.
+/// The minimum tool travel (as a fraction of the toolpath's model-space span diagonal) before a fresh live position
+/// is appended to the cut trail. It decimates the 5–10 Hz status feed and rejects sub-step jitter so a stationary
+/// tool does not pile up coincident points; small enough that the trail still tracks the real cut path finely.
+const TRAIL_MIN_STEP_FRACTION: f32 = 0.002;
+
+/// The rolling cap on cut-trail points. Once exceeded the oldest are dropped (the trail is a `VecDeque`), bounding
+/// memory and per-frame draw cost on a long job; the decimating step gate keeps a typical job well under.
+const MAX_TRAIL_POINTS: usize = 30_000;
+
+/// The model-space span diagonal used to scale the resolution-independent marker/trail tolerances. Clamped to a
+/// small floor so a degenerate (single-point) program cannot collapse the tolerances to zero.
 fn span_diagonal(span: egui::Vec2) -> f32 {
   (span.x * span.x + span.y * span.y).sqrt().max(1.0)
 }
@@ -2348,35 +2417,43 @@ pub fn toolpath(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   let offset = egui::vec2(rect.left() + (rect.width() - used.x) * 0.5, rect.top() + (rect.height() - used.y) * 0.5);
   let to_screen = |p: egui::Vec2| egui::pos2(offset.x + (p.x - min.x) * scale, offset.y + (max.y - p.y) * scale);
 
-  // Fold this frame's live status into the overlay: smooth the live marker toward the sampled work position.
-  // Returns the model-space marker to draw, or `None` to draw no dot. This mutates the cached marker before the
-  // immutable draw borrow of `state.toolpath` below.
+  // Fold this frame's live status into the overlay: extend the cut trail from the live work position (only while
+  // cutting below the surface) and smooth the marker. Returns the model-space marker to draw, or `None` to draw no
+  // dot. This mutates the cached state (trail/marker) before the immutable draw borrows of `state.toolpath`/
+  // `state.trail` below.
   let live_marker = update_live_overlay(state, view, (min, max), span);
 
-  // The toolpath is drawn in a single pass that doubles as the progress backplot, sourced from the DETERMINISTIC
-  // parsed geometry and the streaming engine's acked-line count rather than from status samples — this is the §16
-  // render fix. The old yellow trail was rebuilt from ~10 Hz `?`-poll WPos samples, so a move that finished between
-  // two polls left no segment: phantom gaps that differed run-to-run. Driving the executed/planned split off
-  // `Progress::acked` against the complete parsed segments removes that under-sampling entirely — the rendered cut
-  // path is now an exact, gap-free prefix of the real geometry. Each segment:
-  //   - PLANNED (not yet executed): the dim reference colour (cuts neutral, rapids dimmer), as before.
-  //   - EXECUTED CUT (its line acked, and it is a cutting move): the cut base colour SHADED by depth — brightest at
-  //     the surface, darkest at the program's deepest pass (see [`preview::depth_brightness`]) — at the cut width.
-  //   - EXECUTED RAPID: still drawn dim, never as a cut — an executed travel move is not a cut, preserving the "no
-  //     rapids drawn as cuts" intent of commit 8b4e08c without the under-sampling that made it lose real cuts.
-  // `Progress::acked` runs at most a planner-queue depth ahead of true motion (the firmware acks on ACCEPT, not on
-  // completion), so the executed prefix can lead the physical cutter by a few blocks; the live marker below still
-  // shows the true sampled position, and a few-block lead is invisible at normal feeds. The trade for determinism —
-  // no phantom gaps, ever — is the right one for a progress backplot.
-  let acked = view.progress.acked;
+  // The program preview underneath is drawn uniformly DIM (cuts neutral, rapids dimmer) — it is the reference
+  // geometry, not the progress. Progress is shown by the cut trail drawn over it, so there is no per-segment cut
+  // colouring of the planned path (every host-side attempt to colour the planned geometry by progress — acked-line
+  // prefix, WPos-onto-path projection — led the cutter; see the preview-module doc).
   for seg in &state.toolpath {
-    if !seg.rapid && segment_executed(seg.line_idx, acked) {
-      let color = palette.toolpath_cut.gamma_multiply(preview::depth_brightness(seg.z, state.job_min_z));
-      painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(tp.cut_stroke_px, color));
-    } else {
-      let color = if seg.rapid { palette.border_raised } else { palette.text_dim };
-      painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(1.0, color));
+    let color = if seg.rapid { palette.border_raised } else { palette.text_dim };
+    painter.line_segment([to_screen(seg.from), to_screen(seg.to)], egui::Stroke::new(1.0, color));
+  }
+
+  // The cut trail: the AXIS-style breadcrumb of where the tool has actually CUT, drawn over the dim preview as a set
+  // of separate strokes split at pen-up boundaries. Only below-surface cutting moves were recorded (no rapids), so
+  // every drawn segment is a cut: it takes the cut base colour SHADED by depth — brightest at the surface, darkest at
+  // the program's deepest pass (see [`preview::depth_brightness`]) — at the cut stroke width. A segment is drawn into
+  // a point only when it does NOT begin a fresh stroke AND it connects by distance (see
+  // [`preview::connect_trail_segment`]): a `stroke_start` point is the first cut after a lift, so no line is ever
+  // streaked from the prior cut straight across the travel (the cross-gap artefact); a large XY gap mid-stroke (a
+  // reconnect/teleport) still breaks too. The move INTO a point carries that point's depth, so the segment is shaded
+  // by `cur`'s depth.
+  let break_gap = span_diagonal(span) * tp.trail_break_fraction;
+  let mut prev: Option<&TrailPoint> = None;
+  for cur in &state.trail {
+    if let Some(a) = prev {
+      let within_gap = preview::trail_connects((a.pos.x, a.pos.y), (cur.pos.x, cur.pos.y), break_gap);
+      if preview::connect_trail_segment(cur.stroke_start, within_gap) {
+        // Shade the one base cut colour by depth: multiply its brightness by the job-relative depth fraction so a
+        // deeper pass reads darker. `gamma_multiply` scales perceptually, matching the marker ring's idiom below.
+        let color = palette.toolpath_cut.gamma_multiply(preview::depth_brightness(cur.z, state.job_min_z));
+        painter.line_segment([to_screen(a.pos), to_screen(cur.pos)], egui::Stroke::new(tp.cut_stroke_px, color));
+      }
     }
+    prev = Some(cur);
   }
 
   // The tool dot (warm motion accent) marks where the machine is now: the smoothed live position, projected
@@ -2423,17 +2500,23 @@ fn entered_run(prev: Option<crate::protocol::RunState>, current: Option<crate::p
 ///   the path (homed to machine origin, a units mismatch, a WCS mismatch) draws no dot rather than a
 ///   confident-but-wrong one.
 fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec2), span: egui::Vec2) -> Option<Vec2> {
-  // A new run starts here: on the rising edge into Run (Idle/Hold → Run, or the first Run after connect/load) drop
-  // the stale marker so the fresh job's marker snaps to the new run's first sampled position rather than lerping in
-  // from the prior run's last one. Edge-detected against the previous frame's state so it fires once per run, never
-  // mid-run. The previous state is updated every frame (including the no-work-position frames below) so it stays
-  // accurate. The PROGRESS BACKPLOT itself is no longer accumulated here — it is drawn deterministically from the
-  // parsed geometry and the acked-line count (see the draw loop), so the live overlay only owns the marker now.
+  // A new run starts here: on the rising edge into Run (Idle/Hold → Run, or the first Run after connect/load) wipe
+  // the prior run's accumulated cut trail and drop the stale marker, so the fresh job draws over the dim planned
+  // preview alone. Edge-detected against the previous frame's state so it fires once per run, never mid-run. The
+  // previous state is updated every frame (including the no-work-position frames below), so the edge stays accurate.
   let run_state = view.status.as_ref().map(|s| s.machine_state.state);
   if entered_run(state.prev_run_state, run_state) {
+    state.trail.clear();
     state.marker_pos = None;
+    // A fresh run lifts the pen: the first cut of the new run must begin its own stroke, not continue the prior run.
+    state.prev_frame_was_cut = false;
   }
   state.prev_run_state = run_state;
+  // Capture whether the PREVIOUS frame was a cut (for the stroke-start decision), then default this frame to "not a
+  // cut". Only a successful cut-point append below flips it back to `true`, so every other path — a lift, a non-Run
+  // frame, a decimated frame, or a frame with no derivable position — correctly registers as a pen-up.
+  let prev_was_cut = state.prev_frame_was_cut;
+  state.prev_frame_was_cut = false;
 
   let Some(target) = view.work_xy().map(|(x, y)| (x as f32, y as f32)) else {
     // No derivable work position this frame. Two cases (finding #6):
@@ -2452,6 +2535,29 @@ fn update_live_overlay(state: &mut UiState, view: &ViewState, bounds: (Vec2, Vec
   let current = state.marker_pos.map(|p| (p.x, p.y));
   let smoothed = preview::smooth_marker(current, target, snap_dist, MARKER_LERP);
   state.marker_pos = Some(egui::vec2(smoothed.0, smoothed.1));
+
+  // Extend the CUT trail from the RAW live work position (not the smoothed marker, which lags) — but ONLY while the
+  // machine is in Run AND the tool is engaged below the work surface (live work-Z < 0). A jog, a feed-hold, or an
+  // above-surface travel/clearance move is not program cutting, so it records nothing — this Z < 0 gate is exactly
+  // why a lead-in/rapid sample (which runs above the surface) can never contaminate the trail and make it lead the
+  // cutter. The point carries its cut depth so the draw step can shade it. The step gate decimates the status feed;
+  // the rolling cap bounds it. A breadcrumb of where the tool has ACTUALLY been cannot, by construction, lead it.
+  let running = matches!(view.status.as_ref().map(|s| s.machine_state.state), Some(crate::protocol::RunState::Run));
+  let live_z = view.work_z().map(|z| z as f32);
+  if running
+    && let Some(depth) = preview::cut_segment_depth(live_z)
+  {
+    // This cut point begins a fresh stroke when the previous frame was NOT a cut — a pen-down after a lift (a rapid
+    // or retract to Z >= 0) or the first cut of the run — so the draw loop breaks the polyline before it rather than
+    // streaking a line across the travel. The flag rides on the point only when it actually appends.
+    let stroke_start = !prev_was_cut;
+    let min_step = diagonal * TRAIL_MIN_STEP_FRACTION;
+    let appended = push_trail_point(&mut state.trail, egui::vec2(target.0, target.1), depth, stroke_start, min_step);
+    // The pen is down for this stroke once a cut frame is seen: on a real append, or if it was already down and this
+    // sub-step (decimated) cut frame did not break it. Without the `prev_was_cut` carry, a decimated cut mid-stroke
+    // would reset the tracker and spuriously flag the NEXT appended cut as a new stroke (a false break, not a join).
+    state.prev_frame_was_cut = appended || prev_was_cut;
+  }
 
   // Gate the marker: drawn on/near the path or while actively moving, suppressed for a parked-off-path point
   // (#3/#4/#5). Use the SMOOTHED position so the gate matches what is drawn.
@@ -2491,35 +2597,14 @@ fn draw_grid(painter: &egui::Painter, palette: Palette, tp: ToolpathStyle, rect:
   }
 }
 
-/// One straight XY segment of the parsed toolpath.
+/// One straight XY segment of the parsed toolpath, drawn as the dim planned-geometry reference. Depth shading is a
+/// property of the live CUT TRAIL (see [`TrailPoint`]), not of the planned preview, so a segment carries no Z.
 #[derive(Debug, Clone)]
 struct Segment {
   from: egui::Vec2,
   to: egui::Vec2,
   /// Whether this is a rapid (G0) travel move rather than a cut.
   rapid: bool,
-  /// The zero-based index of the PROGRAM LINE that produced this segment. The streaming engine acknowledges lines
-  /// in order, so its acked-line count (`Progress::acked`) splits the toolpath into an executed prefix (segments
-  /// whose `line_idx < acked`) and a still-planned tail — a DETERMINISTIC progress backplot that replaces the old
-  /// status-sampled trail (which under-sampled fast moves into phantom gaps, the §16 render bug). A line that
-  /// flattens into many arc chords tags every chord with its one line index, so the whole arc flips executed at the
-  /// single ack of its line.
-  line_idx: usize,
-  /// The modal work-Z (millimetres) in effect for this segment — the cut depth when below the work surface. Carried
-  /// so the executed prefix can shade each drawn cut by depth (brightest at the surface, darkest at the program's
-  /// deepest pass; see [`super::preview::depth_brightness`]) without a second status-sampled pass. Positive or zero
-  /// for an above-surface travel/clearance move.
-  z: f32,
-}
-
-/// Whether a toolpath segment from program line `line_idx` has been EXECUTED, given the streaming engine's
-/// acknowledged-line count `acked`. A segment is executed once its producing line has been acked — `line_idx < acked`
-/// — because the engine acks program lines strictly in order. This is the deterministic gate that draws the executed
-/// (cut) prefix of the toolpath apart from the still-planned tail, replacing the §16 status-sampled trail. Pure so
-/// the split is unit-tested without a GUI or a live status feed: an `acked` of 0 executes nothing, an `acked` at or
-/// beyond the program's line count executes every segment, and a one-line-to-many-chords arc flips wholly at its ack.
-fn segment_executed(line_idx: usize, acked: usize) -> bool {
-  line_idx < acked
 }
 
 /// Parse the loaded program into a flat list of XY segments for the preview. A pragmatic linear interpreter:
@@ -2539,18 +2624,12 @@ fn parse_xy_path(lines: &[String], arc_step_rad: f32) -> Vec<Segment> {
   // Modal motion mode: 0 == G0 rapid, 1 == G1 cut, 2 == G2 CW arc, 3 == G3 CCW arc.
   let mut motion = 0u8;
   let mut absolute = true; // modal distance mode: true == G90 (absolute), false == G91 (relative).
-  // Modal work-Z, carried onto each emitted segment so the executed prefix can shade cuts by depth. Tracked across
-  // lines exactly as XY is, honouring the same G90/G91 distance mode, so a Z set on one line persists to later moves.
-  let mut z = 0.0_f32;
-  // `enumerate` counts EVERY program line — including blanks and comments skipped below — so a segment's `line_idx`
-  // stays aligned with the streaming engine's acked-line count, which likewise counts every sent line in file order.
-  for (line_idx, line) in lines.iter().enumerate() {
+  for line in lines {
     let code = line.split(';').next().unwrap_or("").to_ascii_uppercase();
     if code.trim().is_empty() {
       continue;
     }
     let mut next = pos;
-    let mut next_z = z;
     let mut has_xy = false;
     let mut suppress = false; // a non-motion G-word on this line suppresses any segment for it.
     // Arc centre offsets (I/J) relative to the current position; collected only for an arc line. Both default to
@@ -2582,11 +2661,6 @@ fn parse_xy_path(lines: &[String], arc_step_rad: f32) -> Vec<Segment> {
             has_xy = true;
           }
         }
-        'Z' => {
-          if let Ok(v) = number.parse::<f32>() {
-            next_z = if absolute { v } else { z + v };
-          }
-        }
         'I' => {
           if let Ok(v) = number.parse::<f32>() {
             arc_i = v;
@@ -2604,25 +2678,19 @@ fn parse_xy_path(lines: &[String], arc_step_rad: f32) -> Vec<Segment> {
     }
     if has_xy && !suppress {
       let rapid = motion == 0;
-      // The depth shown for this move is its DESTINATION Z (the depth the cut reaches), matching how the trail
-      // records the live work-Z at each sampled point. A non-motion suppressed line never reaches here, so its Z
-      // word (e.g. a `G92 Z0`) is intentionally not applied to `z`, exactly as it does not apply to the position.
       if (motion == 2 || motion == 3) && has_ij {
         // An arc with a usable I/J centre: flatten it into chords. I/J are offsets from the START position.
         let center = (pos.x + arc_i, pos.y + arc_j);
         let mut from = (pos.x, pos.y);
         for point in super::preview::flatten_arc(from, (next.x, next.y), center, motion == 2, arc_step_rad) {
-          segments.push(Segment {
-            from: egui::vec2(from.0, from.1), to: egui::vec2(point.0, point.1), rapid, line_idx, z: next_z,
-          });
+          segments.push(Segment { from: egui::vec2(from.0, from.1), to: egui::vec2(point.0, point.1), rapid });
           from = point;
         }
       } else {
         // A linear move, or an arc with no centre offset (degrade to its chord rather than guessing a centre).
-        segments.push(Segment { from: pos, to: next, rapid, line_idx, z: next_z });
+        segments.push(Segment { from: pos, to: next, rapid });
       }
       pos = next;
-      z = next_z;
     }
   }
   segments
@@ -2645,6 +2713,38 @@ fn toolpath_bounds(segments: &[Segment]) -> Option<(Vec2, Vec2)> {
     }
   }
   Some((min, max))
+}
+
+/// One point of the cut-progress trail: a model-space (work XY) tool position, the live work-Z (the cut DEPTH) at
+/// that point so the trail can shade each segment by how deep the cut was, and a `stroke_start` pen-up/pen-down flag.
+/// Only points cut below the work surface (`z < 0`) are ever pushed, so the stored `z` is always a negative depth.
+/// `stroke_start` is true when this point begins a FRESH stroke — the first cut after a lift (the tool retracted to
+/// Z >= 0 between cuts) or the first point of the trail — so the draw loop never joins a line back across the travel.
+#[derive(Debug, Clone, Copy)]
+struct TrailPoint {
+  pos: Vec2,
+  z: f32,
+  stroke_start: bool,
+}
+
+/// Append the live work position to the trail if the tool has moved at least `min_step` from the last point, and
+/// enforce the rolling [`MAX_TRAIL_POINTS`] cap (oldest dropped). `z` is the live work-Z (the cut depth) carried into
+/// the point so the draw step can shade it; `stroke_start` flags it as the start of a fresh stroke (a pen-down after
+/// a lift) so the draw loop breaks the polyline before it. Returns whether the point was actually appended (false
+/// when decimated by the step gate), so the caller can track pen-down only on a real append. The append decision
+/// itself is the pure [`super::preview::trail_should_append`]; this just owns the `VecDeque` mutation.
+fn push_trail_point(
+  trail: &mut std::collections::VecDeque<TrailPoint>, point: Vec2, z: f32, stroke_start: bool, min_step: f32,
+) -> bool {
+  let last = trail.back().map(|p| (p.pos.x, p.pos.y));
+  if !preview::trail_should_append(last, (point.x, point.y), min_step) {
+    return false;
+  }
+  trail.push_back(TrailPoint { pos: point, z, stroke_start });
+  while trail.len() > MAX_TRAIL_POINTS {
+    trail.pop_front();
+  }
+  true
 }
 
 /// Split one (comment-stripped, upper-cased) G-code line into `(letter, number)` words, handling both spaced
@@ -2985,65 +3085,33 @@ mod tests {
   }
 
   #[test]
-  fn parse_xy_path_tags_each_segment_with_its_source_line_index() {
-    // The §16 fix: every segment must carry the zero-based PROGRAM-LINE index it came from, counting EVERY line —
-    // blanks and comments included — so the index stays aligned with the streaming engine's acked-line count (which
-    // also counts every sent line in file order).
+  fn parse_xy_path_emits_one_segment_per_motion_line_skipping_blanks_and_comments() {
+    // Blank and comment lines emit no geometry; only the two motion lines do. The progress backplot is keyed off the
+    // segment INDEX swept by the live tool (not a per-line tag), so the parser's contract here is simply: one segment
+    // per executing XY move, in order.
     let program = vec![
-      "G90".to_string(),            // line 0: modal only, emits no segment
-      "".to_string(),               // line 1: blank — counted, emits nothing
-      "; a comment".to_string(),    // line 2: comment — counted, emits nothing
-      "G1 X10 Y0 Z-1".to_string(),  // line 3: the first cut segment
-      "G1 X10 Y10".to_string(),     // line 4: the second cut segment
+      "G90".to_string(),            // modal only, emits no segment
+      "".to_string(),               // blank — emits nothing
+      "; a comment".to_string(),    // comment — emits nothing
+      "G1 X10 Y0 Z-1".to_string(),  // the first cut segment
+      "G1 X10 Y10".to_string(),     // the second cut segment
     ];
     let segs = parse_xy_path(&program, 0.1);
-    assert_eq!(segs.len(), 2, "two motion lines emit two segments");
-    assert_eq!(segs[0].line_idx, 3, "the first segment is tagged with its true file line (3, past the blank/comment)");
-    assert_eq!(segs[1].line_idx, 4, "the second segment keeps file-line alignment");
+    assert_eq!(segs.len(), 2, "two motion lines emit two segments, blanks/comments emit none");
   }
 
   #[test]
-  fn parse_xy_path_carries_the_modal_destination_z_onto_each_segment() {
-    // Each segment carries the modal work-Z in effect at its DESTINATION (the depth the move reaches), tracked across
-    // lines under the active distance mode, so the executed prefix can depth-shade without a status-sampled pass.
+  fn parse_xy_path_flattens_an_arc_into_many_chords() {
+    // An arc (G2/G3) flattens into many short chord segments rather than a single start→end chord, so the dim planned
+    // preview draws the real curve.
     let program = vec![
       "G90".to_string(),
-      "G0 X0 Y0 Z5".to_string(),    // above-surface travel: z = +5
-      "G1 X10 Y0 Z-1.0 F300".to_string(), // plunge to −1.0
-      "G1 X20 Y0".to_string(),      // a cut that keeps the modal Z (−1.0)
-    ];
-    let segs = parse_xy_path(&program, 0.1);
-    assert_eq!(segs.len(), 3);
-    assert!((segs[0].z - 5.0).abs() < 1e-6, "the travel move carries its +5 Z");
-    assert!((segs[1].z - (-1.0)).abs() < 1e-6, "the plunge carries its −1.0 destination Z");
-    assert!((segs[2].z - (-1.0)).abs() < 1e-6, "a move with no Z word keeps the modal −1.0");
-  }
-
-  #[test]
-  fn parse_xy_path_shares_one_line_index_across_an_arc_flattened_into_many_chords() {
-    // An arc (G2/G3) flattens into many chord segments — but they all came from ONE program line, so they must all
-    // carry that single line index and thus flip executed together at the single ack of their line.
-    let program = vec![
-      "G90".to_string(),                 // line 0
-      "G0 X1 Y0".to_string(),            // line 1: position to the arc start
-      "G3 X0 Y1 I-1 J0".to_string(),     // line 2: a quarter arc → many chords, all from line 2
+      "G0 X1 Y0".to_string(),            // position to the arc start
+      "G3 X0 Y1 I-1 J0".to_string(),     // a quarter arc → many chords
     ];
     let segs = parse_xy_path(&program, 0.05);
-    let arc: Vec<&Segment> = segs.iter().filter(|s| s.line_idx == 2).collect();
-    assert!(arc.len() > 2, "the arc flattens into several chords (got {})", arc.len());
-    assert!(arc.iter().all(|s| s.line_idx == 2), "every chord of the arc shares its one source line index");
-  }
-
-  #[test]
-  fn segment_executed_splits_the_toolpath_at_the_acked_line_count() {
-    // The deterministic executed/planned gate: a segment is executed once its producing line has been acked.
-    assert!(!segment_executed(0, 0), "with nothing acked, even line 0's segment is not executed");
-    assert!(segment_executed(0, 1), "one ack executes line 0's segment");
-    assert!(!segment_executed(1, 1), "but not line 1's yet");
-    assert!(segment_executed(5, 6), "line 5 executes once acked reaches 6");
-    // An `acked` at or beyond the program's line count executes every segment — the gate never under-draws.
-    assert!(segment_executed(9, 10), "the last line executes at full ack");
-    assert!(segment_executed(9, 1000), "an acked count past the program executes everything (clamps, never panics)");
+    // One positioning move plus several arc chords; the arc alone must contribute more than two chords.
+    assert!(segs.len() > 3, "the arc flattens into several chords beyond the positioning move (got {})", segs.len());
   }
 
   #[test]
@@ -3246,6 +3314,20 @@ mod tests {
     assert_eq!(console_line_style(palette, LogSource::Received, "[MSG:hi]").1, palette.log_info);
     assert_eq!(console_line_style(palette, LogSource::Received, "error:9").1, palette.state_alarm);
     assert_eq!(console_line_style(palette, LogSource::Received, "ok").1, palette.log_recv);
+  }
+
+  #[test]
+  fn should_submit_mdi_gates_on_connection_gesture_and_a_non_blank_line() {
+    // The common path: connected, a submit gesture (Enter or Send), and a real line → submit.
+    assert!(should_submit_mdi(true, true, "G0 X0"), "a non-blank line with a gesture while connected submits");
+    assert!(should_submit_mdi(true, true, "$$"), "a `$` command submits like any other line");
+    // No submit gesture this frame (just typing into the field) → no send.
+    assert!(!should_submit_mdi(true, false, "G0 X0"), "without Enter/Send the line is not submitted");
+    // Disconnected → never send, even with a gesture and a line (the field/button are also disabled in the UI).
+    assert!(!should_submit_mdi(false, true, "G0 X0"), "a disconnected link never submits");
+    // A blank or whitespace-only field is a no-op, so a stray Enter does not push an empty line.
+    assert!(!should_submit_mdi(true, true, ""), "an empty field never submits");
+    assert!(!should_submit_mdi(true, true, "   "), "a whitespace-only field never submits");
   }
 
   #[test]
@@ -3519,11 +3601,101 @@ mod tests {
     assert!(update_live_overlay(&mut state, &view, bounds, span).is_some(), "a moving machine always shows the dot");
   }
 
+  /// Feed one Run-state status sample at work position `(x, y)` and depth `z` (work-Z) and fold it into the overlay.
+  /// The fixture is authored at WCO origin, so the work XY equals the reported MPos. Used by the trail tests below to
+  /// drive a sequence of (WPos, Z) samples through `update_live_overlay`.
+  fn feed_cut_sample(state: &mut UiState, view: &mut ViewState, bounds: (Vec2, Vec2), span: Vec2, x: f32, y: f32, z: f32) {
+    feed_status_into(view, &format!("Run|MPos:{x:.3},{y:.3},{z:.3}|WCO:0.000,0.000,0.000"));
+    update_live_overlay(state, view, bounds, span);
+  }
+
+  #[test]
+  fn the_trail_records_only_below_surface_cutting_samples_in_order() {
+    // THE WORKING MODEL: the cut trail is a breadcrumb of the tool's ACTUAL reported positions, accumulated ONLY
+    // while cutting below the work surface (Z < 0). Samples at Z >= 0 (rapids, lead-ins, clearance) add NO vertices.
+    // We feed a mix and assert the trail vertices are exactly the Z<0 samples, in order, at the reported positions.
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+    // The step gate decimates sub-step moves; the square spans 10mm so a 2mm step clears TRAIL_MIN_STEP_FRACTION.
+    let samples = [
+      (0.0, 0.0, 5.0),   // above surface (rapid to start): NO vertex.
+      (0.0, 0.0, -1.0),  // plunge, first cut: vertex at (0,0).
+      (2.0, 0.0, -1.0),  // cutting along the bottom: vertex at (2,0).
+      (4.0, 0.0, -1.0),  // cutting: vertex at (4,0).
+      (4.0, 0.0, 5.0),   // retract above surface: NO vertex.
+      (8.0, 0.0, 6.0),   // rapid across (above surface): NO vertex.
+    ];
+    for (x, y, z) in samples {
+      feed_cut_sample(&mut state, &mut view, bounds, span, x, y, z);
+    }
+    let recorded: Vec<(f32, f32)> = state.trail.iter().map(|p| (p.pos.x, p.pos.y)).collect();
+    assert_eq!(recorded, vec![(0.0, 0.0), (2.0, 0.0), (4.0, 0.0)], "only the three Z<0 samples are recorded, in order");
+    // (d) the trail never contains a point the tool was not reported at: every recorded point is one of the input
+    // sample XYs (it is a subset of reported positions, never a projected/interpolated point).
+    let reported: Vec<(f32, f32)> = samples.iter().map(|(x, y, _)| (*x, *y)).collect();
+    assert!(recorded.iter().all(|p| reported.contains(p)), "every trail vertex is an actually-reported position");
+  }
+
+  #[test]
+  fn the_trail_ignores_an_above_surface_lead_in_that_passes_near_a_far_segment() {
+    // THE REGRESSION, killed by the Z gate: the lead-in sample `(0.5, 9.0)` that ratcheted every projection approach
+    // ahead of the cutter runs ABOVE the surface (Z >= 0). The breadcrumb simply never records it, so it can never
+    // contaminate the trail — no leading is even possible.
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+    feed_cut_sample(&mut state, &mut view, bounds, span, 0.5, 9.0, 1.0); // the lead-in, above the surface.
+    assert!(state.trail.is_empty(), "an above-surface lead-in contributes no trail vertex");
+    // It does record once the tool actually plunges to cut at the bottom-left where the cutter really is.
+    feed_cut_sample(&mut state, &mut view, bounds, span, 0.0, 0.0, -1.0);
+    let recorded: Vec<(f32, f32)> = state.trail.iter().map(|p| (p.pos.x, p.pos.y)).collect();
+    assert_eq!(recorded, vec![(0.0, 0.0)], "only the actual below-surface cut is recorded — at the tool, never ahead");
+  }
+
+  #[test]
+  fn the_trail_breaks_a_stroke_across_a_pen_up_lift() {
+    // A lift between two cuts (the tool retracts to Z >= 0 and plunges again elsewhere) must begin a FRESH stroke, so
+    // the draw loop never streaks a line across the travel. The first cut after a non-cut frame is flagged
+    // `stroke_start`; a continuing cut is not.
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+    feed_cut_sample(&mut state, &mut view, bounds, span, 0.0, 0.0, -1.0); // first cut: stroke start.
+    feed_cut_sample(&mut state, &mut view, bounds, span, 4.0, 0.0, -1.0); // continuing cut: joins.
+    feed_cut_sample(&mut state, &mut view, bounds, span, 4.0, 0.0, 5.0);  // lift (above surface): no vertex, pen up.
+    feed_cut_sample(&mut state, &mut view, bounds, span, 0.0, 8.0, -1.0); // new cut after the lift: stroke start.
+    let starts: Vec<bool> = state.trail.iter().map(|p| p.stroke_start).collect();
+    assert_eq!(starts, vec![true, false, true], "first cut and the post-lift cut start strokes; the middle joins");
+  }
+
+  #[test]
+  fn the_trail_is_wiped_on_a_fresh_run_entry() {
+    // A rising edge into Run wipes the prior run's trail so the fresh job draws over the dim planned preview alone.
+    // This is "this run" framing — a resume out of a feed-hold (Hold → Run) counts as a run-entry too and begins the
+    // trail fresh (matching `entered_run`), so the trail never carries a previous run's path under the new one.
+    let (mut state, mut view) = overlay_fixture();
+    let bounds = state.toolpath_bounds.expect("bounds");
+    let span = bounds.1 - bounds.0;
+    feed_cut_sample(&mut state, &mut view, bounds, span, 0.0, 0.0, -1.0);
+    feed_cut_sample(&mut state, &mut view, bounds, span, 4.0, 0.0, -1.0);
+    assert!(state.trail.len() >= 2, "two cuts recorded within the run");
+    // Mid-run cut frames do NOT wipe (no rising edge): the trail keeps growing.
+    feed_cut_sample(&mut state, &mut view, bounds, span, 8.0, 0.0, -1.0);
+    assert!(state.trail.len() >= 3, "a continuing Run frame keeps accumulating, never wipes mid-run");
+    // A genuine rising edge (Idle → Run) DOES wipe the prior run's trail for the fresh job.
+    feed_status_into(&mut view, "Idle|MPos:8.000,0.000,0.000|WCO:0.000,0.000,0.000");
+    update_live_overlay(&mut state, &view, bounds, span);
+    feed_status_into(&mut view, "Run|MPos:0.000,0.000,0.000|WCO:0.000,0.000,0.000");
+    update_live_overlay(&mut state, &view, bounds, span);
+    assert!(state.trail.is_empty(), "a fresh run-entry wipes the prior run's trail");
+  }
+
   #[test]
   fn update_live_overlay_tracks_the_marker_in_run_jog_and_hold() {
     // The live marker dot follows the tool whenever a work position is derivable — across Run, Jog, and Hold. The
-    // progress backplot is no longer accumulated here (it is drawn deterministically from the acked-line count), so
-    // the overlay's only per-frame job is the marker.
+    // cut trail is extended alongside it (only while running and cutting below the surface); the overlay's two
+    // per-frame jobs are the marker dot and the cut-trail breadcrumb.
     let (mut state, mut view) = overlay_fixture();
     let bounds = state.toolpath_bounds.expect("bounds");
     let span = bounds.1 - bounds.0;
@@ -3541,8 +3713,8 @@ mod tests {
   #[test]
   fn update_live_overlay_keeps_the_marker_above_the_surface() {
     // A frame with the tool AT or ABOVE the work surface (Z >= 0 — a rapid, a clearance move, a retract) still tracks
-    // the marker: the marker reflects true position regardless of cut depth (the cut RENDER is the deterministic
-    // executed-prefix elsewhere, not gated here).
+    // the marker: the marker reflects true position regardless of cut depth (the cut TRAIL is gated on Z < 0
+    // separately; the marker is not).
     let (mut state, mut view) = overlay_fixture();
     let bounds = state.toolpath_bounds.expect("bounds");
     let span = bounds.1 - bounds.0;

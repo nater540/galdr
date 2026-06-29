@@ -149,6 +149,12 @@ pub struct ViewState {
   /// The last-seen `WCO:` vector, cached across reports (grbl pushes it only intermittently) so we can always
   /// derive the position kind the current report did not carry.
   pub last_wco: Vec<f64>,
+  /// The last-seen `Ov:` override triple `(feed, rapid, spindle)` in percent, cached across reports. Like `WCO:`,
+  /// grblHAL emits `Ov:` only intermittently (on change / periodic refresh, not every report — see
+  /// docs/gcode-streaming.md §status, `{|Ov:f,r,s}`), so a report that omits it carries the LAST value, not a
+  /// reset to 100%. Reading the per-report `status.overrides` directly snapped the sliders/steppers back to
+  /// centre on every Ov-less poll; consumers read [`Self::overrides`] instead. `None` until the first `Ov:`.
+  last_overrides: Option<(u32, u32, u32)>,
   /// The active tool number, sourced from the `T<n>` word of the `$G` / `[GC:]` parser-state line — the
   /// authoritative "what tool is loaded" per the streaming contract (the `<...>` status report carries no tool
   /// number). `Some(0)` means no tool; `None` means none has been reported yet this session. Cleared on
@@ -185,6 +191,7 @@ impl Default for ViewState {
       status: None,
       pins: PinState::default(),
       last_wco: Vec::new(),
+      last_overrides: None,
       current_tool: None,
       progress: Progress::default(),
       banner: None,
@@ -331,6 +338,17 @@ impl ViewState {
     }
   }
 
+  /// The live override triple `(feed, rapid, spindle)` in percent for the override panel and the shell's
+  /// relative-stepping base. Reads the *cached* `Ov:` value, not the per-report `status.overrides`: grblHAL
+  /// reports `Ov:` only intermittently (on change / periodic refresh), so a report that omits it carries the
+  /// last value, and reading the per-report field directly would snap the override to 100% on every Ov-less
+  /// poll (the slider/stepper snap-back-to-centre bug). Falls back to the neutral 100% triple until the first
+  /// `Ov:` arrives, so the panel always has a sensible value to render before any override is reported.
+  pub fn overrides(&self) -> (u32, u32, u32) {
+    let neutral = super::overrides::OVERRIDE_NEUTRAL;
+    self.last_overrides.unwrap_or((neutral, neutral, neutral))
+  }
+
   /// Derive the position kind the current report omitted, from the cached WCO. `MPos` and `WPos` relate by
   /// `WPos = MPos − WCO`. Returns `None` if no WCO is known or the lengths disagree (a malformed mix).
   fn derive_other_position(&self, status: &StatusReport) -> Option<Vec<f64>> {
@@ -385,6 +403,12 @@ impl ViewState {
         // Cache any fresh WCO so later reports of the other kind stay derivable.
         if let Some(wco) = &report.wco {
           self.last_wco = wco.clone();
+        }
+        // Cache any fresh `Ov:` for the same reason WCO is cached: it is intermittent, so an Ov-less report must
+        // preserve the last-known override rather than letting consumers read it as a reset to 100% (the slider
+        // snap-back). Only a report that actually carried `Ov:` updates the cache.
+        if let Some(ov) = report.overrides {
+          self.last_overrides = Some(ov);
         }
         // Decode the input pins once here rather than on every render frame: the ~21-arm letter match runs at the
         // status-report rate (a few Hz) instead of the egui repaint rate (continuous), and the endstop chips just
@@ -499,6 +523,9 @@ impl ViewState {
     // Drop the cached WCO so a reconnect does not show "WCO set" or derive WPos/MPos from a stale offset before
     // the new session reports its own. Report-derived state must not survive across a disconnect.
     self.last_wco.clear();
+    // Drop the cached override for the same reason: it is the previous board's, and a reconnect must start from
+    // neutral rather than carrying a stale feed/rapid/spindle override into a session that has not reported one.
+    self.last_overrides = None;
     // The active tool is the previous board's parser state; clear it so a reconnect shows no tool until the new
     // session's `$G` answers, rather than carrying a stale `T<n>` across the disconnect.
     self.current_tool = None;
@@ -881,6 +908,38 @@ mod tests {
     assert_eq!(view.progress, Progress::default());
     assert!(view.status.is_none());
     assert!(view.last_wco.is_empty(), "cached WCO must not survive a disconnect");
+  }
+
+  #[test]
+  fn the_last_seen_override_persists_across_reports_that_omit_ov() {
+    // The `Ov:` field is intermittent: grblHAL emits it on change / periodic refresh, NOT on every status
+    // report (docs/gcode-streaming.md §status, `{|Ov:f,r,s}`). A report that omits it must NOT be read as
+    // "overrides are now 100%" — that was the snap-back-to-centre bug. The last-seen value is cached and the
+    // accessor returns it across the intervening Ov-less reports.
+    let mut view = ViewState::default();
+    // No report yet: the accessor falls back to the neutral 100% triple so the panel has something to render.
+    assert_eq!(view.overrides(), (100, 100, 100), "with no report yet the override reads as neutral 100%");
+    // A report carrying `Ov:` seeds the cache.
+    feed_status(&mut view, "Run|MPos:1,2,3|FS:500,0|Ov:60,100,140");
+    assert_eq!(view.overrides(), (60, 100, 140), "a report with `Ov:` is reflected");
+    // The very next report — exactly as grblHAL sends them between refreshes — carries NO `Ov:`. The cached
+    // value must survive: this is the regression. Before the fix the accessor snapped to (100,100,100).
+    feed_status(&mut view, "Run|MPos:4,5,6|FS:500,0");
+    assert_eq!(view.overrides(), (60, 100, 140), "an Ov-less report must NOT reset the override to centre");
+    // A later report with a fresh `Ov:` updates the cache as expected.
+    feed_status(&mut view, "Run|MPos:7,8,9|FS:500,0|Ov:60,100,150");
+    assert_eq!(view.overrides(), (60, 100, 150), "a fresh `Ov:` updates the cached value");
+  }
+
+  #[test]
+  fn the_cached_override_is_dropped_on_disconnect() {
+    // The cached override is the previous board's; like the cached WCO it must not survive a disconnect, so a
+    // reconnect to a (possibly different) board starts from neutral rather than the old session's value.
+    let mut view = ViewState::default();
+    feed_status(&mut view, "Run|MPos:1,2,3|Ov:60,100,140");
+    assert_eq!(view.overrides(), (60, 100, 140));
+    view.apply(Event::Disconnected(None));
+    assert_eq!(view.overrides(), (100, 100, 100), "the previous board's override must not survive a disconnect");
   }
 
   #[test]

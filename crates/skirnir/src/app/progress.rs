@@ -50,6 +50,21 @@ pub fn estimate(elapsed: Duration, acked: usize, total: usize) -> TimeEstimate {
   }
 }
 
+/// Whether a streaming job has GENUINELY completed, given the program line counts and whether the firmware's
+/// reported machine state has settled to Idle. Completion requires all three: a real program (`total > 0`), every
+/// program line acknowledged (`acked >= total`), and the machine back at Idle (`run_idle`). This is the signal the
+/// dock clock latches on to FREEZE the elapsed time and stop the ETA once the run is done.
+///
+/// The `run_idle` term is what distinguishes genuine completion from a TRANSIENT idle: a `?` poll mid-stream often
+/// reads `<Idle>` for an instant when the planner momentarily drains between blocks, but at that point `acked` is
+/// still short of `total`, so the `acked >= total` term holds the latch off. Equally, a pre-start idle (no lines
+/// acked yet) fails `acked >= total` (with a non-zero total) or `total > 0` (with none loaded). Only the true end —
+/// every line acked AND the machine parked — satisfies all three. Pure so the latch decision is unit-tested without
+/// a wall clock or a live status feed.
+pub fn stream_is_complete(total: usize, acked: usize, run_idle: bool) -> bool {
+  total > 0 && acked >= total && run_idle
+}
+
 /// Build a [`TimeEstimate`] from a pre-computed physics-based remaining time (see [`crate::eta::EtaTimeline`])
 /// rather than the acked-rate projection of [`estimate`]. The caller supplies the wall-clock `elapsed`, the
 /// `total_seconds` the timeline modeled at 100 % overrides, and the live `remaining_seconds` the timeline drains
@@ -193,5 +208,28 @@ mod tests {
     assert_eq!(format_progress_clock(Duration::from_secs(51), Some(Duration::from_secs(576))), "0:51 / 9:36");
     // Before the ETA is projectable the total is `None`, so the right half is the dim placeholder, not a guess.
     assert_eq!(format_progress_clock(Duration::from_secs(5), None), "0:05 / --:--");
+  }
+
+  #[test]
+  fn stream_is_complete_only_when_all_lines_acked_and_the_machine_is_idle() {
+    // The genuine end: every program line acked AND the machine settled to Idle.
+    assert!(stream_is_complete(10, 10, true), "all 10 lines acked and Idle is complete");
+    assert!(stream_is_complete(10, 11, true), "a late/over-ack past total still counts complete (clamped)");
+  }
+
+  #[test]
+  fn stream_is_complete_holds_off_on_a_transient_mid_stream_idle() {
+    // A `?` poll mid-stream can read Idle for an instant as the planner drains between blocks, but not all lines are
+    // acked yet — the `acked >= total` term must hold the latch off so the clock does not freeze prematurely.
+    assert!(!stream_is_complete(10, 4, true), "a transient Idle with lines still outstanding is NOT complete");
+    // Running (not Idle) with everything acked but the machine still moving is also not yet complete.
+    assert!(!stream_is_complete(10, 10, false), "all acked but still moving (not Idle) is not yet complete");
+  }
+
+  #[test]
+  fn stream_is_complete_is_false_before_a_program_or_progress() {
+    // No program loaded, or a pre-start idle with nothing acked, must never read as complete (no premature latch).
+    assert!(!stream_is_complete(0, 0, true), "no program is never complete");
+    assert!(!stream_is_complete(10, 0, true), "a pre-start idle with nothing acked is not complete");
   }
 }

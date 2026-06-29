@@ -103,9 +103,17 @@ pub struct SkirnirApp {
   /// estimate belongs to the session that just ended.
   override_tracker: super::overrides::OverrideTracker,
   /// When the current stream began, for the dock's elapsed/ETA clock. Set the first frame the lifecycle enters
-  /// `Streaming` and cleared when it leaves; `None` means no stream is timing. Held in the shell (not the pure
-  /// reducer) because it is wall-clock state the egui frame owns — the reducer stays free of `Instant::now()`.
+  /// `Streaming` and cleared when a fresh run begins or the link drops; `None` means no stream has timed. Held in
+  /// the shell (not the pure reducer) because it is wall-clock state the egui frame owns — the reducer stays free of
+  /// `Instant::now()`.
   stream_started: Option<Instant>,
+  /// When the current stream GENUINELY COMPLETED — every program line acked and the machine back at Idle (see
+  /// [`super::progress::stream_is_complete`]). Latched ONCE at that moment so the dock's elapsed FREEZES at its final
+  /// value and the ETA stops, rather than counting up forever off the live `stream_started.elapsed()` (the
+  /// keeps-ticking-after-the-job-finished bug). `None` while a run is still in progress or none has run; cleared
+  /// alongside [`Self::stream_started`] when a new run starts. The freeze is purely a display concern — it does not
+  /// touch the streaming lifecycle, which stays host-driven in the reducer.
+  stream_finished_at: Option<Instant>,
   /// The most recent physics-based job-time estimate ([`crate::eta::EtaTimeline`]) the operator computed with the
   /// Simulate button, or `None` until they run one (cleared when a new program is opened). When present it drives
   /// the dock's ETA: the upfront total before a stream starts, and the live remaining (drained by completed line
@@ -280,6 +288,7 @@ impl SkirnirApp {
       ui,
       override_tracker: super::overrides::OverrideTracker::default(),
       stream_started: None,
+      stream_finished_at: None,
       simulated: None,
       simulated_default_settings: false,
       jog_stream: None,
@@ -489,15 +498,52 @@ impl SkirnirApp {
     true
   }
 
-  /// Keep [`Self::stream_started`] in step with the lifecycle: stamp `now` when streaming starts and clear it
-  /// when it stops. Cheap and idempotent — only the edges mutate it — so it is safe to call every drain.
+  /// Maintain the dock's elapsed/ETA clock across one run. Three edges, all idempotent so this is safe to call
+  /// every drain:
+  /// - **Stream starts** (lifecycle enters `Streaming` with no run timing): stamp `stream_started = now` and clear
+  ///   any prior finish latch, so a fresh run times from zero.
+  /// - **Run ends** (a run is timing and is now over): latch `stream_finished_at = now` ONCE, freezing the elapsed
+  ///   the dock shows. "Over" is genuine completion — every program line acked and the machine back at Idle (the
+  ///   pure [`super::progress::stream_is_complete`]) — OR the lifecycle has settled to a terminal non-streaming
+  ///   state (`Idle`/`Alarm`/`Error`), which also covers a graceful Stop or an Abort mid-job. A feed-`Hold` is NOT
+  ///   terminal, so the clock keeps accumulating through a pause and resumes cleanly (the bug was specifically the
+  ///   counter never STOPPING after completion, not pause behaviour).
+  ///
+  /// The finish latch is purely a display freeze: it never touches the streaming lifecycle, which stays host-driven
+  /// in the reducer. `stream_started` is no longer cleared when streaming ends (that blanked the clock instead of
+  /// freezing it); it is reset only on a fresh run start (here) and on a disconnect.
   fn track_stream_clock(&mut self) {
     use crate::protocol::ConnectionState;
-    let streaming = self.view.connection == ConnectionState::Streaming;
-    match (streaming, self.stream_started.is_some()) {
-      (true, false) => self.stream_started = Some(Instant::now()),
-      (false, true) => self.stream_started = None,
-      _ => {}
+    let state = self.view.connection;
+    if state == ConnectionState::Disconnected {
+      // The link is gone: forget the run entirely so a later session times fresh (and the dock shows no stale clock).
+      self.stream_started = None;
+      self.stream_finished_at = None;
+      return;
+    }
+    if state == ConnectionState::Streaming && (self.stream_started.is_none() || self.stream_finished_at.is_some()) {
+      // A fresh run begins — either nothing has timed yet, or a PREVIOUS run had already frozen (its finish is
+      // latched) and the operator started another. Either way, time from now and drop the prior run's frozen finish.
+      self.stream_started = Some(Instant::now());
+      self.stream_finished_at = None;
+      return;
+    }
+    // While a run is timing and not yet frozen, latch the finish the moment the run is over.
+    if self.stream_started.is_some() && self.stream_finished_at.is_none() {
+      let progress = self.view.progress;
+      let run_idle = self
+        .view
+        .status
+        .as_ref()
+        .map(|s| s.machine_state.state == crate::protocol::status::RunState::Idle)
+        .unwrap_or(false);
+      let complete = super::progress::stream_is_complete(progress.total, progress.acked, run_idle);
+      // A terminal lifecycle state (Idle after `complete_if_drained`/graceful-Stop, or Alarm/Error on abort) also
+      // ends the run. `Hold` is excluded so a pause keeps the clock running.
+      let terminal = matches!(state, ConnectionState::Idle | ConnectionState::Alarm | ConnectionState::Error);
+      if complete || terminal {
+        self.stream_finished_at = Some(Instant::now());
+      }
     }
   }
 
@@ -844,15 +890,12 @@ impl SkirnirApp {
   /// window. The live status reporter will reflect the new value within a poll interval, re-centering the
   /// slider on the firmware's truth.
   fn set_override(&mut self, axis: super::overrides::OverrideAxis, target: u32) {
-    use super::overrides::{OVERRIDE_NEUTRAL, OverrideAxis};
+    use super::overrides::OverrideAxis;
     // The firmware's last-reported override for this axis seeds the tracker; the tracker then steps from its own
     // estimate so back-to-back commits inside one status-poll interval never both base on the same stale value.
-    let (feed, _rapid, spindle) = self
-      .view
-      .status
-      .as_ref()
-      .and_then(|s| s.overrides)
-      .unwrap_or((OVERRIDE_NEUTRAL, OVERRIDE_NEUTRAL, OVERRIDE_NEUTRAL));
+    // Read the CACHED override (not the per-report `status.overrides`): `Ov:` is intermittent, so an Ov-less poll
+    // would otherwise feed the tracker a spurious 100% and step the relative bytes from the wrong base.
+    let (feed, _rapid, spindle) = self.view.overrides();
     let reported = match axis {
       OverrideAxis::Feed => feed,
       OverrideAxis::Spindle => spindle,
@@ -1668,7 +1711,15 @@ impl SkirnirApp {
   /// override fractions come from the `Ov:` percentages (defaulting to 100 % when absent), so a slowed-down run
   /// stretches the remaining estimate the way the machine actually will.
   fn stream_time(&self) -> super::progress::TimeEstimate {
-    let elapsed = self.stream_started.map(|start| start.elapsed()).unwrap_or_default();
+    // Elapsed is FROZEN once the run has finished: measure to the latched finish instant rather than to `now`, so a
+    // completed job's clock holds its final value instead of ticking up forever (the keeps-counting-after-Idle bug).
+    // While the run is live (no finish latched) it is the running `now − start` delta as before. `None` start (no
+    // run has timed) yields the zero default.
+    let elapsed = match (self.stream_started, self.stream_finished_at) {
+      (Some(start), Some(finished)) => finished.saturating_duration_since(start),
+      (Some(start), None) => start.elapsed(),
+      (None, _) => Duration::default(),
+    };
     if let Some(timeline) = &self.simulated {
       let progress = self.view.progress;
       // Prefer the firmware's reported current line over the host ack count: `Ln:` is the line the controller is
@@ -3490,5 +3541,106 @@ mod tests {
       with_acks > with_ln,
       "the `Ln:`-led case completes more lines, so it has less remaining than the ack-led fallback ({with_ln} < {with_acks})",
     );
+  }
+
+  /// Build a minimal [`StatusReport`] reporting the given run state, for driving the elapsed-clock state machine.
+  fn status_in(state: crate::protocol::status::RunState) -> crate::protocol::status::StatusReport {
+    use crate::protocol::status::{MachineState, PositionKind, StatusReport};
+    StatusReport {
+      machine_state: MachineState { state, substate: None },
+      position_kind: PositionKind::Machine,
+      position: Vec::new(),
+      wco: None,
+      feed_speed: None,
+      overrides: None,
+      pins: Vec::new(),
+      buffer: None,
+      line: None,
+    }
+  }
+
+  /// THE BUG: the dock elapsed clock kept counting after the job finished and the machine returned to Idle. The fix
+  /// LATCHES the finish on genuine completion (all lines acked + Idle) so the displayed elapsed FREEZES at its final
+  /// value rather than ticking off the live `stream_started.elapsed()`.
+  #[test]
+  fn the_elapsed_clock_freezes_once_the_job_completes_and_the_machine_is_idle() {
+    use crate::protocol::status::RunState;
+    use crate::protocol::ConnectionState;
+    let mut app = app_disconnected();
+    // A run is timing: started 30s ago, mid-stream (4 of 10 acked), machine running.
+    app.stream_started = Some(Instant::now() - Duration::from_secs(30));
+    app.view.connection = ConnectionState::Streaming;
+    app.view.progress = super::super::view_state::Progress { sent: 10, acked: 4, total: 10 };
+    app.view.status = Some(status_in(RunState::Run));
+    app.track_stream_clock();
+    assert!(app.stream_finished_at.is_none(), "mid-stream the clock must not freeze");
+
+    // A TRANSIENT mid-stream Idle (planner momentarily drained, lines still outstanding) must NOT freeze it.
+    app.view.status = Some(status_in(RunState::Idle));
+    app.track_stream_clock();
+    assert!(app.stream_finished_at.is_none(), "a transient Idle with lines outstanding must not freeze the clock");
+
+    // Genuine completion: every line acked AND the machine settled to Idle. The finish latches now.
+    app.view.progress = super::super::view_state::Progress { sent: 10, acked: 10, total: 10 };
+    app.view.connection = ConnectionState::Idle; // the reducer's complete_if_drained returned to Idle.
+    app.view.status = Some(status_in(RunState::Idle));
+    app.track_stream_clock();
+    let latched = app.stream_finished_at.expect("the finish must latch on genuine completion");
+
+    // The displayed elapsed is now FROZEN: it is `finished − started`, not `now − started`, so repeated frames
+    // (and the re-latch guard) leave it fixed. Read it twice across a real gap and assert it does not advance.
+    let frozen = app.stream_time().elapsed;
+    std::thread::sleep(Duration::from_millis(20));
+    app.track_stream_clock(); // a later frame must not re-stamp the latch...
+    assert_eq!(app.stream_finished_at, Some(latched), "the finish latch is stamped once, not re-stamped each frame");
+    assert_eq!(app.stream_time().elapsed, frozen, "the elapsed must be frozen at its final value, not keep counting");
+  }
+
+  /// A fresh run after a completed one must CLEAR the frozen latch and time from zero again, and a feed-`Hold`
+  /// (a pause, not the end) must keep the clock running.
+  #[test]
+  fn a_new_run_clears_the_freeze_and_a_hold_keeps_counting() {
+    use crate::protocol::status::RunState;
+    use crate::protocol::ConnectionState;
+    let mut app = app_disconnected();
+    // A completed, frozen run.
+    app.stream_started = Some(Instant::now() - Duration::from_secs(30));
+    app.stream_finished_at = Some(Instant::now());
+    app.view.progress = super::super::view_state::Progress { sent: 10, acked: 10, total: 10 };
+
+    // A new stream begins (lifecycle re-enters Streaming): the freeze clears and timing restarts from now.
+    app.view.connection = ConnectionState::Streaming;
+    app.view.progress = super::super::view_state::Progress { sent: 0, acked: 0, total: 8 };
+    app.view.status = Some(status_in(RunState::Run));
+    app.track_stream_clock();
+    assert!(app.stream_finished_at.is_none(), "a fresh run must clear the prior run's frozen finish");
+    assert!(app.stream_started.is_some(), "a fresh run re-stamps the start");
+
+    // A feed-hold mid-run is a pause, not the end: the clock keeps running (no freeze).
+    app.view.connection = ConnectionState::Hold;
+    app.view.status = Some(status_in(RunState::Hold));
+    app.track_stream_clock();
+    assert!(app.stream_finished_at.is_none(), "a feed-hold must not freeze the clock — it is a pause, not completion");
+  }
+
+  /// A graceful Stop / Abort mid-job (the lifecycle reaches a terminal Idle/Alarm with lines still outstanding) also
+  /// ends the run, so the clock stops rather than counting on after the operator halted the job.
+  #[test]
+  fn a_graceful_stop_mid_job_freezes_the_clock() {
+    use crate::protocol::status::RunState;
+    use crate::protocol::ConnectionState;
+    let mut app = app_disconnected();
+    app.stream_started = Some(Instant::now() - Duration::from_secs(15));
+    app.view.connection = ConnectionState::Streaming;
+    app.view.progress = super::super::view_state::Progress { sent: 6, acked: 5, total: 10 }; // only half done.
+    app.view.status = Some(status_in(RunState::Run));
+    app.track_stream_clock();
+    assert!(app.stream_finished_at.is_none(), "still streaming — not frozen");
+
+    // Graceful Stop: the lifecycle returns to Idle with the job incomplete. The run is over, so the clock freezes.
+    app.view.connection = ConnectionState::Idle;
+    app.view.status = Some(status_in(RunState::Idle));
+    app.track_stream_clock();
+    assert!(app.stream_finished_at.is_some(), "a terminal Idle after a stop ends the run and freezes the clock");
   }
 }
