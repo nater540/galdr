@@ -71,6 +71,10 @@ mod crash;
 mod motion;
 mod spindle;
 mod storage;
+// The survivable-watchdog TIMG1 ISR + dual-dog feed (DIAGNOSTIC-only, `capture-reset`-gated, §17.10/§17.11). Absent
+// from the production default build, which keeps the core-0 async `watchdog_feed` + the ALARM:17 fail-safe unchanged.
+#[cfg(feature = "capture-reset")]
+mod survivable_watchdog;
 mod tmc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -388,7 +392,14 @@ fn reset_was_watchdog_or_fault(reason: Option<esp_hal::rtc_cntl::SocResetReason>
   )
 }
 
-fn log_reset_reason() -> bool {
+/// Read WHY the chip last reset and return `(pro_label, was_watchdog_or_fault)`: the PRO_CPU (core 0) reason as a
+/// stable `&'static str` label, plus whether it was a watchdog/fault reset (gating the breadcrumb dump). Also logs
+/// both cores' reasons on the esp-println / defmt sink as before. The label is returned so `main` can ALSO emit it
+/// over the grbl TX as a `[MSG:RESET ...]` line UNCONDITIONALLY at boot — so even a NO-breadcrumb boot (a clean
+/// power-on, a brown-out that wiped RTC_FAST, or the Signature-B silent-lock case where nothing wrote a breadcrumb)
+/// still tells skirnir WHY it reset. That single datum discriminates "a reset DID fire" (`*-sw-reset`/`*-rtc-WDT`)
+/// from "no software reset / dead-zone hang or brown-out" (`power-on`/`brown-out`) on the very next boot.
+fn log_reset_reason() -> (&'static str, bool) {
   let pro_reason = reset_reason(Cpu::ProCpu);
   let pro = pro_reason.map(reset_reason_label).unwrap_or("unknown");
   let app = reset_reason(Cpu::AppCpu).map(reset_reason_label).unwrap_or("unknown");
@@ -397,8 +408,8 @@ fn log_reset_reason() -> bool {
   #[cfg(not(feature = "defmt"))]
   esp_println::println!("[boot] reset reason: PRO_CPU={}, APP_CPU={}", pro, app);
   // The crash-report emit decision keys off the PRO_CPU (core 0) reason — the RWDT this firmware arms resets the
-  // whole system and reports there. Returned so `main` can pass it to `maybe_emit_crash_report`.
-  reset_was_watchdog_or_fault(pro_reason)
+  // whole system and reports there. Returned (with the label) so `main` can pass it to `maybe_emit_crash_report`.
+  (pro, reset_was_watchdog_or_fault(pro_reason))
 }
 
 /// Async entry point. `#[esp_rtos::main]` expands to an `#[esp_hal::main]` reset handler that builds the
@@ -417,7 +428,7 @@ async fn main(spawner: Spawner) {
   //     power-on reads `ChipPowerOn`; a brown-out reads `SysBrownOut`; a panic-driven software reset reads
   //     `Cpu0Sw`/`CoreSw`. Logged on a default build too via esp-println. Returns whether it was a watchdog/fault
   //     reset, which (with a valid breadcrumb) gates the post-mortem crash report emitted after the banner.
-  let reset_was_watchdog = log_reset_reason();
+  let (reset_reason_label, reset_was_watchdog) = log_reset_reason();
 
   // 1b-ii. Read the previous run's crash breadcrumb out of RTC_FAST and CONSUME it (clear the magic), THEN stamp
   //     the magic for THIS run. The breadcrumb survives a watchdog reset but NOT a power-cycle (see `crash`). It is
@@ -425,6 +436,10 @@ async fn main(spawner: Spawner) {
   //     `[MSG:CRASH ...]` line is emitted after the banner (step 8) over the normal grbl TX.
   let breadcrumb = crash::take_breadcrumb();
   crash::init_magic();
+  // Give the free-running §15 truncation counters a clean per-BUILD baseline: RTC_FAST survives a software reset AND
+  // a flash, so a fresh image must NOT inherit a prior image's bytes at the trunc word addresses (a bogus huge
+  // `trunc`). Zeroes them only on a build-id mismatch; a same-image software reset preserves them (survive-the-reset).
+  crash::reset_truncation_on_new_build();
 
   // 1c. Arm the RTC watchdog as early as possible (before the slower settings/coordinate flash loads below) so a
   //     hang anywhere in bring-up is also caught. Stage 0's default action is a system reset; we set only its
@@ -434,6 +449,15 @@ async fn main(spawner: Spawner) {
   let rtc: &'static mut Rtc<'static> = RTC.init(Rtc::new(peripherals.LPWR));
   rtc.rwdt.set_timeout(RwdtStage::Stage0, WATCHDOG_TIMEOUT);
   rtc.rwdt.enable();
+  // 1c-ii. DIAGNOSTIC capture build (`capture-reset`, §17.10/§17.11): ALSO arm the SuperWDT as a second, independent
+  //     dog. `Swd::enable` disables its auto-feed so it becomes a REAL watchdog — but the S3 SuperWDT has no
+  //     `set_timeout` (its period is a short fixed silicon value), so the TIMG1 survivable-watchdog ISR must
+  //     software-feed it at a short cadence (it feeds both dogs together). With BOTH dogs armed and fed only by the
+  //     hardware-timer ISR — which survives a core-0 executor stall — a Signature-B wedge that starves core 0
+  //     withholds both feeds and forces a breadcrumb-bearing reset. Production (default) keeps the RWDT-only async
+  //     feeder.
+  #[cfg(feature = "capture-reset")]
+  rtc.swd.enable();
 
   // 2. Start the esp-rtos scheduler with the TIMG0 timer as the time source. This also installs the
   //    Embassy time-driver, so `embassy-time` and channel/Signal awaits operate from here on. As of
@@ -669,15 +693,40 @@ async fn main(spawner: Spawner) {
   // signal (ALARM / soft-reset / sleep), drives the `SpindleController`, and runs the `$393` reverse dwell.
   spawner.spawn(comms::spindle(spindle).expect("spawn spindle"));
   spawner.spawn(comms::coolant(coolant).expect("spawn coolant"));
-  // The watchdog-feed task pets the RWDT every 500 ms so a healthy board never resets, while a core-0 wedge stops
-  // the feed and lets the dog auto-reset (recorded, so the next boot logs the reason). It owns the `Rtc` `'static`
-  // (the sole feeder). It also samples the core-1 `MOTION_LIVENESS` beat under defmt to show which core froze first.
+  // The watchdog feed path. The DIAGNOSTIC capture build and the PRODUCTION default differ here:
+  //
+  // - PRODUCTION (default): the core-0 async `watchdog_feed` task pets the RWDT every 500 ms so a healthy board never
+  //   resets, while a core-0 wedge stops the feed and lets the dog auto-reset (recorded, so the next boot logs the
+  //   reason). It owns the `Rtc` `'static` (the sole feeder). UNCHANGED from before — a production board builds and
+  //   behaves exactly as today.
+  //
+  // - DIAGNOSTIC (`capture-reset`, §17.10/§17.11): the TIMG1 hardware-timer ISR is the feeder — it SURVIVES a core-0
+  //   executor stall (the async task would be starved) and feeds BOTH dogs via raw PAC, or on a stall WITHHOLDS both
+  //   and captures the breadcrumb. So the async `watchdog_feed` must NOT also feed (that would mask the withhold);
+  //   instead a thin `watchdog_heartbeat` task runs the diagnostic snapshot ring only. The `Rtc` stays parked in its
+  //   `StaticCell` (dogs armed) but is NOT handed to any feeder — the ISR feeds register-side, no `&mut Rtc` needed.
+  #[cfg(not(feature = "capture-reset"))]
   spawner.spawn(comms::watchdog_feed(rtc).expect("spawn watchdog_feed"));
+  #[cfg(feature = "capture-reset")]
+  {
+    // The `Rtc` is owned by the `StaticCell` for `'static` (dogs stay armed); the ISR feeds via raw PAC, not through
+    // this borrow. Bind `_ = rtc` so the unused `&'static mut` does not warn while keeping it conceptually alive.
+    let _ = rtc;
+    survivable_watchdog::start(peripherals.TIMG1);
+    spawner.spawn(comms::watchdog_heartbeat().expect("spawn watchdog_heartbeat"));
+  }
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
   //    hard-reset by the host). The banner is also re-emitted on every soft reset (by the consumer's
   //    pipeline reset, with a best-effort copy from the reader half).
   comms::send_banner().await;
+  // ALWAYS surface WHY the chip last reset over the grbl TX (Signature-B instrumentation): a `[MSG:RESET <reason>]`
+  // line right after the banner, INDEPENDENT of the breadcrumb. The `[MSG:CRASH ...]` dump below is gated on a valid
+  // breadcrumb + a watchdog/fault reset, so a NO-breadcrumb boot (clean power-on, brown-out that wiped RTC_FAST, or
+  // a silent-lock that wrote nothing) would otherwise say nothing on the wire. This line discriminates "a reset DID
+  // fire" (sw-reset / rtc-WDT) from "no software reset" (power-on / brown-out) on the very next boot — the cheapest,
+  // highest-value Signature-B datum (it settles "reset-but-no-reenum" vs "dead-zone hang / brown-out").
+  comms::send_reset_reason(reset_reason_label).await;
   // Post-mortem crash report: if the previous run left a valid RTC_FAST breadcrumb AND this was a watchdog/fault
   // reset, emit a `[MSG:CRASH ...]` line over the normal grbl TX right after the banner so a connected sender logs
   // where the firmware wedged (e.g. `stage=axis1:wait_begin core1-froze-first`). It is ALSO stashed for one replay

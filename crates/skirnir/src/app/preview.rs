@@ -1,25 +1,25 @@
-//! Pure geometry helpers backing the toolpath preview's live-motion overlay.
+//! Pure geometry helpers backing the toolpath preview's live-motion marker and depth shading.
 //!
-//! The overlay is driven by the live machine position carried in the `<...>` status report, not by GCode line
-//! acknowledgements (`ok` arrives when a line enters the planner buffer, not when the move finishes, so it leads
-//! the real tool). Two things are drawn from the live work position: a smoothed marker dot showing where the
-//! tool is now, and a **position trail** — a LinuxCNC-AXIS-style "backplot" polyline accumulating where the tool
-//! has actually been. The trail replaced an earlier attempt to recolour the preview's own segments by progress,
-//! which was hopelessly ambiguous on self-intersecting paths (a spiral's parallel rings, a star tip's near-
-//! touching edges); plotting the real positions sidesteps that entirely — it draws where the tool went rather
-//! than guessing which preview segment it is on.
+//! The live marker dot is driven by the machine position carried in the `<...>` status report — a smoothed dot
+//! showing where the tool is right now. The PROGRESS BACKPLOT (the bright "what has been cut" path) is NOT drawn
+//! from status here: it is a deterministic executed-prefix of the parsed toolpath, gated by the streaming engine's
+//! acked-line count in the view layer. An earlier design accumulated a status-SAMPLED trail polyline instead, but
+//! at the ~10 Hz poll rate a move finishing between two samples left no segment — phantom gaps that differed run-to-
+//! run (the §16 render bug). Splitting the already-complete parsed geometry by acked-line index removes that under-
+//! sampling entirely; the marker still shows true position, so the two together give a gap-free path plus a live
+//! cursor. (`ok` leads the real tool by the planner-buffer depth, which is fine for a progress backplot.)
 //!
 //! Everything here is pure and framework-agnostic — plain `(f32, f32)` model-space points, no egui and no
-//! `ViewState`/UI types — so the marker derivation, the per-frame smoothing step, and the trail accumulation/break
-//! rules are unit-tested without a window or a real status feed. The view layer adapts these tuples to
-//! `egui::Vec2`/`Pos2` and projects them through its fit transform.
+//! `ViewState`/UI types — so the marker derivation, the per-frame smoothing step, and the depth-shading mapping are
+//! unit-tested without a window or a real status feed. The view layer adapts these tuples to `egui::Vec2`/`Pos2`
+//! and projects them through its fit transform.
 
 /// A point in toolpath model space (work-coordinate XY, millimetres). The toolpath segments live in this same
 /// space, so the live marker and the segment geometry share one coordinate frame.
 pub type ModelPoint = (f32, f32);
 
-/// Squared Euclidean distance between two model points. Squared to avoid the `sqrt` in the hot per-frame
-/// smoothing and progress paths; callers compare against squared thresholds.
+/// Squared Euclidean distance between two model points. Squared to avoid the `sqrt` in the hot per-frame marker
+/// smoothing path; callers compare against squared thresholds.
 fn dist_sq(a: ModelPoint, b: ModelPoint) -> f32 {
   let dx = a.0 - b.0;
   let dy = a.1 - b.1;
@@ -43,56 +43,12 @@ pub fn smooth_marker(current: Option<ModelPoint>, target: ModelPoint, snap_dist:
   (current.0 + (target.0 - current.0) * t, current.1 + (target.1 - current.1) * t)
 }
 
-/// Decide whether a fresh live work position should be appended to the position trail (the LinuxCNC-AXIS-style
-/// "backplot" of where the tool has actually been). Appends when there is no prior trail point, or when the
-/// candidate has moved at least `min_step` from the last appended point. The step gate decimates the 5–10 Hz
-/// status feed and rejects sub-step status jitter, so a stationary tool does not pile up coincident points. Pure
-/// so the accumulation rule is unit-tested; the caller owns the trail buffer and the cap on its length.
-pub fn trail_should_append(last: Option<ModelPoint>, candidate: ModelPoint, min_step: f32) -> bool {
-  match last {
-    None => true,
-    Some(last) => dist_sq(last, candidate) >= min_step * min_step,
-  }
-}
-
-/// Whether two consecutive trail points should be JOINED by a drawn line, i.e. they are within `max_gap` of each
-/// other. A larger gap means the tool jumped — a rapid reposition between moves, a reconnect, or a teleport — and
-/// joining it would draw a spurious straight streak across the work that the tool never cut, so the trail is left
-/// broken there instead. Pure so the break rule is unit-tested.
-pub fn trail_connects(a: ModelPoint, b: ModelPoint, max_gap: f32) -> bool {
-  dist_sq(a, b) <= max_gap * max_gap
-}
-
-/// Whether a drawn line segment should JOIN a trail point to its predecessor, combining the two break reasons. A
-/// segment is drawn only when BOTH hold: the point does NOT begin a fresh stroke (`!stroke_start`), and the two
-/// points are close enough to connect (`within_gap`, from [`trail_connects`]). A `stroke_start` point is the first
-/// cut after a pen-up lift (the tool rapided/retracted to Z >= 0 between cuts), so joining it to the previous cut
-/// would streak a line straight across the travel the tool never cut — exactly the cross-gap artefact this guards.
-/// The distance gate still breaks an in-stroke teleport/reconnect. Pure so the combined rule is unit-tested.
-pub fn connect_trail_segment(stroke_start: bool, within_gap: bool) -> bool {
-  !stroke_start && within_gap
-}
-
 /// The dimmest a depth-shaded cut line is drawn, as a fraction of the base cut colour's brightness — the value the
 /// deepest pass (the program's most negative Z) is darkened to. The shallowest cut (Z just below zero) draws at the
 /// full base colour (`1.0`); everything between interpolates linearly toward this floor. Kept here as one tunable so
 /// the depth-cue contrast is adjusted in a single place; ~0.35 keeps the deepest pass clearly visible (not black)
 /// while still reading as "deeper" against the bright shallow passes.
 pub const DEPTH_BRIGHTNESS_FLOOR: f32 = 0.35;
-
-/// Whether the live work-Z marks a CUT that should be drawn into the progress trail, returning the cut DEPTH (a
-/// negative Z) when so and `None` otherwise. The rule is purely the Z sign: at or above the work zero (`z >= 0`) the
-/// tool is at/above the surface — a rapid, a clearance/travel move, a retract — and draws nothing; below zero
-/// (`z < 0`) the tool is engaged in the work and the segment into this point is a cut. This replaces the earlier
-/// feed-rate rapid/cut classification: the Z sign is unambiguous where realized feed was not. An unknown Z (no
-/// derivable work position this frame) is `None` — no segment, rather than a guessed cut. Pure so the gate is
-/// unit-tested without a window.
-pub fn cut_segment_depth(z: Option<f32>) -> Option<f32> {
-  match z {
-    Some(z) if z < 0.0 => Some(z),
-    _ => None,
-  }
-}
 
 /// Map a cut DEPTH (a negative work-Z) to a brightness fraction in `[DEPTH_BRIGHTNESS_FLOOR, 1.0]`, job-relative:
 /// the shallowest cut (`z` just below 0) is brightest (`1.0`, the full base colour) and the program's DEEPEST pass
@@ -214,55 +170,6 @@ mod tests {
     assert_eq!(smooth_marker(Some((4.0, 0.0)), (10.0, 0.0), 50.0, -5.0), (4.0, 0.0));
   }
 
-  #[test]
-  fn trail_should_append_takes_the_first_point_unconditionally() {
-    // With no prior trail point there is nothing to compare against, so the first live position is always taken.
-    assert!(trail_should_append(None, (3.0, 4.0), 1.0));
-  }
-
-  #[test]
-  fn trail_should_append_decimates_sub_step_jitter_and_takes_real_moves() {
-    // A move shorter than `min_step` (status jitter / a near-stationary tool) is rejected so coincident points do
-    // not pile up; a move that clears the step is appended.
-    assert!(!trail_should_append(Some((0.0, 0.0)), (0.3, 0.0), 1.0), "a sub-step wiggle must not append");
-    assert!(trail_should_append(Some((0.0, 0.0)), (1.5, 0.0), 1.0), "a move past the step must append");
-    // Exactly at the step threshold counts as a move (>=).
-    assert!(trail_should_append(Some((0.0, 0.0)), (1.0, 0.0), 1.0));
-  }
-
-  #[test]
-  fn trail_connects_joins_near_points_and_breaks_across_a_jump() {
-    // Consecutive trail points within the gap are joined into the drawn trail; a large jump (a rapid reposition, a
-    // reconnect) is left broken so no spurious streak is drawn across work the tool never cut.
-    assert!(trail_connects((0.0, 0.0), (2.0, 0.0), 5.0), "a small step joins");
-    assert!(!trail_connects((0.0, 0.0), (50.0, 0.0), 5.0), "a large jump breaks the trail");
-  }
-
-  #[test]
-  fn connect_trail_segment_breaks_on_a_stroke_start_even_when_points_are_near() {
-    // A continuing cut (not a stroke start) within the gap draws a joining segment.
-    assert!(connect_trail_segment(false, true), "a near, continuing cut joins");
-    // A stroke start NEVER joins to the prior point, even when the two are spatially adjacent — this is the
-    // lift-then-plunge case: the tool retracted and plunged again near the last cut, and a line across that travel
-    // must NOT be drawn.
-    assert!(!connect_trail_segment(true, true), "a stroke start must not join, even when adjacent");
-    // An in-stroke teleport (not a stroke start, but beyond the gap) still breaks on distance.
-    assert!(!connect_trail_segment(false, false), "a far jump still breaks the stroke");
-    // A stroke start that is also far away: broken for both reasons.
-    assert!(!connect_trail_segment(true, false), "a far stroke start is broken");
-  }
-
-  #[test]
-  fn cut_segment_depth_draws_only_below_the_work_surface() {
-    // At or above the work zero the tool is travelling/retracted — no cut segment is drawn.
-    assert_eq!(cut_segment_depth(Some(0.0)), None, "Z == 0 is the surface, not a cut");
-    assert_eq!(cut_segment_depth(Some(5.0)), None, "Z above the surface is a rapid/clearance move");
-    // Below the work zero the tool is engaged: the segment is a cut and the depth (the negative Z) is returned.
-    assert_eq!(cut_segment_depth(Some(-0.1)), Some(-0.1), "a shallow plunge is a cut");
-    assert_eq!(cut_segment_depth(Some(-3.0)), Some(-3.0), "a deep pass is a cut at its depth");
-    // No derivable Z this frame draws nothing rather than guessing a cut.
-    assert_eq!(cut_segment_depth(None), None, "an unknown Z draws no segment");
-  }
 
   #[test]
   fn depth_brightness_is_full_at_the_surface_and_floors_at_the_deepest_pass() {

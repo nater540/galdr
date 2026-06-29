@@ -126,6 +126,27 @@ pub struct RmtStepSink {
   /// Monotonic count of bursts emitted since boot — captured into the crash breadcrumb on an RMT `wait()` timeout
   /// so the boot dump reports WHICH transmission (since boot) wedged. Wraps harmlessly (diagnostic only).
   burst_seq: u32,
+  /// OBSERVE-ONLY (task #22 §15): the SOURCE + axis of the most recent `emit_burst` error, so the silent-truncation
+  /// counter at the `run_block` swallow site can attribute the abandoned block to the wait-err / transmit-start /
+  /// burst-too-long arm and the RMT channel. Set on each Err-return path of [`emit_burst`](RmtStepSink::emit_burst),
+  /// read (and cleared) by [`take_last_error`](RmtStepSink::take_last_error). `None` between errors.
+  last_error: Option<TruncationSource>,
+}
+
+/// OBSERVE-ONLY (task #22 §15): which `emit_burst` arm abandoned a block, plus the RMT channel/axis it happened on.
+/// Recorded on the sink so the `run_block` truncation counter can split [`crate::comms::RUN_BLOCK_TRUNCATED`] by
+/// source — the wait-error arm (channel survives → recurring, the prime suspect), the transmit-start arm (channel
+/// lost), or a burst-too-long (an encoder/planner bug, a different root).
+#[derive(Clone, Copy)]
+pub enum TruncationSource {
+  /// The RMT `transmit()` START failed for `axis` (`emit_burst`'s transmit arm) — the channel is lost.
+  TransmitStart { axis: u8 },
+  /// The bounded RMT `wait()` returned an ERROR for `axis` (`emit_burst`'s wait arm) — the channel survives, so this
+  /// recurs without a reset; the cleanest fit for a recurring non-deterministic truncation.
+  WaitError { axis: u8 },
+  /// A burst exceeded `MAX_SYMBOLS_PER_BURST` — not a transient RMT error; an encoder/planner bug. `axis` is the
+  /// (nominal) channel the over-long burst was being built for; the cap is per-burst, not per-axis.
+  BurstTooLong { axis: u8 },
 }
 
 impl RmtStepSink {
@@ -142,7 +163,14 @@ impl RmtStepSink {
       last_dir: None,
       scratch: [[PulseCode::end_marker(); MAX_SYMBOLS_PER_BURST + 1]; AXES],
       burst_seq: 0,
+      last_error: None,
     }
+  }
+
+  /// OBSERVE-ONLY (task #22 §15): take + clear the most recent `emit_burst` error source, for the `run_block`
+  /// truncation counter to attribute an abandoned block. Returns `None` if no error was recorded since the last take.
+  fn take_last_error(&mut self) -> Option<TruncationSource> {
+    self.last_error.take()
   }
 
   /// Encode one channel's burst into its scratch buffer: one PulseCode per [`StepEvent`], then the mandatory
@@ -284,6 +312,9 @@ impl StepSink for RmtStepSink {
   /// all three before returning. A burst longer than the cap is rejected (the generator never emits one).
   fn emit_burst(&mut self, ticks: &[StepEvent]) -> Result<(), StepError> {
     if ticks.len() > MAX_SYMBOLS_PER_BURST {
+      // OBSERVE-ONLY (§15): record the source so the run_block truncation counter can split it out (encoder/planner
+      // bug, not a transient RMT error). No axis is meaningful yet (encoding hasn't begun); record 0.
+      self.last_error = Some(TruncationSource::BurstTooLong { axis: 0 });
       return Err(StepError::BurstTooLong);
     }
     if ticks.is_empty() {
@@ -316,6 +347,8 @@ impl StepSink for RmtStepSink {
       // A missing channel would be an internal invariant break; treat it as a transport failure rather than
       // unwrapping, per the no-`unwrap` rule.
       let Some(channel) = self.channels[axis].take() else {
+        // OBSERVE-ONLY (§15): an internal-invariant missing channel — attribute to the transmit-start arm for `axis`.
+        self.last_error = Some(TruncationSource::TransmitStart { axis: axis as u8 });
         return Err(StepError::Transport);
       };
       // Breadcrumb: about to start this axis's RMT transmit. A reboot frozen here pins the wedge to the transmit
@@ -337,6 +370,8 @@ impl StepSink for RmtStepSink {
           // channel remains down until reboot. TODO(DOC-06 alarm path): on this error raise an alarm and
           // re-run `motion::init`'s RMT bring-up to reclaim the channel. The previous comment claiming "the
           // next reset re-inits RMT" was FALSE — nothing currently re-inits RMT — and is corrected here.
+          // OBSERVE-ONLY (§15): attribute this abandoned block to the transmit-start arm for `axis` (channel lost).
+          self.last_error = Some(TruncationSource::TransmitStart { axis: axis as u8 });
           return Err(StepError::Transport);
         }
       }
@@ -409,6 +444,10 @@ impl StepSink for RmtStepSink {
             mtrace!("motion: axis {=usize} wait err", axis);
             crate::crash::record_stage(crate::crash::Stage::AxisWaitDone, axis as u8);
             self.channels[axis] = Some(channel);
+            // OBSERVE-ONLY (§15): the RMT wait() ERROR arm — the prime recurring-truncation suspect (channel SURVIVES,
+            // so it recurs without a reset). Attribute to this `axis`. If several axes err in one burst the last wins
+            // — acceptable for the diagnostic (the run_block counter still counts ONE truncation for the burst).
+            self.last_error = Some(TruncationSource::WaitError { axis: axis as u8 });
             result = Err(StepError::Transport);
           }
         }
@@ -601,6 +640,13 @@ pub async fn run(
         mtrace!("motion: EXECUTOR_RUNNING set -> entering run_block");
         run_block(&generator, &block, exit_speed_sq, max_rate_mm_s, sink, &mut counter);
         mtrace!("motion: run_block returned");
+        // OBSERVE-ONLY probe (task #22, gcode-chunk-skip): a motion block was popped and run to return — the "EXEC"
+        // leg of the lines/acks/execs cross-check. Counted here, after `run_block`, so it tracks blocks the executor
+        // actually processed. (A soft-reset/hold can abort a block mid-run and still return here — rare on a clean
+        // stream and a reset discards those acks host-side anyway — so `BLOCKS_EXECUTED` is a per-run DELTA signal,
+        // cross-checked against `ACKS_EMITTED`, not an exact equality. `ACKS_EMITTED > BLOCKS_EXECUTED` growing
+        // during a skipping run would point at a motion-side block drop; equal growth exonerates the motion path.)
+        crate::comms::BLOCKS_EXECUTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         // Motion stopped (block finished or aborted): zero the published programmed feed so `FS:` reads 0 while
         // idle. The next block republishes it. The override-scaled REALIZED feed is computed by the reporter.
         LIVE_PROGRAMMED_FEED_MM_MIN.store(0, Ordering::Release);
@@ -772,11 +818,51 @@ fn run_block(
   counter.set_direction(DirState {
     dir: core::array::from_fn(|axis| block.steps[axis] >= 0),
   });
-  let mut tracking = CountingSink::live(sink, counter);
   // The generator returns the tick count or a recoverable error; on error we simply stop emitting this
   // block. The error is not surfaced upward because Stage 1 has no alarm state machine yet (DOC-06/Stage 2);
   // the abandoned block leaves the machine where the last published burst put it, which the live MPos shows.
-  let _ = generator.run_block_scaled(block, exit_speed_sq, override_scale, max_speed_sq, &mut tracking);
+  //
+  // The §15 silent-skip mechanism is precisely THIS swallow — a mid-block `emit_burst` Err abandons the REST of the
+  // block's step bursts (a truncated cut). The program would otherwise continue and the host already acked the line at
+  // plan time, so the skip is invisible. We CAPTURE the result, COUNT the truncation (split by source + axis), and —
+  // task #22 / §15.6 — route a genuine mid-block step-output Transport fault into the ALARM path: a broken step sync
+  // loses position certainty on open-loop steppers, so per the grbl lost-step-sync contract (§14.3) the correct
+  // response is feed-hold + `ALARM:17` (MotorFault) + require re-home, NEVER silent abandonment or a silent reset. The
+  // `tracking` borrow of `sink` ends before we read `sink.take_last_error()`.
+  let outcome = {
+    let mut tracking = CountingSink::live(sink, counter);
+    generator.run_block_scaled(block, exit_speed_sq, override_scale, max_speed_sq, &mut tracking)
+  };
+  if outcome.is_err() {
+    let source = sink.take_last_error();
+    record_block_truncation(source);
+    if source.is_some() {
+      // A REAL mid-block step-output fault (any `emit_burst` Transport arm: a bounded-`wait()` error, a failed
+      // `transmit()` start, or a burst-too-long encoder bug) broke the step sync mid-cut. Raise the motion-fault
+      // alarm so the consumer halts the program, locks into `ALARM:17`, and forces a re-home. A `None` source is the
+      // generator's all-or-nothing `InvalidConfig` (a degenerate config that would reject EVERY block, not a mid-cut
+      // step-sync break) — it is counted above but does not raise the per-block motion fault. The alarm is
+      // source-agnostic; the faulting arm/axis is already recorded by `record_block_truncation` for the breadcrumb.
+      mtrace!("motion: run_block truncated -> MOTION_FAULT (raising ALARM:17)");
+      crate::comms::MOTION_FAULT.signal(());
+    }
+  }
+}
+
+/// OBSERVE-ONLY (task #22 §15): record a silently-swallowed `run_block` truncation into the FREE-RUNNING RTC_FAST
+/// probe counters (via `crash::bump_run_block_truncated`), split by the `emit_burst` error SOURCE + axis recorded on
+/// the sink. Pure counter writes — no behavior change. RTC_FAST (not `.bss`) so the count SURVIVES the K-escape
+/// `software_reset` that fires on a `usb_tx` wedge — otherwise a run that wedges+resets would zero the count mid-run
+/// (the run-1 confound). A `None` source (the generator erred for a reason other than an `emit_burst` arm — e.g.
+/// `InvalidConfig`) still bumps the total so no truncation is lost.
+fn record_block_truncation(source: Option<TruncationSource>) {
+  let (crash_source, axis) = match source {
+    Some(TruncationSource::WaitError { axis }) => (Some(crate::crash::TruncSource::WaitErr), axis),
+    Some(TruncationSource::TransmitStart { axis }) => (Some(crate::crash::TruncSource::TxStart), axis),
+    Some(TruncationSource::BurstTooLong { axis }) => (Some(crate::crash::TruncSource::BurstTooLong), axis),
+    None => (None, 0),
+  };
+  crate::crash::bump_run_block_truncated(crash_source, axis);
 }
 
 /// The most-restrictive (smallest) per-axis max-rate in mm/SECOND, the conservative ceiling the Phase-E feed

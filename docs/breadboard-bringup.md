@@ -1,30 +1,32 @@
 # Breadboard Bring-Up — BTT TMC2209 stepsticks
 
-> First-hardware bring-up on a breadboard, BEFORE milling the carrier PCB. The design docs (DOC-03) assume
-> bare TMC2209 silicon on **Adafruit 6121** breakouts (0.05 Ω sense) and the opto-isolated limit stage; this
-> doc captures what changes when you instead use **BTT / Watterott / FYSETC TMC2209 stepstick modules** on a
-> solderless breadboard. Read alongside `hardware/DESIGN.md` (the carrier design) and the bench checklists
-> (`docs/homing-bench-checklist.md`, `docs/4th-axis-bench-checklist.md`).
+> First-hardware bring-up on a breadboard, BEFORE milling the carrier PCB. This build uses **BTT / Watterott /
+> FYSETC TMC2209 stepstick modules** (0.11 Ω sense) on a solderless breadboard — *not* bare TMC2209 silicon on
+> Adafruit 6121 breakouts. Some design docs (`hardware/DESIGN.md`, DOC-03) and the firmware's compile-time
+> default still carry the older Adafruit 6121 assumption; §0 below is what makes the board match the stepsticks
+> you actually have. The opto-isolated limit stage is also deferred on the breadboard (see §3). Read alongside
+> the bench checklists (`docs/homing-bench-checklist.md`, `docs/4th-axis-bench-checklist.md`).
 >
 > Board: ESP32-S3, native USB Serial/JTAG → `/dev/cu.usbmodem31101`.
 
 ## 0. The one that matters — sense resistor
 
 The TMC current-scale math (`firmware-core/src/drivers/tmc2209/registers.rs`) is driven by the sense-resistor
-value, and the stepsticks differ from the Adafruit part:
+value, and the BTT stepsticks use a **larger sense than the Adafruit 6121 the firmware still defaults to**:
 
-| Driver board | R_sense | Constant |
-|---|---|---|
-| Adafruit 6121 breakout (production / milled PCB) | **0.05 Ω** | `R_SENSE_ADAFRUIT_6121_OHMS` |
-| BTT / Watterott / FYSETC TMC2209 stepstick (breadboard) | **0.11 Ω** | `R_SENSE_BTT_TMC2209_OHMS` |
+| Driver board                                                   | R_sense    | Constant                     |
+|----------------------------------------------------------------|------------|------------------------------|
+| BTT / Watterott / FYSETC TMC2209 stepstick (**this build**)    | **0.11 Ω** | `R_SENSE_BTT_TMC2209_OHMS`   |
+| Adafruit 6121 breakout (legacy DOC-03 default — not used here) | 0.05 Ω     | `R_SENSE_ADAFRUIT_6121_OHMS` |
 
-**Verify the silkscreen/schematic for your board revision — clones vary.** If the firmware runs 0.05 Ω while
-the hardware is 0.11 Ω, every `IRUN`/`IHOLD` resolves to ≈ 2.2× the intended coil current (the ratio of the
-two senses): the motor overheats and the driver can fault. The larger 0.11 Ω sense is otherwise *advantageous*
-here — it gives finer CS resolution at the low currents typical of light desktop milling.
+**Verify the silkscreen/schematic for your board revision — clones vary.** If the firmware runs the 0.05 Ω
+Adafruit default while the hardware is the 0.11 Ω stepstick, every `IRUN`/`IHOLD` resolves to ≈ 2.2× the
+intended coil current (the ratio of the two senses): the motor overheats and the driver can fault. The larger
+0.11 Ω sense is otherwise *advantageous* here — it gives finer CS resolution at the low currents typical of
+light desktop milling.
 
-**To switch:** flip the `BREADBOARD_STEPSTICKS` toggle in `TmcConfig::default()`
-(`firmware-core/src/drivers/tmc2209/manager.rs`) from `false` to `true`. Both constants are kept present so the
+**To select the BTT sense:** set the `BREADBOARD_STEPSTICKS` toggle in `TmcConfig::default()`
+(`firmware-core/src/drivers/tmc2209/manager.rs`) to `true`. Both constants are kept present so the
 swap is a single line. Note `tmc_r_sense_ohms` is a **persisted** setting — the compile-time default only seeds
 a fresh/erased flash, so on a board that already has settings stored, push the value over the `$PBX` host-sync
 channel (or erase flash) rather than relying on the rebuild alone.
@@ -66,10 +68,10 @@ You don't need to build the PC817 + 12 V field stage (`hardware/DESIGN.md`) to b
 bare **2-wire NC switch (or just a jumper) straight from GPIO10/11/12 to GND**. The firmware enables the
 internal pull-up on every limit pin, giving the *identical* polarity as the opto design — **no `$5` invert**:
 
-| At the pin | Level | Firmware reads |
-|---|---|---|
-| Switch closed (jumper to GND) | LOW | **not** triggered (idle) |
-| Switch open / floating / broken wire | HIGH | **triggered** |
+| At the pin                           | Level | Firmware reads           |
+|--------------------------------------|-------|--------------------------|
+| Switch closed (jumper to GND)        | LOW   | **not** triggered (idle) |
+| Switch open / floating / broken wire | HIGH  | **triggered**            |
 
 So on the bench a **trip is the *open*, not a connection to ground** — disconnecting a pin (or releasing the
 jumper) raises `ALARM:1`; grounding it returns to idle. The GND→open transition is a real rising edge, so this

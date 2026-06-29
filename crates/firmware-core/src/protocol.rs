@@ -291,6 +291,13 @@ pub enum AlarmCode {
   EStop,
   /// `ALARM:11` homing required — set on boot when `$22` is enabled; cleared by `$H` (home) or `$X` (unlock).
   HomingRequired,
+  /// `ALARM:17` motor / motion fault (grblHAL `Alarm_MotorFault`). Galdr raises this when the core-1 motion
+  /// executor hits an unrecoverable mid-block step-output transport fault — a swallowed RMT `wait()`/`transmit()`
+  /// error that abandons the tail of a cutting move (§15.6 / task #22). The step sync is broken, so on open-loop
+  /// steppers position certainty is LOST; per the grbl lost-step-sync contract this is a LOCKED alarm requiring a
+  /// soft reset + re-home, NEVER a silent resume. Chosen as grblHAL's canonical motor-fault code so senders label
+  /// it correctly; it does not collide with any other code this firmware emits (1,2,3,4,5,8,10,11).
+  MotorFault,
 }
 
 impl AlarmCode {
@@ -305,6 +312,7 @@ impl AlarmCode {
       AlarmCode::HomingFail => 8,
       AlarmCode::EStop => 10,
       AlarmCode::HomingRequired => 11,
+      AlarmCode::MotorFault => 17,
     }
   }
 
@@ -320,6 +328,7 @@ impl AlarmCode {
     AlarmCode::HomingFail,
     AlarmCode::EStop,
     AlarmCode::HomingRequired,
+    AlarmCode::MotorFault,
   ];
 
   /// The short grblHAL alarm NAME, emitted as the 2nd field of an `[ALARMCODE:<id>|<name>|<description>]` line.
@@ -333,6 +342,7 @@ impl AlarmCode {
       AlarmCode::HomingFail => "Homing fail",
       AlarmCode::EStop => "EStop asserted",
       AlarmCode::HomingRequired => "Homing required",
+      AlarmCode::MotorFault => "Motor fault",
     }
   }
 
@@ -350,6 +360,9 @@ impl AlarmCode {
       AlarmCode::HomingFail => "Homing fail. Could not find limit switch within search distance.",
       AlarmCode::EStop => "Emergency stop active.",
       AlarmCode::HomingRequired => "Homing is required. Execute homing cycle ($H) to continue.",
+      AlarmCode::MotorFault => {
+        "Motor fault. The step output to a motor failed mid-move. Machine position is likely lost. Re-homing is required."
+      }
     }
   }
 
@@ -358,7 +371,7 @@ impl AlarmCode {
   /// unlock these. The non-locked alarms (abort, probe-fail, homing-required) still accept `$` commands,
   /// so `$X` unlocks them. Drives the consumer's "accept `$X`?" decision, kept here so it is host-tested.
   pub fn is_locked(self) -> bool {
-    matches!(self, AlarmCode::HardLimit | AlarmCode::SoftLimit | AlarmCode::EStop)
+    matches!(self, AlarmCode::HardLimit | AlarmCode::SoftLimit | AlarmCode::EStop | AlarmCode::MotorFault)
   }
 
   /// The `[MSG:...]` push text grbl prints on entering this alarm: the homing-required / locked-critical
@@ -368,9 +381,8 @@ impl AlarmCode {
     match self {
       // Homing-required and the locked-critical alarms are cleared by homing or unlocking (or, for the
       // locked ones, a soft reset after the cause clears). The same prompt grbl uses fits all of them.
-      AlarmCode::HomingRequired | AlarmCode::HardLimit | AlarmCode::SoftLimit | AlarmCode::EStop => {
-        "'$H'|'$X' to unlock"
-      }
+      AlarmCode::HomingRequired | AlarmCode::HardLimit | AlarmCode::SoftLimit | AlarmCode::EStop
+      | AlarmCode::MotorFault => "'$H'|'$X' to unlock",
       // The recoverable alarms (abort-during-cycle, probe-fail, homing-fail) tell the operator to reset and retry.
       AlarmCode::AbortDuringCycle | AlarmCode::ProbeFailInitial | AlarmCode::ProbeFailContact
       | AlarmCode::HomingFail => "Reset to continue",
@@ -2737,12 +2749,27 @@ mod tests {
     assert_eq!(AlarmCode::ProbeFailContact.code(), 5);
     assert_eq!(AlarmCode::EStop.code(), 10);
     assert_eq!(AlarmCode::HomingRequired.code(), 11);
+    // ALARM:17 = grblHAL `Alarm_MotorFault` — a Galdr motion/step-sync transport fault (a swallowed mid-block RMT
+    // error, §15.6/task #22). Mapped onto grblHAL's canonical motor-fault number so a sender labels it correctly.
+    assert_eq!(AlarmCode::MotorFault.code(), 17);
+  }
+
+  #[test]
+  fn motor_fault_alarm_is_locked_and_requires_rehome() {
+    // ALARM:17 (motor/motion fault) is a LOCKED critical alarm: a mid-block step-sync break loses position
+    // certainty on open-loop steppers, so per the grbl lost-step-sync contract (§14.3) the operator MUST re-home —
+    // it is cleared only by a soft reset / `$H`, never silently resumed. The `'$H'|'$X' to unlock` prompt fits.
+    assert_eq!(AlarmCode::MotorFault.code(), 17);
+    assert!(AlarmCode::MotorFault.is_locked(), "a motion fault loses position — must be a locked alarm");
+    assert_eq!(AlarmCode::MotorFault.unlock_hint(), "'$H'|'$X' to unlock");
+    assert!(!AlarmCode::MotorFault.name().is_empty());
+    assert!(!AlarmCode::MotorFault.description().is_empty());
   }
 
   #[test]
   fn locked_alarms_are_the_critical_subset() {
-    // Codes 1, 2, 10 are locked (cleared only by a soft reset); the rest accept `$X`.
-    for code in [AlarmCode::HardLimit, AlarmCode::SoftLimit, AlarmCode::EStop] {
+    // Codes 1, 2, 10, 17 are locked (cleared only by a soft reset / re-home); the rest accept `$X`.
+    for code in [AlarmCode::HardLimit, AlarmCode::SoftLimit, AlarmCode::EStop, AlarmCode::MotorFault] {
       assert!(code.is_locked(), "{code:?} must be a locked critical alarm");
     }
     for code in [
@@ -3800,9 +3827,9 @@ mod tests {
   #[test]
   fn alarm_all_covers_every_code_with_name_and_description() {
     // `$EA` enumerates `AlarmCode::ALL`; every defined alarm code must appear exactly once with non-empty
-    // name/description, and the codes must be the canonical grbl numbers (1,2,3,4,5,8,10,11).
+    // name/description, and the codes must be the canonical grbl numbers (1,2,3,4,5,8,10,11,17).
     let codes: StdVec<u8> = AlarmCode::ALL.iter().map(|a| a.code()).collect();
-    assert_eq!(codes, std::vec![1, 2, 3, 4, 5, 8, 10, 11]);
+    assert_eq!(codes, std::vec![1, 2, 3, 4, 5, 8, 10, 11, 17]);
     for alarm in AlarmCode::ALL {
       assert!(!alarm.name().is_empty(), "alarm {} has a name", alarm.code());
       assert!(!alarm.description().is_empty(), "alarm {} has a description", alarm.code());

@@ -1,8 +1,357 @@
 ---
 name: project-firmware-lockup-investigation
-description: 2026-06-24 streaming-lockup investigation — ROOT CAUSE FOUND via the RTC crash breadcrumb (core-1 RMT TX wait() hung on ch0/X) + the FIX (cap bursts to 46 events so the 48-slot RMT block is never completely full). Also: the watchdog/breadcrumb/task-watchdog build, and what was ruled out.
+description: streaming-lockup investigation. 2026-06-24 (esp-hal 1.0): RMT ch0 wait() hang (Mode A). 2026-06-25 (esp-hal 1.1.1): REFRAMED — the 2.00s drumbeat is NOT the RMT timeout (that resets on FIRST fire); it matches USB_TX_TIMEOUT, the wedge is a USB-Serial-JTAG TX-drain stall + RESPONSE-channel head-of-line blocking. Plus the watchdog/breadcrumb/task-watchdog build and what was ruled out.
 metadata:
   type: project
+---
+
+**§17.5 FLASHED + CAPTURE PASS #1 (2026-06-28).** `capture-reset` image built clean (both default+`capture-reset`
+Xtensa configs, `-D warnings`) and flashed to `/dev/cu.usbmodem31101` via PLAIN `espflash flash` (NO `--monitor` — the
+runner's baked-in monitor bypassed so no DTR/RTS reattach wipes RTC_FAST). Pikachu pass `--timeout 1800` ran HEALTHY
+the full 30 min (acks 0/46→3243/3279, WPos→564.6, `Run`, NO mid-stream breadcrumb) then skirnir exited on the HARD
+1800 s wall-clock cap (NOT the 12 s idle-timeout). The post-timeout boot dump's `[MSG:CRASH usbtx: host-not-reading
+free=0 … wstg=1 rlen=134 n=3]` + `[MSG:RESET core-sw-reset]` is a HOST-ABANDONMENT ARTIFACT, NOT Signature A: when
+skirnir hit `--timeout` it stopped reading the port mid-execution, `usb_tx` saw `free=0` for K=3 and the capture-build
+K-escape `software_reset()`d. **`free=0` ⇒ verdict `host-not-reading`; Signature A needs `free=1` (host still reading).**
+TIER 1's guards held CORRECTLY (`free=0` AND `rlen=134>64` both failed the §17.1 recovery test ⇒ `Stalled`, `rec=` never
+climbed — no mis-recovery). VERDICT: INCONCLUSIVE for the #20 confirm (host left first on the wall clock, never reached
+the lossless-streaming window). **Pikachu needs ~2483 s just to ACK + execution lags acks (RMT paces pulses at feed rate
+even with steppers disconnected — completed≠executed), so 30 min CANNOT finish it. Re-run with `--timeout ≥3600`, keep
+`--idle-timeout 12` as the real wedge detector (it did NOT trip during healthy streaming).** Raw logs:
+`/tmp/cap_baseline.raw`, `/tmp/cap_capreset_p1.raw`, `/tmp/cap_p1_after.raw`.
+
+**§17.6 CAPTURE PASS #2 (2026-06-28) — TIER 1 CONFIRMED, FULL CLEAN COMPLETION.** Re-ran the same `capture-reset` image
+with `--idle-timeout 12 --timeout 3600`. The ENTIRE 4474-line Pikachu repro (the reliable Signature-A reproducer) ran
+END-TO-END in ~42.5 min, `outcome=Completed`, all 4474 acked, `Idle` at origin, 0 errors/0 alarms. NO `[MSG:CRASH
+usbtx:]`/`[MSG:RESET]`/`[MSG:BOOT]` in the stream OR on the post-run reconnect; board did NOT reset (K-escape never
+armed) and RTC_FAST is now CLEAN (the pass-1 artifact breadcrumb cleared). On-board free-running counter post-run:
+`MSG:SKIP … lines=4477 cons=4477 acks=4476 exec=4508 trunc=0 twait=0 ttx=0 taxis=0` — every line received+planned, 4508
+blocks EXECUTED (arcs subdivide), `trunc=0` (motion.rs:786 landmine never fired), `twait=0` (Mode A never fired), `ttx=0`
+(the Signature-A drumbeat NEVER STARTED). TRIAD: completion + no usbtx crash = the two decisive legs PASS; `rec=` did NOT
+climb but ONLY because there was no wedge to recover (`ttx=0`), not a missed recovery. **VERDICT: TIER 1 confirmed on the
+common path — full Signature-A reproducer no longer wedges / no part-corrupting `software_reset()`.** Caveat: did not
+FORCE a single-chunk lost-wake, so `rec>0` increment itself is unobserved on HW (only reachable if a residual A-wedge
+recurs); the §17.1 recovery logic stays host-tested. Raw logs: `/tmp/cap_capreset_p2.raw`, `/tmp/cap_p2_after.raw`.
+NEXT: more confirming Pikachu passes to bound residual rate; restore `T1_Test.tap` (NOT on disk) for #21 Signature B;
+NOT committed, NOT a production flash (diagnostic `capture-reset` image).
+
+**§17.7 PASS #3 REPRODUCED A SIGNATURE-B HARD SILENT WEDGE (2026-06-28). #21 STILL OPEN + UNTRACED + REPRODUCES.** Same
+flashed `capture-reset` image. Pass 3 WEDGED at ~26.7 min, ~line 2991/4474 (`outcome=IoDisconnect` host code 4, `[down]
+controller not responding`). NOT Signature A: acks climbed SMOOTHLY to the disconnect (NO 2 s usb_tx drumbeat), and the
+board went silent MID-WRITE — last bytes were a status/`$I` response TRUNCATED exactly at `[MSG:SKIP … exec=4508 trunc=`
+(64 B chunk ends mid-word, nothing follows). THREE skirnir-only reconnects over ~1 min ALL = `Connecting→Disconnected`,
+ZERO inbound bytes; port `31101` stayed enumerated (USB alive in silicon) but firmware emits NOTHING — no banner, no
+`[MSG:CRASH]`, no `[MSG:RESET]`; **RWDT did NOT recover within ~1 min** (the §13.4 watchdog dead zone + original
+"EN-button-only" report). The K-escape NEVER fired (it counts usb_tx TIMEOUTS in a loop; a mid-write deadlock/halt never
+returns to that loop), and the armed dead-zone backstop produced NO trace either — so a `capture-reset` image CANNOT
+capture B (nothing alive to write the breadcrumb). Possible clue (not proof): `lines=4483 cons=4479` = 4-line RX-vs-parser
+gap → core-0 consumer/comms may have frozen while RX buffered (Mode-B `comms-froze-first` family) but the task-watchdog
+didn't catch it; core-0-vs-core-1 origin UNDETERMINED. AGGREGATE on this build: clean full Pikachu completions = 1 (pass
+2); pass 1 = host-timeout artifact; pass 3 = B wedge. Residual HARD-wedge rate ≈ ≥1 in ~3 real attempts (non-det).
+Signature A did NOT recur in 2-3 (TIER 1 target clean). NEXT for #21: B needs a DIFFERENT capture channel than in-band
+RTC-on-self-reset — (a) §13.7 always-on RTC boot-count/reset-reason/heartbeat read on NEXT power cycle (but B isn't
+self-resetting, and a forced EN/espflash reset WIPES RTC — §10 trap), (b) HARDEN the RWDT to fire in the dead zone (then
+B → reset+boot-dump), or (c) out-of-band JTAG/RTT. Board is CURRENTLY WEDGED (silent, port enumerated) — needs physical
+EN/power reset, which wipes RTC, so no breadcrumb survives anyway. Raw: `/tmp/cap_p3.raw`, `/tmp/cap_p3_after.raw`,
+`/tmp/cap_p3_retry1.raw`, `/tmp/cap_p3_retry2.raw`. Pass 4 NOT run (stopped early on the wedge). NOT committed/flashed.
+
+**§17 PRODUCTION RECOVERY REDESIGN — TIER 1/2/3 LANDED (2026-06-26, firmware-engineer; uncommitted, build-verified,
+NOT flashed).** Doc `docs/streaming-lockup-investigation.md` §17 is authoritative. Three changes, all pure logic
+host-tested in firmware-core; 314 firmware-core host tests green; ALL FOUR Xtensa configs (default / `defmt` /
+`capture-reset` / `defmt,capture-reset`) clean under `RUSTFLAGS="-C link-arg=-Tlinkall.x -D warnings"`:
+- **TIER 1 (the part-corruption fix, §13.1):** `firmware_core::diag::WriteOutcome::classify_write_stage` is now
+  4-arg `(write_timed_out, write_errored, resp_len, data_free)`; on a WRITE-stage timeout returns
+  `CompletedLostWakeRecovered` (drop+continue, bump `rec=`, reset K-escape) IFF `resp_len<=SINGLE_CHUNK_MAX_BYTES(=64)
+  && data_free`, else `Stalled`. ≤64 B = one `write_async` chunk, fully pushed before park ⇒ drained FIFO proves bytes
+  out ⇒ cannot truncate. Exactly the captured Signature A (`wstg=1 rlen=4 free=1`). >64 B / fifo-not-free stay
+  `Stalled` (truncation guard intact). Wired in `comms.rs::usb_tx`: re-read `serial_in_ep_data_free` on a write
+  timeout BEFORE classify, pass `resp.len()`. STOPS the K-escape `software_reset()` firing on the common mid-cut wedge
+  in BOTH builds.
+- **§15.6/#22 ALARM:** new `AlarmCode::MotorFault` = grbl code **17** (grblHAL `Alarm_MotorFault`; non-colliding),
+  `is_locked()` (require soft-reset+re-home), prompt `'$H'|'$X' to unlock`. New `MOTION_FAULT` signal raised in
+  `motion.rs::run_block` on `Some` `emit_burst` source (WaitError/TransmitStart/BurstTooLong — `None`=InvalidConfig
+  all-or-nothing NOT raised); consumer races it in its main `select` exactly like `HARD_LIMIT_TRIPPED` →
+  `Alarm(MotorFault)`+`emit_alarm`+`reset_pipeline`, guarded by `hard_limit_alarm_applies()`. CLEAN increment on the
+  hard-limit flow — no executor quiesce rewrite.
+- **TIER 2/3 split = `capture-reset` Cargo feature (Option A).** ON (diagnostic): K-escape captures+`software_reset()`
+  AND dead-zone backstop ARMED (`DEAD_ZONE_BACKSTOP_ARMED=true`) — the #20/#21 capture channel. OFF (production
+  default): K-escape raises the SAME `ALARM:17` via `MOTION_FAULT` and RETURNS (clears stall run), dead-zone DISARMED.
+  Compile-time, zero runtime branch. `handle_usb_tx_wedge` has two `#[cfg]` variants; `capture_usb_tx_stall_and_reset`
+  + `crash::record_usb_tx_stall` (WRITER) gated to capture build; breadcrumb DECODE/boot-dump stays unconditional.
+- **OPEN DESIGN NUANCE flagged to team-lead (NOT silently extended):** only the dead-zone backstop is feature-gated;
+  the watchdog's `core1_wedged`/`comms_wedged` withholds STILL force RWDT reset in production (a genuinely-dead task
+  can't ALARM; a bricked board mid-job is worse than a reset). Whether to also convert those to a fail-safe halt is a
+  follow-up the lead owns.
+
+**⚠️ TOP FINDING 2026-06-26 — THE AUTO-RESET RECOVERY SILENTLY CORRUPTS PARTS (outranks the lockup).** User reports
+recent runs no longer hard-lock but SKIP ENTIRE CHUNKS of the cut. ROOT, mechanism proven in code (both legs): a
+mid-stream `software_reset()` — the shipped usb_tx K-escape (commit 6024126, fires ~6 s into an A-wedge) AND the
+dead-zone backstop if armed — (1) loses the host's in-flight character-count window (bytes hit the rebooting
+USB-Serial-JTAG FIFO) + resets parser/modal state, AND (2) skirnir's stream engine (`crates/skirnir/src/protocol/
+core.rs:17-18`, `:391` AbortQueued/DiscardProgram) treats the mid-stream boot banner as a controller reset →
+ABORTS + discards in-flight lines, does NOT re-send. ⇒ every mid-cut auto-reset drops ~the in-flight chunk = a part
+that LOOKS done but has missing toolpaths. STRICTLY WORSE than a visible hard-lock (which you'd scrap). So the SHIPPED
+6024126 K-escape is already corrupting parts on any real-cut A-wedge. (No smoking-gun log: my /tmp raw logs show NO
+mid-stream reset — but they're older fw / timeout-capped-while-healthy, not the skipping runs; the mechanism is airtight
+regardless.) DECISION HELD: do NOT arm the dead-zone backstop (it's another silent-reset path); bughunter retracted the
+earlier "arm=pure upside" ruling. AGREED 3-TIER REDESIGN (fwengineer-2 + bughunter; team-lead owns final call, task #22):
+TIER 1 PREVENT = the §13.1 single-chunk widening recovers the lost-wake IN PLACE (drop+continue, NO reset, when
+resp.len()≤64 && data_free=1 — bytes already delivered) → the primary corruption fix, stops the K-escape firing mid-cut;
+TIER 2 FAIL-SAFE = a genuine unrecoverable wedge → feed-hold + ALARM:N + require-rehome (grbl's lost-step-sync contract),
+NEVER a silent software_reset the host streams through; TIER 3 DIAGNOSTIC = instrumented capture builds keep
+software_reset+breadcrumb (operator-gated, scrap expected) so we don't lose the A/B capture channel — production ships
+tiers 1+2 only. ORDER: land the widening first (needs a wstg=1/rlen≤64 capture to green-light), then convert the residual
+K-escape/backstop reset path to ALARM. The wstg/rlen + passive-B instrumentation (below) is BUILT + verified (309 host
+tests, both Xtensa configs clean -D warnings, backstop gated `DEAD_ZONE_BACKSTOP_ARMED=false`) but NOT flashed for a real
+capture pending the lead's design call; board held at /dev/cu.usbmodem31101 (fwengineer-2 sole owner).
+
+**FIX MERGED + TWO RESIDUAL SIGNATURES (post-merge, bughunter-2 driving; capture-only phase, NO new fix yet).** The
+lost-wake fix is COMMITTED & MERGED (commit `6024126` "Fix USB-TX lost-wake streaming lockup" / PR#9; HEAD now `cc89e47`).
+But it is INCOMPLETE — two distinct signatures survive on `main`:
+- **SIGNATURE A (task #18, diagnosis CONFIRMED) = a WRITE-stage lost wake the deployed flush-only recovery cannot catch.**
+  Reproduced WITH the fix live: `[MSG:CRASH usbtx: lost-tx-wake free=1 empty=0 iena=1 mov=1 exec=0 rdepth=8 n=3 rmt_to=0]`
+  (distinct from capture #1's iena=0 exec=1). TWO convergent proofs it's write-stage: (1) `classify_write_stage(write_timed_out
+  =true,..)` returns `Some(Stalled)` UNCONDITIONALLY (never consults data_free) so flush-stage-only recovery can't fire; (2)
+  my proof: `flush_tx_async` (usb_serial_jtag.rs:826-835) EARLY-RETURNS Ok when serial_in_ep_data_free is SET — it only parks
+  the WriteFuture when data_free is CLEAR, so a free=1 stall is necessarily a write_all park, NOT flush. iena=1 is SECONDARY
+  (ISR-never-ran flavor), NOT load-bearing — the gap is STAGE not flavor. Fix gap: recovery only fires at the flush stage,
+  but Sig A stalls at the write stage. FUTURE FIX (task #18 item 3, NOT yet built): recover at the WRITE stage ONLY when the
+  response is ≤64B (single chunk, no mid-write truncation possible) AND data_free=1 — a ≤64B ok/error is whole-or-nothing.
+  STATUS (2026-06-25, fwengineer): the full wstg instrumentation is DONE-but-UNCOMMITTED + build-verified, awaiting flash.
+  `diag.rs` write_stage_stall bit (UsbTxStall field + WRITE_STAGE_STALL=1<<5; count shrunk 7→6-bit sat 63, depth nibble
+  5→6, count shift 9→10; round-trip tested, 28 diag tests / 308 firmware-core total). comms.rs wiring COMPLETE:
+  `stall_at_write_stage = write_timed_out` threaded into capture_usb_tx_stall_and_reset; boot line gained `wstg=` (after
+  iena). Both Xtensa configs clean under `RUSTFLAGS="-C link-arg=-Tlinkall.x -D warnings"`. Predicted re-capture: wstg=1
+  (write-stage) stable; a wstg=0 with free=1 would contradict both proofs. BUILD GOTCHA reconfirmed: bare
+  `RUSTFLAGS="-D warnings"` clobbers the crate config's `-Tlinkall.x` → flood of undefined-reference LINK errors; use
+  `just build`, or append `-C link-arg=-Tlinkall.x` to RUSTFLAGS.
+- **SIGNATURE B (task #19, leading hypo B-1) = a SILENT TOTAL LOCK — no [MSG:CRASH], no banner, no self-reset, skirnir can't
+  reconnect (T1_Test.tap ~14min, after 6024126).** Currently INVISIBLE. ROOT of invisibility: RWDT is Stage0-only, fed by the
+  SOFTWARE watchdog_feed task; its withholds are gated — comms-stall needs host_active (RX within 6s), core-1 needs
+  EXECUTOR_RUNNING. DEAD ZONE: host quiet (RX aged out) + executor idle (exec=0) → neither withhold fires → dog fed forever →
+  permanent silent lock. B-1 (leading, watchdog-mask REDUX): comms.rs:1487 `if !outcome.is_stall() { COMMS_PROGRESS+= }` — a
+  RECOVERED lost-wake is !is_stall() so it STILL bumps COMMS_PROGRESS; intermittent recoveries keep comms_frozen_ticks<6 so the
+  dog never withholds (the §11.3 defect re-introduced by the fix). Competing: B-2 executor-death, B-3 panic, B-4 brownout.
+  B-INSTRUMENTATION (task #19, NOT yet built): (1) ALWAYS route reset_reason into the grbl [MSG:CRASH] line — note
+  log_reset_reason() (main.rs:391) ALREADY reads+labels it but emits only via esp_println (raw channel), NOT the grbl TX
+  skirnir parses; (2) free-running RTC_FAST heartbeat bumped by watchdog_feed (climbed-through ⇒ B-1 dog-fooled; froze ⇒ B-2);
+  (3) DEAD-ZONE BACKSTOP withhold: RESPONSE depth>0 AND no COMPLETED usb_tx write for >~8s ⇒ withhold REGARDLESS of
+  host_active/exec (instrumentation-grade — converts the silent lock into a breadcrumb-bearing reset). OWNER: bughunter-2
+  (diagnosis/decode/flash) + fwengineer (impl). Repro: 128-Pikachu.tap → A ~30min; T1_Test.tap → B ~14min.
+- CAPTURE-ONLY BUILD LANDED (uncommitted, 2026-06-25→26; both Xtensa configs clean -D warnings, 309 host tests, ELF symbols
+  verified; NO fix — bughunter-2 directed combined A+B, reset_reason FIRST). Files: diag.rs, comms.rs, crash.rs, main.rs (all
+  uncommitted). SIG A (was already wired in tree): `wstg=` bit threaded from the write-vs-flush stall into
+  capture_usb_tx_stall_and_reset + printed on the usbtx boot line — a recorded fact, not iena inference. SIG B (3 items):
+  (1) `send_reset_reason` emits `[MSG:RESET <label>]` over grbl TX UNCONDITIONALLY after the banner (main.rs log_reset_reason
+  now returns (label,bool)) — settles "a reset DID fire (sw/rtc-WDT)" vs "no reset (power-on/brown-out/dead-zone)" even on a
+  no-breadcrumb boot; (2) free-running RTC_FAST `WATCHDOG_HEARTBEAT` word bumped by watchdog_feed each loop, printed `wdog=N`
+  on the crash summary — climbed-through ⇒ B-1 (feed alive but fooled), froze ⇒ B-2 (feed died); (3) DEAD-ZONE BACKSTOP:
+  new `USB_TX_COMPLETED` counter (usb_tx-specific, bumped on !is_stall — distinct from COMMS_PROGRESS which 3 tasks bump and
+  recovered-lost-wakes keep alive), tracked in watchdog_feed as tx_complete_frozen_ticks; host-tested
+  `diag::dead_zone_withhold(response_depth, frozen_ticks)` = `depth>0 && frozen>=DEAD_ZONE_STALL_TICKS(16≈8s)` → new
+  `WithholdReason::DeadZone` ("dead-zone-silent-lock") forces a breadcrumb-bearing reset REGARDLESS of host_active/exec —
+  closing the dead zone that left B invisible. Diff handed to bughunter-2 for review before flash; bughunter-2 owns flash + decode.
+
+**FIX LANDED 2026-06-25 (team-lead GO; both Xtensa configs build clean -D warnings, 300 firmware-core host tests green,
+clippy-clean, ELF verified to contain the symbols/strings — NOT yet committed; commit decision stays with team-lead/user
+after HW fix-confirmation).** The combined `usb_tx` patch is now IN THE TREE (no longer held):
+- POLL-AFTER-ARM recovery (fix a): on a 2s `with_timeout` timeout, re-read `ep1_conf.serial_in_ep_data_free`; SET ⇒
+  recovered lost-wake (reset stall run, bump `USB_TX_LOST_WAKE_RECOVERED` + mirror to RTC_FAST, NO escalate) — breaks the
+  drumbeat without a reset; FIFO-still-full ⇒ genuine `Stalled` ⇒ K-escape (RETAINED as the host-not-reading / partial-fix
+  backstop). Driven by host-tested `firmware_core::diag::WriteOutcome::classify`.
+- FINAL COMMIT BUILD = truncation hardening + explicit write-error handling (LANDED 2026-06-25; both Xtensa configs clean
+  -D warnings, 307 host tests, ELF has `classify_split` + `classify_write_stage`). The usb_tx write stage is now a 3-way
+  match via host-tested `WriteOutcome::classify_write_stage(write_timed_out, write_errored) -> Option<WriteOutcome>`:
+  write TIMEOUT ⇒ Some(Stalled) (possibly-mid-write, never recover); write ERROR (`Ok(Err)` host-closed) ⇒ Some(Completed)
+  (clean drop-and-continue, NOT a stall, never recovered-counted — restores the pre-split `let _ = with_timeout` leniency
+  that discarded write errors); clean ⇒ None → proceed to time+classify the FLUSH stage. (+3 host tests; team-lead asked
+  for the write-error test explicitly. For USB-Serial-JTAG a host close usually surfaces as a write TIMEOUT not Ok(Err),
+  so the error arm is rare, but explicit handling keeps "write-error ≠ stall" unambiguous.)
+- TRUNCATION-SAFETY HARDENING — LANDED 2026-06-25 (team-lead review found the edge; team-lead GO'd option 2; both Xtensa
+  configs build clean -D warnings, ELF has `classify_split`). DECODE-TIME (bughunter, for reading a confirm-run breadcrumb
+  with the fix ACTIVE): post-split, `rec=` counts ONLY flush-stage recoveries (the captured case IS flush-stranded — an `ok`
+  = 4B = single chunk, so write_async never parks mid-write_all for it → recovers identically, rec= semantics + triad +
+  decode plan UNCHANGED). A usbtx breadcrumb with the fix active is therefore NOT automatically "fix failed": its VERDICT
+  field disambiguates — `lost-tx-wake` + `free=1` on a SHORT line = recovery genuinely missed a case (→ tighten with the
+  bounded re-poll loop); a mid-write_all strand on a LONG (>64B) line = the truncation-safety split working AS DESIGNED
+  (Stalled→K-escape refusing to recover unwritten bytes — a different, lower-priority follow-up, NOT a recovery failure).
+  The original fix treated ANY
+  timeout-with-`data_free=1` as fully recovered, but `write_async` (esp-hal usb_serial_jtag.rs:811-824) parks the future
+  BETWEEN 64-byte chunks. So a >64B response (full status ~90B, long `[MSG:]`) whose lost-wake strands write_all AFTER chunk
+  1 has `data_free=1` (host drained chunk 1) yet UNWRITTEN remaining bytes → would classify recovered → advance → TRUNCATED
+  line. Severity was LOW (ok/error/short status ≤64B = single chunk, never parks mid-way, so the flow-control-critical
+  ok-path NEVER truncated; only >64B lines in the rare² window, dropped by skirnir + self-corrected) — but real, so closed
+  before commit. FIX (option 2): `usb_tx` now times write and flush SEPARATELY — `with_timeout(tx.write_all(..))` then (only
+  if that didn't time out) `with_timeout(tx.flush())`; recover ONLY at the FLUSH stage (bytes provably all in the FIFO — the
+  captured case); a MID-write_all timeout ⇒ `Stalled` (possibly-unwritten bytes, not advanceable) ⇒ counts toward K-escape
+  (a clean reset beats silent truncation). Encoded in host-tested `firmware_core::diag::WriteOutcome::classify_split(write_to,
+  flush_to, data_free_after_flush)` (write_to short-circuits to Stalled, else defers to `classify`); `classify` UNCHANGED. +4
+  host tests (mid-write→Stalled regardless of args; flush+data_free→recovered; flush+fifo-full→Stalled; clean→Completed).
+  NOTE: a USB write ERROR (host closed, `Ok(Err)`) now flows to the flush (which times out → stall → eventual reset/
+  re-banner) — same leniency as the prior `let _ = with_timeout(..)` that discarded write errors; not a regression. (Old note
+  preserved below for the pre-hardening reasoning.) FIX = team-lead's option 2,
+  verified correct: SPLIT the write — `with_timeout(write_all)` then `with_timeout(flush)` separately; recover ONLY at the
+  FLUSH stage (bytes provably all in the FIFO — the captured case); a MID-write_all timeout ⇒ `Stalled` (unwritten bytes,
+  not advanceable) ⇒ counts toward K-escape (a clean reset beats silent truncation). `WriteOutcome::classify` UNCHANGED
+  (still host-tested); only the usb_tx write/flush sequencing changes + 1 new host test (write-stage vs flush-stage timeout →
+  outcome). Held until team-lead pings post-flash (they said do NOT touch the tree while they build from it for the confirm).
+- WATCHDOG-MASK (fix b, §11.6): `COMMS_PROGRESS` bump moved from before-write to `if !outcome.is_stall()` — a genuine
+  stall no longer feeds the dog. Other two bumpers untouched.
+- DUAL READOUT (team-lead asked for BOTH): live `$I` → `[MSG:USBTX rec=N]` (N>0 only, via `format_usb_tx_recovered` in
+  send_build_info); boot → new RTC_FAST word `RECOVERED_COUNT` (crash.rs idx, `record_recovered_count`, decoded into
+  `Breadcrumb.recovered_count`, emitted in maybe_emit_crash_report; CRASH_REPORT Vec 5→6). The boot half matters BECAUSE
+  the bug is RARE/BURSTY (team-lead gap analysis: captures #2/#3 had ZERO lost-wake events, max RX gap 122/133ms) — a burst
+  that recovers some wakes then still wedges (one slips through → K-escape reset) would lose the live count, so it's
+  mirrored to survive the reset. (I'd earlier judged the boot line low-value; the bursty finding changed that — the
+  team-lead was right to want both.)
+- CONFIRM-RUN is INCONCLUSIVE on a quiet run: the bug is bursty/rare, so most runs read rec=0 (NOT a failure). Confirm via
+  accumulating rec>0 over time / catching a burst. TRIAD = rec= climbs past the historical wedge zone (~line 400-800+) +
+  Pikachu streams to COMPLETION + NO `[MSG:CRASH usbtx:]` breadcrumb on next boot. Partial fix = rec>0 AND a usbtx
+  breadcrumb (recovery missed a case). Root cause was established on capture #1 + the airtight esp-hal-source decode, so
+  the fix ships on that basis (it's a no-op when healthy); grinding for a 2nd wedge was low-yield (2 clean runs).
+- HELD PARTIAL-FIX CANDIDATE (NOT built — only if the confirm run shows `lost-tx-wake` + boot `rec>0` = recovery missed a
+  case): replace the SINGLE post-timeout `serial_in_ep_data_free` recheck with a BOUNDED RE-POLL LOOP (poll the bit a few
+  times over a short window before declaring a stall) to catch a wake that lands microseconds after the one recheck.
+  CAUTION (bughunter): keep the window SHORT and tightly bounded so a genuinely-non-draining host still escalates to the
+  K-escape promptly rather than spinning. usb_tx is on the core-0 THREAD executor (it yields) so embassy `Instant` is fine
+  here — no CCOUNT needed (unlike the core-1 RMT busy-spin) — but bound it tightly regardless. Single recheck FIRST; widen
+  only on evidence of a slipped-through case.
+
+**ROOT CAUSE = LOST USB TX-DONE WAKE (H-A) — HIGH CONFIDENCE, but ONE positive on-board capture (epistemic flag, bughunter
+as root-cause owner, recorded in doc §12).** The diagnosis rests on a SINGLE positive capture (#1) + the airtight esp-hal-
+source decode; captures #2 AND #3 were ZERO-event non-reproductions (clean streams, max RX gap 122/133ms) — they neither
+contradict NOR corroborate it (silent). So describe it as "high confidence, one positive capture," NOT "confirmed N times,"
+until a second positive lands. The confirm run's `rec>0` does DOUBLE DUTY: it confirms the fix AND is the SECOND independent
+positive observation of the lost-wake mechanism (the recovery path triggers only on a genuine timeout+FIFO-drained = the
+lost-wake event itself), raising the root cause to two data points. A confirm run that completes with rec=0 is DOUBLY
+inconclusive (neither confirms the fix nor adds a data point) — re-run until rec>0 (may take several, given #2/#3 were zero-
+event). The supporting capture #1 detail:
+
+**Capture #1 (2026-06-25) = the one positive observation.** Build #1 flashed + Pikachu streamed; the
+K=3 escape self-reset ~6s into the stall and the boot dump read (over skirnir-only CDC):
+`[MSG:CRASH usbtx: ambiguous free=1 empty=0 mov=1 exec=1 rdepth=8 n=3 rmt_to=0]`. Decoded (bughunter + me): data_free=1
+(host DID drain the FIFO), int_raw.serial_in_empty=0 AND int_ena.serial_in_empty=0 (the ISR RAN — it clears both — and
+called WAKER_TX.wake()), core 1 healthy (mov=1), RESPONSE full (rdepth=8), `rmt_to=0` (the RMT path NEVER fired — RMT
+theory POSITIVELY excluded by evidence). MECHANISM (verified vs esp-hal 1.1.1 `UsbSerialJtagWriteFuture::poll`,
+usb_serial_jtag.rs:736-746 — returns Ready iff int_ena is CLEAR): the ISR fired, cleared int_ena, woke WAKER_TX — but the
+embassy executor never re-polled usb_tx, so the future stayed Pending forever (would've completed if re-polled). It's a
+CORE-0-LOCAL async waker re-poll race in the esp-rtos/embassy + esp-hal WAKER_TX path — NOT H-B (mov=1 + ISR-serviced
+rules out both a core-1 wedge AND core-0 starvation), NOT RMT, NOT host-side. The 2.00s drumbeat = USB_TX_TIMEOUT firing
+in a loop (each 2s rescue re-polls once, completes that one write, re-parks). BUILD #1b (landed, TDD, 16 host tests, both
+Xtensa configs clean): closed the verdict() gap — `data_free && rdepth>0` now classifies as LostTxWake (the captured
+both-bits-clear state was falling to Ambiguous); added raw `iena=` to the boot line so the H-A flavor reads directly.
+NEXT: a confirming RE-RUN of #1b (verify free=1/empty=0/iena=0/mov=1 reproduces — one early-fire shouldn't be the sole
+basis), THEN the fix. Do NOT build #2 (cross-core lock breadcrumb) — the capture says NOT H-B.
+
+**FIX DRAFTED 2026-06-25 (TDD, NOT landed until capture #3 confirms; held as a diff, working tree kept at capture-only
+build #1b so a `just flash` for capture #3 still fires the breadcrumb).** Fix (a) + (b) COMPOSE into ONE coherent
+`usb_tx` patch (the WriteOutcome classification drives both): the pure host-tested logic is LANDED INERT in
+`firmware-core::diag` (`WriteOutcome::{Completed, CompletedLostWakeRecovered, Stalled}` + `classify(timed_out,
+data_free_after_timeout)` + `is_stall()`/`is_recovered_lost_wake()`; 4 new tests, 20 diag tests total — it's `pub` dead
+code until wired, does not change the #1b binary). The WIRING (held as a diff, NOT in the tree):
+- POLL-AFTER-ARM recovery (fix a): on a `with_timeout` TIMEOUT, re-read `ep1_conf.serial_in_ep_data_free`; if SET, the
+  host drained the FIFO so the bytes are out and only esp-hal's wake was lost ⇒ `CompletedLostWakeRecovered` (resets the
+  stall run, bumps a new `USB_TX_LOST_WAKE_RECOVERED` diagnostic AtomicU32) — breaks the drumbeat without a reset. Only a
+  timeout with the FIFO STILL FULL is `Stalled` and counts toward the K-escape (now the backstop for a REAL host-not-
+  reading wedge, which would read `host-not-reading` not `lost-tx-wake`). We can't fix esp-hal's internal future from the
+  task; this layers a polling backstop over its event-driven wait. (Upstream esp-hal WAKER_TX↔esp-rtos wake delivery is a
+  noted investigation, NOT the shipped fix.)
+- WATCHDOG-MASK fix (b, §11.6, correct on its own merits): move the `usb_tx` COMMS_PROGRESS bump (comms.rs:1400) from
+  BEFORE the write to AFTER a non-stall outcome (`!outcome.is_stall()`), so a genuinely-stalled writer stops advancing the
+  counter and the 3s comms-stall detector can fire. Composes cleanly: a recovered lost-wake IS a completed write (bytes
+  delivered) so it SHOULD bump; only a real stall withholds. Other two bumpers (status_responder:4358, comms_consumer:1548)
+  untouched. Both fix configs build clean -D warnings on Xtensa (verified, then reverted the wiring out of the tree).
+- READOUT (fix c, folded into the combined patch — bughunter: LOAD-BEARING for fix-confirmation, not nice-to-have): a new
+  `pub static USB_TX_LOST_WAKE_RECOVERED: AtomicU32`, bumped on the recovered-lost-wake path, surfaced on `$I` build-info as
+  a `[MSG:USBTX rec=N]` line (emitted only when N>0, via send_build_info). WHY: the bug is non-deterministic (one re-run
+  streamed clean = non-event), so "stream ran to completion" alone does NOT prove the fix worked — a CLIMBING rec= during a
+  COMPLETING stream proves lost wakes occurred AND were recovered. The full combined patch (a+b+readout) build-verified
+  clean both Xtensa configs, then reverted so the tree stays at capture-only #1b for capture #3. (Boot/[MSG:] line for the
+  count is LOWER value — the counter zeroes on reset and a working fix means NO reset; the live `$I` poll is the real
+  signal. Offered RTC_FAST persistence of the count if a prior-run boot readout is wanted, but not built.)
+
+**REFRAME 2026-06-25 (esp-hal 1.1.1, collaborative w/ embedded-bug-hunter — analysis only, NO flash yet).** The §10
+`128-Pikachu.tap` repro on the CURRENT 1.1.1 image shows a precise 2.00 s "drumbeat": at the wedge, ONE `ok` drains per
+≈2.00 s for ~8 cycles while the core-0 status reporter is fully DEAD (163 `?` → 0 replies), then a burst-drain + reset.
+Mapping that to code OVERTURNS the long-standing RMT-ch0-hang root cause for the 1.1.1 wedge:
+- **The 2.00 s period is NOT the bounded RMT wait().** `motion.rs` `RMT_WAIT_TIMEOUT_CYCLES = 480_000_000` IS exactly
+  2.000 s at 240 MHz `CpuClock::max()` — BUT that path (`motion.rs` emit_burst timeout branch) does `drop(txn)` →
+  `esp_hal::system::software_reset()` IMMEDIATELY on the FIRST timeout (no retry-N, no force-complete-one-block). Verified
+  vs installed esp-hal 1.1.1 + esp-metadata-generated-0.4.0: esp32s3 `rmt.has_tx_immediate_stop = true`, so `TxGuard::drop`
+  (rmt.rs:1414) takes the immediate-stop branch and the `while !done {}` spin (rmt.rs:1423) is cfg-compiled OUT → the reset
+  fires essentially instantly. So ONE RMT-wait timeout = ONE reset. That CANNOT produce "limp 8× then reset". Disqualified.
+- **The real 2.00 s suspect = `USB_TX_TIMEOUT = Duration::from_secs(2)` (comms.rs:1342).** `usb_tx` wraps every write
+  `with_timeout(2s, write)`. esp-hal's async USB-Serial-JTAG write/flush awaits TX-FIFO-drained (`serial_in_empty`), which
+  only fires when the HOST reads. If the host stops draining, each write parks exactly 2.000 s, the timeout drops that one
+  response, and the loop pulls the next `RESPONSE` item — a perfect "1 item / 2.00 s, repeat" drumbeat. usb_tx is on the
+  core-0 thread-mode executor (it yields), so `with_timeout` (embassy time) advances fine here — unlike the core-1 busy-spin.
+- **Status-dead-while-acks-limp = RESPONSE-channel head-of-line blocking, NOT a shared lock.** Single MPSC `RESPONSE`
+  (comms.rs:118, depth `RESPONSE_QUEUE_DEPTH=8`) drained by the ONE slow `usb_tx`. When it's stuck 2s/write the channel
+  saturates; `status_responder` blocks on `enqueue(s).await` (comms.rs:4436) mid-iteration so it never answers the next `?`
+  (163 `?` → 0). The executor RELEASES the PLANNER lock BEFORE any RMT transmit (`take_block`, motion.rs:564-572), so a
+  core-1 RMT hang does NOT hold a lock that starves status — the lock theory is OUT; the slow shared writer is the mechanism.
+- **Firmware-only discriminator (host-quit vs peripheral-wedge), verified in esp32s3-0.35.2 PAC (the version the firmware
+  ACTUALLY resolves — Cargo.lock + `cargo tree -i esp32s3`; do NOT cite 0.34.0, which is also on disk but unused).** Read at
+  the usb_tx timeout instant: `USB_DEVICE.ep1_conf().read().serial_in_ep_data_free()` (HW "host accepted the IN packet, FIFO
+  has room"), `USB_DEVICE.int_raw().read().serial_in_empty()` (the TX-done event), AND `int_ena().read().serial_in_empty()`
+  (still ARMED ⇒ the ISR never ran ⇒ the sharpest lost-wake fingerprint). `data_free == false` → host stopped draining
+  (host-side/skirnir bug, peripheral healthy). `data_free == true` but the future never woke at 2s → peripheral/waker wedge.
+  `/tmp/pika.raw` asymmetry (host→device `?` writes kept SUCCEEDING through the drumbeat while device→host stalled) already
+  leans device-TX-drain side, RX path alive.
+- **1.0 vs 1.1 reconciliation:** the 2026-06-24 `axis0:wait_begin` RTC breadcrumb (RMT ch0 hang, Mode A) was REAL but on
+  the esp-hal **1.0** image; the RMT driver changed across 1.0→1.1. The 1.1.1 drumbeat is most likely a DIFFERENT/downstream
+  mode (USB-TX-drain stall), not the same RMT hang. NOT a misattribution — a different image's wedge.
+- **TRANSPORT BLOCKER (load-bearing for ANY capture experiment): there is NO usable out-of-band RTT on this board.** On
+  the S3 the defmt sink is NOT a separate RTT channel — esp-println 0.17's `defmt-espflash` backend rides the SAME
+  USB-Serial-JTAG peripheral (`peripherals.USB_DEVICE`) as the grbl CDC stream (documented in crates/firmware/Cargo.toml:73-81
+  + main.rs:368-371). So you CANNOT stream GCode over skirnir's CDC AND watch defmt/RTT at once over the one built-in USB
+  port. The only true separate-RTT path is an EXTERNAL JTAG probe on the dedicated JTAG pins (GPIO39-42), but GPIO39 is
+  already allocated as the A-LIMIT placeholder (main.rs:534) and no probe is wired. ⇒ live-RTT capture plans (incl. doc
+  §11.5's original sketch) are not viable as-is; the correct tool is the EXISTING RTC_FAST post-mortem breadcrumb over the
+  normal grbl CDC in the DEFAULT (no-defmt) build — the same `crash.rs` infrastructure already built for this.
+- **BUILD #1 IMPLEMENTED 2026-06-25 (TDD-first, both Xtensa configs build clean -D warnings, 15 new host tests green, my
+  files clippy-clean — the 5 -D-warnings clippy errors are PRE-EXISTING in cnc-kinematics, untouched by me, and the project
+  has NO clippy CI gate). Team-lead has the user's direct flash authorization and drives the hardware; I do NOT flash.**
+  - NEW pure host-tested module `crates/firmware-core/src/diag.rs` (the only firmware logic that's `cargo test`-able —
+    `firmware` is a Xtensa-only bin with no host test target): `UsbTxStallCounter` (K-counter, resets on a completed write,
+    fires at `USB_TX_STALL_ESCAPE_K = 3`); `UsbTxStall` struct + `pack_usb_tx_stall`/`decode_usb_tx_stall` (one tagged
+    RTC_FAST word, tag `0x5554_0000` "UT"); `UsbTxStall::verdict()` → `HostNotReading`/`LostTxWake`(H-A)/`Core1Wedged`(H-B)/
+    `Ambiguous`. TDD CAUGHT A REAL BUG: a byte-wide timeout_count at shift 9 reached bit 16 and corrupted the high-half tag
+    → shrank to a 7-bit count (sat 127); fields now all in low-16. Signals: data_free, serial_in_empty (int_raw),
+    int_ena_armed (int_ena), motion_advancing, executor_running, response_depth. VERDICT now keys LostTxWake on
+    `int_ena_armed || serial_in_empty` (bughunter's sharper H-A fingerprint: int_ena STILL ARMED ⇒ the ISR never ran =
+    strongest lost-wake; empty set + int_ena cleared ⇒ ISR fired but waker lost = a different H-A flavor). All three
+    USB-reg reads (ep1_conf.serial_in_ep_data_free, int_raw.serial_in_empty, int_ena.serial_in_empty) verified present in
+    the ACTUALLY-RESOLVED esp32s3-0.35.2 PAC, `.bit_is_set()` accessor.
+  - `crash.rs`: +2 RTC_FAST words `USB_TX_STALL` + `RMT_WAIT_COUNT` (RING_BASE/LEN shifted +2); `record_usb_tx_stall(word)`
+    (stores the pre-packed word — bit layout owned by the tested module), `bump_rmt_wait_timeout()` (saturating); decoded
+    into `Breadcrumb.usb_tx_stall`/`.rmt_wait_count`, cleared on consume.
+  - `comms.rs` `usb_tx`: holds the counter across loop turns; samples MOTION_LIVENESS before the write; `with_timeout(...).
+    is_err()` → `stall.record(timed_out)`; at K calls `capture_usb_tx_stall_and_reset()` which reads `USB_DEVICE::regs()`
+    (`ep1_conf().serial_in_ep_data_free()`, `int_raw()`/`int_ena().serial_in_empty()` via `.bit_is_set()`, like
+    capture_rmt_hang reads RMT::regs()), samples MOTION_LIVENESS delta + EXECUTOR_RUNNING + `RESPONSE.len()`, packs,
+    records, `software_reset()`. Boot dump: new `[MSG:CRASH usbtx: <verdict> free=.. empty=.. mov=.. exec=.. rdepth=.. n=..
+    rmt_to=..]` line (CRASH_REPORT Vec 4→5). `motion.rs:382`: `crate::crash::bump_rmt_wait_timeout()` before the existing
+    RMT-wait `software_reset` (RMT path otherwise UNCHANGED — still resets on first timeout).
+  - SCOPE NOTE: deliberately did NOT relocate the per-loop COMMS_PROGRESS bump (§11.6 watchdog-mask fix) — the K=3 escape
+    pre-empts the ~16s limp so the mask is moot for this capture; relocating the bump is a separate behavior change. K=3 not
+    K=4 (team-lead's call): ~6s is inside the 8s RWDT so the K-escape is GUARANTEED the resetter (carries the discriminator),
+    not a bare RWDT reset. BUILD GOTCHA: `RUSTFLAGS="-D warnings"` on the CLI CLOBBERS the crate's config.toml
+    `-Tlinkall.x` → flood of `undefined reference` LINK errors (not compile errors); must pass
+    `RUSTFLAGS="-C link-arg=-Tlinkall.x -D warnings"` to keep both, or just `cargo build` (config rustflags apply).
+- **PROPOSED experiment (breadcrumb-over-CDC, default build; converged w/ bughunter; pending USER go-ahead, no flash by me —
+  team-lead has direct flash authorization and drives the hardware):** add a BOUNDED ESCAPE in `usb_tx` — after K consecutive
+  `with_timeout` EXPIRIES (proposed K=4 ≈8s, inside the 8s RWDT), record a discriminator breadcrumb word + `software_reset()`
+  (CoreSw, RTC-preserving). This (a) converts the 16s limp into a clean ~8s self-recover whose breadcrumb is readable over
+  CDC next boot, AND (b) fixes doc §11.6's watchdog-mask defect (usb_tx's per-loop COMMS_PROGRESS bump at 2s cadence evading
+  the 3s comms-stall detector — §11.3). Discriminator packed at the K-th timeout (firmware-only, no RTT): `ep1_conf.
+  serial_in_ep_data_free` + `int_raw.serial_in_empty` (H-A lost-TX-done-wake test), MOTION_LIVENESS-advancing +
+  EXECUTOR_RUNNING (H-A vs H-B core-1-health), RESPONSE depth. Decode next boot: serial_in_empty SET + wake-never-came +
+  core-1 ALIVE → H-A (esp-hal USB-event loss); core-1 FROZEN/EXECUTOR_RUNNING → H-B (core-0 starvation / cross-core lock).
+  Deliberately NOT suppressing the RMT-wait reset (team-lead risk #1: that would hard-lock the board on a real RMT hang). The
+  K-counter / discriminator pack-decode / timeout-outcome classification are pure-fn host-testable (TDD-first), mirroring the
+  existing `capture_rmt_hang` pattern; only the register reads + software_reset are thin wiring.
+
 ---
 
 **MODE C (HARD WEDGE) = A PANIC — CUSTOM PANIC HANDLER + STACK BUMP ADDED 2026-06-25 (compiled both configs, -D warnings
