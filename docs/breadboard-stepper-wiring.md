@@ -1,7 +1,7 @@
 # Breadboard stepper bring-up wiring (NEMA 17 + TMC2209)
 
 Practical wiring guide for bench-testing the Galdr motion stack on a breadboard with **3× NEMA 17**
-steppers driven by **3× TMC2209 (Adafruit 6121 breakout)**. Pin assignments are the authoritative
+steppers driven by **3× TMC2209 (BTT / Watterott / FYSETC stepstick)**. Pin assignments are the authoritative
 firmware values — they match `crates/firmware/src/main.rs` (`motion::init`/`tmc::init`) and the GPIO
 manifest in [`00-architecture.md`](00-architecture.md). If you change a GPIO here, change it there too.
 
@@ -15,7 +15,7 @@ manifest in [`00-architecture.md`](00-architecture.md). If you change a GPIO her
 | Qty | Item                                       | Notes                                                        |
 |-----|--------------------------------------------|--------------------------------------------------------------|
 | 1   | ESP32-S3 devkit                            | The board the firmware runs on (native USB to host)          |
-| 3   | TMC2209 breakout (Adafruit 6121)           | 0.05 Ω sense resistors; 5–29 V motor, 3–5 V logic            |
+| 3   | TMC2209 stepstick (BTT / Watterott / FYSETC) | **0.11 Ω** sense resistors; 5–29 V motor, 3–5 V logic — *not* Adafruit 6121 (0.05 Ω) |
 | 3   | NEMA 17 stepper, **bipolar (4-wire)**      | Confirm bipolar; 6-wire needs the right pair tapping         |
 | 1   | Motor PSU, **12 V (or up to 24 V)** DC     | Sized for 3× motor current + margin (≥ 3 A for a start)      |
 | 1   | Breadboard + jumper wires                  | Logic/signal only — see safety note                          |
@@ -163,7 +163,10 @@ The drivers are configured over UART by the `tmc_manager` task at boot from thes
 | `$150/$151/$152` | 16      | microstep resolution                     |
 
 Adjust before/after motion with e.g. `$140=400` (gentler first test) or `$140=1000`. Set, then it persists to flash.
-Hold current, R_sense (0.05 Ω), and other advanced TMC params are defaults / `$PBX`.
+Hold current and other advanced TMC params are defaults / `$PBX`. **R_sense must be the BTT stepstick's 0.11 Ω**
+— the firmware still defaults to the Adafruit 6121's 0.05 Ω, so set `BREADBOARD_STEPSTICKS = true` (or push
+`tmc_r_sense_ohms` over `$PBX`) or every `$140` run-current resolves to the wrong coil current (see
+`docs/breadboard-bringup.md` §0).
 
 > **What `G0 X5` does on the bench:** with 250 steps/mm and 16 microsteps (3200 µsteps/rev), `X5` =
 > 1250 µsteps ≈ **0.39 shaft revolution** (there's no leadscrew, so "mm" is just the configured step
