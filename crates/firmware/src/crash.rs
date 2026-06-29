@@ -178,9 +178,16 @@ mod idx {
   /// does NOT match this image's `BUILD_ID`, the trunc words are ZEROED first (a clean per-build baseline) while still
   /// surviving same-image software_resets (the actual requirement).
   pub const TRUNC_BUILD_ID: usize = PANIC_BUILD_ID + 8;
+  /// The last-seen WINDOWED `usb_tx`-stall count (`firmware_core::diag::WindowedStallCounter::count`, §13.8), mirrored
+  /// here on each capturing reset so the boot dump can tell a PURE consecutive stall run (Signature A) from an
+  /// ALTERNATING recovered/stall pattern that resets the consecutive K counter yet still represents a degraded /
+  /// intermittently-locking link. Emitted as `wnd=N` on the `[MSG:CRASH usbtx: ...]` line. Written DIAGNOSTIC-only
+  /// (`capture-reset`) by [`super::record_usb_tx_stall_window`]; the DECODE side is unconditional so a production board
+  /// still replays a prior diagnostic run's window. A plain count, meaningful only alongside a captured USB-TX stall.
+  pub const USB_TX_STALL_WINDOW: usize = PANIC_BUILD_ID + 9;
   /// First word of the snapshot ring (after the comms-stage + panic slots). Each snapshot is [`super::SNAP_WORDS`]
   /// words.
-  pub const RING_BASE: usize = PANIC_BUILD_ID + 9;
+  pub const RING_BASE: usize = PANIC_BUILD_ID + 10;
 }
 
 /// Number of instrumented core-0 tasks, each with its own comms-stage breadcrumb slot. One per [`CommsTask`].
@@ -504,6 +511,18 @@ pub fn record_usb_tx_stall(word: u32, response_len: u16) {
   BREADCRUMB[idx::USB_TX_STALL_LEN].store(response_len as u32, Ordering::Relaxed);
 }
 
+/// Mirror the WINDOWED `usb_tx`-stall count (the §13.8 alternating-vs-pure discriminator from
+/// [`firmware_core::diag::WindowedStallCounter`]) into the breadcrumb, alongside a captured USB-TX stall. A single
+/// relaxed store of the latest window popcount, read only after the reset. DIAGNOSTIC-only (`capture-reset` build,
+/// §17): only a capturing path writes it (production raises `ALARM:17` without resetting). Boot dump emits it as
+/// `wnd=N`: a high `wnd` with a low consecutive `n` says the link is ALTERNATING-degraded (recoveries kept resetting
+/// the K counter) rather than purely stuck — a distinct Signature class. The DECODE side stays unconditional so a
+/// production board still replays a prior diagnostic run's window.
+#[cfg(feature = "capture-reset")]
+pub fn record_usb_tx_stall_window(count: u16) {
+  BREADCRUMB[idx::USB_TX_STALL_WINDOW].store(count as u32, Ordering::Relaxed);
+}
+
 /// Bump the monotonic RMT-wait-timeout count (called from `motion.rs` `emit_burst`'s timeout branch, BEFORE its
 /// existing reset). The RMT path is UNCHANGED — it still resets on the first timeout — so this is normally 0 or 1;
 /// it exists so the boot dump can POSITIVELY show the RMT path did not fire while the USB-TX escape did (the §11.1
@@ -700,6 +719,12 @@ pub struct Breadcrumb {
   /// `len <= 64` (one `write_async` chunk) means the stalled response was fully pushed before the future parked and
   /// the widening fix can recover it without truncation. Emitted as `len=N` on the boot line.
   pub usb_tx_stall_len: u16,
+  /// The last-seen WINDOWED `usb_tx`-stall count (§13.8 alternating-vs-pure discriminator). Mirrored from
+  /// [`firmware_core::diag::WindowedStallCounter`] on a capturing reset; emitted as `wnd=N`. A high `wnd` with a low
+  /// consecutive `n` says the link was ALTERNATING-degraded (recoveries kept resetting the K counter) rather than
+  /// purely stuck. `0` when no window was recorded (or cold boot). Meaningful only alongside [`usb_tx_stall`](Self::
+  /// usb_tx_stall).
+  pub usb_tx_stall_window: u32,
   /// The monotonic RMT-wait-timeout count this run (normally 0; 1 if the RMT path reset on its first timeout). With
   /// a captured [`usb_tx_stall`](Self::usb_tx_stall) whose `timeout_count >= K` and this `== 0`, the boot dump
   /// POSITIVELY excludes the RMT theory for the drumbeat (§11.1).
@@ -789,6 +814,9 @@ pub fn take_breadcrumb() -> Breadcrumb {
   // The stalled response's byte length is carried in its own word (the packed bit-word is full); meaningful only
   // alongside a captured `usb_tx_stall` — a `0` reads as "no length recorded" / no stall this run.
   let usb_tx_stall_len = BREADCRUMB[idx::USB_TX_STALL_LEN].load(Ordering::Relaxed) as u16;
+  // The windowed `usb_tx`-stall count (§13.8) — a plain count, meaningful only alongside a captured `usb_tx_stall`.
+  // Decoded unconditionally so a production build replays a prior diagnostic run's window.
+  let usb_tx_stall_window = BREADCRUMB[idx::USB_TX_STALL_WINDOW].load(Ordering::Relaxed);
   let rmt_wait_count = BREADCRUMB[idx::RMT_WAIT_COUNT].load(Ordering::Relaxed);
   let recovered_count = BREADCRUMB[idx::RECOVERED_COUNT].load(Ordering::Relaxed);
   let watchdog_heartbeat = BREADCRUMB[idx::WATCHDOG_HEARTBEAT].load(Ordering::Relaxed);
@@ -812,6 +840,7 @@ pub fn take_breadcrumb() -> Breadcrumb {
   BREADCRUMB[idx::PANIC_FLAGS].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::USB_TX_STALL].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::USB_TX_STALL_LEN].store(0, Ordering::Relaxed);
+  BREADCRUMB[idx::USB_TX_STALL_WINDOW].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::RMT_WAIT_COUNT].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::RECOVERED_COUNT].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::WATCHDOG_HEARTBEAT].store(0, Ordering::Relaxed);
@@ -827,6 +856,7 @@ pub fn take_breadcrumb() -> Breadcrumb {
     panic,
     usb_tx_stall,
     usb_tx_stall_len,
+    usb_tx_stall_window,
     rmt_wait_count,
     recovered_count,
     watchdog_heartbeat,

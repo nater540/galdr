@@ -11,6 +11,20 @@ being flashed; no A or B fix ships until a capture confirms A's mechanism (`wstg
 (B-1 dead-zone / B-2 executor-death / B-4 brownout / re-enum-failure). This document is the running record so the
 investigation can be resumed cold.
 
+**UPDATE 2026-06-28 — Signature A (lost USB-TX wake) FIXED + hardware-confirmed (TIER 1, §17.6, commit `225d4a4`).
+Signature B (the hard silent Mode-C wedge) is the OPEN FRONTIER and REPRODUCED on the capture build (§17.7, pass 3).
+CRUX RESOLVED to a paradox + a plan (§17.8/§17.9): the RWDT genuinely did NOT fire over >60 s (proven by >1 min of
+silent reconnects), and the §13.4 dead-zone "dog fed forever" story is WRONG for this event — the software feeder
+(`watchdog_feed`, an embassy async task) itself stopped, yet the HARDWARE RWDT still didn't reset. esp-rtos 0.3.0
+does NOT touch the RWDT; the RWDT is a hardware RTC-slow-clock counter that should fire if unfed. The
+load-bearing mystery is the NON-FIRING hardware dog. NEW LEVER: esp32s3 HAS a SuperWDT (`Swd`, `#[cfg(swd)]`
+confirmed) that §13.4 wrongly said didn't exist — it is hardware-independent and currently unarmed. PLAN (§17.9): arm
+the SuperWDT as the primary B-capture instrument (fires where the RWDT didn't ⇒ B becomes readable; doesn't fire ⇒
+near-proof of a non-digital hang, escalate to power/PHY). Also a §17.7 byte-level CORRECTION: the "mid-write
+truncation at the freeze" was a stale boot-replay cut at skirnir's 64 B RX boundary, not a death; the true
+fingerprint is "status dies at +1585 s, ack drumbeat ONSETS (last gaps 2.6 s/1.9 s), then hard silent" — an
+A-family stall that progressed to a hard lock, not an unrelated mode.**
+
 **UPDATE 2026-06-26 — the user's SILENT GCODE-SKIP (the priority that outranked the lockup, §14) is RESOLVED in
 favor of §16 (RENDER ARTIFACT), firmware exonerated.** The §15 firmware mid-block RMT truncation was tested
 on-board with a synthetic max-exposure stimulus (~25-40k `emit_burst` calls across 17 multi-burst blocks, clean
@@ -1689,3 +1703,459 @@ completion. Raw log: `/tmp/cap_capreset_p2.raw`; post-run reconnect: `/tmp/cap_p
   (Signature-B / arc-heavy) repro is NOT on disk — restore it to chase #21 (Signature B) separately; (3) DEFER further
   A work — TIER 1 + the K-escape→`ALARM:17` production conversion (§17.2/§17.3) cover the common wedge. NOT committed.
   NOT flashed to production (this is the `capture-reset` diagnostic image).
+
+### 17.7 Confirming passes #3-#4 (2026-06-28) — pass 3 REPRODUCED A SIGNATURE-B HARD SILENT WEDGE
+Same flashed `capture-reset` image, same invocation (`--idle-timeout 12 --timeout 3600`). Goal: bound the residual
+wedge rate after the pass-2 clean completion. Clean baseline before pass 3 (no breadcrumb, RTC clean). Raw logs:
+`/tmp/cap_p3.raw`, `/tmp/cap_p3_after.raw` + `/tmp/cap_p3_retry1.raw` + `/tmp/cap_p3_retry2.raw` (the 3 post-mortem
+reconnects). Pass 4 was NOT run — stopped early on the pass-3 wedge per the stop-early-on-real-wedge directive.
+- **Pass 3 WEDGED at ~26.7 min (13:55:21 → 14:22:05), `outcome=IoDisconnect` (host code 4), at 2991/3026 acked
+  (~line 2991 of 4474).** skirnir's link-health check tripped: `[down] disconnected: controller not responding
+  (firmware may be wedged)`. The board did NOT complete and did NOT recover.
+- **This is the SIGNATURE-B / Mode-C HARD SILENT WEDGE, not Signature A.** Forensics:
+  - **Acks climbed SMOOTHLY right up to the disconnect** (`Ok`→`Ok`, 2986→2991, WPos advancing 418.696→418.404, `Run`)
+    — NO 2 s `usb_tx` drumbeat preceded it. Signature A announces itself with a stall cadence; this did not.
+  - **The board went silent MID-WRITE.** The very last bytes it emitted were a TRUNCATED status/`$I` response cut off
+    exactly at `[MSG:SKIP drop=0 lines=4483 cons=4479 acks=4478 exec=4508 trunc=` — the 64 B RX chunk ends mid-word
+    and NOTHING follows. The `usb_tx` write path died partway through a single response buffer.
+  - **THREE skirnir-only reconnects over ~1 min (post-mortem + 2 retries, 12-15 s each) ALL returned `Connecting →
+    Disconnected` with ZERO inbound bytes.** Port `/dev/cu.usbmodem31101` stayed enumerated (USB peripheral alive in
+    silicon) but the firmware emitted nothing — no banner, no `[MSG:CRASH]`, no `[MSG:RESET]`. **The RWDT did NOT
+    recover it within ~1 min** (matches §13.4's verified watchdog dead zone + the original "EN-button-only" report).
+  - **NO breadcrumb of any kind** — the K-escape (§12, targets the `usb_tx` consecutive-TIMEOUT loop) never fired,
+    so this is NOT the lost-tx-wake timeout family that K=3 catches: the write did not return to the timeout-counting
+    loop (a genuine deadlock/halt inside the write, or a core fault that took core 0 with it), so the escape code
+    never ran. Consistent with §13.4 (B = a hard silent lock with no trace) and Mode C (§2: panic-into-`interrupt_free`
+    halt OR a silent boot-loop, no breadcrumb written). The dead-zone backstop (armed in this capture build) also did
+    NOT produce a trace this run.
+  - **Possible localization clue (NOT proof):** `lines=4483 cons=4479` at the freeze = a 4-line gap between RX-received
+    and parser/consumer-consumed → the core-0 consumer/comms path may have stopped advancing while RX kept buffering
+    (the Mode-B `comms-froze-first` family) but WITHOUT the task-watchdog catching it this time. Whether the wedge
+    originates core-0 (comms/consumer await) or core-1 (motion) is UNDETERMINED — no breadcrumb to disambiguate.
+- **AGGREGATE on this build:** clean full Pikachu completions = **1** (pass 2). Pass 1 = host-timeout artifact (not a
+  wedge). Pass 3 = Signature-B hard wedge at ~line 2991. So the residual HARD-wedge rate is **at least 1 in ~3 real
+  streaming attempts** (non-deterministic, as always). **Signature A (the lost-tx-wake K=3 family) did NOT recur** in
+  passes 2-3 — TIER 1's target path stayed clean; the survivor is the untraced Signature-B.
+- **VERDICT:** TIER 1 confirmed against Signature A (§17.6 stands), but **Signature B (#21) is STILL OPEN and STILL
+  UNTRACED, and it reproduces.** A `capture-reset` image with the K-escape + dead-zone backstop is INSUFFICIENT to
+  capture B — B produces no breadcrumb because nothing in the firmware is alive to write one. **NEXT for #21:** the B
+  capture needs a fundamentally different channel than the in-band RTC_FAST-on-self-reset breadcrumb — e.g. (a) the
+  §13.7 always-on free-running RTC_FAST boot-count + reset-reason + `watchdog_feed` heartbeat read on the NEXT power
+  cycle (but B isn't self-resetting here, so even that needs a forced reset to read — and a forced EN/espflash reset
+  WIPES RTC, the §10 trap); (b) hardening the RWDT so it actually fires in the dead zone (then B becomes a
+  reset+boot-dump like the others); or (c) out-of-band JTAG/RTT if a debug channel can be brought up. The board is
+  CURRENTLY WEDGED (silent, port enumerated) and will need a physical EN/power reset to recover — that reset WILL wipe
+  RTC_FAST, so there is no breadcrumb left to read regardless. NOT committed, NOT flashed.
+
+### 17.8 CRUX — why the RWDT did NOT fire + why the armed dead-zone backstop left NO trace (bughunter, 2026-06-28)
+
+Worked the crux from the installed esp-rtos 0.3.0 / esp-hal 1.1.1 source + the four raw logs. The §13.4 dead-zone
+theory and the pass-3 evidence are in DIRECT CONTRADICTION, and resolving that contradiction is the whole answer.
+
+**FACTUAL CORRECTION to §17.7 (re-examined the bytes; the brief misread them):**
+- The "truncated mid-write `[MSG:SKIP ... trunc=`" is NOT a freeze-time death. It is at `/tmp/cap_p3.raw` **line 52,
+  +46ms — the BOOT-TIME replay of the PRIOR run's stale `[MSG:SKIP]` status**, cut at skirnir's 64-byte RX-chunk
+  boundary; the continuation `"0 twait=0 ttx=0 tlong=0 taxis=0]\r\n"` is line 53 at +62ms. So the `lines=4483
+  cons=4479` "4-line gap localization clue" is a STALE prior-run counter from boot, NOT the freeze-moment state — it
+  proves NOTHING about which core froze. (Lesson: a 64 B cut at +46ms is the host's read granularity, not a wedge.)
+- The TRUE freeze dynamics (from the actual stream tail): the last `<Run...>` STATUS report is at **+1585.012 s**;
+  status reports then STOP for the rest of the run (~14 s). Acks continue but the cadence DEGRADES from a steady
+  ~36-40 ms to 300-700 ms, and the FINAL TWO inter-ack gaps are **2666 ms then 1902 ms** — i.e. the ~2 s `usb_tx`
+  drumbeat is BEGINNING — then total silence from **+1599.351 s**. This is the SAME "status dies first, ack drumbeat
+  onsets" fingerprint as §10/§11 (the lost-USB-TX-wake family), but it went FULLY silent instead of K-escaping. So
+  §17.7's "acks climbed SMOOTHLY, NO drumbeat, NOT Signature A" is only half-right: the drumbeat WAS starting (2 acks
+  in) when it locked — B here looks like an A-family stall that progressed to a hard lock, NOT an unrelated mode.
+- Post-mortem: three skirnir-only reconnects, each ~5 s of `?` polling, **ZERO inbound bytes, no banner** across
+  ~1 min. The board emitted nothing for **>60 s**. That >60 s is the load-bearing number: the RWDT's 8 s deadline
+  passed >7× over with no reset. **The RWDT genuinely did not fire — proven, not assumed.**
+
+**SOURCE FACTS (installed crates, verified):**
+1. **esp-rtos 0.3.0 does NOT touch the RWDT at all** (`grep` over its `src` for rwdt/watchdog/feed = zero hits). The
+   RWDT is 100% under our `watchdog_feed` task. esp-rtos's idle hook is `waiti` (wait-for-interrupt), a normal CPU
+   idle — NOT a deep-sleep that gates the RTC slow clock.
+2. **The RWDT is a HARDWARE down-counter on the RTC slow clock** (`Rwdt::set_timeout` → `us_to_rtc_ticks`,
+   `rtc_cntl/mod.rs:600`). It counts in silicon independent of CPU/embassy state. If `feed()` is not called within the
+   window, it MUST fire. `enable()` sets Stage0=`ResetSystem` + `wdt_en` + `wdt_pause_in_slp` (mod.rs:566-597). The
+   `pause_in_slp` only pauses during real RTC sleep — which we never enter (no `Rtc::sleep_*` call in `main`).
+3. **`watchdog_feed` is an async task on core-0's THREAD-MODE embassy executor** (comms.rs:3207). Each loop iteration
+   `.await`s `Timer::after(500 ms)`. **If core-0's executor stops scheduling this task, the loop stops — and the loop
+   is the ONLY thing that calls `rtc.rwdt.feed()`.** So executor-death STOPS the feed.
+4. **esp32s3 HAS a SuperWDT (`Swd`, `#[cfg(swd)]` confirmed for s3 in esp-metadata-generated 0.3.0).** It is a
+   hardware-independent RTC super-watchdog. `Swd::enable()` writes `swd_auto_feed_en(false)`; its chip-reset default
+   is auto-feed ENABLED (it pets itself, never fires). **The firmware never constructs/arms `Swd`, so the SuperWDT is
+   currently a no-op.** This DISPROVES §13.4's "NO SuperWDT" claim — there IS one; we just don't use it. (This is the
+   key new lever — see the plan.)
+
+**THE CONTRADICTION (the actual crux), resolved:**
+- The §13.4 dead-zone backstop's premise is: `watchdog_feed` KEEPS RUNNING, sees `tx_complete_frozen_ticks >= 16`,
+  and WITHHOLDS the `feed()` → RWDT fires at 8 s → reset + `[MSG:RESET]`/breadcrumb.
+- But pass-3 gave NO reset AND NO breadcrumb AND no `wdog=` trace over >60 s. For the backstop to be NEEDED,
+  `watchdog_feed` must be alive; if it were alive and withholding, the RWDT would have fired. It did not.
+- **Therefore `watchdog_feed` itself STOPPED RUNNING** (its `.await` never resumed). And if it stopped running it ALSO
+  stopped calling `feed()` — so the dog was NOT being fed either way → the RWDT should STILL have fired on its own 8 s
+  hardware timeout. **It did not. That is the real paradox, and it has only a small set of physically-possible
+  resolutions.** The §13.4 "dead zone = the dog is fed forever" story is WRONG for this event: a fed dog requires a
+  running feeder, a running feeder means the backstop fires, the backstop firing means a reset — none happened. So
+  this B event is NOT "dog fed forever"; it is "feeder dead AND dog still didn't fire."
+
+**Why a hardware RWDT does not fire even though `feed()` stopped — the surviving candidates (ranked):**
+- **B-HW-1 (LEADING): a DUAL-CORE HARD HALT — both cores stop fetching/executing, but the RTC peripheral is NOT the
+  thing that resets without a CPU.** WRONG framing to discard: the RWDT *counter* still expires in silicon and asserts
+  the system-reset request regardless of CPU state — UNLESS the reset is suppressed. The two ways the expiry can be
+  suppressed: (i) write-protect/`wdt_en` got cleared, or (ii) the chip is in a state where the RWDT's reset target is
+  gated. A core-1 panic-into-`interrupt_free(loop{})` (§7, esp-backtrace default) halts core 1 with interrupts off but
+  does NOT clear `wdt_en` and does NOT stop core 0 — so that alone would let the dog fire (core 0 stops feeding within
+  500 ms-3 s). For BOTH the feed to stop AND the RWDT to not reset, the most parsimonious single cause is a fault that
+  takes core 0 INTO an interrupts-disabled spin too (a double-fault / panic-in-panic, or a fault on core 0 itself) —
+  but even that should not stop the *hardware* counter. So B-HW-1 is suspicious but INCOMPLETE on its own.
+- **B-HW-2 (STRONG, the mechanism that actually suppresses the hardware reset): the RWDT was DISABLED/written by
+  errant code, OR the LP_WDT write-protect was left open and a stray write cleared `wdt_en`.** `feed()` opens
+  write-protect (`wkey=0x50D83AA1`), writes, then closes it. If core 0 faults BETWEEN open and close (a window of a
+  few instructions every 500 ms), write-protect is left OPEN; a subsequent stray/corrupted write to `wdtconfig0`
+  (memory corruption — the historic [[xtensa-stack-top-abi-headroom]] class) could clear `wdt_en`. LOW base rate but
+  it is the only path that explains a SILENT non-firing hardware dog. NOT yet evidenced.
+- **B-HW-3 (must keep on the table): it is NOT a software wedge — brownout/USB-PHY/clock-glitch.** A brownout that
+  doesn't cross the BOR threshold can wedge the USB-Serial-JTAG PHY (port stays enumerated in the HOST's OS — macOS
+  caches the CDC ACM node — while the device silicon is hung) without tripping a clean reset. The §10 "port stays
+  enumerated but silent" + the EN-button-only recovery is CONSISTENT with a PHY/analog hang the digital RWDT can't
+  clear. UNKNOWN; needs the SuperWDT or an external measurement to separate from B-HW-1/2.
+- **B-HW-4 (DISFAVORED but not dead): `embassy_time` driver stall freezes `watchdog_feed`'s Timer but NOT the rest.**
+  §4 already established a non-yielding core-1 InterruptExecutor spin can freeze `embassy_time`. If the time driver
+  stalls, `watchdog_feed`'s `Timer::after` never fires → no feed → but then the RWDT SHOULD fire. So B-HW-4 explains
+  the silent feeder but again NOT the non-firing dog. Same gap as B-HW-1.
+
+**KEY INSIGHT (what every candidate except B-HW-2 shares):** they all explain why the FEED stopped, but NONE cleanly
+explains why the HARDWARE RWDT then failed to reset. That convergence is itself a strong signal: **the RWDT's
+non-firing is the load-bearing mystery, and the single highest-value move is to add a watchdog that is IMMUNE to
+whatever suppressed the RWDT — i.e. ARM THE SuperWDT (`Swd`), which §13.4 wrongly said did not exist.** If the
+SuperWDT fires when the RWDT didn't, we learn the RWDT was suppressed (B-HW-2 region) and we ALSO get a reset that
+preserves RTC_FAST → the boot dump finally lands. If the SuperWDT ALSO fails to fire, that is near-proof of a
+hardware/analog hang (B-HW-3) that no on-chip watchdog can catch, and the investigation pivots to power/PHY
+measurement (escalate per the §11.8/§7 transport reality: no usable out-of-band RTT; GPIO39 = A-LIMIT).
+
+### 17.9 PROPOSED CAPTURE REDESIGN (plan — NOT yet implemented; bughunter, 2026-06-28)
+Goal: a capture channel that survives Signature B (which leaves nothing alive to self-reset). Three layers, smallest
+/highest-confidence first. ALL diagnostic-build only (`capture-reset` feature); zero production behavior change.
+
+1. **ARM THE SuperWDT (`Swd::enable()`) as a hardware-independent backstop — THE primary new instrument.** It is RTC-
+   domain, fed by NOTHING in our code (auto-feed disabled by `enable()`), so it fires on a true hang the software-fed
+   RWDT misses. esp-hal exposes no `set_timeout` for `Swd` (fixed ~Stage timeout in silicon, on the order of seconds);
+   verify the actual period from the S3 TRM before relying on the number. When it fires it is a `SysSuperWdt` reset
+   (already in our `reset_reason_label` map, main.rs) that PRESERVES RTC_FAST → the existing `[MSG:RESET reason=
+   sys-super-WDT]` + boot-count + `wdog=` heartbeat all land on next boot. DISCRIMINATOR: SuperWDT fires (RWDT didn't)
+   ⇒ the RWDT was suppressed (B-HW-2) AND we get the boot dump; SuperWDT ALSO doesn't fire ⇒ hardware/analog hang
+   (B-HW-3) — escalate to power/PHY. This single change converts the current "no trace at all" into either a readable
+   reset OR a clean negative that itself narrows the cause. (Risk to weigh: arming a 2nd hardware WDT must not false-
+   trip a healthy long stream — confirm the SuperWDT period is comfortably > the RWDT 8 s and that SOMETHING resets it
+   on a healthy board, else it free-runs to a reset. If the S3 SuperWDT cannot be fed/extended sanely, fall back to
+   layer 2.)
+2. **Make the RWDT itself survive the feeder-death window: move the feed OFF the embassy async task.** The current
+   feeder is an `async fn` that can be descheduled by the very executor death it is meant to catch. Re-home the RWDT
+   feed into a context that survives a core-0 executor stall — candidates (to design): a periodic hardware-timer ISR
+   that conditionally feeds (so a TRUE hang stops the ISR too and the dog fires), or feed from the core-1
+   InterruptExecutor (which §13/§17 evidence shows is the LAST thing alive). The withhold logic stays, but the FEED
+   no longer depends on core-0 embassy scheduling. This closes B-HW-1/B-HW-4 (feeder-death) so the RWDT fires on the
+   common executor-stall flavor. (Bigger change; gate behind `capture-reset`.)
+3. **A pre-reset "about-to-reset" breadcrumb the moment ANY withhold/escape decides, written with MINIMAL ops** (a few
+   raw RTC_FAST stores, no locks/format — the §6 panic-handler discipline), so even a marginal reset that barely
+   re-enumerates leaves the verdict. Mostly already present (`record_withhold`); ensure the SuperWDT path and an
+   "executor-death detected by the ISR feeder" path both stamp it.
+
+**Why this is the right order:** layer 1 (SuperWDT) is ~10 lines, hardware-independent, and is the cleanest test of the
+load-bearing mystery (did the RWDT get suppressed, or is it a non-digital hang?). It must be tried FIRST because its
+result steers everything: a SuperWDT reset makes B as readable as A/C; a SuperWDT non-reset is near-proof we are out
+of software's reach and must escalate to power/PHY measurement (honest dead-end for in-band capture, per §13.7's
+verified "no external probe on this board" reality). Layers 2-3 harden the path for the more common executor-death
+flavor and ensure a trace lands. NONE of this ships to production (default build keeps the §17.3 ALARM:17 fail-safe).
+
+### 17.10 SuperWDT PERIOD FINDING + LAYER-1→LAYER-2 PIVOT (bughunter, 2026-06-28, verified from source/PAC)
+Resolved the load-bearing open question (the S3 SuperWDT period / free-running safety) BEFORE building. Decision:
+**layer 1 as originally framed ("arm Swd and let it free-run") is NOT VIABLE; PIVOT to layer 2 (move the watchdog
+feed off the embassy async task) as the primary B-capture instrument, with the SuperWDT optionally re-homed onto that
+survivable feed.** This SUPERSEDES §17.8's "ARM THE SuperWDT as THE primary instrument" and §17.9 layer-1-first
+ordering. Facts that forced the pivot:
+- **`SWD_CONF` reset value = `0x04b0_0000`** (esp32s3 PAC 0.35.2 `rtc_cntl/swd_conf.rs`): bit31 `SWD_AUTO_FEED_EN`=0,
+  bit30 `SWD_DISABLE`=0, bits18:27 `SWD_SIGNAL_WIDTH`=300. So OUT OF RESET the SuperWDT is ACTIVE with auto-feed OFF —
+  it WILL reset the chip on its fixed silicon period if untouched.
+- **Both esp-idf AND esp-hal neutralize it at boot.** `esp_hal::init()` (lib.rs:751-755) calls `rtc.swd.disable()`
+  (→ `swd_auto_feed_en(true)`, the dog pets itself, never fires) then `rtc.rwdt.disable()`. The firmware then
+  re-enables ONLY the RWDT. esp-idf does the equivalent (`bootloader_super_wdt_auto_feed`). This universal "neutralize
+  immediately" practice is itself evidence the SuperWDT period is SHORT (seconds-scale) — a multi-minute dog would not
+  need pre-emptive neutralizing. (Exact TRM second-count not extracted — the TRM PDF exceeds the fetch cap — but the
+  magnitude is NOT decision-relevant: see the killer below.)
+- **esp-hal's `Swd` exposes ONLY `enable`/`disable` — NO `set_timeout`, NO `feed`.** The period is fixed in silicon and
+  not configurable through the HAL. The PAC DOES expose `SWD_CONF.swd_feed` (bit29, "Sw feed swd"), so a raw
+  esp-hal-boundary write COULD software-feed it — but that feed must run periodically.
+- **THE KILLER for free-running layer 1:** to keep a seconds-scale SuperWDT from false-tripping a healthy ~42-min
+  stream you MUST software-feed it every period. The only periodic context to feed from is the SAME class that DIED in
+  Signature B — `watchdog_feed`, a core-0 embassy async task. A SuperWDT software-fed from that dead task gives NOTHING
+  the RWDT doesn't: when the feeder dies the SuperWDT fires — but the already-unfed RWDT should ALSO have fired and
+  DIDN'T (the §17.8 paradox). Adding a 2nd software-fed dog in the same dead context does not break the paradox.
+- **CONCLUSION:** the real instrument is to put the watchdog feed in a context that SURVIVES core-0 executor death
+  (layer 2). The SuperWDT only earns its keep if fed from that survivable context — at which point it is largely
+  redundant with a survivably-fed RWDT. So: **build layer 2 first; demote the SuperWDT from "primary instrument" to
+  "optional second dog once a survivable feed exists."**
+
+**LAYER 2 — survivable watchdog feed (the new primary B instrument). Evidence on WHERE to home it (from `cap_p3.raw`):**
+at the freeze, core-1 motion was HEALTHY — WPos advanced smoothly to the last status (+1585.0 s,
+`WPos:418.404,199.464`) with `Bf:0,1024` (saturated planner = healthy back-pressure); the core-0 OUTPUT path then died
+status-first (+1585 s) then acks (drumbeat onset 2666 ms/1902 ms, then silent +1599.4 s). So **core 1 / the
+InterruptExecutor is the last-alive context** — the survivable feed should be driven from CORE 1 (or a hardware-timer
+ISR), conditionally: feed the RWDT only while a core-0 progress beat advances AND no absolute-deadline withhold is
+active, so a TRUE dual-core hang still stops the feed and the dog fires. This directly closes B-HW-1/B-HW-4
+(feeder-death): on the COMMON Signature-B flavor (core-0 output dead, core-1 alive), a core-1-driven feed that KEYS ON
+core-0 progress will WITHHOLD → RWDT fires → reset + RTC_FAST boot dump. (If B is ever a true dual-core hang, core-1
+stops feeding too and the RWDT fires anyway.) Strictly better than the current core-0-async feed, which cannot catch
+its own host executor dying. NOTE the design tension to resolve in implementation: the RWDT `feed()` is a `&mut Rtc`
+borrow currently OWNED by the core-0 `watchdog_feed` task — moving the feed to core 1 / an ISR means re-homing that
+ownership (a `CriticalSectionRawMutex`-guarded `Rtc` handle, or doing the feed as a raw PAC `wdtfeed` write at the
+esp-hal boundary). That is the main implementation question for layer 2; flagged, not yet decided.
+
+**SAME-ROOT LINK (answering the §13.8 thread):** the `cap_p3` freeze is the LOST-USB-TX-WAKE FAMILY progressing to a
+hard lock, NOT an independent fault — status+acks share the one `usb_tx`/RESPONSE channel (§11 head-of-line), the
+~2 s drumbeat ONSET (2 ticks) before hard-lock = a usb_tx stall that hard-locked BEFORE K=3 (~6 s) could escape. This
+is exactly §13.8's pre-registered pre-K-escape / alternating hard-lock. **The capture instrument MUST therefore ALSO
+record, at the withhold/lock point: (a) the usb_tx consecutive-timeout count AND a windowed stall count (confirm
+§13.8 alternating-vs-pure), (b) `wstg`/`iena`/`free`/`rlen` (the Signature-A fingerprint — confirm B shares A's
+write-stage lost-wake root), (c) the core-0-vs-core-1 last-progress deltas (which side died first).** If the B capture
+shows a usb_tx write-stage stall fingerprint, A and B are ONE root (lost USB-TX wake) with two outcomes (recoverable
+drumbeat vs hard-lock); the durable fix is the §13.1 write-path robustness, with layer 2 as the safety net that
+guarantees a reset+trace when it hard-locks.
+
+### 17.11 LAYER-2 FEASIBILITY PROVEN + the IMPLEMENTATION DESIGN (bughunter, 2026-06-28, source-cited)
+Before designing the re-homed feed, verified from installed esp-rtos 0.3.0 / esp-hal 1.1.1 source that a hardware-timer
+ISR actually SURVIVES whatever kills core-0 comms. Facts (all source-cited):
+1. **A hardware ISR fires even when the core-0 thread-mode executor is stalled/starved.** The executor idle hook is
+   `waiti 0` (masks NOTHING; esp-hal `interrupt/xtensa.rs:341-343`), thread run-level masks nothing
+   (`interrupt/mod.rs:397-400`), and NO `interrupt_free`/critical-section wraps the executor poll loop (esp-rtos
+   `embassy/mod.rs:283-292`). So an unrelated hardware ISR still preempts and runs even if a comms task is stuck in a
+   non-yielding `.await`/loop. ⇒ an ISR-hosted feed survives the COMMON B flavor.
+2. **The core-0 thread-mode executor is COOPERATIVE — a single non-yielding sibling task starves ALL other tasks on it,
+   INCLUDING `watchdog_feed`** (esp-rtos `embassy/mod.rs:283-292`, `scheduler.rs:226-345`). **THIS IS THE LIKELY
+   ROOT of B's no-trace + stopped-feed: a comms task wedged in a non-yielding await starves `watchdog_feed`, so the
+   `wdog=` heartbeat froze (B-2-looking) AND the feed stopped.** The deep paradox (RWDT then didn't fire) remains, but
+   layer 2 sidesteps it by moving the feed off the starvable executor.
+3. **TIMG1 is fully independent of the esp-rtos/embassy time driver** — esp-rtos "now" reads the SystemTimer
+   (`time.rs:764-781`), TIMG0.timer0 is only the alarm; TIMG1 is a separate peripheral with its own interrupt
+   (`timg.rs:363`). So a TIMG1 periodic alarm fires on schedule even if the embassy time driver stalls (the §4 failure
+   mode). TIMG1's WDT is disabled by `esp_hal::init` but the TIMER is free; TIMG0 is consumed by `esp_rtos::start`.
+4. **A TIMG1 interrupt configured from `main` is core-0-fielded** (binds to `Cpu::current()`; `interrupt/xtensa.rs:336`).
+   That is IDEAL: it survives a core-0 *executor* stall (fact 1) but dies if core 0 is TRULY dead — and if core 0 is
+   truly dead it stops feeding → the dog fires. Win either way. (SWI3 + `InterruptExecutor<3>` at a priority above comms
+   is a confirmed alternative, but the bare TIMG1 ISR is simpler and has no embassy-time dependency.)
+
+**WHY LAYER 2 ALONE IS NOT SUFFICIENT — and why the SuperWDT now RE-ENTERS as a complement.** Moving the feed to a
+survivable ISR makes the WITHHOLD deterministic, but it does NOT prove the RWDT will fire (the §17.8 paradox: the RWDT
+stayed silent even when unfed for >60 s). So layer 2 must feed BOTH dogs and withhold BOTH on a core-0 stall: the
+TIMG1 ISR conditionally feeds the RWDT *and* (now viable, because the ISR is a survivable feed context — the §17.10
+killer is gone) software-feeds the SuperWDT via the raw `SWD_CONF.swd_feed` PAC write. On a core-0 stall the ISR
+withholds both; if the RWDT is somehow suppressed, the SuperWDT (independent RTC hardware path) is the backstop that
+still fires. This is the §17.10 "SuperWDT optional 2nd dog once a survivable feed exists" made concrete.
+
+**IMPLEMENTATION DESIGN (capture-reset-gated; for plan approval):**
+- **Ownership of `Rtc::feed()`:** the ISR cannot hold the core-0 task's `&'static mut Rtc`. Do the feed as a RAW PAC
+  write at the esp-hal boundary inside the ISR (`LP_WDT` `wdtwprotect` unlock → `wdtfeed` → re-lock for the RWDT;
+  `swd_wprotect` unlock → `swd_conf.swd_feed` → re-lock for the SuperWDT), confined to the firmware wiring layer under
+  the `unsafe` allowance. NO `Rtc` borrow, NO mutex, NO cross-core lock on the motion hot path (honors the
+  step-timing-sacred guardrail — the ISR is core-0-fielded and touches only LP_WDT regs, never RMT/core-1 state).
+- **Condition the feed on a core-0 progress beat read from atomics** (the ISR reads `COMMS_PROGRESS`/`USB_TX_COMPLETED`
+  + `RESPONSE.len()` snapshot via existing atomics; the withhold decision stays the pure host-tested
+  `firmware_core::diag` logic — `dead_zone_withhold` + the gated `comms_wedged`/`core1_wedged`). The OLD `watchdog_feed`
+  async task is REPLACED by: (a) the TIMG1 ISR that does the actual feed/withhold, and (b) optionally a thin core-0
+  task that only updates the heartbeat + ring snapshot (diagnostic, not load-bearing for the feed).
+- **Capture-at-withhold:** the moment the ISR decides to WITHHOLD (any reason), snapshot the usb_tx stall fingerprint
+  into RTC_FAST — reuse the existing `UsbTxStall` packer (`wstg`/`iena`/`free`/`rlen`/`response_depth`/`timeout_count`
+  already exist, §17.7's discriminator fields) PLUS a NEW windowed-stall-count word (§13.8 alternating-vs-pure). This
+  is the same `record_usb_tx_stall` writer, called from the withhold path instead of only the K-escape, so a B hard-lock
+  that never reaches K=3 STILL leaves the Signature-A fingerprint. Add `idx::USB_TX_STALL_WINDOW` (after `TRUNC_BUILD_ID`,
+  before `RING_BASE`; `RING_BASE` auto-shifts).
+- **Pure-logic split (host-tested in `firmware-core`):** the withhold DECISION (which dog(s) to feed/withhold given the
+  beat deltas, frozen-tick counts, response depth, and the windowed-stall count) is pure — extend `diag` with a single
+  `watchdog_decision(...)` that returns a `{feed_rwdt, feed_swd, withhold_reason}` so the ISR is a thin shell. TDD the
+  dead-zone/comms/core1/windowed cases. The ISR-side register pokes + the TIMG1 setup are the only firmware-only,
+  unsafe parts.
+- **Production (default build) UNCHANGED:** the §17.3 ALARM:17 fail-safe stays; the TIMG1-ISR feed + SuperWDT arm +
+  withhold-time capture are ALL `#[cfg(feature = "capture-reset")]`. A production board keeps the existing core-0
+  async `watchdog_feed`. (Open question for the team-lead: whether to also adopt the survivable ISR feed in production
+  later — it is strictly safer — but that is a follow-up, not this capture build.)
+
+**RISK / OPEN ITEMS before flashing (honest):**
+- The SuperWDT fixed period is short (seconds-scale, §17.10) and esp-hal exposes no `set_timeout`; the ISR must feed it
+  at a cadence comfortably under that period. The ISR cadence (≤500 ms, like the old feed) is almost certainly fine, but
+  the EXACT S3 SuperWDT period was not extracted from the TRM (PDF over the fetch cap). Mitigation: keep the ISR cadence
+  short (e.g. 250 ms) and, on first flash, run a SHORT healthy stream FIRST to confirm no false SuperWDT reset before a
+  long Pikachu capture. If the SuperWDT false-trips even at 250 ms, drop the SuperWDT arm and rely on the survivable-ISR
+  RWDT feed alone (layer 2 still strictly improves on the status quo).
+- This is a real behavior change in the capture build (a new ISR, a 2nd armed dog). It is diagnostic-only and the whole
+  point is to make B leave a trace; accepted for the capture image, never shipped to production.
+
+### 17.12 LAYER-2 IMPLEMENTED + BUILD-VERIFIED + bug-hunter-reviewed (2026-06-28; NOT flashed, NOT committed)
+Implemented test-first (firmware-engineer) and reviewed line-by-line (bughunter). All four Xtensa configs
+(default / defmt / capture-reset / defmt+capture-reset) build clean under `-D warnings`; `cargo test -p firmware-core`
+green (43 diag tests, +10 new). Files: `firmware-core/src/diag.rs` (pure `watchdog_decision` + `WatchdogInputs`/
+`WatchdogDecision`/`WithholdKind` + `WindowedStallCounter`), `firmware/src/survivable_watchdog.rs` (NEW: TIMG1 250 ms
+ISR + dual-dog raw-PAC feed + capture-at-withhold), `firmware/src/crash.rs` (`idx::USB_TX_STALL_WINDOW`,
+`record_usb_tx_stall_window`, `wnd=` on the breadcrumb), `firmware/src/comms.rs` (gated fingerprint atomics published
+in `usb_tx`, `watchdog_heartbeat` task, feed-path split), `firmware/src/main.rs` (gated SuperWDT arm + TIMG1 start).
+
+**Review findings (all PASS):**
+- The pure `watchdog_decision` REPLICATES the existing withhold logic exactly (same `dead_zone_withhold`, same
+  precedence Core1Motion>Core0Comms>DeadZone) — no regression, host-tested.
+- The `WindowedStallCounter` is an EXACT trailing-16 bit-ring popcount (`(w<<1)&MASK | bit`), recorded EVERY usb_tx
+  loop turn (not only on stall) so it ages correctly: pure run→16, 1:1 alternating→≈8, quiet→0 (the §13.8
+  discriminator). Verified the record site is outside the `if is_stall` block.
+- The ISR touches ONLY `LP_WDT`(=RTC_CNTL) regs + reads atomics; NO `Rtc` borrow, NO mutex, NO RMT/core-1 state
+  (step-timing guardrail honored). The dual-dog raw-PAC feed mirrors `Rwdt::feed`/`Swd` exactly (keys
+  `0x50D83AA1`/`0x8F1D312A`; SuperWDT fed via `swd_conf.modify(swd_feed)` so `Swd::enable`'s auto-feed-disable is
+  preserved). The only `unsafe` is the two `w.bits(key)` writes, confined + commented.
+- Capture-at-withhold writes the breadcrumb EXACTLY ONCE per withhold transition (`WITHHOLD_LATCHED` swap), copying
+  the usb_tx fingerprint atomics `usb_tx` republishes on every timeout — so a B hard-lock that never reaches K=3
+  still carries the last-known `wstg/iena/free/rlen` + `wnd`.
+- The heartbeat keeps climbing while withholding (ISR still fires) — DESIRABLE: it proves the ISR survived the wedge
+  (the whole point) and distinguishes "ISR alive, deliberately withholding" from "ISR died."
+- `SysSuperWdt` is ALREADY in `reset_was_watchdog_or_fault`'s set + has a `super-WDT` label, so a SuperWDT reset
+  correctly gates the `[MSG:CRASH]` boot dump. The K-escape `software_reset()` is still active in the capture build —
+  COMPLEMENTARY, not conflicting: it wins the race on a pure-consecutive A drumbeat (~6 s < dead-zone 8 s), the ISR
+  withhold catches the hard-lock B that never reaches K=3.
+
+**ONE residual hardware UNKNOWN (flagged honestly, settled by the capture itself):** whether a `SysSuperWdt` SYSTEM
+reset preserves the RTC_FAST domain. The TRM principle (RTC-domain memory survives any non-power reset; verified for
+CoreSw/CoreRtcWdt in §4/§7) says yes — `SysSuperWdt` is a system, not chip/RTC-power, reset — but I cannot prove it
+from source (TRM PDF over the fetch cap). **Even in the worst case it is informative:** the ALWAYS-ON `[MSG:RESET
+super-WDT]` boot line is written fresh every boot independent of RTC_FAST, so a SuperWDT-fired-but-RTC-wiped event
+STILL proves "SuperWDT fired, RWDT didn't" — which is the §17.8 "RWDT was suppressed" confirmation; the `[MSG:CRASH]`
+breadcrumb is the bonus. So the SuperWDT half degrades gracefully.
+
+**NEXT (HARDWARE — gated on the user's explicit go + a confirmed physical board reset):** flash the `capture-reset`
+image (plain `espflash flash`, no `--monitor`), RISK-CHECK FIRST with a SHORT healthy stream (confirm no false
+SuperWDT/RWDT reset; if the SuperWDT false-trips even at 250 ms, drop `rtc.swd.enable()` and rely on the survivable-ISR
+RWDT feed alone), THEN the full Pikachu capture (terminal-only monitor, skirnir-only reconnects, RTC discipline). B is
+~1-in-3 non-deterministic — budget 2-3 passes, stop early on a B reproduction that lands a breadcrumb. DECODE GOAL:
+which dog fired (RWDT vs SuperWDT ⇒ was the RWDT suppressed?) + does the captured `wstg/iena/free/rlen`+`wnd` match
+Signature A (⇒ A & B are ONE write-stage root)?
+
+### 17.13 FIRST LAYER-2 CAPTURE — INSTRUMENT VALIDATED, but this trigger was HOST-ABANDONMENT, not in-stream B
+The `capture-reset` image was flashed clean (RTC wiped, baseline `trunc=0`, no stale crumb); a 90 s risk-check streamed
+with NO false SuperWDT/RWDT trip (SuperWDT arm KEPT — the §17.10 risk did not materialize at the 250 ms feed). Full
+Pikachu pass 1 completed 4474/4474 clean (single banner, no mid-run reset). At pass-1's BOOT REPLAY this breadcrumb
+appeared (generated BEFORE pass 1):
+```
+[MSG:CRASH dead-zone-silent-lock stage=axis0:wait_begin comms-stage=line-send-queue comms-froze-first beats comms=2379 motion=8729]
+[MSG:CRASH usbtx: host-not-reading free=0 empty=0 iena=1 wstg=1 mov=1 exec=1 rdepth=0 rlen=4 n=1 rmt_to=0 wnd=1]
+[MSG:CRASH comms: rx=rx-read line=line-send-queue con=consumer-enqueue tx=tx-write sta=status-wait-request]
+```
+Raw logs: `/tmp/cap_b_baseline.raw`, `/tmp/cap_b_riskcheck.raw`, `/tmp/cap_b_p1.raw`.
+
+**AUTHORITATIVE DECODE (bughunter, evidence-cited — corrects/sharpens the coordinator's read):**
+
+**(1) Layer-2 deliverable VALIDATED — the silent-lock class now leaves a trace.** The new TIMG1-ISR
+`dead-zone-silent-lock` WITHHOLD fired, withheld the feed, a dog reset the chip, and RTC_FAST survived → the boot
+replayed a `[MSG:CRASH]`. A silent lock that previously left NOTHING (§17.7) now self-resets with a breadcrumb. This
+is the layer-2 goal, achieved on its first real firing.
+
+**(2) This trigger was HOST-ABANDONMENT, NOT a genuine in-stream B — PROVEN from `cap_b_riskcheck.raw`.** The
+risk-check log ends at **+89.923 s with the board fully HEALTHY**: `<Run>` status flowing every ~100 ms, WPos advancing
+smoothly (motion executing), `Bf:0,1024` (saturated planner), then `[stall] overall timeout elapsed` — skirnir's
+`--timeout 90` cut the HOST off mid-execution. The board did not wedge; the host left while the board was still cutting
+with responses queued. The `usbtx` verdict `host-not-reading free=0` independently confirms it: `free=0` = the EP1 IN
+FIFO is full because the host stopped draining (host side), the §12 LostTxWake requires `free=1`. So this is the
+EXPECTED, CORRECT classification of an abandoned port — same class as the §17.5 pass-1 artifact, now caught by the new
+dead-zone withhold instead of the K-escape. NOT a genuine free=1 in-stream B. (Pass 1 then completing clean with one
+banner corroborates: no carried-over wedge.)
+
+**(3) WHICH PATH wrote the breadcrumb — the new ISR withhold, NOT the K-escape (proven by `n=1`).** The capture build
+has TWO usbtx-word writers: the K-escape (`capture_usb_tx_stall_and_reset`, fires at K=3, `software_reset()`, writes
+`n>=3`) and the new ISR (`survivable_watchdog::capture_withhold`, copies the published fingerprint after as few as 1
+timeout). The breadcrumb shows **`n=1`** ⇒ written by the ISR (only 1 usb_tx timeout had occurred), and the WITHHOLD
+word `dead-zone-silent-lock` is written ONLY by the ISR (the K-escape writes no withhold reason). So: the ISR withheld
+the feed at ~4 s (dead-zone, 16×250 ms), and a DOG reset the chip — the K-escape never reached K=3. **The ISR itself
+does NOT `software_reset()`** (verified — `survivable_watchdog.rs` has zero reset calls); it only withholds → a
+hardware dog fired.
+
+**(4) WHICH DOG fired is UNKNOWN from this capture — and that exposes a real instrumentation GAP.** The `[MSG:RESET
+<reason>]` line is the ONLY field that names the dog (RWDT=`*-rtc-WDT` vs SuperWDT=`super-WDT`), and it is **ABSENT
+from the boot replay** because `send_reset_reason` (comms.rs:956) is emitted LIVE at boot only — it is NOT stashed for
+`$I`/`?` replay like the crash report (`maybe_emit_crash_report`). Pass 1 connected and streamed from the very first
+byte of this boot, so the live `[MSG:RESET]` went out before/around the connect handshake and was not captured in the
+log. **FIX NEEDED before the next capture: stash `[MSG:RESET <reason>]` for one `$I`/`?` replay, exactly like the
+crash report**, so the dog identity survives a late/streaming connect. Without it we cannot answer the load-bearing
+§17.8 question (did the RWDT fire, or did only the SuperWDT?) even when a breadcrumb lands. (We DO know the reset was
+NOT a chip/power reset — RTC_FAST survived — so it was RWDT, SuperWDT, or the CoreSw from some path; the K-escape is
+excluded by `n=1`, leaving RWDT or SuperWDT. The `[MSG:RESET]` label would disambiguate.)
+
+**`rdepth=0` reconciled (the coordinator's flagged paradox — NO contradiction).** Two DIFFERENT reads at two different
+times: (a) the dead-zone TRIGGER reads `RESPONSE.len()` live in the ISR at withhold time and needs `>0` — it saw a
+non-empty backlog (the planner/status kept enqueueing while usb_tx was stuck on the un-drainable write), so it fired
+correctly. (b) The `rdepth=0` in the usbtx fingerprint is `RESPONSE.len()` captured by `usb_tx` at ITS write-timeout,
+when usb_tx had ALREADY pulled the 4-byte `ok` out of the channel (it is holding `resp`, `rlen=4`) and nothing else was
+momentarily queued behind it. `rdepth=0 free=0 rlen=4` = "a 4-byte ok stuck mid-write with the host gone, channel
+momentarily drained behind it" — exactly host-abandonment, consistent.
+
+**(5) What a GENUINE in-stream B must show to confirm the A-shared-root.** This capture's `wstg=1 iena=1` IS the
+write-stage / ISR-never-armed Signature-A fingerprint — but `free=0` makes it host-abandonment, so it does NOT prove
+the A-B link (the host left; the device-side write path was not the thing that died). A GENUINE in-stream B must show
+**`free=1`** (host STILL reading — proving the wedge is device-side, not host-abandonment) together with `wstg=1` and
+ideally `wnd` near `STALL_WINDOW_LEN`/2 or higher (the §13.8 alternating signature) or a high consecutive `n`. THAT
+combination — `free=1 wstg=1` on a wedge where skirnir is still polling `?` and getting silence — is what proves A and
+B are ONE write-stage lost-wake root with two outcomes (recoverable drumbeat vs hard-lock). This capture is a clean
+NEGATIVE for that question (host left first), not a confirmation.
+
+**NEXT (two items):**
+- **INSTRUMENT FIX — LANDED 2026-06-28 (NOT flashed, NOT committed; bughunter).** `[MSG:RESET <reason>]` is now stashed
+  for a one-shot `$I`/`?` replay so the dog identity survives a streaming connect. Implemented in `comms.rs` mirroring
+  the `CRASH_REPORT` stash-and-replay, in a SEPARATE `RESET_REPORT` buffer (the reset line is emitted every boot, gated
+  only on the capture build, NOT on a valid breadcrumb — folding it into `CRASH_REPORT`, which `maybe_emit_crash_report`
+  `set()`s AFTER `send_reset_reason` in `main`, would clobber it and skip a no-breadcrumb reset). Drained at BOTH replay
+  sites (`$I` build-info + first `?` status), replayed BEFORE the crash report (the reset line frames any crash). All
+  `#[cfg(feature = "capture-reset")]` (production untouched). All FOUR Xtensa configs build clean under `-D warnings`
+  (explicit `RUSTFLAGS="-D warnings -C link-arg=-Tlinkall.x"` — `just build` is a plain `cargo build`, does NOT enforce
+  `-D warnings`); `cargo test -p firmware-core` green (324). No pure-logic to TDD (a format string + stash/replay
+  identical in shape to the already-exercised crash-report path). Effect: on the NEXT capture, a B breadcrumb's boot
+  replay carries `[MSG:RESET <reason>]` — `*-rtc-WDT` (RWDT) vs `super-WDT` (SuperWDT) vs `*-sw-reset` — answering
+  §17.8's "was the RWDT suppressed?". READY TO REFLASH for pass 3+.
+- **Keep hunting the free=1 in-stream B** (pass 2 in flight on the PRE-fix image; pass 3+ on the reflashed replay-fix
+  image). On a B that lands: read the dog from the now-stashed `[MSG:RESET]`, and `free/wstg/wnd/n` from `usbtx` for the
+  A-shared-root verdict.
+
+### 17.14 PROVOKE-AND-CAPTURE BUILD (`provoke-b` feature) — re-enable B at its native rate (LANDED, not flashed)
+After 3 full clean Pikachu passes on the `capture-reset` image (the `[MSG:RESET]` replay confirmed live —
+baseline shows `[MSG:RESET other]`), the genuine in-stream B did NOT recur (it reproduced ~line 2991 on an EARLIER
+build). Blind passes are low-yield. Built a diagnostic variant that lets B reproduce at its pre-fix rate.
+
+**PREMISE — validated, NOT assumed (bughunter).** The hypothesis "TIER 1 is now MASKING B" is mechanistically sound:
+the original B (`cap_p3`, §17.8) was a write-stage lost wake (`wstg=1`) on a 4-byte `ok` (`rlen=4`) with the host
+still reading (`free=1`) — which is EXACTLY the input `classify_write_stage` now RECOVERS
+(`write_timed_out && resp_len<=64 && data_free → CompletedLostWakeRecovered`). So TIER 1 rescues precisely the wedge B
+was made of; on the pre-TIER-1 build that wake was NOT recovered and cascaded (§13.8 alternating recovered/genuine
+stalls → neither K=3 nor the old dead-zone → hard lock). Disabling that recovery re-creates the pre-fix cascade.
+
+**THE LEVER (minimal, production untouched).** New pure host-tested sibling `firmware_core::diag::WriteOutcome::
+classify_write_stage_no_recover` — byte-identical to `classify_write_stage` EXCEPT the single-chunk recoverable branch
+returns `Stalled` instead of `CompletedLostWakeRecovered`. The firmware swaps to it via a single
+`#[cfg(feature = "provoke-b")]` at the `usb_tx` write-stage classify call (comms.rs ~1638); the production
+`classify_write_stage` and the DEFAULT build are byte-for-byte unchanged. The K-escape + survivable watchdog +
+`[MSG:RESET]` replay all stay ON, so whichever way B manifests leaves a trace. `provoke-b = ["capture-reset"]` in
+`firmware/Cargo.toml` (verified via `cargo tree`: `--features provoke-b` transitively arms `capture-reset`) — provoking
+B without the capture channel would be pointless + unsafe, so the feature pulls it in. **BUILD+FLASH COMBO:
+`--features provoke-b`** (no need to also pass `capture-reset`; it is pulled in).
+
+**DISCRIMINATING PREDICTIONS (pre-registered so the result is interpreted, not rationalized):**
+- **If `provoke-b` reproduces B at a HIGH rate** (≫ the ~1-in-3 baseline, ideally most passes): strong evidence TIER 1
+  was MASKING the common B (H1). Combined with the breadcrumb showing `free=1 wstg=1` (device-side write-stage lost
+  wake, host still reading) ⇒ **A and B are ONE write-stage lost-wake root**, two outcomes (recoverable drumbeat vs
+  hard-lock); TIER 1 is the durable fix, layer 2 the safety net. Read `[MSG:RESET <dog>]` for the §17.8 RWDT-suppressed
+  answer.
+- **If `provoke-b` STILL does not reproduce B** (clean passes at the same rate as the fixed build): H1 is WRONG —
+  B is NOT the single-chunk write-stage lost wake (disabling its recovery changed nothing), so B is an INDEPENDENT
+  mechanism and the 3 clean fixed-build passes were just non-determinism. That redirects the hunt entirely (B is not
+  A's root). A valuable negative.
+- **If `provoke-b` reproduces a wedge with `free=0`** (host-not-reading) rather than `free=1`: that is NOT the genuine
+  in-stream B — it is the K-escape/host-abandonment class re-exposed by removing recovery, not the §13.8 hard lock.
+  Discriminate by `free=`.
+
+**STATUS:** LANDED, NOT flashed, NOT committed. firmware-core host tests green (326, +2 provoke tests:
+`provoke_no_recover_stalls_the_single_chunk_lost_wake_the_production_path_recovers`,
+`provoke_no_recover_matches_production_on_every_non_recoverable_input`). All Xtensa configs (default / capture-reset /
+provoke-b / defmt+provoke-b) build clean under explicit `RUSTFLAGS="-D warnings -C link-arg=-Tlinkall.x"`. Files:
+`firmware-core/src/diag.rs` (+`classify_write_stage_no_recover` + 2 tests), `firmware/src/comms.rs` (cfg swap at the
+write-stage classify), `firmware/Cargo.toml` (`provoke-b = ["capture-reset"]`).

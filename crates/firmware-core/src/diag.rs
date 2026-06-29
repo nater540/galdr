@@ -160,6 +160,37 @@ impl WriteOutcome {
     }
   }
 
+  /// The PROVOKE-B variant of [`classify_write_stage`](WriteOutcome::classify_write_stage): identical EXCEPT the
+  /// single-chunk recoverable case returns [`Stalled`](WriteOutcome::Stalled) instead of
+  /// [`CompletedLostWakeRecovered`](WriteOutcome::CompletedLostWakeRecovered). It exists ONLY for the diagnostic
+  /// `provoke-b` build (docs §17.14): by NOT recovering the single-chunk write-stage lost wake, the lost wake is left
+  /// to cascade exactly as it did on the PRE-TIER-1 build — re-enabling the genuine in-stream Signature B (the §13.8
+  /// pre-K-escape hard lock) at its native rate so it can be captured with the now-complete instrument. EVERY other
+  /// disposition is unchanged: a `>64 B` multi-chunk timeout and a `data_free=0` timeout were already `Stalled`; a
+  /// `write_errored` clean drop is still `Completed`; a clean write still returns `None` to defer to the flush stage.
+  /// So this differs from the production classifier on EXACTLY one input class — the recoverable single-chunk lost
+  /// wake — which is precisely the wedge TIER 1 mitigates and the thing we want to let happen for the capture. The
+  /// production [`classify_write_stage`](WriteOutcome::classify_write_stage) is untouched; the firmware selects this
+  /// sibling via a single `#[cfg(feature = "provoke-b")]` swap at the call site.
+  pub fn classify_write_stage_no_recover(
+    write_timed_out: bool,
+    write_errored: bool,
+    resp_len: usize,
+    data_free: bool,
+  ) -> Option<WriteOutcome> {
+    if write_timed_out {
+      // PROVOKE-B: do NOT recover the single-chunk lost wake — treat EVERY write timeout as a genuine stall so it
+      // cascades (the `resp_len`/`data_free` recovery guard is deliberately bypassed). The two args are kept in the
+      // signature so the call site is a drop-in `#[cfg]` swap for `classify_write_stage`.
+      let _ = (resp_len, data_free);
+      Some(WriteOutcome::Stalled)
+    } else if write_errored {
+      Some(WriteOutcome::Completed)
+    } else {
+      None
+    }
+  }
+
   /// Classify a `usb_tx` response when the write and flush are timed SEPARATELY (the truncation-safe two-stage
   /// sequencing). This is the SAFE variant of [`classify`](WriteOutcome::classify): the poll-after-arm recovery is
   /// only valid once ALL bytes are provably in the FIFO, which is true at the FLUSH stage but NOT mid-`write_all`.
@@ -403,6 +434,156 @@ pub fn dead_zone_withhold(response_depth: usize, tx_complete_frozen_ticks: u32) 
   response_depth > 0 && tx_complete_frozen_ticks >= DEAD_ZONE_STALL_TICKS
 }
 
+/// The number of consecutive feed intervals the core-1 motion beat may stay frozen WHILE a block is in flight before
+/// [`watchdog_decision`] declares a core-1 wedge. A pure mirror of the firmware's `CORE1_STALL_TICKS` so the decision
+/// is host-tested against the SAME threshold the survivable-watchdog ISR uses (the firmware passes its own constant
+/// in [`WatchdogInputs::core1_stall_ticks`], but this is the canonical default and the value the tests pin). At the
+/// ISR's 250 ms cadence `16 * 250 ms = 4 s` — the same ~4 s order as the async feeder's 500 ms × 8.
+pub const CORE1_STALL_TICKS: u32 = 16;
+
+/// The number of consecutive feed intervals [`COMMS_PROGRESS`] may stay frozen WHILE the host is active before
+/// [`watchdog_decision`] declares a core-0 comms wedge. A pure mirror of the firmware's `COMMS_STALL_TICKS`; at the
+/// ISR's 250 ms cadence `12 * 250 ms = 3 s` — the same ~3 s order as the async feeder's 500 ms × 6.
+pub const COMMS_STALL_TICKS: u32 = 12;
+
+/// Which wedge class made [`watchdog_decision`] withhold the watchdog feed. A PURE mirror of the firmware's
+/// `crash::WithholdReason`, kept here so the survivable-watchdog ISR's decision is fully host-tested; `crash.rs` maps
+/// this to its existing on-wire `WithholdReason`. The precedence when several conditions hold at once is
+/// `Core1Motion > Core0Comms > DeadZone` — the most-specific (the core-1 stage marker pins an exact RMT channel) wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WithholdKind {
+  /// The core-1 motion beat froze while a block was in flight — a core-1 / RMT wedge.
+  Core1Motion,
+  /// The host was driving the board but the core-0 comms path stopped making forward progress.
+  Core0Comms,
+  /// The dead-zone backstop: responses queued yet `usb_tx` completed no write for [`DEAD_ZONE_STALL_TICKS`] —
+  /// independent of host-active / executor state (the Signature-B silent lock the other two structurally miss).
+  DeadZone,
+}
+
+/// The inputs the survivable-watchdog ISR samples each feed interval, fed to the pure [`watchdog_decision`]. Carries
+/// the frozen-tick counters the ISR maintains (the same bookkeeping the async `watchdog_feed` does today), the live
+/// `RESPONSE` backlog + executor / host state, and the stall thresholds — so the wedge conditions are decided HERE
+/// (host-tested) and the ISR is a thin shell that feeds or withholds both dogs on the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchdogInputs {
+  /// Consecutive feed intervals the core-1 [`MOTION_LIVENESS`] beat has stayed frozen WHILE a block is in flight.
+  /// The ISR resets this to 0 whenever the beat advances OR no block is in flight (an idle executor is not a wedge).
+  pub core1_frozen_ticks: u32,
+  /// Consecutive feed intervals [`COMMS_PROGRESS`] has stayed frozen WHILE the host is active. The ISR resets this to
+  /// 0 whenever the counter advances OR the host is not active (a quiescent board legitimately makes no progress).
+  pub comms_frozen_ticks: u32,
+  /// Consecutive feed intervals `usb_tx` has completed NO write (the [`USB_TX_COMPLETED`] beat frozen). The ISR
+  /// resets this to 0 on any completed/recovered write. Ungated by host/executor state — that is the dead zone.
+  pub tx_complete_frozen_ticks: u32,
+  /// The current `RESPONSE` channel occupancy. The dead-zone backstop fires ONLY when this is `> 0` (responses are
+  /// queued to send), the false-trip guard against resetting a truly idle board that legitimately sends nothing.
+  pub response_depth: usize,
+  /// Whether a motion block is in flight (`EXECUTOR_RUNNING`). The caller uses it to gate the core-1 freeze count;
+  /// it is carried for completeness / future use even though the gated `core1_frozen_ticks` already encodes it.
+  pub block_in_flight: bool,
+  /// Whether the host is actively driving the board (recent RX). The caller uses it to gate the comms freeze count;
+  /// carried for completeness even though the gated `comms_frozen_ticks` already encodes it.
+  pub host_active: bool,
+  /// The core-1 stall threshold to apply (the firmware passes its own constant; defaults to [`CORE1_STALL_TICKS`]).
+  pub core1_stall_ticks: u32,
+  /// The core-0 comms stall threshold to apply (defaults to [`COMMS_STALL_TICKS`]).
+  pub comms_stall_ticks: u32,
+}
+
+/// The survivable-watchdog ISR's decision for one feed interval: whether to feed each dog and, when withholding, why.
+/// When `withhold_reason` is `Some`, BOTH `feed_rwdt` and `feed_swd` are `false` (a wedge withholds both dogs so the
+/// next reset — RWDT or SuperWDT — leaves a breadcrumb); when `None`, both are `true` (healthy → feed both).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchdogDecision {
+  /// Feed the RTC watchdog this interval. `false` ⇒ withhold (let it run out toward a reset).
+  pub feed_rwdt: bool,
+  /// Feed the SuperWDT this interval. `false` ⇒ withhold. Always equal to [`feed_rwdt`](Self::feed_rwdt) — the two
+  /// dogs are fed/withheld together so a withhold cannot be masked by one dog still being fed.
+  pub feed_swd: bool,
+  /// The wedge class that forced a withhold, or `None` when feeding (healthy / idle / host-absent).
+  pub withhold_reason: Option<WithholdKind>,
+}
+
+/// The pure survivable-watchdog decision for one feed interval (the core the ISR calls so the ISR is a thin shell).
+/// REPLICATES the existing `watchdog_feed` withhold logic exactly: a core-1 motion wedge (`core1_frozen_ticks >=
+/// core1_stall_ticks`), a core-0 comms wedge (`comms_frozen_ticks >= comms_stall_ticks`), or the dead-zone backstop
+/// ([`dead_zone_withhold`] on `response_depth` + `tx_complete_frozen_ticks`) ⇒ WITHHOLD BOTH dogs, with precedence
+/// `Core1Motion > Core0Comms > DeadZone`; otherwise FEED BOTH. The frozen-tick counters are assumed already gated by
+/// the caller (the ISR zeroes `core1_frozen_ticks` when no block is in flight and `comms_frozen_ticks` when the host
+/// is inactive), exactly as `watchdog_feed` does — so this function is a pure threshold comparison + precedence.
+pub fn watchdog_decision(inputs: WatchdogInputs) -> WatchdogDecision {
+  let core1_wedged = inputs.core1_frozen_ticks >= inputs.core1_stall_ticks;
+  let comms_wedged = inputs.comms_frozen_ticks >= inputs.comms_stall_ticks;
+  let dead_zone = dead_zone_withhold(inputs.response_depth, inputs.tx_complete_frozen_ticks);
+  let withhold_reason = if core1_wedged {
+    Some(WithholdKind::Core1Motion)
+  } else if comms_wedged {
+    Some(WithholdKind::Core0Comms)
+  } else if dead_zone {
+    Some(WithholdKind::DeadZone)
+  } else {
+    None
+  };
+  // A withhold starves BOTH dogs (so whichever fires first leaves the breadcrumb); a clean interval feeds both.
+  let feed = withhold_reason.is_none();
+  WatchdogDecision { feed_rwdt: feed, feed_swd: feed, withhold_reason }
+}
+
+/// The length of the sliding window (in feed intervals) the [`WindowedStallCounter`] ages over. A `usb_tx` write
+/// timeout seen now stays counted for this many subsequent intervals before it ages out, so the window measures
+/// "how degraded was the link over the recent past" rather than the instantaneous state. 16 intervals at the ISR's
+/// 250 ms cadence ≈ 4 s of history — long enough to span the §13.8 ALTERNATING recovered/stall pattern (which keeps
+/// resetting the consecutive K counter yet still represents a locking link) but short enough to age back to 0 once
+/// the link genuinely recovers.
+pub const STALL_WINDOW_LEN: u16 = 16;
+
+/// A WINDOWED `usb_tx`-stall counter (§13.8): the number of write timeouts within a true sliding window of the last
+/// [`STALL_WINDOW_LEN`] feed intervals. It distinguishes a PURE consecutive stall run (Signature A — what the bounded
+/// [`UsbTxStallCounter`] K-escape catches) from an ALTERNATING recovered/stall pattern that resets the consecutive K
+/// counter on every recovery yet still represents a degraded / intermittently-locking link: an alternating pattern
+/// keeps this windowed count near half-full even though the consecutive count never reaches K.
+///
+/// ## Model
+/// The window is an exact ring of the last [`STALL_WINDOW_LEN`] samples, packed one-bit-per-interval into a `u16`
+/// (bit set ⇒ that interval timed out). Each [`record`](Self::record) shifts the ring left by one and ORs in the new
+/// sample's bit; [`count`](Self::count) is the population count of the live window. This is an EXACT trailing-N
+/// window (not a lossy linear age-out), so a 1:1 alternating run reads ≈`N/2`, a pure stall run reads `N`, and a long
+/// quiet run reads `0` — the three regimes are cleanly separable. The whole state is one `u16` (the ring) plus a
+/// cached popcount; no per-interval history buffer, so it is cheap enough to call from the watchdog ISR.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowedStallCounter {
+  /// The trailing-[`STALL_WINDOW_LEN`] sample ring, one bit per interval (bit 0 = most recent). Bits at or above
+  /// `STALL_WINDOW_LEN` are masked off on every shift so they never contribute to the count.
+  window: u16,
+}
+
+impl WindowedStallCounter {
+  /// The mask of live window bits: the low [`STALL_WINDOW_LEN`] bits. Anything shifted into a higher bit has aged out
+  /// of the trailing window and is cleared, so it cannot inflate the count.
+  const WINDOW_MASK: u16 = if STALL_WINDOW_LEN >= 16 { u16::MAX } else { (1u16 << STALL_WINDOW_LEN) - 1 };
+
+  /// A fresh counter (an empty window).
+  pub const fn new() -> Self {
+    WindowedStallCounter { window: 0 }
+  }
+
+  /// Advance the window by one feed interval: shift the sample ring left by one (the oldest sample ages out at the
+  /// trailing edge), mask to the window width, and OR in this interval's bit (`1` ⇒ `timed_out`). Returns the updated
+  /// [`count`](Self::count) for convenience.
+  pub fn record(&mut self, timed_out: bool) -> u16 {
+    self.window = ((self.window << 1) & Self::WINDOW_MASK) | (timed_out as u16);
+    self.count()
+  }
+
+  /// The number of `usb_tx` timeouts currently within the sliding window (`0..=`[`STALL_WINDOW_LEN`]) — the popcount
+  /// of the live ring. A high value means the link has been timing out frequently over the recent past, whether the
+  /// timeouts were CONSECUTIVE (Signature A) or ALTERNATING with recoveries (§13.8); only a long QUIET run reads 0.
+  pub fn count(&self) -> u16 {
+    self.window.count_ones() as u16
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -575,6 +756,51 @@ mod tests {
     assert_eq!(o, Some(WriteOutcome::Stalled));
     assert!(o.unwrap().is_stall());
     assert!(!o.unwrap().is_recovered_lost_wake());
+  }
+
+  #[test]
+  fn provoke_no_recover_stalls_the_single_chunk_lost_wake_the_production_path_recovers() {
+    // The DEFINING difference (§17.14): the EXACT captured Signature-A input `wstg=1 rlen=4 free=1` that the
+    // production classifier RECOVERS, the provoke variant treats as a STALL — so the lost wake is NOT rescued and
+    // cascades, re-enabling the genuine in-stream B for capture. Same inputs, opposite single-chunk disposition.
+    let prod = WriteOutcome::classify_write_stage(true, false, 4, true);
+    let provoke = WriteOutcome::classify_write_stage_no_recover(true, false, 4, true);
+    assert_eq!(prod, Some(WriteOutcome::CompletedLostWakeRecovered), "production recovers the single-chunk lost wake");
+    assert_eq!(provoke, Some(WriteOutcome::Stalled), "provoke does NOT recover it — it cascades as a stall");
+    assert!(provoke.unwrap().is_stall(), "the provoked outcome counts toward the K-escape / cascade");
+    assert!(!provoke.unwrap().is_recovered_lost_wake());
+    // The 64-byte inclusive boundary is also stalled under provoke (production recovers it).
+    assert_eq!(WriteOutcome::classify_write_stage_no_recover(true, false, 64, true), Some(WriteOutcome::Stalled));
+  }
+
+  #[test]
+  fn provoke_no_recover_matches_production_on_every_non_recoverable_input() {
+    // The provoke variant differs from production on EXACTLY one input class (the recoverable single-chunk lost wake
+    // above); on every OTHER disposition it is byte-identical, so the provoke build only re-enables the cascade and
+    // changes nothing else. Verify the three shared dispositions match the production classifier exactly:
+    // - a >64 B multi-chunk write timeout is a stall in BOTH;
+    assert_eq!(
+      WriteOutcome::classify_write_stage_no_recover(true, false, 90, true),
+      WriteOutcome::classify_write_stage(true, false, 90, true),
+    );
+    // - a ≤64 B timeout with the FIFO NOT drained is a stall in BOTH (the provoke path also stalls it, same result);
+    assert_eq!(WriteOutcome::classify_write_stage_no_recover(true, false, 4, false), Some(WriteOutcome::Stalled));
+    assert_eq!(
+      WriteOutcome::classify_write_stage_no_recover(true, false, 4, false),
+      WriteOutcome::classify_write_stage(true, false, 4, false),
+    );
+    // - a write ERROR (no timeout) is a clean Completed drop in BOTH;
+    assert_eq!(
+      WriteOutcome::classify_write_stage_no_recover(false, true, 4, true),
+      WriteOutcome::classify_write_stage(false, true, 4, true),
+    );
+    assert_eq!(WriteOutcome::classify_write_stage_no_recover(false, true, 4, true), Some(WriteOutcome::Completed));
+    // - a clean write (no timeout, no error) defers to the flush stage (None) in BOTH.
+    assert_eq!(
+      WriteOutcome::classify_write_stage_no_recover(false, false, 4, true),
+      WriteOutcome::classify_write_stage(false, false, 4, true),
+    );
+    assert_eq!(WriteOutcome::classify_write_stage_no_recover(false, false, 4, true), None);
   }
 
   #[test]
@@ -778,5 +1004,177 @@ mod tests {
     // flight), not wedged — so it must NOT classify as Core1Wedged. With serial_in_empty set it reads as a lost wake.
     let stall = UsbTxStall { serial_in_empty: true, motion_advancing: false, executor_running: false, ..base() };
     assert_eq!(stall.verdict(), UsbTxVerdict::LostTxWake);
+  }
+
+  /// A neutral, HEALTHY baseline for the watchdog-decision tests: no frozen ticks, no backlog, host driving, a block
+  /// in flight, and the canonical thresholds. Tests mutate one field at a time to assert each withhold condition.
+  fn healthy_inputs() -> WatchdogInputs {
+    WatchdogInputs {
+      core1_frozen_ticks: 0,
+      comms_frozen_ticks: 0,
+      tx_complete_frozen_ticks: 0,
+      response_depth: 0,
+      block_in_flight: true,
+      host_active: true,
+      core1_stall_ticks: CORE1_STALL_TICKS,
+      comms_stall_ticks: COMMS_STALL_TICKS,
+    }
+  }
+
+  #[test]
+  fn watchdog_feeds_both_dogs_when_healthy() {
+    // No wedge condition met → feed BOTH dogs, no withhold reason.
+    let d = watchdog_decision(healthy_inputs());
+    assert!(d.feed_rwdt, "healthy → feed RWDT");
+    assert!(d.feed_swd, "healthy → feed SuperWDT");
+    assert_eq!(d.withhold_reason, None);
+    // Just-below-threshold freezes are still healthy (the boundary is `>=`, so one short of each feeds).
+    let near = WatchdogInputs {
+      core1_frozen_ticks: CORE1_STALL_TICKS - 1,
+      comms_frozen_ticks: COMMS_STALL_TICKS - 1,
+      tx_complete_frozen_ticks: DEAD_ZONE_STALL_TICKS - 1,
+      response_depth: 8,
+      ..healthy_inputs()
+    };
+    let d = watchdog_decision(near);
+    assert_eq!(d.withhold_reason, None, "one short of every threshold still feeds");
+    assert!(d.feed_rwdt && d.feed_swd);
+  }
+
+  #[test]
+  fn watchdog_withholds_both_dogs_on_core1_wedge() {
+    let inputs = WatchdogInputs { core1_frozen_ticks: CORE1_STALL_TICKS, ..healthy_inputs() };
+    let d = watchdog_decision(inputs);
+    assert_eq!(d.withhold_reason, Some(WithholdKind::Core1Motion));
+    assert!(!d.feed_rwdt, "a wedge withholds the RWDT");
+    assert!(!d.feed_swd, "a wedge withholds the SuperWDT too — both, so neither masks the withhold");
+  }
+
+  #[test]
+  fn watchdog_withholds_both_dogs_on_comms_wedge() {
+    let inputs = WatchdogInputs { comms_frozen_ticks: COMMS_STALL_TICKS, ..healthy_inputs() };
+    let d = watchdog_decision(inputs);
+    assert_eq!(d.withhold_reason, Some(WithholdKind::Core0Comms));
+    assert!(!d.feed_rwdt && !d.feed_swd);
+  }
+
+  #[test]
+  fn watchdog_withholds_both_dogs_on_dead_zone() {
+    // Responses queued AND usb_tx idle for the full dead-zone window, with no core1/comms freeze → DeadZone.
+    let inputs = WatchdogInputs {
+      response_depth: 1,
+      tx_complete_frozen_ticks: DEAD_ZONE_STALL_TICKS,
+      ..healthy_inputs()
+    };
+    let d = watchdog_decision(inputs);
+    assert_eq!(d.withhold_reason, Some(WithholdKind::DeadZone));
+    assert!(!d.feed_rwdt && !d.feed_swd);
+  }
+
+  #[test]
+  fn watchdog_dead_zone_matches_dead_zone_withhold() {
+    // The decision's DeadZone arm must agree with the standalone `dead_zone_withhold` for every depth/freeze combo —
+    // the same backstop semantics, just surfaced through the unified decision. (No core1/comms freeze, so DeadZone is
+    // the only candidate and is reached iff `dead_zone_withhold` is true.)
+    for &depth in &[0usize, 1, 8] {
+      for &frozen in &[0u32, DEAD_ZONE_STALL_TICKS - 1, DEAD_ZONE_STALL_TICKS, DEAD_ZONE_STALL_TICKS + 5] {
+        let inputs =
+          WatchdogInputs { response_depth: depth, tx_complete_frozen_ticks: frozen, ..healthy_inputs() };
+        let withholds_dead_zone =
+          watchdog_decision(inputs).withhold_reason == Some(WithholdKind::DeadZone);
+        assert_eq!(
+          withholds_dead_zone,
+          dead_zone_withhold(depth, frozen),
+          "decision DeadZone must match dead_zone_withhold for depth={depth} frozen={frozen}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn watchdog_precedence_is_core1_then_comms_then_dead_zone() {
+    // When ALL three conditions hold at once, the most-specific (core-1, which carries the exact RMT stage marker)
+    // wins, then core-0 comms, then the dead-zone backstop — the same precedence `watchdog_feed` applies.
+    let all = WatchdogInputs {
+      core1_frozen_ticks: CORE1_STALL_TICKS,
+      comms_frozen_ticks: COMMS_STALL_TICKS,
+      response_depth: 8,
+      tx_complete_frozen_ticks: DEAD_ZONE_STALL_TICKS,
+      ..healthy_inputs()
+    };
+    assert_eq!(watchdog_decision(all).withhold_reason, Some(WithholdKind::Core1Motion));
+    // Drop core-1 → comms wins over dead-zone.
+    let comms_and_dz = WatchdogInputs { core1_frozen_ticks: 0, ..all };
+    assert_eq!(watchdog_decision(comms_and_dz).withhold_reason, Some(WithholdKind::Core0Comms));
+    // Drop comms too → dead-zone is the residual.
+    let dz_only = WatchdogInputs { comms_frozen_ticks: 0, ..comms_and_dz };
+    assert_eq!(watchdog_decision(dz_only).withhold_reason, Some(WithholdKind::DeadZone));
+  }
+
+  #[test]
+  fn watchdog_honors_caller_supplied_thresholds() {
+    // The firmware passes its own stall thresholds; a tighter threshold trips sooner. With `core1_stall_ticks = 2`,
+    // two frozen ticks is already a wedge even though it is far below the default CORE1_STALL_TICKS.
+    let inputs = WatchdogInputs { core1_frozen_ticks: 2, core1_stall_ticks: 2, ..healthy_inputs() };
+    assert_eq!(watchdog_decision(inputs).withhold_reason, Some(WithholdKind::Core1Motion));
+  }
+
+  #[test]
+  fn windowed_counter_consecutive_run_pins_at_ceiling() {
+    // A PURE consecutive stall run (Signature A territory): the windowed count climbs to and pins at the ceiling.
+    let mut w = WindowedStallCounter::new();
+    assert_eq!(w.count(), 0);
+    for i in 1..=STALL_WINDOW_LEN {
+      let c = w.record(true);
+      assert_eq!(c, i, "consecutive timeouts climb one per interval");
+    }
+    // Past the window length it saturates — it can hold at most STALL_WINDOW_LEN timeouts.
+    for _ in 0..10 {
+      assert_eq!(w.record(true), STALL_WINDOW_LEN, "windowed count saturates at the window length");
+    }
+    assert_eq!(w.count(), STALL_WINDOW_LEN);
+  }
+
+  #[test]
+  fn windowed_counter_alternating_pattern_still_accrues() {
+    // The §13.8 ALTERNATING recovered/stall pattern: each recovery resets the CONSECUTIVE K counter, but the windowed
+    // count still accrues toward a degraded reading. Over a long alternating run it holds around half the ceiling —
+    // clearly non-zero, distinguishing a degraded link from a healthy one.
+    let mut w = WindowedStallCounter::new();
+    let mut timed_out = true;
+    for _ in 0..200 {
+      w.record(timed_out);
+      timed_out = !timed_out;
+    }
+    // A true trailing-N ring over a 1:1 alternating run holds EXACTLY half the window full — clearly elevated, unlike
+    // a healthy link's 0 and distinct from a pure run's full window. This is the §13.8 signal the consecutive K
+    // counter misses entirely (every recovery resets it to 0).
+    assert_eq!(w.count(), STALL_WINDOW_LEN / 2, "a 1:1 alternating link reads exactly half the window full");
+    // And a burst-heavy alternating pattern (two stalls per recovery) accrues a clearly-elevated count.
+    let mut w2 = WindowedStallCounter::new();
+    for _ in 0..50 {
+      w2.record(true);
+      w2.record(true);
+      w2.record(false);
+    }
+    assert!(w2.count() >= STALL_WINDOW_LEN / 2, "a stall-heavy alternating link reads a clearly elevated window");
+  }
+
+  #[test]
+  fn windowed_counter_long_quiet_ages_back_to_zero() {
+    // After a stall run, a long QUIET stretch ages every timeout out of the window → back to 0 (a recovered link).
+    let mut w = WindowedStallCounter::new();
+    for _ in 0..STALL_WINDOW_LEN {
+      w.record(true);
+    }
+    assert_eq!(w.count(), STALL_WINDOW_LEN);
+    // It takes at most STALL_WINDOW_LEN clean intervals to fully age out (one timeout falls off the trailing edge
+    // per clean interval).
+    for _ in 0..STALL_WINDOW_LEN {
+      w.record(false);
+    }
+    assert_eq!(w.count(), 0, "a full window of clean intervals ages the count back to zero");
+    // ...and it stays at 0 (saturating subtract, never underflows).
+    assert_eq!(w.record(false), 0, "ageing a zero window stays at zero, never wraps");
   }
 }
