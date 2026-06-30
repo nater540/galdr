@@ -2016,7 +2016,17 @@ pub fn run() -> eframe::Result<()> {
   // it must be resolved before the viewport and the visuals are built. Load failures fall back to defaults with
   // notices. The parsed config + its notices are handed to `SkirnirApp::new`, so the normal path reads/parses/
   // resolves exactly once (no duplicate load) and the notices still reach the console.
-  let (config, config_notices) = crate::config::load();
+  let (config, mut config_notices) = crate::config::load();
+
+  // Bring the i18n registry up before the first frame: seed the bundled locales (en-US source + fallback), then
+  // select the operator's configured locale so every `tr!` label resolves against it. An init failure means the
+  // BUNDLED resource is invalid (a build problem) — surfaced as a console notice, never a panic, and `tr!` then
+  // renders keys verbatim rather than bringing the UI down.
+  if let Err(err) = crate::i18n::init() {
+    config_notices.push(format!("i18n initialisation failed (UI strings will show as keys): {err}"));
+  }
+  crate::i18n::set_language(&config.ui.language);
+
   let (palette, _palette_notice) = config.palette();
   // Clamp the window size to sane positive dimensions (a hand-edited 0/negative would make the window unusable).
   let (window_w, window_h) = config.ui.window_size();

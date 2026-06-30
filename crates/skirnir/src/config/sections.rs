@@ -32,6 +32,9 @@ pub struct UiConfig {
   pub window_w: f32,
   /// The initial window height (logical px) for the eframe viewport.
   pub window_h: f32,
+  /// The UI language (a BCP-47 locale tag, e.g. `en-US`) selected on the global i18n registry at startup. Any key
+  /// a non-default locale does not translate falls back to the bundled `en-US` resource.
+  pub language: String,
 }
 
 impl Default for UiConfig {
@@ -46,6 +49,9 @@ impl Default for UiConfig {
       console_auto_scroll: true,
       window_w: 1100.0,
       window_h: 720.0,
+      // Default to the bundled source locale so a fresh install (and any older config that predates this field)
+      // runs in English without an explicit entry; `#[serde(default)]` fills it from here when the key is absent.
+      language: crate::i18n::EN_US.to_string(),
     }
   }
 }

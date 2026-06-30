@@ -36,6 +36,9 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod eta;
+// Fluent-based internationalization: a global registry + `tr!` macro over a pure, host-tested `Translator`.
+// Framework-agnostic (no GUI/serial dependency), so the CLI and GUI share one translation catalog.
+pub mod i18n;
 pub mod profile;
 pub mod protocol;
 pub mod reconnect;

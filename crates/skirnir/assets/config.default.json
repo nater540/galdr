@@ -54,7 +54,8 @@
     "console_verbose": false,
     "console_auto_scroll": true,
     "window_w": 1100.0,
-    "window_h": 720.0
+    "window_h": 720.0,
+    "language": "en-US"
   },
 
   "connection": {
