@@ -612,7 +612,7 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
     let connected = view.connection.is_connected();
 
     if attached {
-      let label = if connected { "Disconnect" } else { "Cancel" };
+      let label = if connected { crate::tr!("btn-disconnect") } else { crate::tr!("btn-cancel") };
       if ui.button(label).clicked() {
         sink.push(Intent::Disconnect);
       }
@@ -639,20 +639,20 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
       // Identify actively probes the selected port for grblHAL. It is opt-in (opening toggles the board's
       // auto-reset line) and never part of a refresh, so it sits behind its own button.
       if ui
-        .add_enabled(has_port, egui::Button::new("Identify"))
+        .add_enabled(has_port, egui::Button::new(crate::tr!("btn-identify")))
         .on_hover_text("Probe the selected port for grblHAL (sends ?/$I)")
         .clicked()
       {
         sink.push(Intent::IdentifyPort { path: state.selected_port.clone() });
       }
-      if ui.add_enabled(has_port, egui::Button::new("Connect")).clicked() {
+      if ui.add_enabled(has_port, egui::Button::new(crate::tr!("btn-connect"))).clicked() {
         sink.push(Intent::Connect { path: state.selected_port.clone(), baud: state.baud });
       }
     }
 
     toolbar_divider(ui, palette);
 
-    if ui.button("Open…").on_hover_text("Load a G-code program").clicked()
+    if ui.button(crate::tr!("btn-open")).on_hover_text("Load a G-code program").clicked()
       && let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "ngc", "tap"]).pick_file()
     {
       sink.push(Intent::OpenProgram(path));
@@ -667,12 +667,12 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
     let badge = view.badge_state();
     let can_home = connected && !matches!(badge, BadgeState::Run | BadgeState::Jog | BadgeState::Home);
     let home_color = if can_home { palette.text_dim } else { palette.text_disabled };
-    let home = egui::Button::new(RichText::new("⌂ Home").color(home_color)).fill(Color32::TRANSPARENT);
+    let home = egui::Button::new(RichText::new(crate::tr!("btn-home")).color(home_color)).fill(Color32::TRANSPARENT);
     if ui.add_enabled(can_home, home).on_hover_text("Run homing cycle ($H)").clicked() {
       sink.push(Intent::Home);
     }
 
-    if ui.button("Settings").clicked() {
+    if ui.button(crate::tr!("btn-settings")).clicked() {
       state.settings_open = !state.settings_open;
     }
 

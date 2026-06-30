@@ -226,6 +226,59 @@ mod tests {
     assert_eq!(notice, None, "the bundled default's active_theme must resolve cleanly");
   }
 
+  #[test]
+  fn the_configured_language_round_trips_and_drives_the_active_locale() {
+    // The `ui.language` field must survive a save/load round trip and be the value the startup wiring selects on the
+    // i18n registry. We assert the application step against an isolated `Translator` (not the process-wide registry)
+    // so the test is deterministic regardless of test execution order — exactly the value `run()` passes to
+    // `i18n::set_language` ends up as the active locale.
+    let mut config = Config::default();
+    assert_eq!(config.ui.language, crate::i18n::EN_US, "a fresh config defaults to the bundled source locale");
+
+    config.ui.language = "fr-FR".to_string();
+    let body = config.to_json().expect("serialises");
+    let parsed = Config::from_json(&body).expect("round-trips");
+    assert_eq!(parsed.ui.language, "fr-FR", "the configured language survives a save/load round trip");
+
+    // Applying the configured locale (what `run()` does via `i18n::set_language(&config.ui.language)`) selects it.
+    let mut translator = crate::i18n::Translator::new();
+    translator.set_language(&parsed.ui.language);
+    assert_eq!(translator.language(), "fr-FR", "the configured language becomes the active locale");
+  }
+
+  #[test]
+  fn an_absent_language_field_fills_from_the_default() {
+    // A config (e.g. one written before this field existed) that omits `ui.language` must fill it from the default
+    // rather than failing the parse — the same `#[serde(default)]` contract every other field honours.
+    let body = r#"{ "version": 1, "ui": { "jog_feed": 250.0 } }"#;
+    let config = Config::from_json(body).expect("a partial config parses");
+    assert_eq!(config.ui.language, crate::i18n::EN_US, "an absent language fills from the default (en-US)");
+  }
+
+  #[test]
+  fn a_swedish_config_language_resolves_to_swedish_strings() {
+    // End-to-end of the config→i18n path: `ui.language = "sv-SE"` round-trips, and selecting it (exactly what
+    // `run()` does with `i18n::set_language(&config.ui.language)`) on a registry loaded with the bundled locales
+    // makes a nav-button label resolve in Swedish. Tested on an isolated `Translator` for determinism.
+    let mut config = Config::default();
+    config.ui.language = crate::i18n::SV_SE.to_string();
+    let body = config.to_json().expect("serialises");
+    let parsed = Config::from_json(&body).expect("round-trips");
+    assert_eq!(parsed.ui.language, "sv-SE", "the Swedish locale survives a save/load round trip");
+
+    let mut translator = crate::i18n::Translator::new();
+    for (locale, content) in crate::i18n::BUNDLED_LOCALES {
+      translator.load_text(locale, content).expect("a bundled locale parses");
+    }
+    translator.set_fallback(crate::i18n::EN_US);
+    translator.set_language(&parsed.ui.language);
+    assert_eq!(
+      translator.translate("btn-settings", &crate::i18n::fluent::FluentArgs::new()),
+      "Inställningar",
+      "a `sv-SE` config language drives the Swedish strings",
+    );
+  }
+
   /// The bundled asset's name for its self-documenting, fully-keyed template theme. Named `"default"` so it shadows
   /// the built-in default and is the ACTIVE theme out of the box — so editing any `themes.default.<color>` in the
   /// seeded file recolours immediately, with no indirection. Unedited, every value equals its `default_dark` channel,
