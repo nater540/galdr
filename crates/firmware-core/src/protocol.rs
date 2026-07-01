@@ -79,6 +79,12 @@ pub const ERROR_LINE_OVERFLOW: u8 = 15;
 /// kinematics about how many axes exist.
 pub const AXIS_COUNT: usize = crate::planner::AXES;
 
+/// The single-letter designation of each motion axis, in `MPos`/`[AXS:]` order. The `[AXS:<n>:<letters>]`
+/// build-info line and the `[DRIVER:]` per-axis breakdown both derive their letters from this array, so the
+/// axis-count constant and the letter set can never drift apart (e.g. a 3-axis build cannot advertise a stale
+/// `XYZA`). Sized to [`AXIS_COUNT`] so adding/removing an axis is a one-line change here.
+pub const AXIS_LETTERS: [char; AXIS_COUNT] = ['X', 'Y', 'Z', 'A'];
+
 /// The firmware version string reported in the banner and the `[VER:]` build-info line. grblHAL reports
 /// a grbl-1.1f-compatible version so senders compliant with grbl 1.1f recognize the controller.
 pub const VERSION: &str = "1.1f";
@@ -1487,10 +1493,12 @@ impl ResponseWriter {
   }
 
   /// The `$I` (or `$I+` when `extended`) build-info response. The base report emits `[VER:]` and
-  /// `[OPT:]`; the extended report adds the grblHAL `[AXS:]`, `[NEWOPT:]`, and `[FIRMWARE:]` lines so a
-  /// sender can detect an extended controller. The `[OPT:]` fields are, in order: options string, block
-  /// buffer size, RX buffer size, axis count, tool-table entries — emitted in exactly the documented
-  /// order so senders that position-parse OPT do not mis-read the buffer sizes. The caller appends `ok`.
+  /// `[OPT:]`; the extended report adds the grblHAL `[AXS:]`, `[NEWOPT:]`, `[FIRMWARE:]`, and `[SIGNALS:]`
+  /// lines so a sender can detect an extended controller and its capabilities. The `[OPT:]` fields are, in
+  /// order: options string, block buffer size, RX buffer size, axis count, tool-table entries — emitted in
+  /// exactly the documented order so senders that position-parse OPT do not mis-read the buffer sizes. The
+  /// live `[DRIVER:]` line is emitted separately by [`ResponseWriter::driver_info`] (it needs hardware
+  /// state). The caller appends `ok`.
   pub fn build_info<const N: usize>(out: &mut String<N>, extended: bool) -> Result<(), FmtError> {
     write!(out, "[VER:{VERSION}.20260616:]\r\n").map_err(|_| FmtError)?;
     write!(
@@ -1500,15 +1508,51 @@ impl ResponseWriter {
     )
     .map_err(|_| FmtError)?;
     if extended {
-      write!(out, "[AXS:{AXIS_COUNT}:XYZA]\r\n").map_err(|_| FmtError)?;
+      // `[AXS:<n>:<letters>]` — derive both the count and the letters from the kinematics constants so the
+      // line can never advertise a letter set that disagrees with [`AXIS_COUNT`] (no hardcoded `XYZA`).
+      write!(out, "[AXS:{AXIS_COUNT}:").map_err(|_| FmtError)?;
+      for letter in AXIS_LETTERS {
+        out.push(letter).map_err(|_| FmtError)?;
+      }
+      out.push_str("]\r\n").map_err(|_| FmtError)?;
       // `ENUMS` advertises the runtime enumeration commands (`$ES`/`$EG`/`$EE`/`$EA`) so a sender builds its
       // settings/error/alarm UI from the controller instead of hardcoding; `RT+` advertises the top-bit-set
       // real-time command forms this module classifies; `SED` advertises the `$SED=<n>` per-setting description
       // command (Phase F). A sender reads these to know it may query the enumerations on connect.
       out.push_str("[NEWOPT:ENUMS,RT+,SED]\r\n").map_err(|_| FmtError)?;
       out.push_str("[FIRMWARE:grblHAL]\r\n").map_err(|_| FmtError)?;
+      // `[SIGNALS:<letters>]` — the input signals this build supports, in the same letter codes as the
+      // realtime `Pn:` status field. Rendered from [`SIGNAL_CAPABILITIES`] via the SAME letter assembly the
+      // `Pn:` element uses, so the two cannot drift. This is a compile-time capability set (which inputs the
+      // firmware can read), independent of whether any is currently asserted.
+      out.push_str("[SIGNALS:").map_err(|_| FmtError)?;
+      SIGNAL_CAPABILITIES.write_letters(out)?;
+      out.push_str("]\r\n").map_err(|_| FmtError)?;
     }
     Ok(())
+  }
+
+  /// The `$I+` `[DRIVER:]` report: the stepper-driver identity plus the live per-axis TMC2209 bus health.
+  /// Emitted only by the extended `$I+` response (after [`build_info`]) because it carries runtime hardware
+  /// state — the `firmware` bin samples the TMC manager's per-axis online flags and hands them in via
+  /// [`DriverStatus`]; this formatter stays pure and host-testable. First line is the fixed `[DRIVER:TMC2209]`
+  /// identity so a sender that only string-matches the driver name still finds it. The second line is the
+  /// per-axis breakdown using the [`AXIS_LETTERS`] designations and an `ok`/`--` state (UART responding vs.
+  /// not detected). Before the init pass has run, `initialized` is `false` and the breakdown is replaced with
+  /// `init pending` so a query during the brief boot window does not falsely report every driver absent. The
+  /// caller appends `ok` for the consumed `$I+` line (this writes no terminator of its own).
+  pub fn driver_info<const N: usize>(out: &mut String<N>, status: &DriverStatus) -> Result<(), FmtError> {
+    out.push_str("[DRIVER:TMC2209]\r\n").map_err(|_| FmtError)?;
+    if !status.initialized {
+      return out.push_str("[DRIVER:TMC2209 init pending]\r\n").map_err(|_| FmtError);
+    }
+    out.push_str("[DRIVER:TMC2209").map_err(|_| FmtError)?;
+    for (axis, &letter) in AXIS_LETTERS.iter().enumerate() {
+      // A present/communicating driver renders `<letter>:ok`; an absent one (no UART reply at init) `<letter>:--`.
+      let state = if status.online.get(axis).copied().unwrap_or(false) { "ok" } else { "--" };
+      write!(out, " {letter}:{state}").map_err(|_| FmtError)?;
+    }
+    out.push_str("]\r\n").map_err(|_| FmtError)
   }
 
   /// The `$G` parser-state report: `[GC:<modal words>]`, rendered from a live [`ParserSnapshot`]. The
@@ -2058,17 +2102,22 @@ impl PinReport {
     self.probe || self.limits.iter().any(|&l| l) || self.door || self.hold || self.reset || self.cycle_start
   }
 
-  /// Append the asserted-pin letters to `out` in grbl's documented order (`P` probe, `X`/`Y`/`Z` limits, `D`
-  /// door, `H` hold, `R` reset, `S` cycle-start), writing nothing for an unasserted pin. The caller wraps this
-  /// with the `Pn:` tag only when [`any`](PinReport::any) is set. Returns [`FmtError`] only on a (never, with a
-  /// correctly sized buffer) capacity failure.
-  fn write_letters<const N: usize>(&self, out: &mut String<N>) -> Result<(), FmtError> {
+  /// Append the set pin letters to `out` in grbl's documented order (`P` probe, `X`/`Y`/`Z` limits, `D`
+  /// door, `H` hold, `R` reset, `S` cycle-start), writing nothing for an unset pin. For the `Pn:` status
+  /// element each `true` means "asserted now"; for the `$I+` `[SIGNALS:]` capability line (via
+  /// [`SIGNAL_CAPABILITIES`]) each `true` means "this input exists in the build" — the letter assembly is the
+  /// same either way, which is exactly why both reuse this one function. The caller wraps it with the relevant
+  /// tag. Returns [`FmtError`] only on a (never, with a correctly sized buffer) capacity failure.
+  pub fn write_letters<const N: usize>(&self, out: &mut String<N>) -> Result<(), FmtError> {
     if self.probe {
       out.push('P').map_err(|_| FmtError)?;
     }
-    // Limit letters in axis order, matching grbl's `X`/`Y`/`Z` signal letters.
-    for (axis, letter) in ['X', 'Y', 'Z'].into_iter().enumerate() {
-      if self.limits.get(axis).copied().unwrap_or(false) {
+    // Limit letters in axis order, derived from [`AXIS_LETTERS`] (not a private `['X','Y','Z']` literal) so the
+    // `Pn:`/`[SIGNALS:]` vocabulary can never drift from the `[AXS:]`/`[DRIVER:]` one. `limits` is sized to
+    // [`AXIS_COUNT`], so the two arrays line up index-for-index; the A axis has no limit switch (its `limits`
+    // slot stays `false`, DOC-10), so no `A` letter is ever emitted here.
+    for (&letter, &triggered) in AXIS_LETTERS.iter().zip(self.limits.iter()) {
+      if triggered {
         out.push(letter).map_err(|_| FmtError)?;
       }
     }
@@ -2086,6 +2135,36 @@ impl PinReport {
     }
     Ok(())
   }
+}
+
+/// The input signals this firmware build can read, rendered as the `$I+` `[SIGNALS:]` capability line. Galdr
+/// sources the `P` probe input and the `X`/`Y`/`Z` limit switches; the door/hold/reset/cycle-start control
+/// inputs have no GPIO budgeted, so they stay `false` and are omitted. Because [`build_info`] renders this with
+/// the very same [`PinReport::write_letters`] the `Pn:` status element uses, the advertised capability set and
+/// the runtime status letters can never use a different letter vocabulary. The A axis has no limit switch
+/// (DOC-10 rotary), so only `X`/`Y`/`Z` limits are advertised.
+pub const SIGNAL_CAPABILITIES: PinReport = PinReport {
+  probe: true,
+  limits: [true, true, true, false],
+  door: false,
+  hold: false,
+  reset: false,
+  cycle_start: false,
+};
+
+/// Live per-axis TMC2209 driver health for the `$I+` `[DRIVER:]` report. `online[axis]` is `true` when that
+/// axis's driver answered on the shared UART bus at init (presence check + write verification) and is therefore
+/// communicating; `false` means it was flagged absent (no reply / wrong version). Indexed in [`AXIS_LETTERS`]
+/// order. `initialized` is `false` until the `firmware` bin's TMC init pass has populated `online`, so a `$I+`
+/// query during the brief boot window reports `init pending` rather than a misleading "all absent". The
+/// `firmware` bin owns the live values; this type keeps [`ResponseWriter::driver_info`] pure and host-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DriverStatus {
+  /// Per-axis UART online flag, [`AXIS_LETTERS`] order; `true` = the driver is communicating.
+  pub online: [bool; AXIS_COUNT],
+  /// `false` until the TMC init pass has run and `online` reflects real bus results.
+  pub initialized: bool,
 }
 
 #[cfg(test)]
@@ -2612,6 +2691,62 @@ mod tests {
     // Phase F: NEWOPT now advertises the enumeration + per-setting-description capabilities alongside RT+.
     assert!(s.as_str().contains("[NEWOPT:ENUMS,RT+,SED]"));
     assert!(s.as_str().contains("[FIRMWARE:grblHAL]"));
+  }
+
+  #[test]
+  fn build_info_axs_letters_derive_from_axis_constants() {
+    // The `[AXS:]` letters must come from AXIS_LETTERS, not a hardcoded literal — assemble the expected line
+    // from the constants so a future axis-count change is caught here instead of shipping a stale `XYZA`.
+    let mut expected = String::<32>::new();
+    write!(expected, "[AXS:{AXIS_COUNT}:").unwrap();
+    for letter in AXIS_LETTERS {
+      expected.push(letter).unwrap();
+    }
+    expected.push(']').unwrap();
+    let mut s = String::<256>::new();
+    ResponseWriter::build_info(&mut s, true).unwrap();
+    assert!(s.as_str().contains(expected.as_str()), "AXS must derive from AXIS_LETTERS, got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn build_info_extended_advertises_supported_signals() {
+    // `[SIGNALS:]` lists the build's capable inputs in `Pn:` letter codes: probe + X/Y/Z limits → `PXYZ`. The
+    // unbudgeted door/hold/reset/cycle-start inputs are omitted. The line is extended-only.
+    let mut s = String::<256>::new();
+    ResponseWriter::build_info(&mut s, true).unwrap();
+    assert!(s.as_str().contains("[SIGNALS:PXYZ]\r\n"), "expected probe+XYZ-limit signals, got {:?}", s.as_str());
+    let mut base = String::<256>::new();
+    ResponseWriter::build_info(&mut base, false).unwrap();
+    assert!(!base.as_str().contains("[SIGNALS:"), "SIGNALS must be extended-only");
+  }
+
+  #[test]
+  fn driver_info_all_online_reports_each_axis_ok() {
+    // Every TMC2209 answered on the UART bus: identity line plus a per-axis breakdown, all `ok`.
+    let mut s = String::<160>::new();
+    let status = DriverStatus { online: [true; AXIS_COUNT], initialized: true };
+    ResponseWriter::driver_info(&mut s, &status).unwrap();
+    assert!(s.as_str().contains("[DRIVER:TMC2209]\r\n"), "missing identity line, got {:?}", s.as_str());
+    assert!(s.as_str().contains("[DRIVER:TMC2209 X:ok Y:ok Z:ok A:ok]\r\n"), "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_info_missing_driver_renders_dashes() {
+    // The Y driver did not answer (no UART reply at init): its slot renders `Y:--`, the others stay `ok`.
+    let mut s = String::<160>::new();
+    let status = DriverStatus { online: [true, false, true, true], initialized: true };
+    ResponseWriter::driver_info(&mut s, &status).unwrap();
+    assert!(s.as_str().contains("[DRIVER:TMC2209 X:ok Y:-- Z:ok A:ok]\r\n"), "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_info_before_init_reports_pending_not_all_absent() {
+    // A `$I+` during the boot window (init pass not yet run) must not claim every driver is absent.
+    let mut s = String::<160>::new();
+    let status = DriverStatus { online: [false; AXIS_COUNT], initialized: false };
+    ResponseWriter::driver_info(&mut s, &status).unwrap();
+    assert!(s.as_str().contains("[DRIVER:TMC2209 init pending]\r\n"), "got {:?}", s.as_str());
+    assert!(!s.as_str().contains(":--"), "pending must not render per-axis dashes, got {:?}", s.as_str());
   }
 
   #[test]

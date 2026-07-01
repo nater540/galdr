@@ -15,7 +15,7 @@ manifest in [`00-architecture.md`](00-architecture.md). If you change a GPIO her
 | Qty | Item                                       | Notes                                                        |
 |-----|--------------------------------------------|--------------------------------------------------------------|
 | 1   | ESP32-S3 devkit                            | The board the firmware runs on (native USB to host)          |
-| 3   | TMC2209 stepstick (BTT / Watterott / FYSETC) | **0.11 Ω** sense resistors; 5–29 V motor, 3–5 V logic — *not* Adafruit 6121 (0.05 Ω) |
+| 3   | TMC2209 stepstick (BTT / Watterott / FYSETC) | **0.11 Ω** sense resistors; 5–29 V motor, 3–5 V logic      |
 | 3   | NEMA 17 stepper, **bipolar (4-wire)**      | Confirm bipolar; 6-wire needs the right pair tapping         |
 | 1   | Motor PSU, **12 V (or up to 24 V)** DC     | Sized for 3× motor current + margin (≥ 3 A for a start)      |
 | 1   | Breadboard + jumper wires                  | Logic/signal only — see safety note                          |

@@ -50,6 +50,41 @@ use firmware_core::drivers::tmc2209::{
   WRITE_DATAGRAM_LEN,
 };
 use firmware_core::hal_traits::TmcBus;
+use firmware_core::protocol::DriverStatus;
+
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Live per-axis TMC2209 bus health, published by [`tmc_manager`] after the init burst and REFRESHED every poll
+/// round, so the comms layer can render the `$I+` `[DRIVER:]` report without re-touching the UART bus (a read
+/// from the comms task would race the manager's polling and the half-duplex turn-around). Bit `i` set ⇒ axis
+/// `i`'s driver is currently communicating AND not reporting a hard `DRV_STATUS` fault; the poll loop clears the
+/// bit on an over-temp / short / open-load fault or a lost reply, and re-sets it on the next clean read, so the
+/// report tracks live health rather than a frozen boot snapshot. A single `u8` covers all [`AXIS_COUNT`] axes
+/// (≤ 4 today) — see the guard below. The mask is stored `Release` and loaded `Acquire`, paired with
+/// [`TMC_INIT_DONE`] (stored last, loaded first) so a reader that sees init done also sees the populated bits.
+static TMC_ONLINE_MASK: AtomicU8 = AtomicU8::new(0);
+
+// The `u8` mask has one bit per axis, so it only covers AXIS_COUNT <= 8 axes. AXIS_LETTERS advertises axis
+// changes as a "one-line change"; couple that promise to this second site with a compile-time guard so bumping
+// AXIS_COUNT past 8 fails to build here (a loud error) instead of silently overflowing `1 << axis`.
+const _: () = assert!(AXIS_COUNT <= 8, "TMC_ONLINE_MASK is a u8; widen it if AXIS_COUNT exceeds 8 axes");
+
+/// `true` once [`tmc_manager`]'s init pass has populated [`TMC_ONLINE_MASK`]. Until then a `$I+` query reports
+/// `init pending` instead of a misleading "all absent". Stored (`Release`) AFTER the mask so a reader that sees
+/// `true` (via an `Acquire` load) is guaranteed to see the populated bits.
+static TMC_INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Snapshot the live per-axis TMC2209 bus health for the `$I+` `[DRIVER:]` report. Lock-free: reads the two
+/// atomics the manager publishes, so the comms task never touches the UART bus directly. The `Acquire` load of
+/// [`TMC_INIT_DONE`] pairs with the manager's `Release` store so seeing `initialized` implies seeing the mask.
+pub fn driver_status() -> DriverStatus {
+  let initialized = TMC_INIT_DONE.load(Ordering::Acquire);
+  let mask = TMC_ONLINE_MASK.load(Ordering::Acquire);
+  // Decode the per-axis bits with the same `from_fn` idiom as `comms::limit_levels`, so the bit layout
+  // (`bit0 = X`, `bit1 = Y`, …) has one shared decoder shape across both reports.
+  let online: [bool; AXIS_COUNT] = core::array::from_fn(|axis| mask & (1 << axis) != 0);
+  DriverStatus { online, initialized }
+}
 
 /// Per-datagram timeout in microseconds: how long [`Uart1TmcBus`] busy-polls for an echo or reply before
 /// declaring the node silent. A full 8-byte datagram at 115200 baud is ≈ 700 µs, and the driver inserts a
@@ -212,10 +247,19 @@ pub async fn tmc_manager(mut bus: Uart1TmcBus, config: TmcConfig) -> ! {
   // drivers (querying an absent one would just time out every interval).
   let reports = manager.init_all(&mut bus).await;
   let mut present = [false; AXIS_COUNT];
+  let mut online_mask: u8 = 0;
   for (axis, report) in reports.iter().enumerate() {
     present[axis] = report.as_ref().map(|report| report.present).unwrap_or(false);
+    if present[axis] {
+      online_mask |= 1 << axis;
+    }
     log_init_result(axis, report);
   }
+  // Publish the initial per-axis online state for the `$I+` `[DRIVER:]` report. `Release` the mask before
+  // flagging init done (also `Release`) so a comms-task reader that observes `TMC_INIT_DONE == true` via an
+  // `Acquire` load always sees the populated bits.
+  TMC_ONLINE_MASK.store(online_mask, Ordering::Release);
+  TMC_INIT_DONE.store(true, Ordering::Release);
 
   loop {
     // Sleep first so the bus is quiet immediately after the init burst, then poll. Awaiting here yields the
@@ -225,13 +269,23 @@ pub async fn tmc_manager(mut bus: Uart1TmcBus, config: TmcConfig) -> ! {
       if !is_present {
         continue;
       }
+      let bit = 1u8 << axis;
       match manager.read_status(&mut bus, axis).await {
-        Ok(status) if status.has_fault() => log_fault(axis, status),
-        // A healthy read or a transient bus error on one poll is not actionable yet (no alarm state); the
-        // next interval re-reads. A persistently faulting driver keeps re-logging until the alarm path lands.
-        _ => {}
+        // A hard `DRV_STATUS` fault (over-temp / short / open-load): the driver still answers but is unhealthy,
+        // so drop it from the live health mask and log it. It re-joins the mask on the next clean read.
+        Ok(status) if status.has_fault() => {
+          online_mask &= !bit;
+          log_fault(axis, status);
+        }
+        // A clean read: the driver is present and healthy, so (re-)mark it online.
+        Ok(_) => online_mask |= bit,
+        // No reply this round (the driver dropped off the half-duplex bus): drop it from the live mask so the
+        // report stops claiming a silent driver is `ok`. A transient error self-heals on the next clean read.
+        Err(_) => online_mask &= !bit,
       }
     }
+    // Republish the refreshed health so `[DRIVER:]` reflects mid-job faults, not just the boot snapshot.
+    TMC_ONLINE_MASK.store(online_mask, Ordering::Release);
   }
 }
 

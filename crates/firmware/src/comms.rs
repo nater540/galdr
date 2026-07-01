@@ -4765,6 +4765,14 @@ async fn send_build_info(extended: bool) {
   if ResponseWriter::build_info(&mut s, extended).is_ok() {
     enqueue(s).await;
   }
+  // `$I+` only: the live `[DRIVER:]` TMC2209 bus-health line(s). Sourced from the lock-free snapshot the TMC
+  // manager publishes after its init pass, so this never touches the half-duplex UART from the comms task.
+  if extended {
+    let mut driver = Response::new();
+    if ResponseWriter::driver_info(&mut driver, &crate::tmc::driver_status()).is_ok() {
+      enqueue(driver).await;
+    }
+  }
   // Surface the live lost-wake recovery count (the §12 fix-confirmation signal) on `$I` so the host can read it on
   // demand WITHOUT a wedge/reset: a climbing `rec=` while a stream runs to completion PROVES lost wakes occurred AND
   // were recovered (not merely that the rare/bursty wedge didn't fire). Emitted only when non-zero so a clean run
