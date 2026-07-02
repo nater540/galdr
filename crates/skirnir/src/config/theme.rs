@@ -21,6 +21,18 @@ use crate::app::theme::Palette;
 /// The built-in theme name used as the universal fallback and the default `base` for a user override.
 pub const DEFAULT_THEME: &str = "default";
 
+/// The accepted range for the global UI font scale ([`AppearanceConfig::font_scale`]). The SINGLE source of truth
+/// for both the settings-dialog slider and the apply-time clamp: a mismatch (a 0.5..=2.0 slider against a 0.5..=2.5
+/// clamp) let egui's default always-clamp slider silently rewrite an in-range hand-edited value the instant the
+/// dialog opened, then mark the config unsaved. Keep every font-scale bound derived from this one constant.
+pub const FONT_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.5;
+
+/// Clamp a font scale to [`FONT_SCALE_RANGE`]. Used at every site that accepts a scale (the intent handler and the
+/// apply-time zoom) so none can drift from the range the slider offers.
+pub fn clamp_font_scale(scale: f32) -> f32 {
+  scale.clamp(*FONT_SCALE_RANGE.start(), *FONT_SCALE_RANGE.end())
+}
+
 /// The appearance section of the config: which theme is active, a global font scale, and the user-defined themes.
 /// Built-in themes are NOT listed here (they live in code); `themes` carries only operator-authored overrides.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -312,6 +324,18 @@ impl ThemeOverride {
 mod tests {
   use super::*;
   use eframe::egui::Color32;
+
+  #[test]
+  fn font_scale_range_and_clamp_share_one_source_and_admit_the_full_span() {
+    // Regression for the slider/clamp range mismatch: a valid scale ABOVE the old 2.0 slider max (e.g. 2.4) must be
+    // accepted unchanged — the settings slider and `clamp_font_scale` both derive from `FONT_SCALE_RANGE`, so the
+    // dialog can no longer silently rewrite a hand-edited 2.4 down to 2.0 the moment it opens.
+    assert!(FONT_SCALE_RANGE.contains(&2.4), "2.4 is a valid, accepted scale");
+    assert_eq!(clamp_font_scale(2.4), 2.4, "an in-range scale passes through unchanged");
+    // The clamp holds out-of-range values to the shared bounds.
+    assert_eq!(clamp_font_scale(9.0), *FONT_SCALE_RANGE.end(), "an above-range scale clamps to the max");
+    assert_eq!(clamp_font_scale(0.1), *FONT_SCALE_RANGE.start(), "a below-range scale clamps to the min");
+  }
 
   #[test]
   fn the_default_appearance_resolves_to_the_default_dark_palette_with_no_notice() {

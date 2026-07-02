@@ -10,7 +10,7 @@
 //! [`ThemeOverride`] (via [`ThemeOverride::from_palette`]) so every colour picker edits a concrete value, and each
 //! picker change round-trips as an [`Intent::UpsertTheme`] so the shell re-resolves and the window re-skins live.
 
-use eframe::egui::{self, Align, Color32, Layout, RichText};
+use eframe::egui::{self, Align, Layout, RichText};
 
 use super::intent::{Intent, IntentSink};
 use super::metrics::Metrics;
@@ -87,7 +87,9 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
     // change is pushed as an intent so the config mutation stays in the shell.
     ui.label(RichText::new(crate::tr!("app-settings-font-scale")).color(palette.text_dim));
     let mut scale = config.appearance.font_scale;
-    if ui.add(egui::Slider::new(&mut scale, 0.5..=2.0).step_by(0.05).fixed_decimals(2)).changed() {
+    // The slider spans the SAME range the config accepts (`FONT_SCALE_RANGE`); a narrower slider let egui's
+    // always-clamp behaviour rewrite a valid hand-edited scale (e.g. 2.4) the moment the dialog opened.
+    if ui.add(egui::Slider::new(&mut scale, crate::config::FONT_SCALE_RANGE).step_by(0.05).fixed_decimals(2)).changed() {
       sink.push(Intent::SetFontScale(scale));
     }
     ui.end_row();
@@ -134,10 +136,10 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
         // Fall back to the ACTIVE resolved palette for any token the (possibly hand-edited, sparse) theme leaves
         // unset, so its picker starts from the colour actually on screen. Same order as `color_entries_mut`.
         let mut resolved = ThemeOverride::from_palette(&palette);
-        let resolved_values: Vec<Color32> = resolved
+        let resolved_values: Vec<[u8; 4]> = resolved
           .color_entries_mut()
           .into_iter()
-          .map(|(_, slot)| slot.map(crate::config::ColorSpec::to_color32).unwrap_or(Color32::BLACK))
+          .map(|(_, slot)| slot.map(crate::config::ColorSpec::to_srgba_unmultiplied).unwrap_or([0, 0, 0, 255]))
           .collect();
         let mut group: &'static str = "";
         for (index, (name, slot)) in edited.color_entries_mut().into_iter().enumerate() {
@@ -155,11 +157,15 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
             ui.add_space(2.0);
           }
           ui.horizontal(|ui| {
-            let mut color = slot
-              .map(crate::config::ColorSpec::to_color32)
-              .unwrap_or_else(|| resolved_values.get(index).copied().unwrap_or(Color32::BLACK));
-            if ui.color_edit_button_srgba(&mut color).changed() {
-              *slot = Some(crate::config::ColorSpec::from_color32(color));
+            // Edit UNmultiplied sRGBA channels directly: `color_edit_button_srgba` (premultiplied) hands back a
+            // Color32 whose raw channels, captured into a spec and re-expanded via `from_rgba_unmultiplied`, double-
+            // apply alpha and decay a translucent colour toward black on every frame/reload. The unmultiplied picker
+            // round-trips the [r,g,b,a] the operator actually chose, so config.json keeps the picked colour exactly.
+            let mut rgba = slot
+              .map(crate::config::ColorSpec::to_srgba_unmultiplied)
+              .unwrap_or_else(|| resolved_values.get(index).copied().unwrap_or([0, 0, 0, 255]));
+            if ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed() {
+              *slot = Some(crate::config::ColorSpec::from_srgba_unmultiplied(rgba));
               changed = true;
             }
             ui.label(RichText::new(name).monospace().size(11.0).color(palette.text));

@@ -965,9 +965,9 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   egui::Frame::new().inner_margin(Metrics::DRO_PAD).show(ui, |ui| {
   let (machine, work) = view.dro();
   // A rotary-enabled firmware reports 4-field positions (DOC-10); grow the readout an A row (in degrees) exactly
-  // when the report carries one, so a plain 3-axis board never shows a phantom rotary. The count is taken from
-  // whichever position vector exists, so an MPos-only report (no WCO yet) still sizes the layout correctly.
-  let axis_count = machine.as_ref().map(Vec::len).or_else(|| work.as_ref().map(Vec::len)).unwrap_or(3);
+  // when the report carries one, so a plain 3-axis board never shows a phantom rotary. The shared
+  // `reported_axis_count` is the same gate the jog pad's A column uses, so the two never disagree about the rotary.
+  let axis_count = view.reported_axis_count();
   let shown = if state.show_machine_pos { machine.as_ref() } else { work.as_ref() };
   let axes: &[Axis] =
     if axis_count >= 4 { &[Axis::X, Axis::Y, Axis::Z, Axis::A] } else { &[Axis::X, Axis::Y, Axis::Z] };
@@ -1146,9 +1146,14 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       // 32px cells with two inter-cell gaps; the Z and A columns then split what remains after the grid, the
       // 16px inter-column gap (a `JOG_GAP` item space, the `JOG_GAP*2` separator, and a second `JOG_GAP` item
       // space), and the `JOG_GAP` between the two columns.
+      // The rotary A column is shown ONLY when the firmware reports a 4-field position (the same gate the DRO's A
+      // row uses). On a 3-axis board an A jog would emit `$J=...A...`, which the firmware rejects with `error:N` and
+      // then holds the stream in the error state — so we must not even offer it. With no A column the Z column takes
+      // the whole fill so no empty gap is left where A would sit.
+      let has_rotary = view.has_rotary_axis();
       let xy_width = 3.0 * Metrics::JOG_CELL + 2.0 * Metrics::JOG_GAP;
       let fill = (ui.available_width() - xy_width - Metrics::JOG_GAP * 5.0).max(2.0 * Metrics::JOG_CELL);
-      let zw = (fill / 2.0).floor();
+      let zw = if has_rotary { (fill / 2.0).floor() } else { fill };
       ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(Metrics::JOG_GAP);
         let gap = Vec2::splat(Metrics::JOG_GAP);
@@ -1174,12 +1179,14 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
           jog_z(ui, "Z", zw, state, sink, None);
           jog_z(ui, "Z−", zw, state, sink, Some((Axis::Z, Dir::Neg)));
         });
-        ui.vertical(|ui| {
-          ui.spacing_mut().item_spacing.y = Metrics::JOG_GAP;
-          jog_z(ui, "A+", zw, state, sink, Some((Axis::A, Dir::Pos)));
-          jog_z(ui, "A", zw, state, sink, None);
-          jog_z(ui, "A−", zw, state, sink, Some((Axis::A, Dir::Neg)));
-        });
+        if has_rotary {
+          ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = Metrics::JOG_GAP;
+            jog_z(ui, "A+", zw, state, sink, Some((Axis::A, Dir::Pos)));
+            jog_z(ui, "A", zw, state, sink, None);
+            jog_z(ui, "A−", zw, state, sink, Some((Axis::A, Dir::Neg)));
+          });
+        }
       });
 
       // Step selector (design §03: segmented quick steps) and the jog feed rate. The step drives X/Y/Z in mm and
@@ -3312,6 +3319,7 @@ mod tests {
   #[test]
   fn eta_qualifier_text_joins_the_default_settings_flag_and_the_pause_count() {
     // The qualifier parts resolve through `tr!`, so seed the bundled en-US registry first (idempotent).
+    let _lang = crate::i18n::lock_global_for_test();
     let _ = crate::i18n::init();
     // Nothing to qualify (real settings, no pauses): no text at all, so the dock shows the clock alone.
     assert_eq!(eta_qualifier_text(EtaQualifier { default_settings: false, pauses: 0 }), None);
@@ -3449,6 +3457,7 @@ mod tests {
   fn tooltip_meta_lists_name_unit_and_full_range() {
     // The full case: name, unit, and a two-sided range all enumerated. The unit/range lines resolve through `tr!`,
     // so seed the bundled en-US registry first (idempotent) or they would come back as raw keys.
+    let _lang = crate::i18n::lock_global_for_test();
     let _ = crate::i18n::init();
     let row = row_with_meta(110, "Max rate", "mm/min", Some("0"), Some("10000"));
     let lines = setting_tooltip_meta(&row);
@@ -3459,6 +3468,7 @@ mod tests {
   fn tooltip_meta_handles_a_one_sided_range_and_a_unitless_setting() {
     // Only a max advertised, and no unit (a unitless bitmask like a status-report mask): the unit line is omitted
     // and the range is shown one-sided. The range line resolves through `tr!`, so seed the registry first.
+    let _lang = crate::i18n::lock_global_for_test();
     let _ = crate::i18n::init();
     let row = row_with_meta(10, "Report mask", "", None, Some("255"));
     let lines = setting_tooltip_meta(&row);
@@ -3645,6 +3655,7 @@ mod tests {
   #[test]
   fn the_tool_change_headline_names_a_real_tool_and_falls_back_otherwise() {
     // The headline resolves through `tr!`, so seed the bundled en-US registry first (idempotent).
+    let _lang = crate::i18n::lock_global_for_test();
     let _ = crate::i18n::init();
     // A real tool number is named so the operator knows which tool to fit.
     assert_eq!(tool_change_headline(Some(3)), "🔧 Tool change: insert T3, then Resume");

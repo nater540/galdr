@@ -71,6 +71,16 @@ no orphans — extracts top-level ids by scanning column-0 `key =` lines) and
 superset of dummy args — catches a present-but-broken value that would render as its key). Add a string ⇒ add it
 to BOTH `.ftl` or these fail.
 
+**TEST-RACE GUARD (code-review finding, 2026-07-02):** `tr!` resolves against ONE process-global registry, so any
+test that mutates the global language (`init`/`set_language`/shell `SetLanguage`) OR asserts a locale-specific
+`tr!`/label result must serialize on the SINGLE shared guard `crate::i18n::lock_global_for_test()` (pub(crate),
+`#[cfg(test)]`, in i18n/mod.rs). Do NOT add a new mutex — the bug was exactly that (snapshot suite had its own
+`RENDER_LOCK` separate from the i18n module's guard, so a Swedish render raced the global-locale test). Users of
+the shared guard: i18n mod tests, `snapshot_test::render_in` (holds it + resets to en-US on drop), the shell
+appearance/SetLanguage + streaming-tool-change tests, the 4 views pure-fn tests. Harness builders seed locales via
+`ui_test::ensure_locales_seeded()` (inits ONLY when the registry is empty — never flips an already-selected
+locale), so they don't need to hold the guard. Empirically validated 30× at `RUST_TEST_THREADS=16`, 0 flakes.
+
 **Deps (aligned):** fluent 0.17 -> fluent-bundle 0.16 -> unic-langid 0.9 / intl-memoizer 0.5. Bundles use
 `FluentBundle::new_concurrent` + `intl_memoizer::concurrent::IntlLangMemoizer` so Translator is Send+Sync.
 Typed errors: `I18nError` (thiserror) variants Resource/LangId/AddResource/Io.

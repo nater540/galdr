@@ -14,7 +14,7 @@
 //! real job file. Each state is rendered through [`super::ui_test::shell_layout`], the shared mirror of the real
 //! shell's panel arrangement, with the app's fonts and theme applied so the pixels match the live window.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::MutexGuard;
 
 use eframe::egui;
 
@@ -33,26 +33,22 @@ const DEFAULT_SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
 /// locale must survive, which is where the longer Swedish labels are most likely to crowd or clip.
 const MIN_SIZE: egui::Vec2 = egui::vec2(800.0, 500.0);
 
-/// Serialises snapshot rendering across the parallel test threads AND pins the process-global i18n locale for
-/// the render's whole duration: `tr!` resolves against ONE global registry, so a Swedish render racing an
-/// English one would corrupt both. Every snapshot helper takes this guard before building its harness and holds
-/// it through the `snapshot` call; dropping it restores `en-US` so no test leaks a locale into the next.
-static RENDER_LOCK: Mutex<()> = Mutex::new(());
+/// The held global-i18n guard + the locale reset on drop. See [`render_in`].
+struct LocaleGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
 
-/// The held render lock + the locale reset on drop. See [`render_in`].
-struct LocaleGuard<'l>(#[allow(dead_code)] MutexGuard<'l, ()>);
-
-impl Drop for LocaleGuard<'_> {
+impl Drop for LocaleGuard {
   fn drop(&mut self) {
     crate::i18n::set_language(crate::i18n::EN_US);
   }
 }
 
-/// Take the render lock and select `locale` on the global i18n registry (seeding the bundles first — `init`
-/// also resets the language, hence the explicit select afterwards). A poisoned lock is recovered, not
-/// propagated: the inner unit state cannot be corrupt, and one failed snapshot must not cascade.
-fn render_in(locale: &str) -> LocaleGuard<'static> {
-  let guard = RENDER_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+/// Take the SHARED global-i18n test guard ([`crate::i18n::lock_global_for_test`]) and select `locale` on the
+/// global registry (seeding the bundles first — `init` also resets the language, hence the explicit select
+/// afterwards). Using the one shared guard — rather than a snapshot-private mutex — means a Swedish render cannot
+/// race the i18n module's own global-locale tests (they now serialize on the SAME lock). Dropping the guard
+/// restores `en-US` so no test leaks a locale into the next, then releases the lock.
+fn render_in(locale: &str) -> LocaleGuard {
+  let guard = crate::i18n::lock_global_for_test();
   let _ = crate::i18n::init();
   crate::i18n::set_language(locale);
   LocaleGuard(guard)

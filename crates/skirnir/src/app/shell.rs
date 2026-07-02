@@ -657,7 +657,7 @@ impl SkirnirApp {
       Intent::SetFontScale(scale) => {
         // Hold the scale to the same range `apply_theme` clamps to, so the config never records a value the
         // window will refuse to render at.
-        self.config.appearance.font_scale = scale.clamp(0.5, 2.5);
+        self.config.appearance.font_scale = crate::config::clamp_font_scale(scale);
         self.mark_appearance_changed();
       }
       Intent::UpsertTheme { name, theme } => {
@@ -680,12 +680,16 @@ impl SkirnirApp {
   /// Record that an appearance edit happened: re-resolve the palette/toolpath style into the view state NOW (the
   /// pure half, so the next frame's views already render the new colours and tests observe it synchronously) and
   /// flag the context re-skin for `ui()` (the egui half, which needs the `Context`).
+  ///
+  /// Deliberately does NOT re-flatten the toolpath: an appearance edit (theme colours, active theme, font scale)
+  /// only changes render STYLE, never geometry — arc density (`toolpath.arc_step_deg`) is not an appearance field
+  /// and changes only via a config reload (F5), which does its own [`Self::reload_config`] reflow. Reflowing here
+  /// re-parsed the whole program on EVERY colour-picker drag frame (a full `parse_xy_path` over every line) for no
+  /// geometric change; the cached geometry is already correct under an unchanged arc density.
   fn mark_appearance_changed(&mut self) {
     self.config_dirty = true;
     self.appearance_dirty = true;
     apply_appearance(&mut self.ui, &self.config);
-    // The toolpath arc density may ride on the style; keep the cached geometry in step (a no-op with no program).
-    self.ui.reflow_toolpath();
   }
 
   /// Write the in-memory config to `config.json` (the test-injected override path when set). Surfaces the outcome
@@ -2320,7 +2324,7 @@ pub(crate) fn apply_theme(ctx: &egui::Context, palette: &Palette, font_scale: f3
   spacing.interact_size.y = Metrics::PANEL_CONTROL_H; // §01 spacing legend: 22px control row.
   ctx.set_global_style(style);
   // Apply the UI font scale as the global zoom; clamp so a hand-edited extreme cannot shrink/blow up the UI.
-  ctx.set_zoom_factor(font_scale.clamp(0.5, 2.5));
+  ctx.set_zoom_factor(crate::config::clamp_font_scale(font_scale));
 
   let mut visuals = egui::Visuals::dark();
   visuals.panel_fill = palette.panel;
@@ -2448,7 +2452,33 @@ mod tests {
   /// view state synchronously — the ctx-level re-skin is deferred to `ui()` via `appearance_dirty`, but the pure
   /// half must be observable immediately so the next frame's views already render the new colours.
   #[test]
+  fn a_theme_upsert_does_not_reflow_the_toolpath() {
+    // A colour-picker drag emits `UpsertTheme` every changed frame; that must NOT re-flatten the whole program
+    // (a full `parse_xy_path` over every line) — colour edits never change geometry. We flatten an arc at a COARSE
+    // density, then make the config's arc density much finer so a reflow WOULD be detectable (more chords), then
+    // fire a theme upsert. The cached geometry must stay coarse, proving the appearance path no longer reflows.
+    let (mut app, _controller) = app_with_engine();
+    app.ui.style.toolpath = crate::config::ToolpathConfig { arc_step_deg: 45.0, ..Default::default() }.resolve();
+    app.ui.set_program(vec!["G0 X10 Y0".to_string(), "G2 X0 Y10 I-10 J0".to_string()], None);
+    let before = app.ui.toolpath_segment_count();
+
+    // A finer arc density in the config: were the appearance path to reflow, it would re-flatten the arc into MANY
+    // more chords at this density — so an unchanged count is proof the theme edit did not reparse the program.
+    app.config.toolpath.arc_step_deg = 3.0;
+    let theme = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::midnight());
+    app.handle_intent(Intent::UpsertTheme { name: "fixture".to_string(), theme });
+
+    assert_eq!(
+      app.ui.toolpath_segment_count(), before,
+      "a theme upsert must not re-flatten the toolpath at the config's (now finer) arc density",
+    );
+  }
+
+  #[test]
   fn appearance_intents_update_the_config_and_resolve_the_palette_immediately() {
+    // This test drives `SetLanguage`, which mutates the process-global i18n registry — serialize on the shared guard
+    // so it can never race the i18n module's own global-locale tests (finding: several independent locks).
+    let _lang = crate::i18n::lock_global_for_test();
     let (mut app, _controller) = app_with_engine();
     assert!(!app.config_dirty, "a fresh app starts with no unsaved config edits");
 
@@ -2508,6 +2538,10 @@ mod tests {
   /// hold; the banner must then name the reported tool.
   #[test]
   fn the_tool_change_banner_names_the_tool_from_the_g_answer_during_a_streaming_hold() {
+    // The final assertion reads the banner copy through `tr!`, so pin the global locale to en-US under the shared
+    // guard: this test must see the English string regardless of any concurrent locale-switching test.
+    let _lang = crate::i18n::lock_global_for_test();
+    let _ = crate::i18n::init();
     let (mut app, mut controller) = app_with_engine();
     // Complete the handshake to Idle (the banner is the readiness signal), then drain its writes (including the
     // connect-time `$G` seed) so we assert only on the traffic the hold provokes.

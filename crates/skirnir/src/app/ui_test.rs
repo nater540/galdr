@@ -168,6 +168,17 @@ pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: su
   state.intents.extend(sink.drain());
 }
 
+/// Seed the bundled locales into the global registry for a harness render WITHOUT flipping an already-selected
+/// locale. `init` resets the language to en-US, which would both clobber a locale a sv-SE snapshot just pinned AND,
+/// running unguarded on every call, race the i18n module's global-locale tests — so we init ONLY when the registry
+/// is still empty (the first harness of the run). Errors are ignored — a bundled parse failure already fails the
+/// i18n unit tests. Callers that must render a SPECIFIC locale set it themselves under the shared test guard.
+pub(crate) fn ensure_locales_seeded() {
+  if crate::i18n::languages().is_empty() || crate::i18n::get_language().is_empty() {
+    let _ = crate::i18n::init();
+  }
+}
+
 /// Build a kittest harness that renders the full [`shell_layout`] at the given window size, folding each frame's
 /// intents into the [`HarnessState`]. The bundled locales are initialised (idempotently) so the `tr!` labels
 /// render as real strings, and the app's fonts + theme are applied to the context so the harness paints exactly
@@ -175,12 +186,8 @@ pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: su
 pub(crate) fn build_shell_harness(
   state: HarnessState, size: egui::Vec2, time: super::progress::TimeEstimate,
 ) -> Harness<'static, HarnessState> {
-  // The toolbar labels go through `tr!`; seed the global registry so they render as words, not raw keys —
-  // WITHOUT resetting an already-selected language (`init` resets to en-US, which would clobber the locale a
-  // sv-SE snapshot just pinned). Errors are ignored — a bundled parse failure already fails the i18n unit tests.
-  if crate::i18n::languages().is_empty() || crate::i18n::get_language().is_empty() {
-    let _ = crate::i18n::init();
-  }
+  // The toolbar labels go through `tr!`; seed the global registry so they render as words, not raw keys.
+  ensure_locales_seeded();
   let palette = state.ui.style.palette;
   let harness = Harness::builder().with_size(size).build_ui_state(
     move |ui, state: &mut HarnessState| shell_layout(ui, state, time),
@@ -228,7 +235,7 @@ pub(crate) fn build_dro_harness(state: HarnessState) -> Harness<'static, Harness
 pub(crate) fn build_app_settings_harness(
   state: HarnessState, config: crate::config::Config,
 ) -> Harness<'static, HarnessState> {
-  let _ = crate::i18n::init();
+  ensure_locales_seeded();
   Harness::builder()
     .with_size(egui::vec2(440.0, 600.0))
     .build_ui_state(
@@ -545,7 +552,9 @@ mod tests {
     let mut ui = UiState::default();
     ui.jog_step = 5.0;
     ui.jog_feed = 400.0;
-    let state = HarnessState::new(view_idle(), ui);
+    // A rotary (4-field) report is required for the A column to render at all (the 3-axis gate); an Idle rotary view
+    // both shows it and leaves it enabled.
+    let state = HarnessState::new(view_idle_rotary(), ui);
     let mut harness = build_jog_harness(state);
     harness.run();
 
@@ -577,13 +586,16 @@ mod tests {
 
   #[test]
   fn the_rotary_a_jog_is_disabled_outside_idle_and_jog() {
-    // The same `$J=` gate as every other jog control: in Alarm the A buttons render disabled and a click commands
-    // nothing — never offer a control the firmware is guaranteed to reject (and that would be unsafe on a fault).
-    let mut view = ViewState::default();
+    // The same `$J=` gate as every other jog control: with a rotary board in Alarm the A buttons render (a 4-field
+    // report is present) but DISABLED, and a click commands nothing — never offer a control the firmware is
+    // guaranteed to reject (and that would be unsafe on a fault).
+    let mut view = view_idle_rotary();
     view.connection = ConnectionState::Alarm;
     let state = HarnessState::new(view, UiState::default());
     let mut harness = build_jog_harness(state);
     harness.run();
+    // The A control renders (rotary board) but is inert on a fault.
+    assert!(harness.query_by_label("A+").is_some(), "a rotary board still renders the A column, even in Alarm");
     if let Some(node) = harness.query_by_label("A+") {
       node.click();
       harness.run();
@@ -593,6 +605,20 @@ mod tests {
       "a disabled A jog must not emit any jog intent: {:?}",
       harness.state().intents
     );
+  }
+
+  #[test]
+  fn the_jog_pad_hides_the_a_column_on_a_three_axis_firmware() {
+    // Finding: the jog A column was ungated, so on a plain 3-axis board a click sent `$J=...A...`, which the firmware
+    // rejects with `error:N` and then holds the stream in the error state. The A controls must be HIDDEN whenever the
+    // report is not 4-field (matching the DRO's A-row gate). `view_idle` reports no position → reads as 3-axis.
+    let state = HarnessState::new(view_idle(), UiState::default());
+    let mut harness = build_jog_harness(state);
+    harness.run();
+    assert!(harness.query_by_label("A+").is_none(), "a 3-axis board must not offer an A+ jog");
+    assert!(harness.query_by_label("A−").is_none(), "a 3-axis board must not offer an A− jog");
+    // The Z column is unaffected — a 3-axis board still jogs Z.
+    assert!(harness.query_by_label("Z+").is_some(), "the Z column must remain on a 3-axis board");
   }
 
   #[test]
@@ -758,6 +784,18 @@ mod tests {
     view
   }
 
+  /// An Idle view whose latest status report carries a 4-field (rotary) position, so the DOC-10 A controls — the
+  /// DRO A row and the jog A column — render. Plain `view_idle` reports no position and so reads as a 3-axis board,
+  /// where the A controls are correctly hidden (a `$J=...A...` on a 3-axis firmware errors and wedges the stream).
+  fn view_idle_rotary() -> ViewState {
+    let mut view = ViewState::default();
+    view.connection = ConnectionState::Idle;
+    view.apply(crate::engine::Event::Response(crate::protocol::Response::Status(
+      "Idle|MPos:1.000,2.000,3.000,45.000|WCO:0.000,0.000,0.000,0.000".to_string(),
+    )));
+    view
+  }
+
   /// A fixed elapsed/ETA estimate for the dock progress clock so the rendered readout is deterministic.
   fn zero_time() -> TimeEstimate {
     TimeEstimate { elapsed: Duration::from_secs(0), remaining: None, total: None }
@@ -881,7 +919,7 @@ mod tests {
     let captured = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::default_dark());
     config.appearance.themes.insert("fixture-theme".to_string(), captured);
     config.appearance.active_theme = "fixture-theme".to_string();
-    let _ = crate::i18n::init();
+    ensure_locales_seeded();
     let rig = Rig { ui: UiState::default(), config, dirty: false };
     let mut harness = Harness::builder().with_size(egui::vec2(460.0, 640.0)).build_ui_state(
       |ui, rig: &mut Rig| {

@@ -157,19 +157,26 @@ macro_rules! tr {
   }};
 }
 
+/// A process-wide serialization guard for ANY test — in this module or elsewhere in the crate — that touches the
+/// GLOBAL i18n registry (via [`init`], [`set_language`], or the shell's `SetLanguage` intent) or asserts a
+/// locale-specific `tr!` result. `tr!` resolves against ONE global registry, so a test that sets a non-default
+/// locale and a test that reads the default one must not run concurrently — they race on the shared active-language
+/// slot (an empirically-reproduced flake). Every such test holds THIS single guard for its whole body, giving the
+/// crate one serialization point instead of several independent mutexes that did not exclude one another (the
+/// snapshot suite's own render lock vs. this module's former private guard). Hold it: `let _guard = ...;`.
+#[cfg(test)]
+pub(crate) fn lock_global_for_test() -> std::sync::MutexGuard<'static, ()> {
+  static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+  GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::sync::Mutex;
-
-  // The global registry is one process-wide singleton, so the few tests that touch it must not run
-  // concurrently with one another. They serialize on this guard and re-`init` so each starts from a known
-  // state. (The exhaustive behavioral coverage lives in `fluent.rs` against isolated `Translator`s.)
-  static GLOBAL_GUARD: Mutex<()> = Mutex::new(());
 
   #[test]
   fn init_seeds_bundled_en_us() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(get_language(), EN_US);
     assert_eq!(get_fallback(), EN_US);
@@ -179,7 +186,7 @@ mod tests {
 
   #[test]
   fn tr_macro_interpolates_named_args() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(tr!("stream-progress", { current: 42, total: 100 }), "Streaming line 42 of 100");
     // Trailing comma in the argument list is accepted.
@@ -189,14 +196,14 @@ mod tests {
 
   #[test]
   fn tr_macro_handles_missing_key_via_key_itself() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(tr!("totally-unknown-key"), "totally-unknown-key");
   }
 
   #[test]
   fn bundled_ports_found_selector_is_wired() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(tr!("ports-found", { count: 0 }), "No serial ports found");
     assert_eq!(tr!("ports-found", { count: 1 }), "1 serial port found");
@@ -331,7 +338,7 @@ mod tests {
 
   #[test]
   fn init_loads_both_locales_and_swedish_is_selectable_globally() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("the bundled locales must be valid");
     let mut langs = languages();
     langs.sort();

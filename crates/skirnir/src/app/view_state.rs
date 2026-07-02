@@ -289,6 +289,22 @@ impl ViewState {
     }
   }
 
+  /// The number of axes the firmware's latest status report carries: 3 for a plain XYZ board, 4 when a rotary A is
+  /// present (DOC-10). Read from the reported position vector; defaults to 3 before any report. The DRO's A row and
+  /// the jog pad's A column BOTH gate on this so a 3-axis board never shows — nor tries to jog — a phantom rotary
+  /// axis: a `$J=...A...` sent to a 3-axis firmware is rejected with `error:N`, which then holds the stream in the
+  /// error state (the finding this fixes). Equivalent to the length the DRO derives from [`Self::dro`], without its
+  /// allocation.
+  pub fn reported_axis_count(&self) -> usize {
+    self.status.as_ref().map(|s| s.position.len()).unwrap_or(3)
+  }
+
+  /// Whether the firmware reports a rotary A axis (a 4-field position report). The single gate the DRO A row and the
+  /// jog A column share; see [`Self::reported_axis_count`].
+  pub fn has_rotary_axis(&self) -> bool {
+    self.reported_axis_count() >= 4
+  }
+
   /// The live work-coordinate `(x, y)` for the toolpath overlay, with NO per-frame allocation. [`Self::dro`]
   /// clones `status.position` and builds a second derived `Vec` every call; the overlay runs at up to 20 Hz and
   /// reads only the work XY, so it takes this allocation-free path instead (finding #10). When the report already
@@ -627,6 +643,24 @@ mod tests {
   /// Convenience: feed a bracketed `[...]` message body through the reducer as the engine would.
   fn feed_message(view: &mut ViewState, body: &str) {
     view.apply(Event::Response(Response::Message(body.to_string())));
+  }
+
+  #[test]
+  fn reported_axis_count_gates_the_rotary_controls_on_the_report_width() {
+    // The DRO A row and the jog A column share this single signal. No report yet reads as a 3-axis board (the safe
+    // default); a 3-field report stays 3-axis; only a 4-field (rotary) report flips `has_rotary_axis`, so a plain
+    // board never offers an A jog (which the firmware would reject with `error:N` and wedge the stream).
+    let mut view = ViewState::default();
+    assert_eq!(view.reported_axis_count(), 3, "no report yet defaults to 3 axes");
+    assert!(!view.has_rotary_axis(), "no report is not a rotary board");
+
+    feed_status(&mut view, "Idle|MPos:1.000,2.000,3.000");
+    assert_eq!(view.reported_axis_count(), 3, "a 3-field report is a 3-axis board");
+    assert!(!view.has_rotary_axis(), "a 3-field report must not read as rotary");
+
+    feed_status(&mut view, "Idle|MPos:1.000,2.000,3.000,45.000");
+    assert_eq!(view.reported_axis_count(), 4, "a 4-field report is a rotary board");
+    assert!(view.has_rotary_axis(), "a 4-field report reads as rotary");
   }
 
   #[test]
