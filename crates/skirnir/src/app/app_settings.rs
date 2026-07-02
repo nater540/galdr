@@ -139,7 +139,7 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
     .resizable(false)
     .show_separator_line(false)
     .frame(egui::Frame::NONE)
-    .show_inside(ui, |ui| {
+    .show(ui, |ui| {
       ui.separator();
       // The explicit save boundary: nothing writes the operator-owned config.json implicitly. The unsaved marker
       // rides on the right; Save is disabled when there is nothing to write.

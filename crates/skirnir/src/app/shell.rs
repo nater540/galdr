@@ -1754,6 +1754,7 @@ impl SkirnirApp {
       rotary_dowel_diameter: self.ui.rotary_dowel_diameter,
       rotary_index_angle: self.ui.rotary_index_angle,
       rotary_bench: self.ui.rotary_bench,
+      dock_fraction: self.ui.dock_fraction,
     };
   }
 
@@ -1866,7 +1867,7 @@ impl eframe::App for SkirnirApp {
 
     // 2. Build the frame. Views push intents into a per-frame sink; we act on them after layout so a view
     //    never mutates engine state mid-render. eframe 0.34 hands us the root `Ui`; panels are laid out into
-    //    it with `show_inside`, and the central panel is what remains after the docked panels claim their
+    //    it with `show`, and the central panel is what remains after the docked panels claim their
     //    edges. We reach the `Context` (for repaint scheduling and the settings window) via `ui.ctx()`.
     let mut sink = super::intent::IntentSink::new();
     let ctx = ui.ctx().clone();
@@ -1904,6 +1905,16 @@ impl eframe::App for SkirnirApp {
       sweep: self.sweep.as_ref().map(|run| (&run.sweep, run.kind)),
     };
     views::shell_panels(ui, &self.view, &mut self.ui, data, &mut sink);
+
+    // SKIRNIR_SIZE_TRACE=1: log the dock region's geometry every frame it CHANGES, and force continuous
+    // repaints so frame-paced effects reproduce without anyone wiggling the mouse. This is the desktop-truth
+    // instrument for the self-resizing-dock investigation — the kittest harness said green three times while
+    // the shipped binary disagreed, so the confirmation pass now runs in the REAL eframe loop. Env-gated and
+    // near-free when off; deliberately left in place so the operator can run a verification pass themselves.
+    if std::env::var_os("SKIRNIR_SIZE_TRACE").is_some() {
+      size_trace(&ctx, &self.ui);
+      ctx.request_repaint();
+    }
 
     if self.ui.settings_open {
       let mut open = self.ui.settings_open;
@@ -2011,6 +2022,33 @@ fn is_probe_cycle_state(state: crate::protocol::RunState) -> bool {
   // resolves the latch via the Alarm/Error path, so `probe_finished` is never consulted on that path. `Check` and
   // `Unknown` are likewise treated as not-finished (conservative). Only `Idle` is a clean completion.
   !matches!(state, RunState::Idle)
+}
+
+/// The `SKIRNIR_SIZE_TRACE=1` frame hook: print the dock region's rect (recorded by [`views::dock`] via
+/// [`super::views::dock_rect_probe`]) whenever it changes between frames, with the frame counter and the live
+/// `pixels_per_point`. Chatty by design — an unsolicited line here IS the self-resizing bug reproducing in the
+/// real eframe loop, which the offscreen harness failed to catch three times. Debug instrumentation only.
+fn size_trace(ctx: &egui::Context, ui_state: &UiState) {
+  use std::sync::Mutex;
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static FRAME: AtomicU64 = AtomicU64::new(0);
+  static LAST: Mutex<Option<egui::Rect>> = Mutex::new(None);
+  let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+  let now = super::views::dock_rect_probe::last(ctx);
+  let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+  if let Some(now) = now
+    && *last != Some(now)
+  {
+    eprintln!(
+      "[size-trace] frame {frame}: dock rect {:?} -> [{:.3},{:.3}]..[{:.3},{:.3}] h={:.3} (ppp {}, collapsed {})",
+      last.map(|r| r.height()),
+      now.min.x, now.min.y, now.max.x, now.max.y,
+      now.height(),
+      ctx.pixels_per_point(),
+      ui_state.dock_collapsed,
+    );
+    *last = Some(now);
+  }
 }
 
 /// Build the tokio runtime and launch the eframe window. This is the binary's GUI entry point; `expect` is

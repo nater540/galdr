@@ -44,6 +44,8 @@ pub use view_state::{Banner, CONSOLE_CAPACITY, LogLine, LogSource, Progress, Vie
 #[cfg(feature = "gui")]
 pub mod app_settings;
 #[cfg(feature = "gui")]
+pub mod dock_tiles;
+#[cfg(feature = "gui")]
 pub mod fonts;
 #[cfg(feature = "gui")]
 pub mod metrics;

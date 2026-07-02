@@ -98,20 +98,15 @@ pub(crate) fn build_dock_harness(
 pub(crate) fn build_docked_panel_harness(
   state: HarnessState, time: super::progress::TimeEstimate,
 ) -> Harness<'static, HarnessState> {
-  use crate::app::metrics::Metrics;
   // The dock's tab labels go through `tr!`; seed the registry so label queries work in any test order.
   ensure_locales_seeded();
   let harness = Harness::builder()
     .with_size(egui::vec2(900.0, 600.0))
     .build_ui_state(
-      move |ui, state: &mut HarnessState| {
-        let mut sink = IntentSink::new();
-        // Mirror the shell: a status bar then the REAL dock panel (`views::dock_panel`, the same code the app
-        // runs), so the dock body sees exactly the height policy the real app gives it.
-        egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |_ui| {});
-        views::dock_panel(ui, &state.view, &mut state.ui, time, None, &mut sink);
-        state.intents.extend(sink.drain());
-      },
+      // The FULL shell: since the egui_tiles migration the dock lives in the central viewport/dock split, so
+      // rendering the real geometry means rendering the whole panel arrangement — which is the shared
+      // `views::shell_panels` anyway.
+      move |ui, state: &mut HarnessState| shell_layout(ui, state, time),
       state,
     );
   // The APP's fonts and theme, not kittest's defaults: row heights (and therefore every measured content rect)
@@ -881,52 +876,53 @@ mod tests {
 
   #[test]
   fn the_console_dock_holds_its_size_across_frames_without_input() {
-    // The user-reported "console keeps resizing itself": a resizable egui panel PERSISTS its CONTENT's measured
-    // rect as next frame's panel size (`PanelState { rect }.store`), so any console body that does not exactly
-    // fill the panel feeds its error back 1:1 and the dock creeps frame over frame with no input at all. The
-    // tab strip's top edge must stay put across many idle frames.
+    // The original self-resizing-console symptom: with no input at all the dock crept a little every frame
+    // (egui's resizable panels persist the measured CONTENT rect as the next frame's size). The dock now lives
+    // in an egui_tiles share split, where pane content structurally cannot alter the ratio — the dock's
+    // rendered rect and the persisted fraction must both be byte-stable across many idle frames.
     let mut ui = UiState::default();
     ui.active_tab = views::DockTab::Console;
     let state = HarnessState::new(view_idle(), ui);
     let mut harness = build_docked_panel_harness(state, zero_time());
-    harness.run_steps(3); // settle fonts/theme and the first stored panel size.
-    let top_before = harness.get_by_label("Console").rect().top();
+    harness.run_steps(3); // settle fonts/theme and the first laid-out split.
+    let rect_before = views::dock_rect_probe::last(&harness.ctx).expect("the dock must have rendered");
+    let fraction_before = harness.state().ui.dock_fraction;
     harness.run_steps(20);
-    let top_after = harness.get_by_label("Console").rect().top();
+    let rect_after = views::dock_rect_probe::last(&harness.ctx).expect("the dock must still render");
     assert!(
-      (top_after - top_before).abs() <= 0.5,
-      "the dock must hold its size with no input: strip top drifted {top_before} -> {top_after} over 20 frames"
+      (rect_after.height() - rect_before.height()).abs() <= 0.5,
+      "the dock must hold its size with no input: {rect_before:?} -> {rect_after:?} over 20 frames"
+    );
+    assert!(
+      (harness.state().ui.dock_fraction - fraction_before).abs() <= 1e-4,
+      "the persisted split fraction must not move without a drag"
     );
   }
 
   #[test]
   fn the_console_dock_holds_its_size_while_the_pointer_roams_over_it() {
-    // The user-reported SECOND variant of the self-resizing dock: it grew only while the mouse moved — i.e. per
-    // pointer-driven repaint. The earlier stability tests pumped frames with no pointer over the dock, so a
-    // hover-dependent contributor to the measured content rect slipped through them. Sweep the pointer across
-    // every widget class in the dock (the resize band — without pressing — the tab strip, the checkbox row, log
-    // rows, the MDI field and Send button) and assert the PERSISTED panel rect stays byte-stable.
+    // The second-reported variant: growth paced by pointer-driven repaints. Sweep the pointer across every
+    // widget class in the dock region (the split divider — without pressing — the tab strip, checkbox row, log
+    // rows, the MDI field and Send button) and assert the dock's rendered rect stays put.
     let mut ui = UiState::default();
     ui.active_tab = views::DockTab::Console;
     let state = HarnessState::new(view_idle(), ui);
     let mut harness = build_docked_panel_harness(state, zero_time());
     harness.run_steps(3);
-    let before = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
-      .expect("the dock panel must have stored state")
-      .rect;
-    // Three passes of a pseudo-scan over x ∈ [20, 850] and y ∈ [360, 570] — the dock spans ~[368, 568] in this
-    // 900×600 harness, so the scan crosses the resize band, strip, body, and MDI row repeatedly.
+    let before = views::dock_rect_probe::last(&harness.ctx).expect("the dock must have rendered");
+    // Three passes of a pseudo-scan across the central region and the dock (including the divider band above
+    // the dock's top edge), never pressing a button.
+    let x0 = before.left();
+    let x_span = before.width().max(1.0);
     for pass in 0..3u32 {
       for step in 0..24u32 {
-        let x = 20.0 + step as f32 * 36.0;
-        let y = 360.0 + ((step * 9 + pass * 5) % 22) as f32 * 10.0;
+        let x = x0 + (step as f32 / 23.0) * x_span;
+        let y = before.top() - 12.0 + ((step * 9 + pass * 5) % 22) as f32 * 10.0;
         harness.hover_at(egui::pos2(x, y));
         harness.run_steps(1);
       }
     }
-    let after = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
-      .expect("the dock panel state must survive")
-      .rect;
+    let after = views::dock_rect_probe::last(&harness.ctx).expect("the dock must still render");
     assert!(
       (after.height() - before.height()).abs() <= 0.5,
       "the dock must hold its size under pointer movement: {before:?} -> {after:?} after 72 hover frames"
@@ -935,13 +931,10 @@ mod tests {
 
   #[test]
   fn the_console_dock_holds_its_size_under_the_app_fonts_at_both_dpis() {
-    // THE faithful reproduction of the user's "console grows while moving the mouse": under the APP's font
-    // stack + theme (row heights differ from kittest's defaults) the dock's content measured taller than the
-    // panel, and since egui persists the measured content rect as next frame's panel size, the dock grew on
-    // every repaint — which in the shipped app only happen on pointer input, hence "only while moving the
-    // mouse". The default-font harnesses were blind to it. Renders the full shell with the real fonts/theme at
-    // both 1x and Retina 2x and asserts the persisted dock rect is byte-stable across frames; the guard in
-    // `views::dock_panel` is what holds it.
+    // The faithful desktop reproduction fixture: the pre-tiles bug only reproduced under the APP's font stack
+    // and theme (row heights differ from kittest's defaults) — a default-font harness waved three fixes
+    // through. Renders the full shell with the real fonts/theme at both 1x and Retina 2x and asserts the dock's
+    // rendered rect and split fraction are stable across frames.
     ensure_locales_seeded();
     for ppp in [1.0f32, 2.0] {
       let mut ui = UiState::default();
@@ -957,13 +950,9 @@ mod tests {
       crate::app::fonts::install(&harness.ctx);
       crate::app::shell::apply_theme(&harness.ctx, &crate::app::theme::Palette::default_dark(), 1.0);
       harness.run_steps(3);
-      let before = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
-        .expect("the dock panel must have stored state")
-        .rect;
+      let before = views::dock_rect_probe::last(&harness.ctx).expect("the dock must have rendered");
       harness.run_steps(20);
-      let after = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
-        .expect("the dock panel state must survive")
-        .rect;
+      let after = views::dock_rect_probe::last(&harness.ctx).expect("the dock must still render");
       assert!(
         (after.height() - before.height()).abs() <= 0.5,
         "at {ppp}x under the app fonts the dock must hold its size: {before:?} -> {after:?} over 20 frames"
@@ -973,29 +962,39 @@ mod tests {
 
   #[test]
   fn the_console_dock_holds_a_manually_dragged_size() {
-    // The other half of the report: a size the operator SET must stick. Drag the dock's top edge up, then run
-    // many uneventful frames — the dragged size must survive them, not be fought back frame by frame.
+    // A size the operator SET must stick: drag the split divider up, then run many uneventful frames — the
+    // dragged ratio must survive them.
     let mut ui = UiState::default();
     ui.active_tab = views::DockTab::Console;
     let state = HarnessState::new(view_idle(), ui);
     let mut harness = build_docked_panel_harness(state, zero_time());
     harness.run_steps(3);
-    let dock_top = 600.0 - 8.0 - Metrics::STATUS_BAR_H - Metrics::DOCK_H;
-    let handle = egui::pos2(450.0, dock_top);
-    let target = egui::pos2(450.0, dock_top - 80.0);
+    drag_dock_divider(&mut harness, -80.0);
+    let after_drag = views::dock_rect_probe::last(&harness.ctx).expect("the dock must have rendered");
+    harness.run_steps(20);
+    let later = views::dock_rect_probe::last(&harness.ctx).expect("the dock must still render");
+    assert!(
+      (later.height() - after_drag.height()).abs() <= 0.5,
+      "a dragged dock size must stick: {after_drag:?} -> {later:?} over 20 frames"
+    );
+  }
+
+  /// Drag the central split's divider by `dy` (negative = grow the dock). The divider is the hairline gap just
+  /// above the dock pane; egui_tiles senses drags within `resize_grab_radius_side` of it.
+  fn drag_dock_divider(harness: &mut Harness<'static, HarnessState>, dy: f32) {
+    let dock = views::dock_rect_probe::last(&harness.ctx).expect("the dock must have rendered before a drag");
+    // The probe rect is the dock CONTENT inside the pane frame's 2px vertical margin; the divider line sits just
+    // above the pane.
+    let divider_y = dock.top() - 2.0 - 1.0;
+    let x = dock.center().x;
+    let handle = egui::pos2(x, divider_y);
+    let target = egui::pos2(x, divider_y + dy);
     harness.hover_at(handle);
     harness.drag_at(handle);
-    harness.hover_at(egui::pos2(450.0, dock_top - 40.0));
+    harness.hover_at(egui::pos2(x, divider_y + dy * 0.5));
     harness.hover_at(target);
     harness.drop_at(target);
     harness.run();
-    let top_after_drag = harness.get_by_label("Console").rect().top();
-    harness.run_steps(20);
-    let top_later = harness.get_by_label("Console").rect().top();
-    assert!(
-      (top_later - top_after_drag).abs() <= 0.5,
-      "a dragged dock size must stick: strip top drifted {top_after_drag} -> {top_later} over 20 frames"
-    );
   }
 
   #[test]
@@ -1133,6 +1132,44 @@ mod tests {
   }
 
   #[test]
+  fn the_side_columns_never_overflow_their_fixed_widths_in_any_locale() {
+    // Under egui 0.35, a side panel whose CONTENT overflows its width re-anchors its measured rect on the
+    // overflowed edge and shifts the central-region cursor — the viewport then paints OVER the column's inner
+    // strip (found as clipped Swedish labels: "Snabbmatning 100%" + presets ran ~18px past the 286px column).
+    // Guard the CLASS: in every locale, with the busiest fixture (tool-change banner + full status), both
+    // columns' persisted rects must sit exactly inside the window at exactly their design widths.
+    ensure_locales_seeded();
+    for locale in ["en-US", "sv-SE"] {
+      let _guard = crate::i18n::lock_global_for_test();
+      crate::i18n::set_language(locale);
+      let mut view = view_idle();
+      view.apply(crate::engine::Event::Response(crate::protocol::Response::Status(
+        "Tool|MPos:12.500,20.000,-1.200|WCO:2.000,3.000,1.000".to_string(),
+      )));
+      view.current_tool = Some(3);
+      let state = HarnessState::new(view, UiState::default());
+      let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+      harness.run_steps(3);
+      let right = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("rightcol"))
+        .expect("the right column must have stored state")
+        .outer_rect;
+      let left = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("controls"))
+        .expect("the left column must have stored state")
+        .outer_rect;
+      // The kittest root inset is 8px; the window content spans [8, 1272].
+      assert!(
+        (right.max.x - 1272.0).abs() <= 0.5 && (right.width() - Metrics::RIGHT_COL_W).abs() <= 0.5,
+        "{locale}: the right column must sit flush inside the window at its fixed width, got {right:?}"
+      );
+      assert!(
+        (left.min.x - 8.0).abs() <= 0.5 && (left.width() - Metrics::LEFT_COL_W).abs() <= 0.5,
+        "{locale}: the left column must sit flush inside the window at its fixed width, got {left:?}"
+      );
+      crate::i18n::set_language("en-US");
+    }
+  }
+
+  #[test]
   fn the_theme_name_field_matches_the_height_of_the_button_beside_it() {
     // The user-flagged inconsistency: text inputs must sit at the same control height as adjacent buttons. The
     // "new theme name…" field and its "Create from current" button share a row, so their heights must agree.
@@ -1256,37 +1293,33 @@ mod tests {
   }
 
   #[test]
-  fn the_console_dock_resizes_vertically_by_dragging_its_top_edge() {
-    // The dock is a resizable bottom panel: dragging its top edge upward must GROW the dock (the tab strip moves
-    // up with it) and the MDI input must stay visible at the bottom. Uses the real `views::dock_panel` inside the
-    // shell-faithful harness, so this drives egui's actual panel-resize interaction, not a synthetic height.
+  fn the_console_dock_resizes_vertically_by_dragging_the_split_divider() {
+    // The dock is the lower pane of the central egui_tiles split: dragging the divider upward must GROW the
+    // dock (its rect top rises, the persisted fraction increases) and the MDI input must stay visible at the
+    // bottom. Drives egui_tiles' real divider interaction, not a synthetic ratio write.
     let mut ui = UiState::default();
     ui.active_tab = views::DockTab::Console;
     let state = HarnessState::new(view_idle(), ui);
     let mut harness = build_docked_panel_harness(state, zero_time());
-    harness.run();
+    harness.run_steps(3);
 
-    let strip_top_before = harness.get_by_label("Console").rect().top();
-
-    // The resize handle is egui's ±5px grab band around the panel's TOP EDGE — computed from the harness layout
-    // (600px window, kittest's 8px root inset, the 24px status bar, the 200px default dock), not from the tab
-    // label, which sits ~10px below the edge (outside the band — aiming there grabs nothing). Drag it 80px up.
-    let dock_top = 600.0 - 8.0 - Metrics::STATUS_BAR_H - Metrics::DOCK_H;
-    let handle = egui::pos2(450.0, dock_top);
-    let target = egui::pos2(450.0, dock_top - 80.0);
-    harness.hover_at(handle);
-    harness.drag_at(handle);
-    harness.hover_at(egui::pos2(450.0, dock_top - 40.0));
-    harness.hover_at(target);
-    harness.drop_at(target);
-    harness.run();
-
-    let strip_top_after = harness.get_by_label("Console").rect().top();
+    let before = views::dock_rect_probe::last(&harness.ctx).expect("the dock must have rendered");
+    let fraction_before = harness.state().ui.dock_fraction;
+    drag_dock_divider(&mut harness, -80.0);
+    let after = views::dock_rect_probe::last(&harness.ctx).expect("the dock must still render");
     assert!(
-      strip_top_before - strip_top_after > 40.0,
-      "dragging the dock's top edge up must grow the dock (strip top {strip_top_before} -> {strip_top_after})"
+      before.top() - after.top() > 40.0,
+      "dragging the divider up must grow the dock (top {} -> {})",
+      before.top(),
+      after.top()
     );
-    // The MDI input must still be laid out inside the grown panel — resizing must never cost the command line.
+    assert!(
+      harness.state().ui.dock_fraction > fraction_before + 0.02,
+      "the grown dock must be mirrored into the persisted fraction ({} -> {})",
+      fraction_before,
+      harness.state().ui.dock_fraction
+    );
+    // The MDI input must still be laid out inside the grown pane — resizing must never cost the command line.
     assert!(
       harness.query_by_role(egui::accesskit::Role::TextInput).is_some(),
       "the MDI input must survive a dock resize"

@@ -1,23 +1,32 @@
 ---
 name: egui-tiles-verdict
-description: Decision (2026-07-02) to NOT adopt egui_tiles for skirnir's panel layout — rationale + revisit criteria
+description: DECISION REVERSED (2026-07-02) — egui_tiles 0.15 now hosts the viewport/console split; why the pass verdict was overridden
 metadata:
   type: project
 ---
 
-Evaluated `egui_tiles` (rerun-io, 0.16.0 June 2026, 1.7M downloads, actively maintained; 0.15.0 is the egui-0.34
-match; `Behavior::is_tile_draggable`/`is_container_resizable` can lock tiles down) as a replacement for the
-hand-rolled panel arrangement, prompted by the resize-fight bug. PASSED on adopting it.
+ORIGINAL verdict (2026-07-02 morning): pass on egui_tiles — fixed machine-control chrome vs its rearrangeable-
+workspace purpose, and the resize bug seemed fixable in-place.
 
-**Why:** its value is USER-REARRANGEABLE tiled workspaces (drag-and-drop docking, tabs, share-based splits) — the
-opposite of skirnir's deliberately FIXED machine-control chrome (268|1fr|286 grid, pinned toolbar/status,
-design-locked; operators build muscle memory against fixed control placement). Adopting it means disabling its
-headline feature via Behavior overrides, keeping the toolbar/status/banner layout hand-rolled anyway (tiles only
-manage a central tree), churning every snapshot baseline, and tracking another dependency one release behind our
-egui pin. Crucially it would NOT have prevented the reported bug class: the dialog half lived in `egui::Window`
-auto-sizing (tiles don't manage windows), and the dock half (panel content-rect feedback) is fixed and pinned by
-five stability tests. `views::shell_panels` is now a single small shared layout function — low maintenance.
+**REVERSED by user decision the same day**: THREE successive fixes to the hand-rolled resizable dock (exact-fill
+content, content-fill windows, a persisted-size write-back guard) each went green in kittest and kept
+self-resizing on the user's desktop. The theoretical assessment lost to repeated real-world failure — the panel
+content-rect persistence model was the problem, and tiles' top-down share sizing removes the feedback path
+entirely rather than guarding it.
 
-**How to apply:** revisit if user-rearrangeable/dockable panels become a product goal (pop-out tabs, custom
-workspaces) — egui_tiles is the right tool then, proven at scale in rerun; its top-down share-based sizing is
-also inherently immune to the content-feedback drift. Related: [[egui-elegance-verdict]], [[egui-034-layout-gotchas]].
+**Shape shipped** (`crates/skirnir/src/app/dock_tiles.rs`): egui_tiles 0.15 (egui-0.34 match) manages ONLY the
+central [toolpath viewport | console dock] vertical split; all fixed chrome stays hand-rolled. Dragging disabled
+(`Behavior::is_tile_draggable → false`), no Tabs containers (panes render bare; the dock keeps its own strip),
+`min_size = DOCK_MIN_H`, divider = 1px gap. Split fraction persists via `profile.ron` (`Prefs::dock_fraction`,
+default `profile::DEFAULT_DOCK_FRACTION = 0.3` — lives in the ungated profile module) — NOT config.json
+(operator-owned, explicit-save-only) and NOT egui memory (eframe persistence off). The collapsed dock is still a
+hand-rolled full-width exact strip. Consequence accepted per scope: the expanded dock spans the viewport width,
+not the window width, and the side columns run full height (which un-clipped the jog pad + rotary panels).
+
+**Verification lesson that drove it**: `SKIRNIR_SIZE_TRACE=1` (env-gated, left in the shell) logs the dock rect
+per change + forces repaints — desktop-truth evidence the harness can't fake. Real-binary runs: the pre-tiles
+guard was stable under 15s of forced repaints (the remaining desktop gap needs real pointer input or a state
+transition — never identified); tiles: one initial line, zero changes over 25s. Also: egui ScrollArea's default
+`min_scrolled_height=64` overflows tight panes — the console log sets it to 0.
+
+Related: [[egui-034-layout-gotchas]], [[egui-elegance-verdict]].

@@ -195,8 +195,14 @@ pub struct UiState {
   /// read an earlier line. `None` until the first followed line; cleared when a new program is loaded.
   pub program_followed_line: Option<usize>,
   /// Whether the bottom dock is collapsed to just its tab strip, hiding the console/program body so the toolpath
-  /// and panels reclaim the space. Defaults to expanded (the design opens the dock at its full 200px height).
+  /// and panels reclaim the space. Defaults to expanded.
   pub dock_collapsed: bool,
+  /// The central viewport/console split (an egui_tiles tree), built lazily on the first expanded frame from
+  /// [`Self::dock_fraction`] and held here so the operator's divider drag survives frames and collapse cycles.
+  pub central_split: Option<super::dock_tiles::CentralSplit>,
+  /// The dock's share of the central region (`0..1`), mirrored out of the live split each frame so the profile
+  /// can persist it and a fresh split (or next launch) reopens at the operator's chosen ratio.
+  pub dock_fraction: f32,
   /// Whether "fabulous" mode — the hidden Pride-month accent — is on, painting a thin rainbow band along the
   /// toolbar and status bar. A pure cosmetic flourish that never touches the machine; off by default and
   /// transient (not persisted), toggled by the [`Self::register_fabulous_click`] badge easter egg.
@@ -285,6 +291,8 @@ impl Default for UiState {
       setting_descriptions: super::setting_help::SettingDescriptions::bundled(),
       active_tab: DockTab::default(),
       dock_collapsed: false,
+      central_split: None,
+      dock_fraction: super::dock_tiles::DEFAULT_DOCK_FRACTION,
       program_followed_line: None,
       fabulous: false,
       fabulous_click_streak: 0,
@@ -306,6 +314,7 @@ impl UiState {
       rotary_dowel_diameter: prefs.rotary_dowel_diameter,
       rotary_index_angle: prefs.rotary_index_angle,
       rotary_bench: prefs.rotary_bench,
+      dock_fraction: prefs.dock_fraction,
       ..UiState::default()
     }
   }
@@ -657,6 +666,22 @@ impl ShellPanelsData<'_> {
   }
 }
 
+/// Render `content` into a DETACHED child ui pinned to exactly the caller's remaining rect, then claim that
+/// rect. A child ui's overflow never expands its parent, so whatever the content measures — fractional font
+/// rows, a hand-laid row a hair too wide, a future widget — the caller's own measured size stays exactly its
+/// allocated rect. This is the side columns' containment: under egui 0.35 a panel whose content measures wider
+/// than the panel re-anchors its stored rect on the overflowed edge and shifts the central-region cursor over
+/// the column (the clipped-labels bug); with containment that class of overflow is clipped where it happens and
+/// can never move layout. (The same principle the panel machinery itself applies via clip — but the measurement
+/// escape is only sealed by the detached child.)
+fn contained(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+  let rect = ui.available_rect_before_wrap();
+  let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(Align::Min)));
+  child.set_clip_rect(rect.intersect(child.clip_rect()));
+  content(&mut child);
+  ui.allocate_rect(rect, egui::Sense::hover());
+}
+
 /// Lay out the ENTIRE window-panel arrangement — toolbar, alarm/tool-change banner, status bar, bottom dock,
 /// the fixed left/right columns, and the central toolpath viewport — into the window's root `Ui`. This is THE
 /// single description of the app's frame: `SkirnirApp::ui` calls it with live shell state and the whole-window
@@ -673,12 +698,12 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
   // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
   egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
     .frame(egui::Frame::NONE.fill(palette.panel_alt))
-    .show_inside(ui, |ui| {
+    .show(ui, |ui| {
       toolbar(ui, view, state, sink);
     });
 
   if view.banner.is_some() {
-    egui::Panel::top("banner").show_inside(ui, |ui| {
+    egui::Panel::top("banner").show(ui, |ui| {
       alarm_banner(ui, palette, view, sink);
     });
   } else if view.badge_state() == BadgeState::Tool {
@@ -686,20 +711,26 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
     // tool-change affordance in the same top slot (a fault banner, if any, takes precedence above). The Resume
     // action routes through the existing cycle-start path, not a second control. The banner names the tool from
     // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
-    egui::Panel::top("tool_change").show_inside(ui, |ui| {
+    egui::Panel::top("tool_change").show(ui, |ui| {
       tool_change_banner(ui, palette, view, sink);
     });
   }
 
   // The status bar is a fixed 24px mono strip (design §03).
-  egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |ui| {
+  egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show(ui, |ui| {
     status_bar(ui, view, state);
   });
 
-  // The bottom dock spans the full window width under the body grid (design §03: a single dock hosting the
-  // Console and Program tabs across all three columns). It must be laid out BEFORE the side panels so it
-  // claims the full width and the columns rise only above it; the status bar, declared earlier, stays below.
-  dock_panel(ui, view, state, data.time, data.eta_qualifier, sink);
+  // COLLAPSED, the dock is just its tab strip: a fixed, hand-rolled bottom panel spanning the full window width
+  // (exact-sized, so no resize machinery is in play). EXPANDED, the dock lives in the central egui_tiles split
+  // below — so it is laid out AFTER the side columns and spans the viewport width, not the window width, and
+  // the columns run the full height between toolbar and status bar.
+  if state.dock_collapsed {
+    egui::Panel::bottom("dock-collapsed").resizable(false).exact_size(Metrics::DOCK_COLLAPSED_H)
+      .show(ui, |ui| {
+        dock(ui, view, state, data.time, data.eta_qualifier, sink);
+      });
+  }
 
   // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
   // Settings) columns are exact widths, not resizable, so the layout matches the mock regardless of window
@@ -712,22 +743,31 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
   // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
   let column_frame = egui::Frame::NONE.fill(palette.panel);
   egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
-    .show_inside(ui, |ui| {
+    .show(ui, |ui| contained(ui, |ui| {
       // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
       // area shrink to the widest child, which otherwise leaves an unfilled strip on the column's inner edge.
       egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Cap the content width to the column: a vertical scroll area REMEMBERS its content size, so a single
+        // frame where a full-width allocation (the section header bars) reads a transiently wide
+        // `available_width` ratchets the content wider forever — and under egui 0.35 a side panel whose content
+        // overflows its width re-anchors its measured rect on the overflowed edge, shifting the central region
+        // over the column (the clipped-labels bug). A hard cap makes the ratchet impossible.
+        ui.set_max_width(Metrics::LEFT_COL_W);
         dro(ui, view, state, sink);
         ui.separator();
         jog(ui, view, state, sink);
       });
-    });
+    }));
 
   egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
-    .show_inside(ui, |ui| {
+    .show(ui, |ui| contained(ui, |ui| {
       // `auto_shrink([false, false])`: fill the full fixed column width and height so the content never
       // collapses to its natural size and leaves a bare strip beside it. Settings live only in the toolbar's
       // Settings window now, not as a right-column section.
       egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Same content-width cap as the left column (see there): the ratchet bug manifested HERE first, as the
+        // overrides header allocating a transiently-wide row and pushing the whole column off-window.
+        ui.set_max_width(Metrics::RIGHT_COL_W);
         overrides(ui, view, state, sink);
         ui.separator();
         probe(ui, view, state, sink);
@@ -739,15 +779,27 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
         // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
         verify_measure(ui, view, state, data.sweep, sink);
       });
-    });
+    }));
 
-  // The central toolpath panel takes a zero-margin frame too. egui's default central-panel frame insets the
-  // content by 8px on every side, which left a black gutter between the left column's right edge and the
-  // viewport (the user-flagged band). With no margin the viewport sits flush against both columns — exactly the
-  // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
-  // its own `INSET` canvas over the rect, so the frame fill never shows through.
-  egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
-    toolpath(ui, view, state);
+  // The central region takes a zero-margin frame (egui's default central-panel frame insets 8px on every side,
+  // which left a black gutter beside the columns — the user-flagged band). Collapsed: the toolpath alone fills
+  // it. Expanded: the egui_tiles [viewport | dock] split fills it — the split ratio is share-based state the
+  // operator owns via the divider drag, and pane content structurally cannot feed back into it (the resizable-
+  // panel self-resize bug class this replaced). The split is TAKEN OUT of the state for the render so the tiles
+  // behavior can borrow the rest of the `UiState`, then put back with the (possibly dragged) fraction mirrored
+  // for the profile to persist.
+  egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show(ui, |ui| {
+    if state.dock_collapsed {
+      toolpath(ui, view, state);
+    } else {
+      let mut split = state
+        .central_split
+        .take()
+        .unwrap_or_else(|| super::dock_tiles::CentralSplit::new(state.dock_fraction));
+      split.ui(ui, view, state, data.time, data.eta_qualifier, sink);
+      state.dock_fraction = split.dock_fraction();
+      state.central_split = Some(split);
+    }
   });
 }
 
@@ -1528,18 +1580,25 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
       RealtimeCommand::SpindleOverridePlus1);
     ui.add_space(4.0);
 
-    // Rapid override is preset-only in grbl (100/50/25), so it gets buttons rather than a slider.
+    // Rapid override is preset-only in grbl (100/50/25), so it gets buttons rather than a slider. The three
+    // buttons are RIGHT-ALIGNED and the label TRUNCATES into whatever remains: laid left-to-right, the Swedish
+    // "Snabbmatning 100%" pushed the row ~18px past the 286px column — and under egui 0.35 a side panel whose
+    // content overflows its width shifts the whole central-region cursor and paints the viewport OVER the
+    // column's edge (the measured-rect clamp re-anchors on the overflowed edge). A width-proof row cannot
+    // regress that way in any locale; the column-overflow regression test guards the class.
     ui.horizontal(|ui| {
-      ui.label(crate::tr!("ov-rapid", { pct: format!("{rapid:>3}") }));
-      if ui.button("100").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::RapidOverrideReset));
-      }
-      if ui.button("50").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::RapidOverride50));
-      }
-      if ui.button("25").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::RapidOverride25));
-      }
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.button("25").clicked() {
+          sink.push(Intent::Realtime(RealtimeCommand::RapidOverride25));
+        }
+        if ui.button("50").clicked() {
+          sink.push(Intent::Realtime(RealtimeCommand::RapidOverride50));
+        }
+        if ui.button("100").clicked() {
+          sink.push(Intent::Realtime(RealtimeCommand::RapidOverrideReset));
+        }
+        ui.add(egui::Label::new(crate::tr!("ov-rapid", { pct: format!("{rapid:>3}") })).truncate());
+      });
     });
 
     // Realized feed/speed from the latest report: what the machine is actually doing after overrides.
@@ -1669,23 +1728,19 @@ fn override_axis(ui: &mut egui::Ui, palette: Palette, label: &str, axis: super::
   });
 
   // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%. Gated on the same
-  // live link as the slider — a relative override byte is a no-op with nothing connected to act on it.
+  // live link as the slider — a relative override byte is a no-op with nothing connected to act on it. Placed
+  // via [`button_row`] at exact, width-splitting rects: five free-flowing buttons at the default padding are
+  // intrinsically ~283px wide — wider than the column's inner width — which was invisible under egui 0.34
+  // (silently clipped) but shifts the whole central region under 0.35 (see the rapid-row comment above). The
+  // split row always fits by construction.
   ui.add_enabled_ui(enabled, |ui| {
-    ui.horizontal(|ui| {
-      if ui.button("−10").clicked() {
-        sink.push(Intent::Realtime(minus10));
-      }
-      if ui.button("−1").clicked() {
-        sink.push(Intent::Realtime(minus1));
-      }
-      if ui.button("100").clicked() {
-        sink.push(Intent::Realtime(reset));
-      }
-      if ui.button("+1").clicked() {
-        sink.push(Intent::Realtime(plus1));
-      }
-      if ui.button("+10").clicked() {
-        sink.push(Intent::Realtime(plus10));
+    let commands = [minus10, minus1, reset, plus1, plus10];
+    let labels = ["−10", "−1", "100", "+1", "+10"];
+    button_row(ui, 6.0, &[1.0; 5], |ui, index, rect| {
+      let text = RichText::new(labels[index]).size(11.5);
+      let button = egui::Button::new(text).wrap_mode(egui::TextWrapMode::Extend);
+      if ui.put(rect, button).clicked() {
+        sink.push(Intent::Realtime(commands[index]));
       }
     });
   });
@@ -2155,58 +2210,25 @@ fn verify_readings_table(ui: &mut egui::Ui, palette: Palette, s: &super::angle_s
   }
 }
 
-/// Lay out the bottom dock as its window panel: the full-width strip under the body grid that hosts [`dock`]'s
-/// tab strip + console/program body. Extracted from the shell (and shared with the whole-window test harness) so
-/// the panel's geometry — its height policy and collapse behaviour — lives in exactly one place and cannot drift
-/// between the app and its tests.
-///
-/// Expanded, the panel is VERTICALLY RESIZABLE: it opens at the design's 200px ([`Metrics::DOCK_H`]) and the
-/// operator drags its top edge between [`Metrics::DOCK_MIN_H`] and [`Metrics::DOCK_MAX_FRACTION`] of the
-/// remaining window height (so the dock can grow for reading a long console but never swallow the control
-/// columns). Collapsed, it pins to just the tab strip — under a DIFFERENT panel id, so egui's remembered size for
-/// the expanded dock survives a collapse/expand cycle instead of being overwritten by the 30px strip and then
-/// clamped back to the minimum on re-expand.
-///
-/// THE SIZE-PERSISTENCE GUARD (the class-proof half of the self-resizing-console fix): egui persists a resizable
-/// panel's measured CONTENT rect as next frame's panel size, so any content that measures taller or shorter than
-/// the panel — fractional font rows, theme-dependent row heights, a future widget — makes the dock creep on
-/// every repaint (in the shipped app that reads as "grows while the mouse moves", because pointer input is what
-/// drives repaints). Sizing the content exactly proved whack-a-mole: it held under the default test fonts and
-/// broke again under the app's real font stack. So the guard closes the LOOP instead of chasing contributors:
-/// after layout, the persisted height is written back to what it was before the frame — clamped to the current
-/// range — unless the operator is genuinely dragging the resize handle. Content measurement can therefore never
-/// change the dock's size; only a drag (or the range clamp on a window resize) can.
-pub fn dock_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
-  eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
-  if state.dock_collapsed {
-    egui::Panel::bottom("dock-collapsed").resizable(false).exact_size(Metrics::DOCK_COLLAPSED_H)
-      .show_inside(ui, |ui| {
-        dock(ui, view, state, time, eta_qualifier, sink);
-      });
-    return;
+/// Debug probe: the rect the dock CONTENT last rendered into, recorded by [`dock`] each frame and read by the
+/// shell's `SKIRNIR_SIZE_TRACE` instrument and the stability tests. Stored in egui TEMP MEMORY (per-context, so
+/// parallel test harnesses cannot race each other's readings), same side-channel idea as `slider_rect_probe` —
+/// the dock body is not an AccessKit-labelled widget.
+pub(crate) mod dock_rect_probe {
+  use eframe::egui;
+
+  fn key() -> egui::Id {
+    egui::Id::new("skirnir-dock-rect-probe")
   }
-  use egui::containers::panel::PanelState;
-  let dock_id = egui::Id::new("dock");
-  let height_before = PanelState::load(ui.ctx(), dock_id).map(|s| s.rect.height());
-  let max_h = (ui.available_height() * Metrics::DOCK_MAX_FRACTION).max(Metrics::DOCK_H);
-  egui::Panel::bottom("dock")
-    .resizable(true)
-    .default_size(Metrics::DOCK_H)
-    .size_range(Metrics::DOCK_MIN_H..=max_h)
-    .show_inside(ui, |ui| {
-      dock(ui, view, state, time, eta_qualifier, sink);
-    });
-  // The size-persistence guard (see the doc above). `__resize` is the panel machinery's drag-interaction id;
-  // while it is dragged the operator owns the size and the freshly-stored value stands. The panel is
-  // bottom-anchored, so the height restore moves only the top edge.
-  let dragging = ui.ctx().read_response(dock_id.with("__resize")).is_some_and(|r| r.dragged());
-  if !dragging && let Some(stored) = PanelState::load(ui.ctx(), dock_id) {
-    let height = height_before.unwrap_or(Metrics::DOCK_H).clamp(Metrics::DOCK_MIN_H, max_h);
-    if (stored.rect.height() - height).abs() > f32::EPSILON {
-      let mut rect = stored.rect;
-      rect.min.y = rect.max.y - height;
-      ui.ctx().data_mut(|d| d.insert_persisted(dock_id, PanelState { rect }));
-    }
+
+  /// Record this frame's dock region rect on its context.
+  pub fn record(ctx: &egui::Context, rect: egui::Rect) {
+    ctx.data_mut(|d| d.insert_temp(key(), rect));
+  }
+
+  /// The most recently recorded dock region rect on this context, if the dock has rendered.
+  pub fn last(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp(key()))
   }
 }
 
@@ -2214,10 +2236,13 @@ pub fn dock_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time
 /// tab strip switches `state.active_tab`, the strip's right edge carries the §03 progress readout (acked/total ·
 /// 260px bar · percent) plus the collapse toggle for whichever tab is active, and the body below renders the
 /// selected tab. Keeping both tabs in one dock matches the mock, where Console and Program share a single dock
-/// rather than sitting in separate panels. The hosting window panel — height policy, drag-resize, collapse — is
-/// [`dock_panel`]; this draws only what lives inside it.
+/// rather than sitting in separate panels. The hosting geometry — the egui_tiles split when expanded, the fixed
+/// collapsed strip otherwise — lives in [`shell_panels`]/[`super::dock_tiles`]; this draws only the content.
 pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
   eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
+  // Record the dock region's rect for the SKIRNIR_SIZE_TRACE debug instrument and the stability tests
+  // (implementation-agnostic: this is the region the dock actually rendered into, whatever container hosts it).
+  dock_rect_probe::record(ui.ctx(), ui.max_rect());
   let palette = state.style.palette;
   let active = state.active_tab;
   let console_label = crate::tr!("tab-console");
@@ -2494,15 +2519,18 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   // Height budget: the strip's real height depends on the font stack (the mono row is ~15.1px under the test
   // fonts but taller under the app's JetBrains Mono + themed spacing), so the slot carries generous headroom —
   // 4px top breathing room between the last log row and the strip plus slack over the tallest observed content.
-  // Content that still outgrew the slot would clip at the dock floor, NOT resize the dock: the dock's persisted
-  // size is guarded in [`dock_panel`] regardless of what the content measures.
+  // Content that still outgrew the slot would clip at the pane floor, NOT resize anything: the dock's height is
+  // a share of the egui_tiles split, which pane content structurally cannot alter.
   egui::Panel::bottom("dock-mdi")
     .exact_size(Metrics::MDI_ROW_H + 8.0)
     .resizable(false)
     .show_separator_line(false)
     .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 4, bottom: 0 }))
-    .show_inside(ui, |ui| mdi_strip(ui, view, state, sink));
-  let scroll = ScrollArea::vertical().auto_shrink([false, false])
+    .show(ui, |ui| mdi_strip(ui, view, state, sink));
+  // `min_scrolled_height(0)`: egui's 64px default floor would force the log BELOW the reserved space at the
+  // split's minimum pane height and paint it over the MDI strip; the log may shrink to a sliver instead — it
+  // still scrolls, and the MDI line always stays whole.
+  let scroll = ScrollArea::vertical().auto_shrink([false, false]).min_scrolled_height(0.0)
     .stick_to_bottom(state.auto_scroll).show_rows(
     ui,
     row_height,

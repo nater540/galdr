@@ -53,3 +53,16 @@ egui 0.34 behaviors verified the hard way in skirnir (each caused a visible bug 
   through; (2) the CLASS fix is the persisted-size guard in `views::dock_panel`: after `show_inside`, write the
   pre-frame height back into `PanelState` (via `insert_persisted`) unless `read_response(id.with("__resize"))`
   reports a genuine drag — content measurement can then never change a resizable panel's size.
+- **egui 0.35 notes (upgrade done 2026-07-02, single API break: `Panel::show_inside` → `show`).** Re-verified:
+  TextEdit height math, ComboBox width-as-minimum, SliderClamping::Always default, Window title-derived ids (our
+  explicit `.id()`s still needed) — all unchanged. **0.35 FIXED the panel-persistence bug upstream**: PanelState
+  now stores the chosen `outer_rect` (not the content rect) and skips storing mid-drag — the pre-tiles dock bug
+  class no longer exists in 0.35 panels (calculus changes if panels are ever wanted back; tiles kept per user
+  decision). NEW 0.35 hazard: a side panel whose CONTENT measures wider than the panel re-anchors its measured
+  rect on the overflowed edge and shifts the central-region cursor over the column (0.34 clipped silently).
+  Found: the override stepper row (5 free-flow buttons ≈283px) and sv "Snabbmatning 100%" row overflowed the
+  286px column; plus sub-2px fractional font overflows. Fix = `views::contained()` (detached child ui pinned to
+  the panel rect — child overflow can never expand a parent) around both column bodies, width-splitting
+  `button_row` for the steppers, truncating right-aligned rapid row, and the
+  `the_side_columns_never_overflow_their_fixed_widths_in_any_locale` guard test (en+sv, PanelState-asserted).
+  Rename memo: this file's title says 0.34; entries above predate the 0.35 bump but were all re-verified on it.

@@ -3,4 +3,4 @@
 - [Snapshot harness](snapshot-harness.md) — GPU snapshot suite: run/regenerate commands, kittest 8px inset, fixture rules
 - [egui 0.34 layout gotchas](egui-034-layout-gotchas.md) — RTL horizontal(), TextEdit sizing, panel resize band, dual dock ids, glyph coverage, no rustfmt
 - [egui-elegance verdict](egui-elegance-verdict.md) — passed on adopting the widget crate (theming coherence); rationale + when to revisit
-- [egui_tiles verdict](egui-tiles-verdict.md) — passed on the tiling crate (fixed chrome vs rearrangeable tiles); revisit if dockable panels become a goal
+- [egui_tiles verdict](egui-tiles-verdict.md) — REVERSED: tiles 0.15 now hosts the viewport/console split after 3 failed panel fixes; shape + persistence choices

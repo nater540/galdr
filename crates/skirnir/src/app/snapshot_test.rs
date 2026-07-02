@@ -160,7 +160,7 @@ fn snapshot_toolbar(name: &str, width: f32, view: ViewState, ui: UiState, locale
         egui::Panel::top("toolbar")
           .exact_size(Metrics::TOOLBAR_H)
           .frame(egui::Frame::NONE.fill(palette.panel_alt))
-          .show_inside(ui, |ui| super::views::toolbar(ui, &state.view, &mut state.ui, &mut sink));
+          .show(ui, |ui| super::views::toolbar(ui, &state.view, &mut state.ui, &mut sink));
         state.intents.extend(sink.drain());
       },
       state,
@@ -186,22 +186,25 @@ fn snapshot_toolbar(name: &str, width: f32, view: ViewState, ui: UiState, locale
   harness.snapshot(name);
 }
 
-/// Render the bottom dock (via the real `views::dock_panel`) at 2× density — the close-up for console/MDI review.
+/// Render the dock CONTENT at 2× density on its pane surface (the same fill + margins the tiles pane gives it)
+/// — the close-up for console/MDI review. The hosting split geometry is covered by the full-shell shots.
 fn snapshot_dock(name: &str, view: ViewState, ui: UiState, locale: &str) {
   use super::intent::IntentSink;
-  use super::metrics::Metrics;
   let _locale = render_in(locale);
   let palette = ui.style.palette;
   let state = HarnessState::new(view, ui);
   let time = no_time();
   let mut harness = egui_kittest::Harness::builder()
-    .with_size(egui::vec2(900.0, Metrics::DOCK_H + Metrics::STATUS_BAR_H + 16.0))
+    .with_size(egui::vec2(900.0, 212.0))
     .with_pixels_per_point(2.0)
     .build_ui_state(
       move |ui, state: &mut HarnessState| {
         let mut sink = IntentSink::new();
-        egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |_ui| {});
-        super::views::dock_panel(ui, &state.view, &mut state.ui, time, None, &mut sink);
+        let palette = state.ui.style.palette;
+        egui::Frame::new().fill(palette.panel).inner_margin(egui::Margin::symmetric(8, 2)).show(ui, |ui| {
+          ui.set_min_size(ui.available_size());
+          super::views::dock(ui, &state.view, &mut state.ui, time, None, &mut sink);
+        });
         state.intents.extend(sink.drain());
       },
       state,

@@ -107,17 +107,13 @@ impl Metrics {
   /// Override slider track height (`height:6px`, design §03).
   pub const SLIDER_H: f32 = 6.0;
 
-  // ── Bottom dock (design §03) ───────────────────────────────────────────────────────────────────────────
-  /// Bottom dock DEFAULT height (`height:200px`, design §03). The dock panel is vertically resizable; this is
-  /// where a fresh session opens it.
-  pub const DOCK_H: f32 = 200.0;
-  /// The smallest height the dock may be dragged down to: the 30px tab strip plus enough body for the console's
-  /// controls row, a couple of log lines, and the MDI input — below this the body degrades into clipped chrome,
-  /// so the resize clamps here (collapse is the deliberate way to go smaller).
+  // ── Bottom dock ────────────────────────────────────────────────────────────────────────────────────────
+  /// The smallest height either side of the central viewport/dock split may be dragged down to (the egui_tiles
+  /// `Behavior::min_size`): the 30px tab strip plus enough body for the console's controls row, a couple of log
+  /// lines, and the MDI input — below this the body degrades into clipped chrome, so the divider clamps here
+  /// (collapse is the deliberate way to go smaller). The design's 200px opening height now lives as the default
+  /// split share, [`crate::profile::DEFAULT_DOCK_FRACTION`].
   pub const DOCK_MIN_H: f32 = 120.0;
-  /// The fraction of the remaining window height the dock may be dragged up to. Caps the resize so the dock can
-  /// never swallow the DRO/jog columns and the toolpath viewport entirely; the columns stay usable above it.
-  pub const DOCK_MAX_FRACTION: f32 = 0.75;
   /// Bottom dock height when collapsed: just the 30px tab strip stays visible so the operator can still read
   /// the tabs and re-expand, while the body (console/program) is hidden and the viewport reclaims the space.
   pub const DOCK_COLLAPSED_H: f32 = Self::HEADER_H;
@@ -194,7 +190,6 @@ mod tests {
     assert_eq!(Metrics::TAB_UNDERLINE, 2.0);
     assert_eq!(Metrics::PROGRESS_W, 260.0);
     assert_eq!(Metrics::PROGRESS_H, 6.0);
-    assert_eq!(Metrics::DOCK_H, 200.0);
   }
 
   // The comparisons ARE constant — that is the point: this test exists to break loudly if someone reorders the
@@ -202,13 +197,10 @@ mod tests {
   #[allow(clippy::assertions_on_constants)]
   #[test]
   fn dock_size_bounds_are_ordered() {
-    // The resizable dock's clamps must nest sanely: the collapsed strip is smaller than the drag minimum, which
-    // is smaller than the default opening height; the max fraction leaves real room for the columns above.
-    // (The old pinned-height resolver `dock_height` was removed when the dock became resizable — the panel's
-    // height policy now lives in `views::dock_panel` and is exercised by the drag-resize interaction test.)
+    // The split's clamps must nest sanely: the collapsed strip is smaller than the drag minimum. (The resizable
+    // panel's DOCK_H/DOCK_MAX_FRACTION were retired with the egui_tiles migration — the opening height is the
+    // default split share in `crate::profile`, exercised by the divider-drag interaction test.)
     assert!(Metrics::DOCK_COLLAPSED_H < Metrics::DOCK_MIN_H);
-    assert!(Metrics::DOCK_MIN_H < Metrics::DOCK_H);
-    assert!(Metrics::DOCK_MAX_FRACTION > 0.0 && Metrics::DOCK_MAX_FRACTION < 1.0);
   }
 
   #[test]
