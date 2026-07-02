@@ -1984,7 +1984,8 @@ impl eframe::App for SkirnirApp {
       // Give the window a real default size and let it resize in both axes; the settings list inside fills the
       // available height (see `settings`), so dragging the bottom edge actually grows the list rather than
       // snapping back to a fixed content height (the prior vertical-resize stall).
-      egui::Window::new("Settings").open(&mut open).resizable(true).default_size([340.0, 460.0]).show(&ctx, |ui| {
+      egui::Window::new(crate::tr!("settings-window-title")).open(&mut open).resizable(true)
+        .default_size([340.0, 460.0]).show(&ctx, |ui| {
         views::settings(ui, &self.view, &mut self.ui, &mut sink);
       });
       // The window's `X` set `open` false. With unsaved edits staged, defer the close behind the discard

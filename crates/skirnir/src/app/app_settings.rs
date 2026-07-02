@@ -146,7 +146,7 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
             group = this_group;
             ui.add_space(6.0);
             ui.label(
-              RichText::new(this_group.to_ascii_uppercase())
+              RichText::new(crate::tr!(group_display_key(this_group)).to_uppercase())
                 .size(Metrics::HEADER_TEXT)
                 .color(palette.text_dim)
                 .strong()
@@ -204,6 +204,22 @@ pub(crate) fn language_display_name(tag: &str) -> String {
     "en-US" => "English (US)".to_string(),
     "sv-SE" => "Svenska".to_string(),
     other => other.to_string(),
+  }
+}
+
+/// The i18n message key for a colour-editor group header, mapped from the stable identity string [`group_for`]
+/// returns. Kept separate from `group_for` so the group's identity (used for change detection) stays a plain
+/// `&str` while only the displayed header is localized. The total match mirrors `group_for`'s outputs.
+fn group_display_key(group: &str) -> &'static str {
+  match group {
+    "accents" => "theme-group-accents",
+    "text" => "theme-group-text",
+    "machine states" => "theme-group-states",
+    "alarm surface" => "theme-group-alarm",
+    "console" => "theme-group-console",
+    "toolpath" => "theme-group-toolpath",
+    "chrome & surfaces" => "theme-group-chrome",
+    _ => "theme-group-other",
   }
 }
 
