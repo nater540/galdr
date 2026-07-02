@@ -42,3 +42,16 @@ ports-found = { $count ->
 
 # Recoverable error surfaced when a port cannot be opened.
 error-port-open = Could not open port { $port }: { $reason }
+
+# App settings dialog — language/theme/font-scale (host-side appearance, distinct from the firmware Settings).
+app-settings-title = Application Settings
+app-settings-language = Language
+app-settings-theme = Theme
+app-settings-font-scale = Font scale
+app-settings-new-theme-hint = new theme name…
+app-settings-create = Create from current
+app-settings-create-hint = Snapshot the active colors into a new editable theme
+app-settings-builtin-hint = Built-in themes are read-only — create a copy to customize its colors.
+app-settings-save = Save to config.json
+app-settings-save-hint = Write the current settings to the config file (rewrites the whole file)
+app-settings-unsaved = unsaved changes

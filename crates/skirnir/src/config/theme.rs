@@ -263,6 +263,36 @@ impl ThemeOverride {
     base
   }
 
+  /// Capture a resolved [`Palette`] back into a FULLY-KEYED override: every colour field `Some`, `base: None`.
+  /// This is how the in-app theme editor materialises a new user theme — it snapshots whatever palette is active
+  /// into concrete per-token values, so every colour picker has a real value to edit and the theme no longer
+  /// depends on its base changing underneath it. Generated from the single [`palette_color_fields!`] list, so a
+  /// new palette token extends this automatically.
+  pub fn from_palette(palette: &Palette) -> Self {
+    macro_rules! capture {
+      ($($field:ident),+ $(,)?) => {
+        ThemeOverride {
+          base: None,
+          $($field: Some(ColorSpec::from_color32(palette.$field)),)+
+        }
+      };
+    }
+    palette_color_fields!(capture)
+  }
+
+  /// Every colour slot as `(token name, mutable slot)`, in the palette's declaration order — the theme editor's
+  /// iteration surface, so the picker list is generated from the same single [`palette_color_fields!`] list as the
+  /// resolution logic and can never miss a token. The name is the `Palette` field ident (also the config's JSON
+  /// key), so what the editor shows is exactly what the file says.
+  pub fn color_entries_mut(&mut self) -> Vec<(&'static str, &mut Option<ColorSpec>)> {
+    macro_rules! entries {
+      ($($field:ident),+ $(,)?) => {
+        vec![$((stringify!($field), &mut self.$field),)+]
+      };
+    }
+    palette_color_fields!(entries)
+  }
+
   /// Whether EVERY overridable colour field is `Some` — i.e. this override names every token, not just a subset.
   /// Used to guard the bundled `config.default.json`'s self-documenting template theme: if a new palette token is
   /// added but the template entry is not extended, this returns `false` and the asset test fails, so the template
@@ -435,6 +465,42 @@ mod tests {
     assert_eq!(notice, None, "a self-referential `base: \"default\"` must resolve cleanly, not trip the depth guard");
     assert_eq!(palette.accent_motion, Color32::from_rgb(0xFF, 0x00, 0xFF), "the override applies");
     assert_eq!(palette.panel, Palette::default_dark().panel, "unset fields inherit the built-in default");
+  }
+
+  #[test]
+  fn from_palette_captures_every_token_and_reproduces_the_palette_over_any_base() {
+    // The editor's materialise step: capturing midnight must yield a fully-keyed override that resolves back to
+    // exactly midnight even over a completely different base — no token may leak through from the base.
+    let captured = ThemeOverride::from_palette(&Palette::midnight());
+    assert!(captured.all_color_fields_set(), "a captured palette must name every token");
+    assert_eq!(captured.base, None, "a captured theme carries no base dependency");
+    assert_eq!(captured.apply_over(Palette::light_slate()), Palette::midnight(),
+      "applying the capture over an unrelated base must reproduce the captured palette exactly");
+  }
+
+  #[test]
+  fn color_entries_mut_iterates_every_token_with_its_config_key_name() {
+    // The editor iterates `color_entries_mut`; if it missed a token the picker list would silently go stale. A
+    // fully-keyed override must expose all-Some entries, unique names, and clearing one through the entry must
+    // clear the real field.
+    let mut theme = ThemeOverride::from_palette(&Palette::default_dark());
+    let mut names: Vec<&'static str> = Vec::new();
+    for (name, slot) in theme.color_entries_mut() {
+      assert!(slot.is_some(), "a captured theme exposes a concrete value for {name}");
+      names.push(name);
+    }
+    let count = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), count, "token names must be unique");
+    assert!(names.contains(&"accent") && names.contains(&"toolpath_cut"), "names are the Palette field idents");
+    // Mutating through an entry hits the real field.
+    for (name, slot) in theme.color_entries_mut() {
+      if name == "accent" {
+        *slot = ColorSpec::parse("#123456");
+      }
+    }
+    assert_eq!(theme.accent, ColorSpec::parse("#123456"));
   }
 
   #[test]

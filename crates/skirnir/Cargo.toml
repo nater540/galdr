@@ -75,13 +75,15 @@ eframe = { version = "0.34.3", optional = true, default-features = false, featur
 rfd = { version = "0.17.2", optional = true }
 
 [dev-dependencies]
-# The egui UI test harness (kittest + AccessKit), version-matched to egui 0.34. We deliberately take it with
-# NO default features: the `wgpu`/`snapshot` features pull a GPU backend for image-snapshot tests, which we do
-# not use yet — our UI tests drive real pointer interaction over egui's tessellation only, so they run
-# headless/CI-clean with no GPU. Image-snapshot (pixel-diff) tests would need the `wgpu` feature and are a
-# later add. The harness + its tests are `#[cfg(all(test, feature = "gui"))]` (they need `eframe::egui`), so
-# they compile only for the gui-featured test build; a `--no-default-features` test run skips them.
-egui_kittest = { version = "0.34.3", default-features = false }
+# The egui UI test harness (kittest + AccessKit), version-matched to egui 0.34. The interaction tests drive
+# real pointer input over egui's tessellation only and run headless/CI-clean with no GPU. The `wgpu` +
+# `snapshot` features additionally enable the IMAGE-snapshot path (`src/app/snapshot_test.rs`): offscreen
+# wgpu renders diffed against committed PNG baselines under `tests/snapshots/`. Those tests are `#[ignore]`d
+# so a plain `cargo test` (and GPU-less CI) never requires a GPU — run them explicitly with
+# `cargo test -p skirnir -- --ignored snapshot` (and `UPDATE_SNAPSHOTS=1` to regenerate baselines). The
+# harness + its tests are `#[cfg(all(test, feature = "gui"))]` (they need `eframe::egui`), so they compile
+# only for the gui-featured test build; a `--no-default-features` test run skips them.
+egui_kittest = { version = "0.34.3", default-features = false, features = ["wgpu", "snapshot"] }
 # The current-thread runtime + test macro are enough to drive the async engine tests; paused-time helpers
 # come from the `time` feature already enabled above.
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "io-util", "time", "test-util"] }

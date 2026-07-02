@@ -104,13 +104,128 @@ pub(crate) fn build_docked_panel_harness(
     .build_ui_state(
       move |ui, state: &mut HarnessState| {
         let mut sink = IntentSink::new();
-        // Mirror the shell: a status bar then the dock panel pinned to its exact height, both bottom-anchored, so
-        // the dock body sees the same constrained height the real app gives it.
+        // Mirror the shell: a status bar then the REAL dock panel (`views::dock_panel`, the same code the app
+        // runs), so the dock body sees exactly the height policy the real app gives it.
         egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |_ui| {});
-        let dock_h = Metrics::dock_height(state.ui.dock_collapsed);
-        egui::Panel::bottom("dock").resizable(false).exact_size(dock_h).show_inside(ui, |ui| {
-          views::dock(ui, &state.view, &mut state.ui, time, None, &mut sink);
-        });
+        views::dock_panel(ui, &state.view, &mut state.ui, time, None, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    )
+}
+
+/// Lay out the FULL application shell exactly as [`super::SkirnirApp`]'s frame does — toolbar, alarm banner,
+/// status bar, bottom dock, the fixed left/right columns, and the central toolpath viewport — driven by a
+/// [`HarnessState`] instead of the live app (no engine, no runtime, no I/O). This is the shared surface for
+/// whole-window tests: the snapshot suite renders it offscreen and diffs the pixels, and interaction tests can
+/// drive pointer input against the real panel geometry. Mirrors `SkirnirApp::ui`'s layout; if the shell's panel
+/// arrangement changes, change this in step (the snapshot baselines will flag any drift on the next run).
+pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: super::progress::TimeEstimate) {
+  use crate::app::metrics::Metrics;
+  let palette = state.ui.style.palette;
+  let mut sink = IntentSink::new();
+  egui::Panel::top("toolbar")
+    .exact_size(Metrics::TOOLBAR_H)
+    .frame(egui::Frame::NONE.fill(palette.panel_alt))
+    .show_inside(ui, |ui| views::toolbar(ui, &state.view, &mut state.ui, &mut sink));
+  if state.view.banner.is_some() {
+    egui::Panel::top("banner").show_inside(ui, |ui| views::alarm_banner(ui, palette, &state.view, &mut sink));
+  }
+  egui::Panel::bottom("status")
+    .exact_size(Metrics::STATUS_BAR_H)
+    .show_inside(ui, |ui| views::status_bar(ui, &state.view, &state.ui));
+  views::dock_panel(ui, &state.view, &mut state.ui, time, None, &mut sink);
+  let column_frame = egui::Frame::NONE.fill(palette.panel);
+  egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
+    .show_inside(ui, |ui| {
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        views::dro(ui, &state.view, &mut state.ui, &mut sink);
+        ui.separator();
+        views::jog(ui, &state.view, &mut state.ui, &mut sink);
+      });
+    });
+  egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
+    .show_inside(ui, |ui| {
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        views::overrides(ui, &state.view, &mut state.ui, &mut sink);
+        ui.separator();
+        views::probe(ui, &state.view, &mut state.ui, &mut sink);
+        ui.separator();
+        views::rotary_center(ui, &state.view, &mut state.ui, None, false, &mut sink);
+        ui.separator();
+        views::verify_measure(ui, &state.view, &mut state.ui, None, &mut sink);
+      });
+    });
+  egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
+    views::toolpath(ui, &state.view, &mut state.ui);
+  });
+  state.intents.extend(sink.drain());
+}
+
+/// Build a kittest harness that renders the full [`shell_layout`] at the given window size, folding each frame's
+/// intents into the [`HarnessState`]. The bundled locales are initialised (idempotently) so the `tr!` labels
+/// render as real strings, and the app's fonts + theme are applied to the context so the harness paints exactly
+/// what the window would. Used by the snapshot suite and available to whole-window interaction tests.
+pub(crate) fn build_shell_harness(
+  state: HarnessState, size: egui::Vec2, time: super::progress::TimeEstimate,
+) -> Harness<'static, HarnessState> {
+  // The toolbar labels go through `tr!`; seed the global registry so they render as words, not raw keys. Errors
+  // are ignored — a bundled-locale parse failure would already fail the i18n unit tests.
+  let _ = crate::i18n::init();
+  let palette = state.ui.style.palette;
+  let harness = Harness::builder().with_size(size).build_ui_state(
+    move |ui, state: &mut HarnessState| shell_layout(ui, state, time),
+    state,
+  );
+  super::fonts::install(&harness.ctx);
+  super::shell::apply_theme(&harness.ctx, &palette, 1.0);
+  harness
+}
+
+/// Build a kittest harness that renders the real [`views::jog`] pad at the app's exact left-column width, so the
+/// XY grid, the Z/A columns, and the step selector lay out with the geometry the real window gives them.
+pub(crate) fn build_jog_harness(state: HarnessState) -> Harness<'static, HarnessState> {
+  use crate::app::metrics::Metrics;
+  Harness::builder()
+    .with_size(egui::vec2(Metrics::LEFT_COL_W, 320.0))
+    .build_ui_state(
+      |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        views::jog(ui, &state.view, &mut state.ui, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    )
+}
+
+/// Build a kittest harness that renders the real [`views::dro`] at the app's exact left-column width.
+pub(crate) fn build_dro_harness(state: HarnessState) -> Harness<'static, HarnessState> {
+  use crate::app::metrics::Metrics;
+  Harness::builder()
+    .with_size(egui::vec2(Metrics::LEFT_COL_W, 420.0))
+    .build_ui_state(
+      |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        views::dro(ui, &state.view, &mut state.ui, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    )
+}
+
+/// Build a kittest harness that renders the app settings dialog BODY ([`crate::app::app_settings::body`]) with a
+/// given loaded config (dirty, so the Save button is enabled), folding each frame's intents into the state. The
+/// bundled locales are initialised so the `tr!` labels render as real strings the tests can query by.
+pub(crate) fn build_app_settings_harness(
+  state: HarnessState, config: crate::config::Config,
+) -> Harness<'static, HarnessState> {
+  let _ = crate::i18n::init();
+  Harness::builder()
+    .with_size(egui::vec2(440.0, 600.0))
+    .build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        crate::app::app_settings::body(ui, &mut state.ui, &config, true, &mut sink);
         state.intents.extend(sink.drain());
       },
       state,
@@ -413,6 +528,93 @@ mod tests {
   }
 
   #[test]
+  fn the_jog_pad_offers_a_rotary_a_jog_that_emits_an_a_axis_step_jog() {
+    // DOC-10: the rotary A axis jogs like Z — a fixed-step `$J=` move — via dedicated A+/A− controls beside the
+    // Z column. Clicking each must emit a step `Intent::Jog` on `Axis::A` in the matching direction, carrying the
+    // selected step (degrees, by the degrees-as-mm convention) and feed.
+    use crate::app::intent::{Axis, Dir};
+    let mut ui = UiState::default();
+    ui.jog_step = 5.0;
+    ui.jog_feed = 400.0;
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_jog_harness(state);
+    harness.run();
+
+    harness.get_by_label("A+").click();
+    harness.run();
+    harness.get_by_label("A−").click();
+    harness.run();
+
+    let jogs: Vec<(Axis, Dir)> = harness
+      .state()
+      .intents
+      .iter()
+      .filter_map(|i| match i {
+        Intent::Jog { axis: Axis::A, dir, distance, feed } => {
+          assert_eq!(*distance, 5.0, "the A jog carries the selected step");
+          assert_eq!(*feed, 400.0, "the A jog carries the selected feed");
+          Some((Axis::A, *dir))
+        }
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      jogs,
+      vec![(Axis::A, Dir::Pos), (Axis::A, Dir::Neg)],
+      "A+ then A− must emit one A-axis step jog each, in order: {:?}",
+      harness.state().intents
+    );
+  }
+
+  #[test]
+  fn the_rotary_a_jog_is_disabled_outside_idle_and_jog() {
+    // The same `$J=` gate as every other jog control: in Alarm the A buttons render disabled and a click commands
+    // nothing — never offer a control the firmware is guaranteed to reject (and that would be unsafe on a fault).
+    let mut view = ViewState::default();
+    view.connection = ConnectionState::Alarm;
+    let state = HarnessState::new(view, UiState::default());
+    let mut harness = build_jog_harness(state);
+    harness.run();
+    if let Some(node) = harness.query_by_label("A+") {
+      node.click();
+      harness.run();
+    }
+    assert!(
+      !harness.state().intents.iter().any(|i| matches!(i, Intent::Jog { .. } | Intent::JogStart { .. })),
+      "a disabled A jog must not emit any jog intent: {:?}",
+      harness.state().intents
+    );
+  }
+
+  #[test]
+  fn the_dro_shows_an_a_axis_row_only_when_the_firmware_reports_four_axes() {
+    // A rotary-enabled firmware reports 4-field positions (DOC-10); the DRO must then show an A row (in degrees).
+    // A plain 3-axis report must NOT grow a phantom A row.
+    let mut view3 = ViewState::default();
+    view3.connection = ConnectionState::Idle;
+    view3.apply(crate::engine::Event::Response(crate::protocol::Response::Status(
+      "Idle|MPos:1.000,2.000,3.000|WCO:0.000,0.000,0.000".to_string(),
+    )));
+    let mut harness = build_dro_harness(HarnessState::new(view3, UiState::default()));
+    harness.run();
+    assert!(harness.query_by_label("A").is_none(), "a 3-axis report must not render an A row");
+
+    let mut view4 = ViewState::default();
+    view4.connection = ConnectionState::Idle;
+    view4.apply(crate::engine::Event::Response(crate::protocol::Response::Status(
+      "Idle|MPos:1.000,2.000,3.000,45.000|WCO:0.000,0.000,0.000,0.000".to_string(),
+    )));
+    let mut harness = build_dro_harness(HarnessState::new(view4, UiState::default()));
+    harness.run();
+    assert!(harness.query_by_label("A").is_some(), "a 4-axis report must render the A row");
+    // The DRO pads values to 8 columns (`{:>8.3}`), so the rendered label carries leading spaces.
+    assert!(
+      harness.query_by_label(&format!("{:>8.3}", 45.0)).is_some(),
+      "the A row must carry the reported angle"
+    );
+  }
+
+  #[test]
   fn the_transport_group_stop_button_issues_the_graceful_program_stop_not_a_soft_reset() {
     // The everyday Stop is the GRACEFUL program stop (`0x86`): clicking it must emit ProgramStop and must NOT emit
     // the hard SoftReset — the regression this guards is Stop secretly alarming the controller.
@@ -470,7 +672,7 @@ mod tests {
     let mut harness = build_transport_group_harness(state);
     harness.run();
 
-    harness.get_by_label("∿ Simulate").click();
+    harness.get_by_label("≈ Simulate").click();
     harness.run();
 
     assert!(
@@ -486,8 +688,8 @@ mod tests {
     let state = HarnessState::new(ViewState::default(), UiState::default());
     let mut harness = build_transport_group_harness(state);
     harness.run();
-    assert!(harness.query_by_label("∿ Simulate").is_some(), "the Simulate control is present even with no program");
-    if let Some(node) = harness.query_by_label("∿ Simulate") {
+    assert!(harness.query_by_label("≈ Simulate").is_some(), "the Simulate control is present even with no program");
+    if let Some(node) = harness.query_by_label("≈ Simulate") {
       node.click();
       harness.run();
     }
@@ -553,6 +755,212 @@ mod tests {
   }
 
   #[test]
+  fn creating_a_theme_snapshots_the_active_palette_and_selects_it() {
+    // The app settings "Create from current" flow: with a name typed, clicking Create must emit a fully-keyed
+    // UpsertTheme snapshotting the ACTIVE palette, then a SetActiveTheme for it, and clear the draft field.
+    let mut ui = UiState::default();
+    ui.theme_name_draft = "shop-red".to_string();
+    let state = HarnessState::new(ViewState::default(), ui);
+    let mut harness = build_app_settings_harness(state, crate::config::Config::default());
+    harness.run();
+
+    harness.get_by_label("Create from current").click();
+    harness.run();
+
+    let intents = &harness.state().intents;
+    let upsert = intents
+      .iter()
+      .find_map(|i| match i {
+        Intent::UpsertTheme { name, theme } => Some((name.clone(), theme.clone())),
+        _ => None,
+      })
+      .expect("Create must emit an UpsertTheme");
+    assert_eq!(upsert.0, "shop-red");
+    assert!(upsert.1.all_color_fields_set(), "the created theme snapshots every token, so every picker is concrete");
+    assert!(
+      intents.iter().any(|i| matches!(i, Intent::SetActiveTheme(name) if name == "shop-red")),
+      "the created theme becomes active: {intents:?}"
+    );
+    assert!(harness.state().ui.theme_name_draft.is_empty(), "the name draft clears once created");
+  }
+
+  #[test]
+  fn the_toolbar_gear_toggles_the_app_settings_dialog() {
+    // The ⚙ ghost button beside the state badge opens (and closes) the app settings dialog.
+    let state = HarnessState::new(view_idle(), UiState::default());
+    let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+    harness.run();
+    assert!(!harness.state().ui.app_settings_open);
+    harness.get_by_label("⚙").click();
+    harness.run();
+    assert!(harness.state().ui.app_settings_open, "clicking the gear must open the app settings dialog");
+    harness.get_by_label("⚙").click();
+    harness.run();
+    assert!(!harness.state().ui.app_settings_open, "clicking it again must close the dialog");
+  }
+
+  #[test]
+  fn the_theme_name_field_matches_the_height_of_the_button_beside_it() {
+    // The user-flagged inconsistency: text inputs must sit at the same control height as adjacent buttons. The
+    // "new theme name…" field and its "Create from current" button share a row, so their heights must agree.
+    let state = HarnessState::new(ViewState::default(), UiState::default());
+    let mut harness = build_app_settings_harness(state, crate::config::Config::default());
+    harness.run();
+    let field = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
+    let button = harness.get_by_label("Create from current").rect();
+    assert!(
+      (field.height() - button.height()).abs() <= 1.5,
+      "the theme-name field ({}px) must match the Create button height ({}px)",
+      field.height(),
+      button.height()
+    );
+  }
+
+  #[test]
+  fn editing_a_user_theme_color_through_the_picker_updates_the_config_and_palette() {
+    // The end-to-end colour-picker proof: click a swatch in a USER theme → the picker popup opens → commit a new
+    // channel value → the theme in the config, the RESOLVED live palette, and the unsaved marker all update. The
+    // rig folds drained intents back the way `SkirnirApp::handle_intent` does (upsert + re-resolve), so the test
+    // observes the live UI updating, not just an intent being emitted.
+    use egui::accesskit::Role;
+    struct Rig {
+      ui: UiState,
+      config: crate::config::Config,
+      dirty: bool,
+    }
+    let mut config = crate::config::Config::default();
+    let captured = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::default_dark());
+    config.appearance.themes.insert("fixture-theme".to_string(), captured);
+    config.appearance.active_theme = "fixture-theme".to_string();
+    let _ = crate::i18n::init();
+    let rig = Rig { ui: UiState::default(), config, dirty: false };
+    let mut harness = Harness::builder().with_size(egui::vec2(460.0, 640.0)).build_ui_state(
+      |ui, rig: &mut Rig| {
+        let mut sink = IntentSink::new();
+        crate::app::app_settings::body(ui, &mut rig.ui, &rig.config, rig.dirty, &mut sink);
+        for intent in sink.drain() {
+          match intent {
+            Intent::UpsertTheme { name, theme } => {
+              rig.config.appearance.themes.insert(name, theme);
+              rig.dirty = true;
+              let (palette, _) = rig.config.palette();
+              rig.ui.style.palette = palette;
+            }
+            Intent::SetActiveTheme(name) => {
+              rig.config.appearance.active_theme = name;
+              let (palette, _) = rig.config.palette();
+              rig.ui.style.palette = palette;
+            }
+            _ => {}
+          }
+        }
+      },
+      rig,
+    );
+    harness.run();
+
+    // The swatches appear in `color_entries_mut` declaration order; index 10 is `accent` (#0E86D4, R = 0x0E).
+    let spin_count_before = harness.query_all_by_role(Role::SpinButton).count();
+    {
+      let swatches: Vec<_> = harness.query_all_by_role(Role::ColorWell).collect();
+      assert!(swatches.len() > 10, "the user-theme editor must render a swatch per token, got {}", swatches.len());
+      swatches[10].click();
+    }
+    harness.run();
+
+    // The popup contributes the R/G/B channel DragValues (spin buttons) beyond those already in the dialog.
+    {
+      let spins: Vec<_> = harness.query_all_by_role(Role::SpinButton).collect();
+      assert!(
+        spins.len() > spin_count_before,
+        "clicking a swatch must open the picker popup (spin buttons {} -> {})",
+        spin_count_before,
+        spins.len()
+      );
+      // Focus the popup's first channel field (R) and type a new value; Enter commits the DragValue edit.
+      spins[spin_count_before].focus();
+    }
+    harness.run();
+    {
+      let spins: Vec<_> = harness.query_all_by_role(Role::SpinButton).collect();
+      spins[spin_count_before].type_text("255");
+    }
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+
+    let theme = harness
+      .state()
+      .config
+      .appearance
+      .themes
+      .get("fixture-theme")
+      .expect("the fixture theme stays present");
+    let accent = theme.accent.expect("the fixture theme is fully keyed");
+    assert_eq!(accent.r, 255, "the picker edit must land in the theme's accent red channel, got {accent:?}");
+    assert_eq!(
+      harness.state().ui.style.palette.accent.r(),
+      255,
+      "the LIVE resolved palette must carry the edited colour"
+    );
+    assert!(harness.state().dirty, "a colour edit must raise the unsaved-changes marker");
+  }
+
+  #[test]
+  fn the_app_settings_save_button_emits_save_config() {
+    // The explicit save boundary: the Save button (enabled — the harness renders dirty=true) emits SaveConfig
+    // and nothing writes the file implicitly before that.
+    let state = HarnessState::new(ViewState::default(), UiState::default());
+    let mut harness = build_app_settings_harness(state, crate::config::Config::default());
+    harness.run();
+    harness.get_by_label("Save to config.json").click();
+    harness.run();
+    assert!(
+      harness.state().intents.iter().any(|i| matches!(i, Intent::SaveConfig)),
+      "Save must emit Intent::SaveConfig: {:?}",
+      harness.state().intents
+    );
+  }
+
+  #[test]
+  fn the_console_dock_resizes_vertically_by_dragging_its_top_edge() {
+    // The dock is a resizable bottom panel: dragging its top edge upward must GROW the dock (the tab strip moves
+    // up with it) and the MDI input must stay visible at the bottom. Uses the real `views::dock_panel` inside the
+    // shell-faithful harness, so this drives egui's actual panel-resize interaction, not a synthetic height.
+    let mut ui = UiState::default();
+    ui.active_tab = views::DockTab::Console;
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_docked_panel_harness(state, zero_time());
+    harness.run();
+
+    let strip_top_before = harness.get_by_label("Console").rect().top();
+
+    // The resize handle is egui's ±5px grab band around the panel's TOP EDGE — computed from the harness layout
+    // (600px window, kittest's 8px root inset, the 24px status bar, the 200px default dock), not from the tab
+    // label, which sits ~10px below the edge (outside the band — aiming there grabs nothing). Drag it 80px up.
+    let dock_top = 600.0 - 8.0 - Metrics::STATUS_BAR_H - Metrics::DOCK_H;
+    let handle = egui::pos2(450.0, dock_top);
+    let target = egui::pos2(450.0, dock_top - 80.0);
+    harness.hover_at(handle);
+    harness.drag_at(handle);
+    harness.hover_at(egui::pos2(450.0, dock_top - 40.0));
+    harness.hover_at(target);
+    harness.drop_at(target);
+    harness.run();
+
+    let strip_top_after = harness.get_by_label("Console").rect().top();
+    assert!(
+      strip_top_before - strip_top_after > 40.0,
+      "dragging the dock's top edge up must grow the dock (strip top {strip_top_before} -> {strip_top_after})"
+    );
+    // The MDI input must still be laid out inside the grown panel — resizing must never cost the command line.
+    assert!(
+      harness.query_by_role(egui::accesskit::Role::TextInput).is_some(),
+      "the MDI input must survive a dock resize"
+    );
+  }
+
+  #[test]
   fn the_console_mdi_field_renders_with_usable_size_through_the_real_docked_panel() {
     // REGRESSION (the field vanished from the Console tab), in TWO parts — both blind spots of a directly-invoked
     // widget harness, both caught here by rendering through the real `Panel::bottom().exact_size` dock path:
@@ -575,8 +983,10 @@ mod tests {
     // is clipped away (the height half of the bug).
     let dock_floor = 600.0 - Metrics::STATUS_BAR_H;
     assert!(
-      rect.height() >= 16.0,
-      "the MDI field must have a usable height, got {}px — clipped by the greedy log scroll area", rect.height()
+      (rect.height() - Metrics::PANEL_CONTROL_H).abs() <= 1.5,
+      "the MDI field must match the {}px control height of the Send button beside it, got {}px",
+      Metrics::PANEL_CONTROL_H,
+      rect.height()
     );
     assert!(
       rect.bottom() <= dock_floor + 1.0,
@@ -635,6 +1045,34 @@ mod tests {
       "Enter must submit the typed `$` command through Intent::SendLine: {:?}", harness.state().intents
     );
     assert!(harness.state().ui.console_input.is_empty(), "the field is cleared after an Enter submit");
+  }
+
+  #[test]
+  fn the_console_mdi_recalls_sent_lines_with_arrow_up_and_down() {
+    // Shell-style history on the command line: after sending a line, ↑ in the focused field recalls it, and ↓
+    // steps back to the (empty) draft. Drives the real console body through the dock harness.
+    let mut ui = UiState::default();
+    ui.console_input = "G0 X1 Y2".to_string();
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_dock_harness(state, zero_time());
+    harness.run();
+
+    // Send the line (clears the field and records it in the history).
+    harness.get_by_label("Send").click_accesskit();
+    harness.run();
+    assert!(harness.state().ui.console_input.is_empty(), "sending clears the field");
+
+    // Focus the field and press ↑: the sent line comes back for editing/re-sending.
+    harness.get_by_role(egui::accesskit::Role::TextInput).focus();
+    harness.run();
+    harness.key_press(egui::Key::ArrowUp);
+    harness.run();
+    assert_eq!(harness.state().ui.console_input, "G0 X1 Y2", "↑ must recall the last sent line");
+
+    // ↓ steps past the newest entry and restores the (empty) draft.
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run();
+    assert!(harness.state().ui.console_input.is_empty(), "↓ past the newest entry restores the empty draft");
   }
 
   #[test]

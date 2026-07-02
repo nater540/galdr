@@ -30,6 +30,11 @@ impl Metrics {
   pub const TOOLBAR_PAD_X: f32 = 10.0;
   /// Gap between toolbar items (`gap:6px`, design §03).
   pub const TOOLBAR_GAP: f32 = 6.0;
+  /// Width of the strip a toolbar group divider occupies (the 1px hairline centred in it). Wider than the line so
+  /// groups are separated by ~19px of air (strip + a [`Self::TOOLBAR_GAP`] each side) versus the 6px within one —
+  /// the grouping must survive even where the subtle hairline is hard to see against the `panelAlt` bar. Kept
+  /// this tight so the full bar (connect group through the ⚙/badge cluster) still fits the 800px minimum window.
+  pub const TOOLBAR_DIVIDER_W: f32 = 7.0;
 
   // ── Section / tab headers (design §03 — the recurring 30px strip) ──────────────────────────────────────
   /// Section-header and tab-strip bar height (`height:30px`, design §03 — DRO/Jog/Overrides/Probe/Settings/
@@ -103,8 +108,16 @@ impl Metrics {
   pub const SLIDER_H: f32 = 6.0;
 
   // ── Bottom dock (design §03) ───────────────────────────────────────────────────────────────────────────
-  /// Bottom dock height (`height:200px`, design §03).
+  /// Bottom dock DEFAULT height (`height:200px`, design §03). The dock panel is vertically resizable; this is
+  /// where a fresh session opens it.
   pub const DOCK_H: f32 = 200.0;
+  /// The smallest height the dock may be dragged down to: the 30px tab strip plus enough body for the console's
+  /// controls row, a couple of log lines, and the MDI input — below this the body degrades into clipped chrome,
+  /// so the resize clamps here (collapse is the deliberate way to go smaller).
+  pub const DOCK_MIN_H: f32 = 120.0;
+  /// The fraction of the remaining window height the dock may be dragged up to. Caps the resize so the dock can
+  /// never swallow the DRO/jog columns and the toolpath viewport entirely; the columns stay usable above it.
+  pub const DOCK_MAX_FRACTION: f32 = 0.75;
   /// Bottom dock height when collapsed: just the 30px tab strip stays visible so the operator can still read
   /// the tabs and re-expand, while the body (console/program) is hidden and the viewport reclaims the space.
   pub const DOCK_COLLAPSED_H: f32 = Self::HEADER_H;
@@ -124,6 +137,10 @@ impl Metrics {
   pub const CONSOLE_PAD_X: f32 = 14.0;
   /// Send-button horizontal padding (`padding:0 16px`, design §03).
   pub const SEND_PAD_X: f32 = 16.0;
+  /// Total height the console reserves for the MDI command strip: the 22px control row plus the strip's 4px
+  /// vertical inner margins and 1px recess border on each side. The log scroll area caps itself to the space
+  /// above this so the command line is never pushed below the panel floor (the vanished-MDI bug).
+  pub const MDI_ROW_H: f32 = Self::PANEL_CONTROL_H + 2.0 * 4.0 + 2.0;
 
   // ── Body grid (design §03) ─────────────────────────────────────────────────────────────────────────────
   /// Left controls column width (`268px`, design §03).
@@ -133,11 +150,15 @@ impl Metrics {
   /// 1px panel divider thickness (`1px dividers`, design §01 stroke notes).
   pub const DIVIDER: f32 = 1.0;
 
-  /// Resolve the bottom dock's pinned height from its collapsed state: the full [`DOCK_H`](Self::DOCK_H) body
-  /// when expanded, or just the [`DOCK_COLLAPSED_H`](Self::DOCK_COLLAPSED_H) tab strip when collapsed. Pure so
-  /// the shell can size the panel deterministically and the choice is unit-tested without a window.
-  pub fn dock_height(collapsed: bool) -> f32 {
-    if collapsed { Self::DOCK_COLLAPSED_H } else { Self::DOCK_H }
+  /// The `TextEdit` margin that sizes a single-line field to exactly [`Self::PANEL_CONTROL_H`], so text inputs
+  /// sit at the same height as the buttons beside them (the user-flagged mismatch). egui sizes a text edit as
+  /// `row_height + vertical margins` — its `min_size.y` is ignored — so the vertical padding must be computed
+  /// from the actual font row height. The odd pixel goes to the bottom, keeping the text on the control's
+  /// optical centreline; a font taller than the control clamps to zero rather than going negative.
+  pub fn text_field_margin(row_height: f32, pad_x: i8) -> Margin {
+    let total = (Self::PANEL_CONTROL_H - row_height).max(0.0).round() as i8;
+    let top = total / 2;
+    Margin { left: pad_x, right: pad_x, top, bottom: total - top }
   }
 }
 
@@ -176,15 +197,32 @@ mod tests {
     assert_eq!(Metrics::DOCK_H, 200.0);
   }
 
+  // The comparisons ARE constant — that is the point: this test exists to break loudly if someone reorders the
+  // dock's height tokens, exactly like the other design-token pin tests in this module.
+  #[allow(clippy::assertions_on_constants)]
   #[test]
-  fn dock_height_resolves_from_collapsed_state() {
-    // Expanded opens at the spec'd 200px dock; collapsed shrinks to just the 30px tab strip so the body hides
-    // and the viewport reclaims the freed 170px.
-    assert_eq!(Metrics::dock_height(false), Metrics::DOCK_H);
-    assert_eq!(Metrics::dock_height(false), 200.0);
-    assert_eq!(Metrics::dock_height(true), Metrics::DOCK_COLLAPSED_H);
-    assert_eq!(Metrics::dock_height(true), Metrics::HEADER_H);
-    assert!(Metrics::dock_height(true) < Metrics::dock_height(false), "collapsing must free vertical space");
+  fn dock_size_bounds_are_ordered() {
+    // The resizable dock's clamps must nest sanely: the collapsed strip is smaller than the drag minimum, which
+    // is smaller than the default opening height; the max fraction leaves real room for the columns above.
+    // (The old pinned-height resolver `dock_height` was removed when the dock became resizable — the panel's
+    // height policy now lives in `views::dock_panel` and is exercised by the drag-resize interaction test.)
+    assert!(Metrics::DOCK_COLLAPSED_H < Metrics::DOCK_MIN_H);
+    assert!(Metrics::DOCK_MIN_H < Metrics::DOCK_H);
+    assert!(Metrics::DOCK_MAX_FRACTION > 0.0 && Metrics::DOCK_MAX_FRACTION < 1.0);
+  }
+
+  #[test]
+  fn text_field_margin_sizes_a_field_to_the_control_height() {
+    // egui sizes a single-line TextEdit as `row_height + vertical margins` (its `min_size.y` is ignored), so
+    // matching the 22px buttons means computing the padding from the font's actual row height. The odd pixel
+    // goes to the bottom, keeping the text on the control's optical centreline.
+    let m = Metrics::text_field_margin(15.0, 6);
+    assert_eq!((m.left, m.right), (6, 6));
+    assert_eq!(m.top + m.bottom, 7, "15px text + 7px pad = the 22px control height");
+    assert!(m.bottom - m.top <= 1, "the split is as even as integers allow");
+    // A font taller than the control clamps to zero padding rather than going negative.
+    let tall = Metrics::text_field_margin(30.0, 0);
+    assert_eq!((tall.top, tall.bottom), (0, 0));
   }
 
   #[test]

@@ -40,3 +40,16 @@ ports-found = { $count ->
 
 # Återställbart fel när en port inte kan öppnas.
 error-port-open = Kunde inte öppna porten { $port }: { $reason }
+
+# Appinställningar — språk/tema/textskala (värdsidan, skilt från firmwarens Inställningar).
+app-settings-title = Programinställningar
+app-settings-language = Språk
+app-settings-theme = Tema
+app-settings-font-scale = Textskala
+app-settings-new-theme-hint = nytt temanamn…
+app-settings-create = Skapa från aktuellt
+app-settings-create-hint = Spara de aktiva färgerna som ett nytt redigerbart tema
+app-settings-builtin-hint = Inbyggda teman är skrivskyddade — skapa en kopia för att anpassa färgerna.
+app-settings-save = Spara till config.json
+app-settings-save-hint = Skriv de aktuella inställningarna till konfigurationsfilen (skriver om hela filen)
+app-settings-unsaved = osparade ändringar
