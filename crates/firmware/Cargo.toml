@@ -109,3 +109,19 @@ capture-reset = []
 # `[MSG:RESET]` replay all stay ON, so whichever way B manifests (K-escape reset, ISR-withhold→dog, or the §13.8
 # alternating hard-lock) leaves a readable breadcrumb. Build+flash combo: `--features provoke-b` (pulls capture-reset).
 provoke-b = ["capture-reset"]
+
+# DIAGNOSTIC continuous-TX build for a scope-free multimeter test of the TMC single-wire bus (GPIO9). When ENABLED,
+# `tmc_manager` skips all normal operation (init/presence/poll) and instead transmits `0x00` bytes back-to-back
+# forever, keeping the TX FIFO saturated. Each `0x00` UART frame is a start bit plus eight zero data bits — 9 of
+# every 10 bit-times low — so a DMM on GPIO9 reads a drooped average near ground when the TX half is healthy,
+# isolating the transmit path from RX. It is PURELY a bench diagnostic (no motion, no comms value); NEVER a
+# production path. Flash it only for the DMM test, then reflash the default build.
+tmc-tx-diag = []
+
+# DIAGNOSTIC repeating-request build for the TMC single-wire bus instrument session (docs/tmc-uart-scope-bringup.md
+# §2). When ENABLED, `tmc_manager` skips all normal operation (loopback/init/presence/poll) and instead loops *send
+# IOIN read to node 0 → wait ~50 ms → repeat, forever* through the full production transport path (half-duplex
+# push-pull transmit, echo drain, reply wait) — a stable ~20 Hz request burst a scope / logic analyzer can trigger
+# on to answer whether the request edges are clean and whether any driver ever drives a reply edge. PURELY a bench
+# diagnostic; NEVER a production path. If combined with `tmc-tx-diag`, the continuous-TX blast wins.
+tmc-scope-diag = []

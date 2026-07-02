@@ -43,6 +43,26 @@ pub const DRV_STATUS: u8 = 0x6F;
 /// `PWMCONF` (0x70): StealthChop PWM auto-scaling configuration.
 pub const PWMCONF: u8 = 0x70;
 
+/// The short mnemonic for a TMC2209 register byte, for the `$I+` init-failure diagnostic (e.g. `err:wGSTAT:to`).
+/// Returns `None` for a register this firmware does not touch, so the caller can fall back to a hex rendering.
+/// Covers exactly the registers the init sequence and status poll use (DOC-03).
+pub fn register_name(reg: u8) -> Option<&'static str> {
+  match reg {
+    GCONF => Some("GCONF"),
+    GSTAT => Some("GSTAT"),
+    IFCNT => Some("IFCNT"),
+    SLAVECONF => Some("SLAVECONF"),
+    IOIN => Some("IOIN"),
+    IHOLD_IRUN => Some("IHOLD_IRUN"),
+    TPOWERDOWN => Some("TPOWERDOWN"),
+    TPWMTHRS => Some("TPWMTHRS"),
+    CHOPCONF => Some("CHOPCONF"),
+    DRV_STATUS => Some("DRV_STATUS"),
+    PWMCONF => Some("PWMCONF"),
+    _ => None,
+  }
+}
+
 // --- GCONF (0x00) field bits ---------------------------------------------------------------------
 
 /// `I_scale_analog`: use the VREF analog input as the current reference (0 ⇒ internal reference, used here).

@@ -79,6 +79,12 @@ pub const ERROR_LINE_OVERFLOW: u8 = 15;
 /// kinematics about how many axes exist.
 pub const AXIS_COUNT: usize = crate::planner::AXES;
 
+/// The single-letter designation of each motion axis, in `MPos`/`[AXS:]` order. The `[AXS:<n>:<letters>]`
+/// build-info line and the `[DRIVER:]` per-axis breakdown both derive their letters from this array, so the
+/// axis-count constant and the letter set can never drift apart (e.g. a 3-axis build cannot advertise a stale
+/// `XYZA`). Sized to [`AXIS_COUNT`] so adding/removing an axis is a one-line change here.
+pub const AXIS_LETTERS: [char; AXIS_COUNT] = ['X', 'Y', 'Z', 'A'];
+
 /// The firmware version string reported in the banner and the `[VER:]` build-info line. grblHAL reports
 /// a grbl-1.1f-compatible version so senders compliant with grbl 1.1f recognize the controller.
 pub const VERSION: &str = "1.1f";
@@ -169,6 +175,11 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     id: 5,
     name: "Setting disabled",
     description: "Homing cycle failure. Homing is not enabled via settings.",
+  },
+  ErrorCode {
+    id: 8,
+    name: "Not idle",
+    description: "Grbl '$' command cannot be used unless Grbl is IDLE. Ensures smooth operation during a job.",
   },
   ErrorCode {
     id: 9,
@@ -601,6 +612,17 @@ impl ControlState {
   /// the consumer gates live execution — together they realize grbl's "jog only from Idle/Jog".
   pub fn jog_allowed(self) -> bool {
     matches!(self, ControlState::Normal | ControlState::Jog)
+  }
+
+  /// Whether a settings-mutating `$` command (`$n=val`, `$Nx=`, `$RST=`, the `$PBX` import) may be accepted
+  /// now. grbl accepts these ONLY while IDLE or ALARMED and rejects them with `error:8` otherwise — settings
+  /// must never change under a running job (the planner/executor would mix old- and new-scale kinematics), and
+  /// Alarm is allowed so a bad value (say a soft-limit travel) can be corrected without unlocking first. Like
+  /// [`jog_allowed`](ControlState::jog_allowed), this gates the LATCHED mode only: `Normal` means Idle-or-Run,
+  /// so the consumer additionally requires live motion to be quiescent — together they realize grbl's
+  /// "settings only when idle". Hold/Jog/Check/Sleep/Tool are rejected outright, as in grbl.
+  pub fn settings_write_allowed(self) -> bool {
+    matches!(self, ControlState::Normal | ControlState::Alarm(_))
   }
 
   /// Latch [`Jog`](ControlState::Jog) on accepting a `$J=` jog. From `Normal` or an existing `Jog` it enters
@@ -1487,10 +1509,12 @@ impl ResponseWriter {
   }
 
   /// The `$I` (or `$I+` when `extended`) build-info response. The base report emits `[VER:]` and
-  /// `[OPT:]`; the extended report adds the grblHAL `[AXS:]`, `[NEWOPT:]`, and `[FIRMWARE:]` lines so a
-  /// sender can detect an extended controller. The `[OPT:]` fields are, in order: options string, block
-  /// buffer size, RX buffer size, axis count, tool-table entries — emitted in exactly the documented
-  /// order so senders that position-parse OPT do not mis-read the buffer sizes. The caller appends `ok`.
+  /// `[OPT:]`; the extended report adds the grblHAL `[AXS:]`, `[NEWOPT:]`, `[FIRMWARE:]`, and `[SIGNALS:]`
+  /// lines so a sender can detect an extended controller and its capabilities. The `[OPT:]` fields are, in
+  /// order: options string, block buffer size, RX buffer size, axis count, tool-table entries — emitted in
+  /// exactly the documented order so senders that position-parse OPT do not mis-read the buffer sizes. The
+  /// live `[DRIVER:]` line is emitted separately by [`ResponseWriter::driver_info`] (it needs hardware
+  /// state). The caller appends `ok`.
   pub fn build_info<const N: usize>(out: &mut String<N>, extended: bool) -> Result<(), FmtError> {
     write!(out, "[VER:{VERSION}.20260616:]\r\n").map_err(|_| FmtError)?;
     write!(
@@ -1500,15 +1524,117 @@ impl ResponseWriter {
     )
     .map_err(|_| FmtError)?;
     if extended {
-      write!(out, "[AXS:{AXIS_COUNT}:XYZA]\r\n").map_err(|_| FmtError)?;
+      // `[AXS:<n>:<letters>]` — derive both the count and the letters from the kinematics constants so the
+      // line can never advertise a letter set that disagrees with [`AXIS_COUNT`] (no hardcoded `XYZA`).
+      write!(out, "[AXS:{AXIS_COUNT}:").map_err(|_| FmtError)?;
+      for letter in AXIS_LETTERS {
+        out.push(letter).map_err(|_| FmtError)?;
+      }
+      out.push_str("]\r\n").map_err(|_| FmtError)?;
       // `ENUMS` advertises the runtime enumeration commands (`$ES`/`$EG`/`$EE`/`$EA`) so a sender builds its
       // settings/error/alarm UI from the controller instead of hardcoding; `RT+` advertises the top-bit-set
       // real-time command forms this module classifies; `SED` advertises the `$SED=<n>` per-setting description
       // command (Phase F). A sender reads these to know it may query the enumerations on connect.
       out.push_str("[NEWOPT:ENUMS,RT+,SED]\r\n").map_err(|_| FmtError)?;
       out.push_str("[FIRMWARE:grblHAL]\r\n").map_err(|_| FmtError)?;
+      // `[SIGNALS:<letters>]` — the input signals this build supports, in the same letter codes as the
+      // realtime `Pn:` status field. Rendered from [`SIGNAL_CAPABILITIES`] via the SAME letter assembly the
+      // `Pn:` element uses, so the two cannot drift. This is a compile-time capability set (which inputs the
+      // firmware can read), independent of whether any is currently asserted.
+      out.push_str("[SIGNALS:").map_err(|_| FmtError)?;
+      SIGNAL_CAPABILITIES.write_letters(out)?;
+      out.push_str("]\r\n").map_err(|_| FmtError)?;
     }
     Ok(())
+  }
+
+  /// The `$I+` `[DRIVER:]` report: the stepper-driver identity plus the live per-axis TMC2209 bus health.
+  /// Emitted only by the extended `$I+` response (after [`build_info`]) because it carries runtime hardware
+  /// state — the `firmware` bin samples the TMC manager's per-axis online flags and hands them in via
+  /// [`DriverStatus`]; this formatter stays pure and host-testable. First line is the fixed `[DRIVER:TMC2209]`
+  /// identity so a sender that only string-matches the driver name still finds it. The second line is the
+  /// per-axis breakdown using the [`AXIS_LETTERS`] designations and an `ok`/`--` state (UART responding vs.
+  /// not detected). Before the init pass has run, `initialized` is `false` and the breakdown is replaced with
+  /// `init pending` so a query during the brief boot window does not falsely report every driver absent. The
+  /// caller appends `ok` for the consumed `$I+` line (this writes no terminator of its own).
+  pub fn driver_info<const N: usize>(out: &mut String<N>, status: &DriverStatus) -> Result<(), FmtError> {
+    out.push_str("[DRIVER:TMC2209]\r\n").map_err(|_| FmtError)?;
+    if !status.initialized {
+      return out.push_str("[DRIVER:TMC2209 init pending]\r\n").map_err(|_| FmtError);
+    }
+    out.push_str("[DRIVER:TMC2209").map_err(|_| FmtError)?;
+    for (axis, &letter) in AXIS_LETTERS.iter().enumerate() {
+      // A present/communicating driver renders `<letter>:ok`; an absent one (no UART reply at init) `<letter>:--`.
+      let state = if status.online.get(axis).copied().unwrap_or(false) { "ok" } else { "--" };
+      write!(out, " {letter}:{state}").map_err(|_| FmtError)?;
+    }
+    out.push_str("]\r\n").map_err(|_| FmtError)
+  }
+
+  /// The `$I+` echo-vs-reply presence-probe diagnostic: `[MSG:TMC-PROBE X:<tok> Y:<tok> Z:<tok> A:<tok>]`,
+  /// rendered from a [`DriverProbe`]. The single-wire TMC2209 bus reads back the MCU's OWN transmitted bytes
+  /// (the echo) before the driver's reply, so a per-node `no-echo`/`no-reply`/`ok` token localizes a whole-bus
+  /// no-reply WITHOUT a scope: `no-echo` means the RX path never saw the shared pin (firmware/pin-matrix
+  /// fault), `no-reply` means routing is fine and the driver simply never answered (hardware/line fault), and
+  /// `ok` means the node responded. Emitted alongside the `[DRIVER:]` lines only when the caller decides it is
+  /// worth reporting (see [`DriverProbe::should_report`]); this formatter stays pure and always renders when
+  /// called. The letters derive from [`AXIS_LETTERS`] so the probe report and the `[DRIVER:]`/`[AXS:]` reports
+  /// can never drift apart. No terminator beyond the line itself is written.
+  pub fn driver_probe<const N: usize>(out: &mut String<N>, probe: &DriverProbe) -> Result<(), FmtError> {
+    out.push_str("[MSG:TMC-PROBE").map_err(|_| FmtError)?;
+    for (axis, &letter) in AXIS_LETTERS.iter().enumerate() {
+      let stage = probe.stages.get(axis).copied().unwrap_or_default();
+      write!(out, " {letter}:").map_err(|_| FmtError)?;
+      // Enrich the captured `InitError` node's token with the failing register/op/kind; other nodes (and every
+      // categorized outcome) render their self-describing token.
+      match (stage, probe.init_failure) {
+        (TmcProbeStage::InitError, Some(failure)) if failure.axis == axis => failure.write_token(out)?,
+        _ => stage.write_token(out)?,
+      }
+    }
+    out.push_str("]\r\n").map_err(|_| FmtError)
+  }
+
+  /// The `$I+` `[MSG:TMC-IOIN <letter>:0xNN 0xNN …]` framing dump: the raw 8-byte `IOIN` reply of a node whose
+  /// presence read hit a [`TmcProbeStage::DecodeError`], rendered as space-separated lowercase hex bytes so the
+  /// framing / echo-reply alignment can be eyeballed over serial. Emitted alongside the `[MSG:TMC-PROBE …]` line
+  /// only when [`DriverProbe::raw_ioin`] is populated. The letter derives from [`AXIS_LETTERS`]; an
+  /// out-of-range axis renders `?`. No terminator beyond the line itself is written.
+  pub fn driver_ioin_raw<const N: usize>(out: &mut String<N>, capture: &IoinRawCapture) -> Result<(), FmtError> {
+    let letter = AXIS_LETTERS.get(capture.axis).copied().unwrap_or('?');
+    write!(out, "[MSG:TMC-IOIN {letter}:").map_err(|_| FmtError)?;
+    for (index, byte) in capture.bytes.iter().enumerate() {
+      if index > 0 {
+        out.push_str(" ").map_err(|_| FmtError)?;
+      }
+      write!(out, "{byte:#04x}").map_err(|_| FmtError)?;
+    }
+    out.push_str("]\r\n").map_err(|_| FmtError)
+  }
+
+  /// The `$I+` boot loopback self-test line: `[MSG:TMC-LOOPBACK sent:8 got:N match:M/8 err:<none|ovf|glt|frm|par>]`,
+  /// rendered from a [`LoopbackReport`]. `sent` is the fixed [`TMC_LOOPBACK_PATTERN`] length; `got` the bytes
+  /// echoed back; `match` the positions that matched; `err` the first RX-error variant (or `none`). Proves the
+  /// MCU TX+RX path and line levels without a scope (see [`LoopbackReport`]). Pure and host-testable; the caller
+  /// emits it only after the test has run.
+  pub fn loopback<const N: usize>(out: &mut String<N>, report: &LoopbackReport) -> Result<(), FmtError> {
+    let sent = TMC_LOOPBACK_PATTERN.len();
+    let err = report.err.map(RxErrorKind::token).unwrap_or("none");
+    write!(out, "[MSG:TMC-LOOPBACK sent:{sent} got:{} match:{}/{sent} err:{err}]\r\n", report.got, report.matched)
+      .map_err(|_| FmtError)
+  }
+
+  /// The `$I+` bus-margin meter: `[MSG:TMC-BUS X:<fail>/<total> Y:… Z:… A:…]`, rendered from a [`BusStats`]
+  /// snapshot — each axis's failed vs attempted datagram exchanges since boot (see [`BusStats`] for what counts
+  /// and why this grades a marginal bus). The letters derive from [`AXIS_LETTERS`] so this report can never
+  /// drift from the `[DRIVER:]`/`[MSG:TMC-PROBE]` lines. Pure and always renders when called; the caller gates
+  /// emission on [`BusStats::any_attempted`]. No terminator beyond the line itself is written.
+  pub fn tmc_bus_stats<const N: usize>(out: &mut String<N>, stats: &BusStats) -> Result<(), FmtError> {
+    out.push_str("[MSG:TMC-BUS").map_err(|_| FmtError)?;
+    for (axis, &letter) in AXIS_LETTERS.iter().enumerate() {
+      write!(out, " {letter}:{}/{}", stats.fail[axis], stats.total[axis]).map_err(|_| FmtError)?;
+    }
+    out.push_str("]\r\n").map_err(|_| FmtError)
   }
 
   /// The `$G` parser-state report: `[GC:<modal words>]`, rendered from a live [`ParserSnapshot`]. The
@@ -1788,6 +1914,11 @@ pub const ERROR_UNSUPPORTED_COMMAND: u8 = 3;
 /// The grbl `error:N` code for `$H` when `$22` homing is not enabled ("Homing cycle is not enabled").
 pub const ERROR_HOMING_DISABLED: u8 = 5;
 
+/// The grbl `error:N` code for a settings-mutating `$` command issued while the machine is not Idle (or
+/// Alarmed): grbl's "'$' command cannot be used unless Grbl is IDLE" (`STATUS_IDLE_ERROR`). Gates `$n=val`,
+/// `$Nx=`, `$RST=`, and the `$PBX` import — see [`ControlState::settings_write_allowed`].
+pub const ERROR_NOT_IDLE: u8 = 8;
+
 impl<'a> SystemCommand<'a> {
   /// Classify the bytes AFTER the leading `$` into a [`SystemCommand`]. Leading/trailing ASCII whitespace in
   /// the caller's line is assumed already trimmed (the consumer trims before splitting on `$`), but the
@@ -2058,17 +2189,22 @@ impl PinReport {
     self.probe || self.limits.iter().any(|&l| l) || self.door || self.hold || self.reset || self.cycle_start
   }
 
-  /// Append the asserted-pin letters to `out` in grbl's documented order (`P` probe, `X`/`Y`/`Z` limits, `D`
-  /// door, `H` hold, `R` reset, `S` cycle-start), writing nothing for an unasserted pin. The caller wraps this
-  /// with the `Pn:` tag only when [`any`](PinReport::any) is set. Returns [`FmtError`] only on a (never, with a
-  /// correctly sized buffer) capacity failure.
-  fn write_letters<const N: usize>(&self, out: &mut String<N>) -> Result<(), FmtError> {
+  /// Append the set pin letters to `out` in grbl's documented order (`P` probe, `X`/`Y`/`Z` limits, `D`
+  /// door, `H` hold, `R` reset, `S` cycle-start), writing nothing for an unset pin. For the `Pn:` status
+  /// element each `true` means "asserted now"; for the `$I+` `[SIGNALS:]` capability line (via
+  /// [`SIGNAL_CAPABILITIES`]) each `true` means "this input exists in the build" — the letter assembly is the
+  /// same either way, which is exactly why both reuse this one function. The caller wraps it with the relevant
+  /// tag. Returns [`FmtError`] only on a (never, with a correctly sized buffer) capacity failure.
+  pub fn write_letters<const N: usize>(&self, out: &mut String<N>) -> Result<(), FmtError> {
     if self.probe {
       out.push('P').map_err(|_| FmtError)?;
     }
-    // Limit letters in axis order, matching grbl's `X`/`Y`/`Z` signal letters.
-    for (axis, letter) in ['X', 'Y', 'Z'].into_iter().enumerate() {
-      if self.limits.get(axis).copied().unwrap_or(false) {
+    // Limit letters in axis order, derived from [`AXIS_LETTERS`] (not a private `['X','Y','Z']` literal) so the
+    // `Pn:`/`[SIGNALS:]` vocabulary can never drift from the `[AXS:]`/`[DRIVER:]` one. `limits` is sized to
+    // [`AXIS_COUNT`], so the two arrays line up index-for-index; the A axis has no limit switch (its `limits`
+    // slot stays `false`, DOC-10), so no `A` letter is ever emitted here.
+    for (&letter, &triggered) in AXIS_LETTERS.iter().zip(self.limits.iter()) {
+      if triggered {
         out.push(letter).map_err(|_| FmtError)?;
       }
     }
@@ -2085,6 +2221,486 @@ impl PinReport {
       out.push('S').map_err(|_| FmtError)?;
     }
     Ok(())
+  }
+}
+
+/// The input signals this firmware build can read, rendered as the `$I+` `[SIGNALS:]` capability line. Galdr
+/// sources the `P` probe input and the `X`/`Y`/`Z` limit switches; the door/hold/reset/cycle-start control
+/// inputs have no GPIO budgeted, so they stay `false` and are omitted. Because [`build_info`] renders this with
+/// the very same [`PinReport::write_letters`] the `Pn:` status element uses, the advertised capability set and
+/// the runtime status letters can never use a different letter vocabulary. The A axis has no limit switch
+/// (DOC-10 rotary), so only `X`/`Y`/`Z` limits are advertised.
+pub const SIGNAL_CAPABILITIES: PinReport = PinReport {
+  probe: true,
+  limits: [true, true, true, false],
+  door: false,
+  hold: false,
+  reset: false,
+  cycle_start: false,
+};
+
+/// Live per-axis TMC2209 driver health for the `$I+` `[DRIVER:]` report. `online[axis]` is `true` when that
+/// axis's driver answered on the shared UART bus at init (presence check + write verification) and is therefore
+/// communicating; `false` means it was flagged absent (no reply / wrong version). Indexed in [`AXIS_LETTERS`]
+/// order. `initialized` is `false` until the `firmware` bin's TMC init pass has populated `online`, so a `$I+`
+/// query during the brief boot window reports `init pending` rather than a misleading "all absent". The
+/// `firmware` bin owns the live values; this type keeps [`ResponseWriter::driver_info`] pure and host-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DriverStatus {
+  /// Per-axis UART online flag, [`AXIS_LETTERS`] order; `true` = the driver is communicating.
+  pub online: [bool; AXIS_COUNT],
+  /// `false` until the TMC init pass has run and `online` reflects real bus results.
+  pub initialized: bool,
+}
+
+/// The outcome of one node's TMC2209 presence read (`IOIN`) for the `$I+` diagnostic. The single-wire bus first
+/// reads back the MCU's OWN transmitted bytes (the echo) before the driver's reply, and the reply is then
+/// decoded and its `VERSION` byte checked — so a per-node outcome localizes a failure through every layer
+/// without a scope: an echo timeout means the RX signal never saw the pin (firmware/pin-matrix fault); a reply
+/// timeout with a good echo means routing is fine but the driver never answered (line/hardware fault); a decode
+/// error means a reply arrived but failed sync/address/register/CRC (signal-integrity, echo-reply misalignment,
+/// send-delay, or edge quality — inspect the raw bytes); and a version mismatch means the datagram decoded
+/// cleanly but carried the wrong `VERSION` (wrong `EXPECTED_VERSION` const, a clone chip, or bit errors landing
+/// in the version byte). `Responded` is a present, correctly-versioned driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum TmcProbeStage {
+  /// The presence read completed and the driver answered with the expected `VERSION`. The default, and the
+  /// state for every present/healthy node.
+  #[default]
+  Responded,
+  /// The half-duplex ECHO read timed out — the MCU's transmitted bytes never looped back on the shared line, so
+  /// the RX signal is not seeing the pin. Points at the firmware/esp-hal pin-matrix, not the driver.
+  EchoTimeout,
+  /// The driver's REPLY read timed out. Carries a post-timeout RX-FIFO snapshot that distinguishes a genuinely
+  /// silent driver from a reply that WAS on the wire but got gated away by the glitch detector: `fifo` is the
+  /// number of bytes drained from the FIFO after the timeout (packed, saturates at 127), and `ready` is
+  /// `read_ready()` sampled at the timeout — raw FIFO occupancy that, unlike a `read_buffered` drain, does not
+  /// clear latched error flags. `fifo:0` + `!ready` ⇒ nothing arrived (driver silent / wiring / VIO); `fifo:N>0`
+  /// with the drained bytes (dumped via [`IoinRawCapture`]) ⇒ the driver DID reply and the read strategy gated
+  /// it; `fifo:0` + `ready` ⇒ occupancy reported but undrainable (a flag re-latched every poll).
+  ReplyTimeout {
+    /// Bytes drained from the RX FIFO after the timeout (saturating; the packed snapshot caps at 127).
+    fifo: u8,
+    /// `read_ready()` at the timeout — raw FIFO occupancy, independent of the latched glitch/framing flag.
+    ready: bool,
+  },
+  /// A full reply arrived but failed to decode (bad sync / address / register / CRC). The physical layer works
+  /// but the framing does not — signal integrity, echo-reply misalignment, send-delay, or edge quality. The
+  /// raw reply bytes are surfaced alongside (see [`IoinRawCapture`]) so the framing can be eyeballed.
+  DecodeError,
+  /// The reply decoded cleanly but its `VERSION` byte did not match `EXPECTED_VERSION`. Carries the actual byte
+  /// so a wrong version const, a clone chip, or a bit error in the version field is distinguishable at a glance.
+  VersionMismatch(u8),
+  /// The driver answered `IOIN` correctly but its config writes did not verify: `IFCNT` advanced by `actual`
+  /// instead of the `expected` write count, so at least one register datagram was not accepted (reads work but
+  /// writes are not landing — send-delay, write-frame corruption, or a write-protected driver). Both counts are
+  /// nibble-packed in the snapshot, so each renders 0..=15 (the write set is 8; a larger value saturates at 15).
+  WriteVerify {
+    /// The number of config writes issued (the expected `IFCNT` delta).
+    expected: u8,
+    /// The observed `IFCNT` delta across the write sequence.
+    actual: u8,
+  },
+  /// A non-timeout, non-decode init failure not otherwise categorized (e.g. an invalid microstep config, or a
+  /// write-side bus error whose read stage is stale). Ensures an errored node is never silently `Responded`.
+  InitError,
+  /// The reply read tripped the RX glitch/framing detector but the datagram STILL decoded with a valid CRC — the
+  /// driver is proven alive and we relied on RX tolerance. Carries the RX variant; renders `ok(<variant>)` so the
+  /// reliance is visible, never silently swallowed. Still counts as a present/healthy driver in `[DRIVER:]`.
+  RespondedDespiteGlitch(RxErrorKind),
+  /// The reply read tripped the RX glitch/framing detector AND the datagram failed to decode — the glitch
+  /// genuinely corrupted the bytes. Renders `crc(<variant>)`, distinguishing glitch-corrupted from a clean-line
+  /// decode failure (bare `crc`) so a real signal-integrity problem is not mistaken for a framing coincidence.
+  DecodeErrorGlitched(RxErrorKind),
+}
+
+impl TmcProbeStage {
+  /// Pack this outcome into the 16-bit code the `firmware` bin stores per axis in its lock-free snapshot: the
+  /// high byte is a discriminant tag and the low byte carries the payload — the version for
+  /// [`VersionMismatch`](Self::VersionMismatch), or the two nibble-packed IFCNT counts for
+  /// [`WriteVerify`](Self::WriteVerify) (each saturated at 15, ample for the 8-write set).
+  pub fn to_bits(self) -> u16 {
+    match self {
+      TmcProbeStage::Responded => 0x0000,
+      TmcProbeStage::EchoTimeout => 0x0100,
+      TmcProbeStage::ReplyTimeout { fifo, ready } => {
+        let payload = (fifo.min(0x7F)) | (u8::from(ready) << 7);
+        0x0200 | u16::from(payload)
+      }
+      TmcProbeStage::DecodeError => 0x0300,
+      TmcProbeStage::VersionMismatch(version) => 0x0400 | u16::from(version),
+      TmcProbeStage::WriteVerify { expected, actual } => {
+        let payload = (expected.min(0x0F) << 4) | actual.min(0x0F);
+        0x0500 | u16::from(payload)
+      }
+      TmcProbeStage::InitError => 0x0600,
+      TmcProbeStage::RespondedDespiteGlitch(variant) => 0x0700 | variant.to_code() as u16,
+      TmcProbeStage::DecodeErrorGlitched(variant) => 0x0800 | variant.to_code() as u16,
+    }
+  }
+
+  /// Recover an outcome from its 16-bit code. Any unknown tag decodes to `Responded` so a corrupt snapshot
+  /// degrades to "healthy" rather than a false fault.
+  pub fn from_bits(bits: u16) -> Self {
+    let payload = (bits & 0xFF) as u8;
+    match bits >> 8 {
+      0x01 => TmcProbeStage::EchoTimeout,
+      0x02 => TmcProbeStage::ReplyTimeout { fifo: payload & 0x7F, ready: payload & 0x80 != 0 },
+      0x03 => TmcProbeStage::DecodeError,
+      0x04 => TmcProbeStage::VersionMismatch(payload),
+      0x05 => TmcProbeStage::WriteVerify { expected: payload >> 4, actual: payload & 0x0F },
+      0x06 => TmcProbeStage::InitError,
+      0x07 => TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::from_code(u32::from(payload))),
+      0x08 => TmcProbeStage::DecodeErrorGlitched(RxErrorKind::from_code(u32::from(payload))),
+      _ => TmcProbeStage::Responded,
+    }
+  }
+
+  /// Write this outcome's compact `$I+` token into `out`: `ok`, `no-echo`, `no-reply(fifo:N)`, `crc`, `ver:0xNN` (the
+  /// version as two lowercase hex digits), `wrver:<actual>/<expected>` (the IFCNT deltas), `err`, `ok(<variant>)`
+  /// (decoded despite an RX glitch — proven alive on tolerance), or `crc(<variant>)` (glitch-corrupted decode).
+  /// Kept a writer rather than a `&str` getter because several tokens are dynamic.
+  fn write_token<const N: usize>(self, out: &mut String<N>) -> Result<(), FmtError> {
+    match self {
+      TmcProbeStage::Responded => out.push_str("ok").map_err(|_| FmtError),
+      TmcProbeStage::EchoTimeout => out.push_str("no-echo").map_err(|_| FmtError),
+      // `no-reply(fifo:N)` names the post-timeout FIFO occupancy: `fifo:0` = nothing arrived (driver silent);
+      // `fifo:N>0` = the driver replied and the read gated it (see the dumped bytes); `fifo:0,rdy` = occupancy
+      // reported but nothing drainable (a flag re-latched).
+      TmcProbeStage::ReplyTimeout { fifo: 0, ready: false } => out.push_str("no-reply(fifo:0)").map_err(|_| FmtError),
+      TmcProbeStage::ReplyTimeout { fifo: 0, ready: true } => out.push_str("no-reply(fifo:0,rdy)").map_err(|_| FmtError),
+      TmcProbeStage::ReplyTimeout { fifo, .. } => write!(out, "no-reply(fifo:{fifo})").map_err(|_| FmtError),
+      TmcProbeStage::DecodeError => out.push_str("crc").map_err(|_| FmtError),
+      TmcProbeStage::VersionMismatch(version) => write!(out, "ver:{version:#04x}").map_err(|_| FmtError),
+      TmcProbeStage::WriteVerify { expected, actual } => write!(out, "wrver:{actual}/{expected}").map_err(|_| FmtError),
+      TmcProbeStage::InitError => out.push_str("err").map_err(|_| FmtError),
+      TmcProbeStage::RespondedDespiteGlitch(variant) => write!(out, "ok({})", variant.token()).map_err(|_| FmtError),
+      TmcProbeStage::DecodeErrorGlitched(variant) => write!(out, "crc({})", variant.token()).map_err(|_| FmtError),
+    }
+  }
+}
+
+/// Per-axis TMC2209 presence-probe read-stage outcomes for the `$I+` echo-vs-reply diagnostic (`[MSG:TMC-PROBE
+/// ...]`). Captured by the `firmware` bin's TMC init pass — for each node it records whether the presence read
+/// responded, timed out at the echo stage, or timed out at the reply stage — and rendered by
+/// [`ResponseWriter::driver_probe`]. Indexed in [`AXIS_LETTERS`] order. Kept a pure snapshot so the formatter is
+/// host-testable, mirroring [`DriverStatus`]; the `firmware` bin owns the live values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DriverProbe {
+  /// Per-axis presence-probe stage outcome, [`AXIS_LETTERS`] order.
+  pub stages: [TmcProbeStage; AXIS_COUNT],
+  /// `false` until the TMC init pass has run and `stages` reflect real bus results.
+  pub initialized: bool,
+  /// The raw 8-byte `IOIN` reply of the first node whose presence read hit a [`TmcProbeStage::DecodeError`], so
+  /// the framing/alignment can be eyeballed on `$I+`. `None` when no node had a decode error (the common case).
+  pub raw_ioin: Option<IoinRawCapture>,
+  /// The failing bus operation of the first node whose init hit a bare [`TmcProbeStage::InitError`], so `$I+`
+  /// names exactly which register + operation + error kind failed (`err:wGSTAT:to`). `None` when no node was an
+  /// `InitError` — every categorized outcome (timeout/decode/version/write-verify) is self-describing already.
+  pub init_failure: Option<InitFailure>,
+}
+
+/// Per-axis TMC2209 bus-exchange statistics for the `$I+` `[MSG:TMC-BUS …]` margin meter: how many datagram
+/// exchanges each axis has attempted since boot (presence re-probes while absent, `DRV_STATUS` health polls
+/// while present) and how many of them FAILED (no decodable reply). On a marginal single-wire bus this turns a
+/// bench A/B — pull-up value, bus pad, baud, wiring — into a numeric failure rate over a fixed interval instead
+/// of an eyeballed `ok`/`--` flicker: a genuinely absent node reads `N/N` (100 %), a solid one `0/N`, a marginal
+/// one somewhere between. Counters saturate at `u16::MAX` (≈ 18 h of 1 Hz rounds) rather than wrap, so a
+/// long-running bench never shows a misleading small number. Kept a pure snapshot so the formatter is
+/// host-testable; the firmware manager task owns the live counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BusStats {
+  /// Per-axis failed-exchange count, [`AXIS_LETTERS`] order. Saturating.
+  pub fail: [u16; AXIS_COUNT],
+  /// Per-axis attempted-exchange count, [`AXIS_LETTERS`] order. Saturating.
+  pub total: [u16; AXIS_COUNT],
+}
+
+impl BusStats {
+  /// `true` once any axis has attempted an exchange — the caller's gate for emitting the `[MSG:TMC-BUS …]`
+  /// line, so a fresh boot (before the first poll round) adds no meaningless all-zero line.
+  pub fn any_attempted(&self) -> bool {
+    self.total.iter().any(|&total| total > 0)
+  }
+}
+
+impl DriverProbe {
+  /// True when the snapshot is populated AND at least one axis's presence read did not cleanly respond, so the
+  /// diagnostic line is worth emitting. A fully-responding bus (every axis `Responded`) reports nothing, keeping
+  /// a healthy `$I+` free of the extra line.
+  pub fn should_report(&self) -> bool {
+    self.initialized && self.stages.iter().any(|stage| *stage != TmcProbeStage::Responded)
+  }
+}
+
+/// The kind of bus error a TMC2209 operation failed with, for the `$I+` init-failure diagnostic. A compact
+/// projection of [`TmcError`](crate::drivers::tmc2209::TmcError): the decode family (bad sync / address /
+/// register / CRC) collapses to [`Decode`](Self::Decode) since the raw-bytes dump already carries the detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum BusErrorKind {
+  /// The echo or reply did not arrive within the turn-around window (token `to`).
+  Timeout,
+  /// The UART peripheral reported a framing/overflow error (token `io`).
+  Io,
+  /// A reply arrived but failed to decode — bad sync / address / register / CRC (token `dec`).
+  Decode,
+}
+
+impl BusErrorKind {
+  /// Map a [`TmcError`](crate::drivers::tmc2209::TmcError) to its compact diagnostic kind.
+  pub fn from_error(error: crate::drivers::tmc2209::TmcError) -> Self {
+    use crate::drivers::tmc2209::TmcError;
+    match error {
+      TmcError::Timeout => BusErrorKind::Timeout,
+      TmcError::Io => BusErrorKind::Io,
+      _ => BusErrorKind::Decode,
+    }
+  }
+
+  /// The compact `$I+` token for this kind: `to`, `io`, or `dec`.
+  fn token(self) -> &'static str {
+    match self {
+      BusErrorKind::Timeout => "to",
+      BusErrorKind::Io => "io",
+      BusErrorKind::Decode => "dec",
+    }
+  }
+
+  /// The 2-bit code used in the packed [`InitFailure`] snapshot.
+  fn to_code(self) -> u32 {
+    match self {
+      BusErrorKind::Timeout => 0,
+      BusErrorKind::Io => 1,
+      BusErrorKind::Decode => 2,
+    }
+  }
+}
+
+/// The specific UART RX error underneath a [`BusErrorKind::Io`], for the `$I+` init-failure diagnostic. A pure
+/// projection of esp-hal's `RxError` variants (the `firmware` bin maps them at the one seam where the variant is
+/// still in scope, before it flattens to `TmcError::Io`), so this stays esp-hal-free and host-testable. The
+/// distinction is load-bearing for the fix: `Glitch`/`Framing` point at edge quality (pull-up / baud / slew),
+/// `Overflow` at read cadence, and `Parity` at config drift (impossible on this 8N1 bus, so a red flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum RxErrorKind {
+  /// The RX FIFO overflowed (token `ovf`) — a read-cadence problem, not an edge-quality one.
+  Overflow,
+  /// A glitch was detected on the RX line (token `glt`) — edge quality: pull-up strength, slew, or noise.
+  Glitch,
+  /// A framing error: the received bits did not conform to the UART frame (token `frm`) — edge quality / baud.
+  Framing,
+  /// A parity error (token `par`) — impossible on this 8N1 bus, so a sign of config drift if it appears.
+  Parity,
+}
+
+impl RxErrorKind {
+  /// The compact `$I+` token for this RX error: `ovf`, `glt`, `frm`, or `par`.
+  fn token(self) -> &'static str {
+    match self {
+      RxErrorKind::Overflow => "ovf",
+      RxErrorKind::Glitch => "glt",
+      RxErrorKind::Framing => "frm",
+      RxErrorKind::Parity => "par",
+    }
+  }
+
+  /// The 2-bit code used in the packed [`InitFailure`] snapshot.
+  fn to_code(self) -> u32 {
+    match self {
+      RxErrorKind::Overflow => 0,
+      RxErrorKind::Glitch => 1,
+      RxErrorKind::Framing => 2,
+      RxErrorKind::Parity => 3,
+    }
+  }
+
+  /// Recover from the 2-bit snapshot code.
+  fn from_code(code: u32) -> Self {
+    match code & 0x3 {
+      0 => RxErrorKind::Overflow,
+      1 => RxErrorKind::Glitch,
+      2 => RxErrorKind::Framing,
+      _ => RxErrorKind::Parity,
+    }
+  }
+}
+
+/// Which half-duplex read produced an [`BusErrorKind::Io`], for the `$I+` init-failure diagnostic. A reply-side
+/// glitch and an echo-side glitch call for different fixes (a "skip echo + reset FIFO" workaround helps only the
+/// echo case), so the stage must travel with the RX error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum IoStage {
+  /// The half-duplex echo read (the MCU's own transmitted bytes looped back) — token `e`.
+  Echo,
+  /// The driver's reply read — token `r`.
+  Reply,
+}
+
+impl IoStage {
+  /// The compact `$I+` token for this stage: `e` (echo) or `r` (reply).
+  fn token(self) -> &'static str {
+    match self {
+      IoStage::Echo => "e",
+      IoStage::Reply => "r",
+    }
+  }
+}
+
+/// The failing bus operation captured for a bare [`TmcProbeStage::InitError`] node, so `$I+` can name exactly
+/// which register access failed and how — the key datum being the register identity (a first-write `GSTAT`
+/// failure is a systemic write-path fault; a later one is accumulating timing/contention). Kept a pure snapshot
+/// with reversible bit-packing so both the packing and [`write_token`](Self::write_token) are host-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct InitFailure {
+  /// The axis (and thus [`AXIS_LETTERS`] letter) whose init failed.
+  pub axis: usize,
+  /// The register byte the failing operation targeted (rendered via [`register_name`], else hex).
+  pub reg: u8,
+  /// `true` if the failing operation was a register write, `false` if a read (its request transmit).
+  pub was_write: bool,
+  /// The bus error kind, or `None` when the init failed with no failed bus op (a config/logic error, token
+  /// `cfg`) — the fallback that keeps a mis-eliminated cause from masquerading as a bus fault.
+  pub kind: Option<BusErrorKind>,
+  /// For a [`BusErrorKind::Io`] originating from a UART RX error, the read stage and specific RX error variant,
+  /// rendered as an `@<stage><variant>` suffix (e.g. `@efrm`). `None` when the `Io` was a transmit-side error
+  /// (no `RxError` in scope) or the failure was not an `Io` at all — so the suffix's absence is itself a signal
+  /// (a TX-side `io` rather than an RX glitch/framing/overflow).
+  pub io_detail: Option<(IoStage, RxErrorKind)>,
+}
+
+impl InitFailure {
+  /// Pack into a `u32` for the firmware's lock-free snapshot. Bit 0 is a validity flag (a stored `0` means "no
+  /// failure captured"); bits 1..=14 carry register, the read/write flag, a 2-bit kind (`3` ⇒ `None`), and axis.
+  /// Bit 15 flags an [`io_detail`](Self::io_detail); when set, bit 16 is the [`IoStage`] and bits 17..=18 the
+  /// [`RxErrorKind`]. All within the `u32`, so the whole failure round-trips through one atomic.
+  pub fn to_bits(&self) -> u32 {
+    let kind = self.kind.map(BusErrorKind::to_code).unwrap_or(3);
+    let mut bits = 1
+      | (u32::from(self.reg) << 1)
+      | (u32::from(self.was_write) << 9)
+      | (kind << 10)
+      | ((self.axis as u32 & 0x7) << 12);
+    if let Some((stage, variant)) = self.io_detail {
+      let stage_bit = matches!(stage, IoStage::Reply) as u32;
+      bits |= (1 << 15) | (stage_bit << 16) | (variant.to_code() << 17);
+    }
+    bits
+  }
+
+  /// Recover from the packed `u32`; returns `None` when the validity bit is clear (no failure captured).
+  pub fn from_bits(bits: u32) -> Option<Self> {
+    if bits & 1 == 0 {
+      return None;
+    }
+    let reg = ((bits >> 1) & 0xFF) as u8;
+    let was_write = (bits >> 9) & 1 != 0;
+    let kind = match (bits >> 10) & 0x3 {
+      0 => Some(BusErrorKind::Timeout),
+      1 => Some(BusErrorKind::Io),
+      2 => Some(BusErrorKind::Decode),
+      _ => None,
+    };
+    let axis = ((bits >> 12) & 0x7) as usize;
+    let io_detail = if (bits >> 15) & 1 != 0 {
+      let stage = if (bits >> 16) & 1 != 0 { IoStage::Reply } else { IoStage::Echo };
+      Some((stage, RxErrorKind::from_code(bits >> 17)))
+    } else {
+      None
+    };
+    Some(InitFailure { axis, reg, was_write, kind, io_detail })
+  }
+
+  /// Write the enriched `$I+` token for this failure: `err:<w|r><REG>:<kind>` (e.g. `err:wGSTAT:to`), plus an
+  /// `@<stage><variant>` suffix when [`io_detail`](Self::io_detail) is present (e.g. `err:rIOIN:io@efrm` = an RX
+  /// framing error on the echo read). The register is a mnemonic when known (via [`register_name`]) else `0xNN`;
+  /// the kind is `to`/`io`/`dec`, or `cfg` when no bus op failed.
+  fn write_token<const N: usize>(self, out: &mut String<N>) -> Result<(), FmtError> {
+    let rw = if self.was_write { 'w' } else { 'r' };
+    let kind = self.kind.map(BusErrorKind::token).unwrap_or("cfg");
+    match crate::drivers::tmc2209::registers::register_name(self.reg) {
+      Some(name) => write!(out, "err:{rw}{name}:{kind}").map_err(|_| FmtError)?,
+      None => write!(out, "err:{rw}{:#04x}:{kind}", self.reg).map_err(|_| FmtError)?,
+    }
+    if let Some((stage, variant)) = self.io_detail {
+      write!(out, "@{}{}", stage.token(), variant.token()).map_err(|_| FmtError)?;
+    }
+    Ok(())
+  }
+}
+
+/// A captured raw `IOIN` reply for the `$I+` `[MSG:TMC-IOIN …]` framing dump. Surfaced only for a node whose
+/// presence read hit a [`TmcProbeStage::DecodeError`] (a reply arrived but failed to decode), where the exact
+/// bytes on the wire are the single most useful thing for diagnosing framing / echo-reply misalignment without
+/// a scope. Kept a pure snapshot so [`ResponseWriter::driver_ioin_raw`] is host-testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct IoinRawCapture {
+  /// The axis (and thus [`AXIS_LETTERS`] letter) the captured bytes belong to.
+  pub axis: usize,
+  /// The raw 8-byte reply datagram exactly as read from the bus, before decode.
+  pub bytes: [u8; crate::drivers::tmc2209::READ_REPLY_LEN],
+}
+
+/// The fixed 8-byte pattern the boot loopback self-test transmits on GPIO9 to read back its own half-duplex
+/// echo. It exercises every bit level and both alternating phases — all-low (`0x00`), all-high (`0xFF`), the
+/// `0x55`/`0xAA` alternations, and the `0x0F`/`0xF0`/`0x33`/`0xCC` nibble splits — so a stuck bit, wrong level,
+/// or marginal edge shows as a mismatch rather than a lucky pass. It is deliberately NOT a valid addressed read
+/// request (its CRC will not match any node), so no driver replies to it — the test is safe to run with the
+/// drivers attached (their high-Z receivers do not interfere).
+pub const TMC_LOOPBACK_PATTERN: [u8; 8] = [0x00, 0xFF, 0x55, 0xAA, 0x0F, 0xF0, 0x33, 0xCC];
+
+/// The result of the boot loopback self-test (DOC-03 bring-up aid), rendered on `$I+` as
+/// `[MSG:TMC-LOOPBACK sent:8 got:N match:M/8 err:<none|ovf|glt|frm|par>]`. Because RX and TX share GPIO9, the
+/// MCU always half-duplex-echoes its own transmit; reading that echo back and comparing it to
+/// [`TMC_LOOPBACK_PATTERN`] proves the MCU's TX + RX path and line levels WITHOUT a scope. A full `8/8` match
+/// means TX, RX, and edges are healthy and any remaining fault is driver-side; `got:0` means the MCU half is
+/// broken; a partial/mismatch means TX transmits but the levels/edges are marginal. Kept a pure snapshot with
+/// reversible packing so both the packing and [`ResponseWriter::loopback`] are host-testable, mirroring
+/// [`InitFailure`]; the `firmware` bin owns the live values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LoopbackReport {
+  /// `false` until the boot self-test has run; suppresses the `$I+` line during the pre-test window.
+  pub ran: bool,
+  /// The number of bytes echoed back (0..=8).
+  pub got: u8,
+  /// The number of byte positions whose echo matched the transmitted pattern (0..=8).
+  pub matched: u8,
+  /// The first RX-error variant seen during the readback, or `None` if the echo came back clean.
+  pub err: Option<RxErrorKind>,
+}
+
+impl LoopbackReport {
+  /// Pack into a `u32` for the firmware's lock-free snapshot: bit 0 = `ran`, bits 1..=4 = `got`, bits 5..=8 =
+  /// `matched`, bits 9..=11 = the RX-error code (`0` = none, else variant code + 1). `got`/`matched` are ≤ 8 so
+  /// they fit a nibble.
+  pub fn to_bits(&self) -> u32 {
+    let err = self.err.map(|variant| variant.to_code() + 1).unwrap_or(0);
+    u32::from(self.ran)
+      | (u32::from(self.got.min(0x0F)) << 1)
+      | (u32::from(self.matched.min(0x0F)) << 5)
+      | (err << 9)
+  }
+
+  /// Recover from the packed `u32`.
+  pub fn from_bits(bits: u32) -> Self {
+    let err = match (bits >> 9) & 0x7 {
+      0 => None,
+      code => Some(RxErrorKind::from_code(code - 1)),
+    };
+    LoopbackReport {
+      ran: bits & 1 != 0,
+      got: ((bits >> 1) & 0x0F) as u8,
+      matched: ((bits >> 5) & 0x0F) as u8,
+      err,
+    }
   }
 }
 
@@ -2612,6 +3228,348 @@ mod tests {
     // Phase F: NEWOPT now advertises the enumeration + per-setting-description capabilities alongside RT+.
     assert!(s.as_str().contains("[NEWOPT:ENUMS,RT+,SED]"));
     assert!(s.as_str().contains("[FIRMWARE:grblHAL]"));
+  }
+
+  #[test]
+  fn build_info_axs_letters_derive_from_axis_constants() {
+    // The `[AXS:]` letters must come from AXIS_LETTERS, not a hardcoded literal — assemble the expected line
+    // from the constants so a future axis-count change is caught here instead of shipping a stale `XYZA`.
+    let mut expected = String::<32>::new();
+    write!(expected, "[AXS:{AXIS_COUNT}:").unwrap();
+    for letter in AXIS_LETTERS {
+      expected.push(letter).unwrap();
+    }
+    expected.push(']').unwrap();
+    let mut s = String::<256>::new();
+    ResponseWriter::build_info(&mut s, true).unwrap();
+    assert!(s.as_str().contains(expected.as_str()), "AXS must derive from AXIS_LETTERS, got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn build_info_extended_advertises_supported_signals() {
+    // `[SIGNALS:]` lists the build's capable inputs in `Pn:` letter codes: probe + X/Y/Z limits → `PXYZ`. The
+    // unbudgeted door/hold/reset/cycle-start inputs are omitted. The line is extended-only.
+    let mut s = String::<256>::new();
+    ResponseWriter::build_info(&mut s, true).unwrap();
+    assert!(s.as_str().contains("[SIGNALS:PXYZ]\r\n"), "expected probe+XYZ-limit signals, got {:?}", s.as_str());
+    let mut base = String::<256>::new();
+    ResponseWriter::build_info(&mut base, false).unwrap();
+    assert!(!base.as_str().contains("[SIGNALS:"), "SIGNALS must be extended-only");
+  }
+
+  #[test]
+  fn driver_info_all_online_reports_each_axis_ok() {
+    // Every TMC2209 answered on the UART bus: identity line plus a per-axis breakdown, all `ok`.
+    let mut s = String::<160>::new();
+    let status = DriverStatus { online: [true; AXIS_COUNT], initialized: true };
+    ResponseWriter::driver_info(&mut s, &status).unwrap();
+    assert!(s.as_str().contains("[DRIVER:TMC2209]\r\n"), "missing identity line, got {:?}", s.as_str());
+    assert!(s.as_str().contains("[DRIVER:TMC2209 X:ok Y:ok Z:ok A:ok]\r\n"), "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_info_missing_driver_renders_dashes() {
+    // The Y driver did not answer (no UART reply at init): its slot renders `Y:--`, the others stay `ok`.
+    let mut s = String::<160>::new();
+    let status = DriverStatus { online: [true, false, true, true], initialized: true };
+    ResponseWriter::driver_info(&mut s, &status).unwrap();
+    assert!(s.as_str().contains("[DRIVER:TMC2209 X:ok Y:-- Z:ok A:ok]\r\n"), "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_info_before_init_reports_pending_not_all_absent() {
+    // A `$I+` during the boot window (init pass not yet run) must not claim every driver is absent.
+    let mut s = String::<160>::new();
+    let status = DriverStatus { online: [false; AXIS_COUNT], initialized: false };
+    ResponseWriter::driver_info(&mut s, &status).unwrap();
+    assert!(s.as_str().contains("[DRIVER:TMC2209 init pending]\r\n"), "got {:?}", s.as_str());
+    assert!(!s.as_str().contains(":--"), "pending must not render per-axis dashes, got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_probe_echo_timeout_renders_no_echo() {
+    // A whole-bus echo timeout (the MCU's own bytes never looped back): the diagnostic marks every node
+    // `no-echo`, pointing at the firmware/pin-matrix RX path rather than the drivers.
+    let mut s = String::<160>::new();
+    let probe = DriverProbe { stages: [TmcProbeStage::EchoTimeout; AXIS_COUNT], initialized: true, raw_ioin: None, init_failure: None };
+    ResponseWriter::driver_probe(&mut s, &probe).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-PROBE X:no-echo Y:no-echo Z:no-echo A:no-echo]\r\n", "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_probe_reply_timeout_renders_no_reply_with_fifo() {
+    // Flash #4: the reply-timeout token carries the post-timeout FIFO snapshot. An empty FIFO (`fifo:0`, not
+    // ready) means the driver was silent; a non-empty FIFO (`fifo:N`) means the reply arrived but was gated;
+    // occupancy-without-drainable-bytes renders `fifo:0,rdy`.
+    let mut s = String::<160>::new();
+    let stages = [
+      TmcProbeStage::ReplyTimeout { fifo: 0, ready: false },
+      TmcProbeStage::ReplyTimeout { fifo: 8, ready: true },
+      TmcProbeStage::ReplyTimeout { fifo: 0, ready: true },
+      TmcProbeStage::ReplyTimeout { fifo: 20, ready: true },
+    ];
+    let probe = DriverProbe { stages, initialized: true, raw_ioin: None, init_failure: None };
+    ResponseWriter::driver_probe(&mut s, &probe).unwrap();
+    assert_eq!(
+      s.as_str(),
+      "[MSG:TMC-PROBE X:no-reply(fifo:0) Y:no-reply(fifo:8) Z:no-reply(fifo:0,rdy) A:no-reply(fifo:20)]\r\n",
+      "got {:?}",
+      s.as_str(),
+    );
+  }
+
+  #[test]
+  fn driver_probe_mixed_stages_render_per_axis() {
+    // Per-axis tokens across all five outcomes: responding `ok`, echo `no-echo`, decode `crc`, wrong version
+    // `ver:0xNN` (actual byte shown). This is the case-A vs case-B disambiguation the diagnostic exists for.
+    let mut s = String::<160>::new();
+    let stages = [
+      TmcProbeStage::Responded,
+      TmcProbeStage::EchoTimeout,
+      TmcProbeStage::DecodeError,
+      TmcProbeStage::VersionMismatch(0x10),
+    ];
+    let probe = DriverProbe { stages, initialized: true, raw_ioin: None, init_failure: None };
+    ResponseWriter::driver_probe(&mut s, &probe).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-PROBE X:ok Y:no-echo Z:crc A:ver:0x10]\r\n", "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_ioin_raw_dumps_reply_bytes_as_hex() {
+    // The framing dump for a decode-error node: the raw 8-byte IOIN reply as space-separated lowercase hex, so
+    // echo-reply misalignment / bit errors are eyeballable over serial without a scope.
+    let mut s = String::<160>::new();
+    let capture = IoinRawCapture { axis: 1, bytes: [0x05, 0xff, 0x6c, 0x00, 0x21, 0x1a, 0x00, 0x3c] };
+    ResponseWriter::driver_ioin_raw(&mut s, &capture).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-IOIN Y:0x05 0xff 0x6c 0x00 0x21 0x1a 0x00 0x3c]\r\n", "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn loopback_line_renders_counts_and_error() {
+    // A healthy MCU: every byte of the 8-byte pattern echoed back and matched, no RX error.
+    let mut healthy = String::<80>::new();
+    ResponseWriter::loopback(&mut healthy, &LoopbackReport { ran: true, got: 8, matched: 8, err: None }).unwrap();
+    assert_eq!(healthy.as_str(), "[MSG:TMC-LOOPBACK sent:8 got:8 match:8/8 err:none]\r\n", "got {:?}", healthy.as_str());
+    // A marginal MCU: only some bytes returned and fewer matched, with a framing error captured.
+    let mut marginal = String::<80>::new();
+    let report = LoopbackReport { ran: true, got: 5, matched: 3, err: Some(RxErrorKind::Framing) };
+    ResponseWriter::loopback(&mut marginal, &report).unwrap();
+    assert_eq!(marginal.as_str(), "[MSG:TMC-LOOPBACK sent:8 got:5 match:3/8 err:frm]\r\n", "got {:?}", marginal.as_str());
+    // A dead RX half: nothing came back.
+    let mut dead = String::<80>::new();
+    ResponseWriter::loopback(&mut dead, &LoopbackReport { ran: true, got: 0, matched: 0, err: None }).unwrap();
+    assert_eq!(dead.as_str(), "[MSG:TMC-LOOPBACK sent:8 got:0 match:0/8 err:none]\r\n", "got {:?}", dead.as_str());
+  }
+
+  #[test]
+  fn tmc_bus_stats_render_per_axis() {
+    // The margin meter renders every axis as fail/total in AXIS_LETTERS order, including a solid node (0/N), a
+    // marginal one (3/120), a saturated long-bench counter, and a genuinely absent node (N/N).
+    let stats = BusStats { fail: [0, 3, 65535, 60], total: [120, 120, 65535, 60] };
+    let mut s = String::<96>::new();
+    ResponseWriter::tmc_bus_stats(&mut s, &stats).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-BUS X:0/120 Y:3/120 Z:65535/65535 A:60/60]\r\n", "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn tmc_bus_stats_any_attempted_gates_on_totals() {
+    // A fresh boot (no exchanges yet) must not emit the line; a single attempt on any axis unlocks it.
+    assert!(!BusStats::default().any_attempted());
+    let mut one = BusStats::default();
+    one.total[2] = 1;
+    assert!(one.any_attempted());
+  }
+
+  #[test]
+  fn loopback_report_bits_roundtrip() {
+    // The packed `u32` snapshot must round-trip `ran`, the counts, and every RX-error variant (incl. `None`).
+    let cases = [
+      LoopbackReport { ran: false, got: 0, matched: 0, err: None },
+      LoopbackReport { ran: true, got: 8, matched: 8, err: None },
+      LoopbackReport { ran: true, got: 5, matched: 3, err: Some(RxErrorKind::Framing) },
+      LoopbackReport { ran: true, got: 8, matched: 7, err: Some(RxErrorKind::Overflow) },
+      LoopbackReport { ran: true, got: 8, matched: 7, err: Some(RxErrorKind::Glitch) },
+      LoopbackReport { ran: true, got: 8, matched: 7, err: Some(RxErrorKind::Parity) },
+    ];
+    for report in cases {
+      assert_eq!(LoopbackReport::from_bits(report.to_bits()), report, "roundtrip failed for {report:?}");
+    }
+  }
+
+  #[test]
+  fn driver_probe_should_report_gates_on_init_and_fault() {
+    // A healthy, fully-responding bus reports nothing; any non-responding outcome after init does; an
+    // uninitialized probe stays quiet even if a stage looks bad (the snapshot is not yet valid).
+    let healthy = DriverProbe { stages: [TmcProbeStage::Responded; AXIS_COUNT], initialized: true, raw_ioin: None, init_failure: None };
+    assert!(!healthy.should_report(), "a fully-responding bus must add no diagnostic line");
+    let faulted = DriverProbe { stages: [TmcProbeStage::DecodeError; AXIS_COUNT], initialized: true, raw_ioin: None, init_failure: None };
+    assert!(faulted.should_report(), "a decode error after init must be reported");
+    let pending = DriverProbe { stages: [TmcProbeStage::EchoTimeout; AXIS_COUNT], initialized: false, raw_ioin: None, init_failure: None };
+    assert!(!pending.should_report(), "an uninitialized probe snapshot must not report");
+  }
+
+  #[test]
+  fn driver_probe_write_verify_and_init_error_render() {
+    // The write-verification blind-spot fix: a driver that reads fine but whose config writes did not land shows
+    // `wrver:<actual>/<expected>` (0/8 = none verified, 3/8 = partial), and any other init error shows `err` —
+    // so a node that errored during init is never silently `ok` again.
+    let mut s = String::<160>::new();
+    let stages = [
+      TmcProbeStage::WriteVerify { expected: 8, actual: 0 },
+      TmcProbeStage::WriteVerify { expected: 8, actual: 3 },
+      TmcProbeStage::InitError,
+      TmcProbeStage::Responded,
+    ];
+    let probe = DriverProbe { stages, initialized: true, raw_ioin: None, init_failure: None };
+    ResponseWriter::driver_probe(&mut s, &probe).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-PROBE X:wrver:0/8 Y:wrver:3/8 Z:err A:ok]\r\n", "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn driver_probe_enriches_captured_init_error_node() {
+    // The bare-`err` blind-spot fix: the captured InitError node names the failing register + op + kind
+    // (`err:wGSTAT:to` = write to GSTAT timed out — a systemic write-path fault), while other `err` nodes stay
+    // bare. This is exactly the on-board case (all `err`) resolved to a specific cause.
+    let mut s = String::<160>::new();
+    let stages = [TmcProbeStage::InitError; AXIS_COUNT];
+    let failure = InitFailure {
+      axis: 0,
+      reg: crate::drivers::tmc2209::registers::GSTAT,
+      was_write: true,
+      kind: Some(BusErrorKind::Timeout),
+      io_detail: None,
+    };
+    let probe = DriverProbe { stages, initialized: true, raw_ioin: None, init_failure: Some(failure) };
+    ResponseWriter::driver_probe(&mut s, &probe).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-PROBE X:err:wGSTAT:to Y:err Z:err A:err]\r\n", "got {:?}", s.as_str());
+  }
+
+  #[test]
+  fn init_failure_token_renders_op_reg_and_kind() {
+    // Each field is surfaced: read vs write prefix, register mnemonic (or hex fallback), and error kind — plus
+    // the `cfg` fallback for an init error with no failed bus op (so a mis-eliminated cause is not hidden).
+    let render = |failure: InitFailure| {
+      let mut s = String::<64>::new();
+      failure.write_token(&mut s).unwrap();
+      s
+    };
+    let gconf = crate::drivers::tmc2209::registers::GCONF;
+    assert_eq!(
+      render(InitFailure { axis: 1, reg: gconf, was_write: true, kind: Some(BusErrorKind::Io), io_detail: None }).as_str(),
+      "err:wGCONF:io",
+    );
+    let ifcnt = crate::drivers::tmc2209::registers::IFCNT;
+    assert_eq!(
+      render(InitFailure { axis: 0, reg: ifcnt, was_write: false, kind: Some(BusErrorKind::Timeout), io_detail: None }).as_str(),
+      "err:rIFCNT:to",
+    );
+    // An unknown register falls back to hex; a `None` kind renders `cfg`.
+    assert_eq!(
+      render(InitFailure { axis: 2, reg: 0x42, was_write: true, kind: None, io_detail: None }).as_str(),
+      "err:w0x42:cfg",
+    );
+  }
+
+  #[test]
+  fn init_failure_io_detail_appends_stage_and_variant_suffix() {
+    // The RxError-detail enrichment: an `Io` on a read carries `@<stage><variant>` — the two discriminators the
+    // bare `:io` lost. Echo-vs-reply changes the fix (a skip-echo workaround helps only the echo case), and the
+    // variant separates edge quality (glt/frm) from cadence (ovf) from config drift (par).
+    let render = |io_detail| {
+      let mut s = String::<64>::new();
+      let failure =
+        InitFailure { axis: 0, reg: crate::drivers::tmc2209::registers::IOIN, was_write: false, kind: Some(BusErrorKind::Io), io_detail };
+      failure.write_token(&mut s).unwrap();
+      s
+    };
+    assert_eq!(render(Some((IoStage::Echo, RxErrorKind::Framing))).as_str(), "err:rIOIN:io@efrm");
+    assert_eq!(render(Some((IoStage::Reply, RxErrorKind::Glitch))).as_str(), "err:rIOIN:io@rglt");
+    assert_eq!(render(Some((IoStage::Echo, RxErrorKind::Overflow))).as_str(), "err:rIOIN:io@eovf");
+    assert_eq!(render(Some((IoStage::Reply, RxErrorKind::Parity))).as_str(), "err:rIOIN:io@rpar");
+    // A TX-side `io` (no RxError in scope) carries NO suffix — the absence itself distinguishes it from an RX error.
+    assert_eq!(render(None).as_str(), "err:rIOIN:io");
+  }
+
+  #[test]
+  fn init_failure_bits_roundtrip_including_none_and_validity() {
+    // A cleared validity bit (stored 0) means "no failure captured".
+    assert_eq!(InitFailure::from_bits(0), None);
+    // Every field round-trips through the packed u32, including the `None`-kind (cfg) case, each axis, and the
+    // optional io_detail across all stage × variant combinations.
+    let base = [
+      InitFailure { axis: 0, reg: crate::drivers::tmc2209::registers::GSTAT, was_write: true, kind: Some(BusErrorKind::Timeout), io_detail: None },
+      InitFailure { axis: 3, reg: crate::drivers::tmc2209::registers::PWMCONF, was_write: true, kind: Some(BusErrorKind::Io), io_detail: None },
+      InitFailure { axis: 2, reg: crate::drivers::tmc2209::registers::IFCNT, was_write: false, kind: Some(BusErrorKind::Decode), io_detail: None },
+      InitFailure { axis: 1, reg: 0xFF, was_write: false, kind: None, io_detail: None },
+    ];
+    for failure in base {
+      assert_eq!(InitFailure::from_bits(failure.to_bits()), Some(failure), "roundtrip failed for {failure:?}");
+    }
+    let ioin = crate::drivers::tmc2209::registers::IOIN;
+    for stage in [IoStage::Echo, IoStage::Reply] {
+      for variant in [RxErrorKind::Overflow, RxErrorKind::Glitch, RxErrorKind::Framing, RxErrorKind::Parity] {
+        let failure =
+          InitFailure { axis: 2, reg: ioin, was_write: false, kind: Some(BusErrorKind::Io), io_detail: Some((stage, variant)) };
+        assert_eq!(InitFailure::from_bits(failure.to_bits()), Some(failure), "io_detail roundtrip failed for {failure:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn driver_probe_stage_bits_roundtrip() {
+    // The 16-bit packing the firmware atomic uses must round-trip every outcome — including the version byte in
+    // `VersionMismatch` and the nibble-packed IFCNT deltas in `WriteVerify` — and an unknown tag must degrade to
+    // `Responded` (a corrupt snapshot reads as healthy, not a false fault).
+    let cases = [
+      TmcProbeStage::Responded,
+      TmcProbeStage::EchoTimeout,
+      TmcProbeStage::ReplyTimeout { fifo: 0, ready: false },
+      TmcProbeStage::ReplyTimeout { fifo: 8, ready: true },
+      TmcProbeStage::ReplyTimeout { fifo: 127, ready: false },
+      TmcProbeStage::ReplyTimeout { fifo: 0, ready: true },
+      TmcProbeStage::DecodeError,
+      TmcProbeStage::VersionMismatch(0x00),
+      TmcProbeStage::VersionMismatch(0x21),
+      TmcProbeStage::VersionMismatch(0xFF),
+      TmcProbeStage::WriteVerify { expected: 8, actual: 0 },
+      TmcProbeStage::WriteVerify { expected: 8, actual: 8 },
+      TmcProbeStage::WriteVerify { expected: 15, actual: 15 },
+      TmcProbeStage::InitError,
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Overflow),
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Glitch),
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Framing),
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Parity),
+      TmcProbeStage::DecodeErrorGlitched(RxErrorKind::Overflow),
+      TmcProbeStage::DecodeErrorGlitched(RxErrorKind::Glitch),
+      TmcProbeStage::DecodeErrorGlitched(RxErrorKind::Framing),
+      TmcProbeStage::DecodeErrorGlitched(RxErrorKind::Parity),
+    ];
+    for stage in cases {
+      assert_eq!(TmcProbeStage::from_bits(stage.to_bits()), stage, "roundtrip failed for {stage:?}");
+    }
+    // Counts above a nibble saturate at 15 rather than corrupting the tag (the 8-write set never hits this).
+    assert_eq!(
+      TmcProbeStage::from_bits(TmcProbeStage::WriteVerify { expected: 200, actual: 99 }.to_bits()),
+      TmcProbeStage::WriteVerify { expected: 15, actual: 15 },
+    );
+    assert_eq!(TmcProbeStage::from_bits(0x0900), TmcProbeStage::Responded, "unknown tag must decode healthy");
+  }
+
+  #[test]
+  fn driver_probe_glitch_tolerance_tokens_render() {
+    // Flash #3: a driver that decoded only via RX tolerance shows `ok(<variant>)` (proven alive, reliance
+    // visible), and a glitch that corrupted the decode shows `crc(<variant>)` — distinct from a clean-line
+    // decode failure (`crc`), so a real SI problem is not mistaken for a framing coincidence.
+    let mut s = String::<160>::new();
+    let stages = [
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Glitch),
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Framing),
+      TmcProbeStage::DecodeErrorGlitched(RxErrorKind::Glitch),
+      TmcProbeStage::DecodeError,
+    ];
+    let probe = DriverProbe { stages, initialized: true, raw_ioin: None, init_failure: None };
+    ResponseWriter::driver_probe(&mut s, &probe).unwrap();
+    assert_eq!(s.as_str(), "[MSG:TMC-PROBE X:ok(glt) Y:ok(frm) Z:crc(glt) A:crc]\r\n", "got {:?}", s.as_str());
   }
 
   #[test]
@@ -3386,6 +4344,21 @@ mod tests {
   fn error_code_constants_match_grbl() {
     assert_eq!(ERROR_UNSUPPORTED_COMMAND, 3);
     assert_eq!(ERROR_HOMING_DISABLED, 5);
+    assert_eq!(ERROR_NOT_IDLE, 8);
+  }
+
+  #[test]
+  fn settings_write_allowed_only_idle_or_alarm() {
+    // grbl's STATUS_IDLE_ERROR rule: settings writes pass in Normal (Idle-or-Run — the consumer gates live
+    // motion) and Alarm (so a bad value can be fixed without `$X` first); every other latched mode rejects.
+    assert!(ControlState::Normal.settings_write_allowed());
+    assert!(ControlState::Alarm(AlarmCode::HomingRequired).settings_write_allowed());
+    assert!(!ControlState::Hold(false).settings_write_allowed());
+    assert!(!ControlState::Hold(true).settings_write_allowed());
+    assert!(!ControlState::Jog.settings_write_allowed());
+    assert!(!ControlState::Check.settings_write_allowed());
+    assert!(!ControlState::Sleep.settings_write_allowed());
+    assert!(!ControlState::Tool.settings_write_allowed());
   }
 
   // --- Phase E: feed/rapid/spindle overrides --------------------------------------------------------

@@ -68,7 +68,8 @@ use firmware_core::protocol::{
   LastProbe, MachineSnapshot, MachineState, Overrides, ParserCoolant, ParserDistance, ParserFeedMode, ParserMotion,
   ParserPlane, ParserSnapshot, ParserSpindle, ParserUnits,
   PinReport, PositionReport, ProbeResponse, RealtimeCommand, RefreshReporter, ResponseWriter, StreamEngine,
-  SystemCommand, UnlockOutcome, ERROR_CODES, ERROR_HOMING_DISABLED, ERROR_UNSUPPORTED_COMMAND, MAX_LINE_LEN,
+  SystemCommand, UnlockOutcome, ERROR_CODES, ERROR_HOMING_DISABLED, ERROR_NOT_IDLE, ERROR_UNSUPPORTED_COMMAND,
+  MAX_LINE_LEN,
   NGC_PARAMETER_LINES, RX_BUFFER_SIZE, RESPONSE_CAPACITY,
 };
 use firmware_core::settings::{self, PbChunkResult, PbReceiver, SettingError, Settings};
@@ -4342,6 +4343,11 @@ fn write_startup_echo(index: u8, gcode: &[u8], out: &mut Response) -> bool {
 /// PERSISTENCE BOUNDARY (TODO DOC-04): the lines are held only in RAM. Persisting them needs a separate NVS
 /// record or a non-scalar proto field (which would break `Settings: Copy`), both larger than Phase A.
 async fn handle_startup_set(index: u8, gcode: &[u8], state: &mut ConsumerState) {
+  // grbl's error:8 gate: a `$Nx=` startup-line write is a persisted-settings mutation, Idle/Alarm only.
+  if settings_write_blocked().await {
+    error(ERROR_NOT_IDLE).await;
+    return;
+  }
   let slot = index as usize;
   if slot >= state.startup_lines.len() {
     // `classify` only emits index 0/1, so this is unreachable; reject defensively rather than panic-index.
@@ -4370,6 +4376,11 @@ async fn handle_startup_set(index: u8, gcode: &[u8], state: &mut ConsumerState) 
 /// info — Phase A clears the startup lines for both; the build-info string is compiled, not stored, so there
 /// is nothing further to clear. The terminating banner comes from `reset_pipeline`.
 async fn handle_restore_settings(parser: &mut Parser, state: &mut ConsumerState, flash: &'static SharedFlash) {
+  // grbl's error:8 gate: `$RST=$` wipes the whole settings blob (and runs the pipeline reset), Idle/Alarm only.
+  if settings_write_blocked().await {
+    error(ERROR_NOT_IDLE).await;
+    return;
+  }
   let defaults = Settings::default();
   {
     let mut guard = SETTINGS.lock().await;
@@ -4445,6 +4456,14 @@ async fn export_pb() {
 /// (the coalesced flush persists it once the burst drains — Finding #14b) before acknowledging; malformed
 /// input resets the receiver and returns `error:N` so the host can retry from the first chunk.
 async fn handle_pb_write(hex: &[u8], state: &mut ConsumerState) {
+  // grbl's error:8 gate, applied per chunk: a `$PBX` import mutates the whole settings blob, so it is accepted
+  // only while Idle (or Alarmed). A mid-import rejection also drops the partial reassembly — the import failed
+  // as a unit, and keeping the prefix would splice a stale sequence onto a later retry.
+  if settings_write_blocked().await {
+    state.pb.reset();
+    error(ERROR_NOT_IDLE).await;
+    return;
+  }
   let Ok(hex) = core::str::from_utf8(hex) else {
     state.pb.reset();
     error(SettingError::BadValue.code()).await;
@@ -4459,9 +4478,9 @@ async fn handle_pb_write(hex: &[u8], state: &mut ConsumerState) {
       }
       // Apply to RAM and mark dirty; the consumer flushes once the burst drains (or on soft reset / safety
       // interval), so a `$PBX` import that arrives split across many lines is persisted with a SINGLE flash
-      // append rather than one per chunk. Planner-affecting fields take effect on the next soft reset, as with
-      // `$x=val`. Keep the `$22` homing mirror in sync so the boot-lock / `$H` / soft-reset decisions reflect a
-      // bulk import that changed it. Acknowledge immediately — the in-RAM value already applied.
+      // append rather than one per chunk. Keep the `$22` homing mirror in sync so the boot-lock / `$H` /
+      // soft-reset decisions reflect a bulk import that changed it. Acknowledge immediately — the in-RAM value
+      // already applied.
       HOMING_ENABLED.store(new_settings.homing_enabled(), Ordering::Relaxed);
       // Keep the `$21` hard-limit-enable mirror in sync too so the executor's hard-limit check reflects a bulk
       // import that changed it (DOC-06).
@@ -4474,8 +4493,11 @@ async fn handle_pb_write(hex: &[u8], state: &mut ConsumerState) {
       // imported interval (enable/disable/retune) takes effect immediately, no reboot.
       AUTO_REPORT_INTERVAL_MS.store(new_settings.auto_report_interval_ms(), Ordering::Relaxed);
       AUTO_REPORT_WAKE.signal(());
-      // A bulk import can change `$100`/`$10`/`$110`; refresh the cached status config (Finding #14).
+      // A bulk import can change `$100`/`$10`/`$110`; refresh the cached status config (Finding #14) AND push
+      // the planner-affecting fields into the live planner, exactly as the `$x=val` path does — the error:8
+      // gate above guarantees the machine is idle, so the swap is safe.
       refresh_status_cfg().await;
+      refresh_planner_config().await;
       mark_settings_dirty();
       ack().await;
     }
@@ -4530,6 +4552,11 @@ fn coordinate_report() -> CoordinateReport {
 /// a `$RST`; coordinate data has no planner-modal coupling beyond the WCO, so a full soft reset is not required
 /// here (mirroring how a `$RST=#` only touches parameters, not `$$` settings or modal state).
 async fn handle_restore_params(flash: &'static SharedFlash) {
+  // grbl's error:8 gate: `$RST=#` wipes and persists the coordinate parameters, Idle/Alarm only.
+  if settings_write_blocked().await {
+    error(ERROR_NOT_IDLE).await;
+    return;
+  }
   clear_and_persist_coordinates(flash).await;
   ack().await;
 }
@@ -4564,6 +4591,12 @@ async fn clear_and_persist_coordinates(flash: &'static SharedFlash) {
 /// settings restore runs the soft-reset pipeline rebuild (which is the acknowledgment, as for `$RST=$`), so the
 /// coordinates are cleared FIRST and the reset's `push_wco_to_planner` then resolves against the now-zero WCS.
 async fn handle_restore_all(parser: &mut Parser, state: &mut ConsumerState, flash: &'static SharedFlash) {
+  // grbl's error:8 gate, checked BEFORE the coordinate wipe so a rejected `$RST=*` is all-or-nothing (the
+  // inner `handle_restore_settings` re-checks, but by then the coordinates would already be gone).
+  if settings_write_blocked().await {
+    error(ERROR_NOT_IDLE).await;
+    return;
+  }
   clear_and_persist_coordinates(flash).await;
   // Restore the `$$` settings to defaults and rebuild the pipeline (its banner is the `$RST=*` acknowledgment).
   // `handle_restore_settings` re-pushes the WCO into the freshly-rebuilt planner via `reset_pipeline`, so the
@@ -4696,6 +4729,11 @@ async fn send_setting_description(id: u16) {
 /// fake-ack. A valid write is applied to the live [`SETTINGS`] and marked DIRTY for the coalesced flush; the
 /// flash append is deferred to the consumer's burst-boundary flush, so a `$$`-bulk restore is one flash write.
 async fn write_setting_command(body: &[u8]) {
+  // grbl's error:8 gate: a `$n=val` is accepted only while Idle (or Alarmed) — see `settings_write_blocked`.
+  if settings_write_blocked().await {
+    error(ERROR_NOT_IDLE).await;
+    return;
+  }
   // The classifier ensured `<digits>=<value>`; re-parse to extract the number/value for the setter. A parse
   // failure here would be an internal inconsistency with the classifier, surfaced as a bad-value error rather
   // than a fabricated `ok` (it cannot occur for a body the classifier accepted).
@@ -4750,6 +4788,10 @@ async fn write_setting_command(body: &[u8]) {
       }
       // Refresh the cached status config so a `$100`/`$10`/`$110` change is in the next report (Finding #14).
       refresh_status_cfg().await;
+      // Push the planner-affecting settings (`$100–$102` steps/mm, rates, accel, junction, soft limits) into
+      // the live planner too, so the NEXT motion line uses them — grbl applies these immediately, and the
+      // status conversion above already did. Safe: the error:8 gate above guarantees the machine is idle.
+      refresh_planner_config().await;
       mark_settings_dirty();
       ack().await;
     }
@@ -4764,6 +4806,51 @@ async fn send_build_info(extended: bool) {
   let mut s = Response::new();
   if ResponseWriter::build_info(&mut s, extended).is_ok() {
     enqueue(s).await;
+  }
+  // `$I+` only: the live `[DRIVER:]` TMC2209 bus-health line(s). Sourced from the lock-free snapshot the TMC
+  // manager publishes after its init pass, so this never touches the half-duplex UART from the comms task.
+  if extended {
+    let mut driver = Response::new();
+    if ResponseWriter::driver_info(&mut driver, &crate::tmc::driver_status()).is_ok() {
+      enqueue(driver).await;
+    }
+    // The per-node `IOIN` presence-read diagnostic, only when the init pass saw at least one node not cleanly
+    // respond (a healthy bus adds no line). Localizes a whole-bus failure (`[DRIVER:.. X:-- Y:-- Z:-- A:--]`)
+    // through every layer without a scope: echo/reply timeout (pin-matrix vs silent driver), `crc` (framing),
+    // or `ver:0xNN` (wrong version). A `crc` node also gets a `[MSG:TMC-IOIN …]` raw-bytes framing dump.
+    let probe = crate::tmc::driver_probe();
+    if probe.should_report() {
+      let mut diag = Response::new();
+      if ResponseWriter::driver_probe(&mut diag, &probe).is_ok() {
+        enqueue(diag).await;
+      }
+    }
+    if let Some(capture) = probe.raw_ioin {
+      let mut raw = Response::new();
+      if ResponseWriter::driver_ioin_raw(&mut raw, &capture).is_ok() {
+        enqueue(raw).await;
+      }
+    }
+    // The boot loopback self-test line (once it has run): proves the MCU TX+RX path + line levels via the shared
+    // GPIO9 self-echo, so a scope-free bench can tell an MCU-side fault from a driver-side one.
+    let loopback = crate::tmc::loopback_report();
+    if loopback.ran {
+      let mut lb = Response::new();
+      if ResponseWriter::loopback(&mut lb, &loopback).is_ok() {
+        enqueue(lb).await;
+      }
+    }
+    // The per-axis bus margin meter (fail/total exchanges since boot): grades the marginal single-wire bus
+    // numerically, so a bench A/B (pull-up, bus pad, baud, wiring) is a failure-rate comparison over a fixed
+    // interval instead of an eyeballed `ok`/`--` flicker. Gated on any_attempted so a fresh boot (before the
+    // first poll round) adds no all-zero line.
+    let stats = crate::tmc::bus_stats();
+    if stats.any_attempted() {
+      let mut meter = Response::new();
+      if ResponseWriter::tmc_bus_stats(&mut meter, &stats).is_ok() {
+        enqueue(meter).await;
+      }
+    }
   }
   // Surface the live lost-wake recovery count (the §12 fix-confirmation signal) on `$I` so the host can read it on
   // demand WITHOUT a wedge/reset: a climbing `rec=` while a stream runs to completion PROVES lost wakes occurred AND
@@ -5167,6 +5254,37 @@ async fn motion_idle() -> bool {
     return false;
   }
   planner_blocks_free().await == firmware_core::planner::BLOCK_QUEUE_LEN as u8
+}
+
+/// The grbl "settings only when idle" gate (`error:8`), shared by every settings-mutating `$` handler
+/// (`$n=val`, `$Nx=`, `$RST=…`, the `$PBX` import). Two halves, mirroring the jog gate's split: the pure
+/// [`ControlState::settings_write_allowed`] rejects every latched non-Normal/non-Alarm mode (Hold/Jog/Check/
+/// Sleep/Tool), and — because `Normal` means Idle-or-Run — [`motion_idle`] additionally requires live motion to
+/// be fully quiescent (executor idle AND queue drained), so a write can never land under a running job and
+/// leave the planner mixing old- and new-scale kinematics. Alarm passes the gate (grbl allows it) so a bad
+/// soft-limit/travel value can be corrected without `$X` first.
+async fn settings_write_blocked() -> bool {
+  let control = control_state();
+  if !control.settings_write_allowed() {
+    return true;
+  }
+  control == ControlState::Normal && !motion_idle().await
+}
+
+/// Push the LIVE settings' [`PlannerConfig`] into the planner in place — the settings-commit companion to
+/// [`refresh_status_cfg`], so a `$100–$102`/`$110+`/junction/soft-limit change takes effect on the NEXT motion
+/// line instead of waiting for a soft reset (grbl applies these immediately; a planner that lagged them would
+/// also disagree with the status reporter's already-live steps→mm conversion). Position and work offset are
+/// preserved by [`Planner::set_config`]; the settings-write gate guarantees the queue is empty when any commit
+/// site runs, so no queued block mixes scales. Call at every site that mutates a planner-affecting setting:
+/// the `$x=val` write path and the `$PBX` import completion (the `$RST` paths instead run the full pipeline
+/// reset, which rebuilds the planner from the restored settings wholesale).
+async fn refresh_planner_config() {
+  let config = settings_snapshot().await.planner_config();
+  let mut guard = PLANNER.lock().await;
+  if let Some(planner) = guard.as_mut() {
+    planner.set_config(config);
+  }
 }
 
 /// How long the consumer waits before retrying a [`PlannerError::QueueFull`] command. Short relative to a

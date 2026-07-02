@@ -571,6 +571,22 @@ impl Planner {
     self.prev_nominal_speed_sq = 0.0;
   }
 
+  /// Swap in a new [`PlannerConfig`] LIVE — the `$x=val`-while-Idle path (grbl applies `$100–$102` steps/mm,
+  /// `$110+` rates/accelerations, junction deviation, and soft-limit travel immediately; a planner rebuilt only
+  /// at reset would lag them and disagree with the status reporter's live steps→mm conversion). The commanded
+  /// step position and the pushed work offset are machine state, not configuration, so both are preserved — the
+  /// position's MM interpretation shifts exactly as the status reporter's does, keeping the two views
+  /// consistent. The trailing junction state is dropped (as in [`sync_position`](Planner::sync_position)) so
+  /// the next move corners from rest under the new limits rather than blending against a speed computed under
+  /// the old ones. The caller must only invoke this while the machine is idle (queue empty, executor quiescent)
+  /// — the consumer's settings-write gate enforces that — so no queued block ever mixes old- and new-scale
+  /// kinematics.
+  pub fn set_config(&mut self, config: PlannerConfig) {
+    self.config = config;
+    self.prev_unit_vec = [0.0; AXES];
+    self.prev_nominal_speed_sq = 0.0;
+  }
+
   /// The current machine position in mm per axis, derived from the step position and `$100–$102`.
   pub fn position_mm(&self) -> [f32; AXES] {
     let mut out = [0.0; AXES];
@@ -1615,6 +1631,40 @@ mod tests {
     let target = planner.resolve_target(&axes, Units::Inch, DistanceMode::Absolute, false);
     // 1 inch = 25.4 mm × 100 steps/mm = 2540 steps.
     assert_eq!(target, [2540, 0, 0, 0]);
+  }
+
+  #[test]
+  fn set_config_applies_new_steps_per_mm_and_preserves_position() {
+    let mut planner = Planner::new(test_config());
+    // Establish a commanded position and a work offset under the old scale: X10 mm at 100 steps/mm = 1000 steps.
+    planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
+    assert_eq!(planner.position_steps(), [1000, 0, 0, 0]);
+    planner.set_work_offset([2.0, 0.0, 0.0, 0.0]);
+    // Live `$100=200`-style change: double the X resolution. Step position (machine state) must be untouched,
+    // and its mm interpretation must shift with the new scale exactly as the status reporter's does.
+    let mut config = test_config();
+    config.steps_per_mm[0] = 200.0;
+    planner.set_config(config);
+    assert_eq!(planner.position_steps(), [1000, 0, 0, 0], "step position is machine state, not config");
+    assert_eq!(planner.position_mm()[0], 5.0, "mm view re-derives from the NEW steps/mm");
+    // A subsequent absolute WORK move resolves with the new scale AND the preserved offset: (X10 + WCO 2) mm
+    // × 200 steps/mm = 2400 steps.
+    let axes = AxisWords { x: Some(10.0), y: None, z: None, a: None };
+    let target = planner.resolve_target(&axes, Units::Millimeter, DistanceMode::Absolute, false);
+    assert_eq!(target, [2400, 0, 0, 0], "new scale + preserved work offset");
+  }
+
+  #[test]
+  fn set_config_drops_trailing_junction_state() {
+    let mut planner = Planner::new(test_config());
+    planner.plan_command(&mm_move(Some(10.0), None, None, 600.0, false)).expect("queued");
+    // Swap the config, then plan a colinear follow-up move. With the junction state dropped it must enter from
+    // rest (entry speed 0), not blend against the pre-change cruise speed.
+    planner.set_config(test_config());
+    planner.plan_command(&mm_move(Some(20.0), None, None, 600.0, false)).expect("queued");
+    let _first = planner.pop_block().expect("first");
+    let second = planner.pop_block().expect("second");
+    assert_eq!(second.entry_speed_sq, 0.0, "post-config move corners from rest");
   }
 
   #[test]
