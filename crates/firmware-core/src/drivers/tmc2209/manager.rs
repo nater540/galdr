@@ -25,6 +25,7 @@ use crate::drivers::tmc2209::registers::{
 };
 use crate::drivers::tmc2209::TmcError;
 use crate::hal_traits::TmcBus;
+use crate::protocol::TmcProbeStage;
 
 /// Number of stepper drivers the manager configures (X, Y, Z, A), aliasing `planner::AXES`. Node 3 is the
 /// rotary A driver (DOC-10); its MS1/MS2 address strap and bus wiring are firmware-side and bench-deferred.
@@ -260,10 +261,54 @@ impl TmcManager {
   }
 }
 
+/// Classify one axis's init outcome into a [`TmcProbeStage`] for the `$I+` diagnostic, folding the manager's
+/// [`AxisReport`]/error together with the transport's captured read stage. The transport knows whether a read
+/// timed out (echo/reply) or failed to decode ([`TmcProbeStage::DecodeError`]); it cannot see a clean reply with
+/// the wrong `VERSION`, nor a write-verification failure — those come from the report here. Crucially, an
+/// `Err(_)` must NOT pass through a stale `Responded` transport stage (a write-side failure leaves the last read
+/// clean), which would silently mark an errored node healthy and suppress the whole diagnostic line — the blind
+/// spot behind "no `[MSG]` line yet all `--`". Pure and host-tested — the firmware task passes the per-axis
+/// `init_axis` result plus the transport stage sampled right after that read.
+pub fn classify_ioin(report: &Result<AxisReport, TmcManagerError>, transport_stage: TmcProbeStage) -> TmcProbeStage {
+  match report {
+    // A present, correctly-versioned driver: the healthy case. Preserve `RespondedDespiteGlitch` from the last
+    // read's stage so a driver that decoded only via RX tolerance still surfaces `ok(<variant>)` (proven alive,
+    // but the reliance is visible); any clean stage collapses to plain `Responded`.
+    Ok(report) if report.present => match transport_stage {
+      TmcProbeStage::RespondedDespiteGlitch(variant) => TmcProbeStage::RespondedDespiteGlitch(variant),
+      _ => TmcProbeStage::Responded,
+    },
+    // Absent. A timeout leaves the transport stage at echo/reply (and version 0); a reply that decoded (cleanly
+    // or via glitch tolerance) but mismatched leaves a `Responded`/`RespondedDespiteGlitch` stage — so those mean
+    // the version was wrong, and we surface the actual byte. Any other stage (echo/reply timeout) passes through.
+    Ok(report) => match transport_stage {
+      TmcProbeStage::Responded | TmcProbeStage::RespondedDespiteGlitch(_) => TmcProbeStage::VersionMismatch(report.version),
+      other => other,
+    },
+    // Config writes did not verify (`IFCNT` did not advance by the write count): reads worked but writes are not
+    // landing. Surface the deltas. The transport stage is a stale `Responded` here (the failure is a post-write
+    // comparison, not a read), so it must NOT be trusted — this arm closes the blind spot.
+    Err(TmcManagerError::WriteVerification { expected, actual, .. }) => {
+      TmcProbeStage::WriteVerify { expected: *expected, actual: *actual }
+    }
+    // A bus/datagram error on some read (never an IOIN timeout — `init_axis` maps that to `Ok(absent)`). If it
+    // failed on a read, the transport captured the precise stage (`DecodeError` on a bad post-write `IFCNT` read,
+    // or an echo/reply timeout on a later read); a write-side timeout leaves the stage a stale `Responded`, so
+    // fall back to a generic `InitError` rather than falsely reporting the node healthy.
+    Err(TmcManagerError::Bus(_)) => match transport_stage {
+      TmcProbeStage::Responded => TmcProbeStage::InitError,
+      other => other,
+    },
+    // Any other init error (e.g. an invalid microstep config): never leave it silently `Responded`.
+    Err(_) => TmcProbeStage::InitError,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::drivers::tmc2209::registers::CHOPCONF_VSENSE;
+  use crate::protocol::RxErrorKind;
 
   /// A byte-buffer [`TmcBus`] mock: records every write, increments `IFCNT` like a real driver, and serves
   /// canned `IOIN`/`DRV_STATUS` replies. `ioin_responds = false` models an absent node (the read times out);
@@ -436,6 +481,61 @@ mod tests {
     // The IHOLD_IRUN write carries the resolved run CS in the IRUN field (bits 12:8).
     let ihold_irun_val = bus.written(0, IHOLD_IRUN).expect("IHOLD_IRUN written");
     assert_eq!(((ihold_irun_val >> 8) & 0x1F) as u8, scale.cs);
+  }
+
+  #[test]
+  fn classify_ioin_maps_each_presence_outcome() {
+    // Present, correctly-versioned driver → healthy `Responded` regardless of stage.
+    let present = Ok(AxisReport { node: 0, present: true, version: EXPECTED_VERSION, current: CurrentScaling { cs: 0, vsense: false } });
+    assert_eq!(classify_ioin(&present, TmcProbeStage::Responded), TmcProbeStage::Responded);
+
+    // Absent via echo/reply timeout → the transport stage passes straight through (version is 0, ignored).
+    let absent_timeout = Ok(AxisReport { node: 1, present: false, version: 0, current: CurrentScaling { cs: 0, vsense: false } });
+    assert_eq!(classify_ioin(&absent_timeout, TmcProbeStage::EchoTimeout), TmcProbeStage::EchoTimeout);
+    let reply_timeout = TmcProbeStage::ReplyTimeout { fifo: 8, ready: true };
+    assert_eq!(classify_ioin(&absent_timeout, reply_timeout), reply_timeout);
+
+    // Absent with a cleanly-decoded reply (stage `Responded`) but the wrong version → `VersionMismatch` with the
+    // actual byte, the case-A signal. Note version 0x00 with a `Responded` stage is still a mismatch, not a
+    // timeout — the stage, not the version value, is the discriminator.
+    let wrong_version = Ok(AxisReport { node: 2, present: false, version: 0x10, current: CurrentScaling { cs: 0, vsense: false } });
+    assert_eq!(classify_ioin(&wrong_version, TmcProbeStage::Responded), TmcProbeStage::VersionMismatch(0x10));
+
+    // A non-timeout bus/decode error → the captured `DecodeError` stage passes through, the case-B signal.
+    let decode_error: Result<AxisReport, TmcManagerError> = Err(TmcManagerError::Bus(TmcError::BadCrc));
+    assert_eq!(classify_ioin(&decode_error, TmcProbeStage::DecodeError), TmcProbeStage::DecodeError);
+
+    // The blind-spot fix: a write-verification failure carries a STALE `Responded` transport stage (the failure
+    // is a post-write IFCNT comparison, not a read), yet must surface `WriteVerify`, never `Responded`.
+    let write_verify: Result<AxisReport, TmcManagerError> =
+      Err(TmcManagerError::WriteVerification { node: 0, expected: 8, actual: 0 });
+    assert_eq!(
+      classify_ioin(&write_verify, TmcProbeStage::Responded),
+      TmcProbeStage::WriteVerify { expected: 8, actual: 0 },
+    );
+
+    // A write-side bus timeout also leaves the transport stage a stale `Responded` (write_reg does not touch it),
+    // so it must fall back to `InitError`, not be reported healthy.
+    let write_bus_error: Result<AxisReport, TmcManagerError> = Err(TmcManagerError::Bus(TmcError::Timeout));
+    assert_eq!(classify_ioin(&write_bus_error, TmcProbeStage::Responded), TmcProbeStage::InitError);
+
+    // Any other init error (e.g. invalid microsteps) is never silently `Responded`.
+    let invalid: Result<AxisReport, TmcManagerError> =
+      Err(TmcManagerError::InvalidMicrosteps { node: 0, microsteps: 7 });
+    assert_eq!(classify_ioin(&invalid, TmcProbeStage::Responded), TmcProbeStage::InitError);
+
+    // Flash #3: a present driver whose last read decoded only via RX tolerance keeps `RespondedDespiteGlitch`
+    // (surfaces `ok(<variant>)`) — the reliance is preserved through classification, not collapsed to `ok`.
+    assert_eq!(
+      classify_ioin(&present, TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Glitch)),
+      TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Glitch),
+    );
+    // An absent driver whose glitch-tolerant reply decoded to the wrong version is still a `VersionMismatch`
+    // (the glitch stage counts as "decoded", so the version byte is what matters).
+    assert_eq!(
+      classify_ioin(&wrong_version, TmcProbeStage::RespondedDespiteGlitch(RxErrorKind::Framing)),
+      TmcProbeStage::VersionMismatch(0x10),
+    );
   }
 
   #[test]
