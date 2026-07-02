@@ -2166,6 +2166,16 @@ fn verify_readings_table(ui: &mut egui::Ui, palette: Palette, s: &super::angle_s
 /// columns). Collapsed, it pins to just the tab strip — under a DIFFERENT panel id, so egui's remembered size for
 /// the expanded dock survives a collapse/expand cycle instead of being overwritten by the 30px strip and then
 /// clamped back to the minimum on re-expand.
+///
+/// THE SIZE-PERSISTENCE GUARD (the class-proof half of the self-resizing-console fix): egui persists a resizable
+/// panel's measured CONTENT rect as next frame's panel size, so any content that measures taller or shorter than
+/// the panel — fractional font rows, theme-dependent row heights, a future widget — makes the dock creep on
+/// every repaint (in the shipped app that reads as "grows while the mouse moves", because pointer input is what
+/// drives repaints). Sizing the content exactly proved whack-a-mole: it held under the default test fonts and
+/// broke again under the app's real font stack. So the guard closes the LOOP instead of chasing contributors:
+/// after layout, the persisted height is written back to what it was before the frame — clamped to the current
+/// range — unless the operator is genuinely dragging the resize handle. Content measurement can therefore never
+/// change the dock's size; only a drag (or the range clamp on a window resize) can.
 pub fn dock_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
   eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
   if state.dock_collapsed {
@@ -2175,6 +2185,9 @@ pub fn dock_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time
       });
     return;
   }
+  use egui::containers::panel::PanelState;
+  let dock_id = egui::Id::new("dock");
+  let height_before = PanelState::load(ui.ctx(), dock_id).map(|s| s.rect.height());
   let max_h = (ui.available_height() * Metrics::DOCK_MAX_FRACTION).max(Metrics::DOCK_H);
   egui::Panel::bottom("dock")
     .resizable(true)
@@ -2183,6 +2196,18 @@ pub fn dock_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time
     .show_inside(ui, |ui| {
       dock(ui, view, state, time, eta_qualifier, sink);
     });
+  // The size-persistence guard (see the doc above). `__resize` is the panel machinery's drag-interaction id;
+  // while it is dragged the operator owns the size and the freshly-stored value stands. The panel is
+  // bottom-anchored, so the height restore moves only the top edge.
+  let dragging = ui.ctx().read_response(dock_id.with("__resize")).is_some_and(|r| r.dragged());
+  if !dragging && let Some(stored) = PanelState::load(ui.ctx(), dock_id) {
+    let height = height_before.unwrap_or(Metrics::DOCK_H).clamp(Metrics::DOCK_MIN_H, max_h);
+    if (stored.rect.height() - height).abs() > f32::EPSILON {
+      let mut rect = stored.rect;
+      rect.min.y = rect.max.y - height;
+      ui.ctx().data_mut(|d| d.insert_persisted(dock_id, PanelState { rect }));
+    }
+  }
 }
 
 /// Render the bottom dock's CONTENT (design §03): one surface hosting the Console and Program tabs. The shared
@@ -2466,14 +2491,13 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   //   panel height and the stored size is a fixed point.
   // - The strip can never be pushed below the dock floor by a greedy fill-height scroll area (the older
   //   vanished-MDI bug the reservation arithmetic was originally added for) — the panel owns its space.
-  // Height budget: the strip's real height is FRACTIONAL (the mono text row is ~15.125px, so the field is
-  // ~32.125px) while panel geometry is whole pixels. The inner panel pins its content's MIN height to
-  // `exact − margins`, so as long as that min EXCEEDS the fractional content, the strip's measured rect lands on
-  // exactly the panel's own edges and the dock's stored size is stable. The +5 (4px top breathing room between
-  // the last log row and the strip, +1px of headroom over the fraction) buys ~0.9px of slack; if a font-metric
-  // change ever eats it, the drift stability test fails loudly rather than the dock creeping again.
+  // Height budget: the strip's real height depends on the font stack (the mono row is ~15.1px under the test
+  // fonts but taller under the app's JetBrains Mono + themed spacing), so the slot carries generous headroom —
+  // 4px top breathing room between the last log row and the strip plus slack over the tallest observed content.
+  // Content that still outgrew the slot would clip at the dock floor, NOT resize the dock: the dock's persisted
+  // size is guarded in [`dock_panel`] regardless of what the content measures.
   egui::Panel::bottom("dock-mdi")
-    .exact_size(Metrics::MDI_ROW_H + 5.0)
+    .exact_size(Metrics::MDI_ROW_H + 8.0)
     .resizable(false)
     .show_separator_line(false)
     .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 4, bottom: 0 }))

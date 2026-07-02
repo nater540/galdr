@@ -99,7 +99,9 @@ pub(crate) fn build_docked_panel_harness(
   state: HarnessState, time: super::progress::TimeEstimate,
 ) -> Harness<'static, HarnessState> {
   use crate::app::metrics::Metrics;
-  Harness::builder()
+  // The dock's tab labels go through `tr!`; seed the registry so label queries work in any test order.
+  ensure_locales_seeded();
+  let harness = Harness::builder()
     .with_size(egui::vec2(900.0, 600.0))
     .build_ui_state(
       move |ui, state: &mut HarnessState| {
@@ -111,7 +113,13 @@ pub(crate) fn build_docked_panel_harness(
         state.intents.extend(sink.drain());
       },
       state,
-    )
+    );
+  // The APP's fonts and theme, not kittest's defaults: row heights (and therefore every measured content rect)
+  // are font-stack-dependent, and the dock's self-resize bug reproduced ONLY under the real fonts — a harness on
+  // default fonts waved it through. Every dock-fidelity test must run on what the window actually renders.
+  super::fonts::install(&harness.ctx);
+  super::shell::apply_theme(&harness.ctx, &super::theme::Palette::default_dark(), 1.0);
+  harness
 }
 
 /// Lay out the FULL application shell exactly as [`super::SkirnirApp`]'s frame does, driven by a
@@ -892,6 +900,78 @@ mod tests {
   }
 
   #[test]
+  fn the_console_dock_holds_its_size_while_the_pointer_roams_over_it() {
+    // The user-reported SECOND variant of the self-resizing dock: it grew only while the mouse moved — i.e. per
+    // pointer-driven repaint. The earlier stability tests pumped frames with no pointer over the dock, so a
+    // hover-dependent contributor to the measured content rect slipped through them. Sweep the pointer across
+    // every widget class in the dock (the resize band — without pressing — the tab strip, the checkbox row, log
+    // rows, the MDI field and Send button) and assert the PERSISTED panel rect stays byte-stable.
+    let mut ui = UiState::default();
+    ui.active_tab = views::DockTab::Console;
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_docked_panel_harness(state, zero_time());
+    harness.run_steps(3);
+    let before = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
+      .expect("the dock panel must have stored state")
+      .rect;
+    // Three passes of a pseudo-scan over x ∈ [20, 850] and y ∈ [360, 570] — the dock spans ~[368, 568] in this
+    // 900×600 harness, so the scan crosses the resize band, strip, body, and MDI row repeatedly.
+    for pass in 0..3u32 {
+      for step in 0..24u32 {
+        let x = 20.0 + step as f32 * 36.0;
+        let y = 360.0 + ((step * 9 + pass * 5) % 22) as f32 * 10.0;
+        harness.hover_at(egui::pos2(x, y));
+        harness.run_steps(1);
+      }
+    }
+    let after = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
+      .expect("the dock panel state must survive")
+      .rect;
+    assert!(
+      (after.height() - before.height()).abs() <= 0.5,
+      "the dock must hold its size under pointer movement: {before:?} -> {after:?} after 72 hover frames"
+    );
+  }
+
+  #[test]
+  fn the_console_dock_holds_its_size_under_the_app_fonts_at_both_dpis() {
+    // THE faithful reproduction of the user's "console grows while moving the mouse": under the APP's font
+    // stack + theme (row heights differ from kittest's defaults) the dock's content measured taller than the
+    // panel, and since egui persists the measured content rect as next frame's panel size, the dock grew on
+    // every repaint — which in the shipped app only happen on pointer input, hence "only while moving the
+    // mouse". The default-font harnesses were blind to it. Renders the full shell with the real fonts/theme at
+    // both 1x and Retina 2x and asserts the persisted dock rect is byte-stable across frames; the guard in
+    // `views::dock_panel` is what holds it.
+    ensure_locales_seeded();
+    for ppp in [1.0f32, 2.0] {
+      let mut ui = UiState::default();
+      ui.active_tab = views::DockTab::Console;
+      let state = HarnessState::new(view_idle(), ui);
+      let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_pixels_per_point(ppp)
+        .build_ui_state(
+          move |ui, state: &mut HarnessState| shell_layout(ui, state, TimeEstimate::default()),
+          state,
+        );
+      crate::app::fonts::install(&harness.ctx);
+      crate::app::shell::apply_theme(&harness.ctx, &crate::app::theme::Palette::default_dark(), 1.0);
+      harness.run_steps(3);
+      let before = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
+        .expect("the dock panel must have stored state")
+        .rect;
+      harness.run_steps(20);
+      let after = egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("dock"))
+        .expect("the dock panel state must survive")
+        .rect;
+      assert!(
+        (after.height() - before.height()).abs() <= 0.5,
+        "at {ppp}x under the app fonts the dock must hold its size: {before:?} -> {after:?} over 20 frames"
+      );
+    }
+  }
+
+  #[test]
   fn the_console_dock_holds_a_manually_dragged_size() {
     // The other half of the report: a size the operator SET must stick. Drag the dock's top edge up, then run
     // many uneventful frames — the dragged size must survive them, not be fought back frame by frame.
@@ -939,6 +1019,8 @@ mod tests {
       },
       state,
     );
+    crate::app::fonts::install(&harness.ctx);
+    crate::app::shell::apply_theme(&harness.ctx, &crate::app::theme::Palette::default_dark(), 1.0);
     harness.run_steps(5);
     let window_id = egui::Id::new("app-settings-window");
     let rect_before = harness
@@ -977,6 +1059,8 @@ mod tests {
       },
       state,
     );
+    crate::app::fonts::install(&harness.ctx);
+    crate::app::shell::apply_theme(&harness.ctx, &crate::app::theme::Palette::default_dark(), 1.0);
     harness.run_steps(5);
     let window_id = egui::Id::new("app-settings-window");
     let rect = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
@@ -1022,6 +1106,8 @@ mod tests {
       },
       state,
     );
+    crate::app::fonts::install(&harness.ctx);
+    crate::app::shell::apply_theme(&harness.ctx, &crate::app::theme::Palette::default_dark(), 1.0);
     harness.run_steps(5);
     let window_id = egui::Id::new("app-settings-window");
     let rect = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");

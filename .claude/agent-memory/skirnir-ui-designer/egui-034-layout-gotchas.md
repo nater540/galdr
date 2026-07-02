@@ -46,3 +46,10 @@ egui 0.34 behaviors verified the hard way in skirnir (each caused a visible bug 
   (2) egui snaps a resizable WINDOW's height back to content height, so short non-filling dialog content makes
   vertical drags revert instantly; fix = content that always fills (bottom-anchored save row + fill scroll).
   Both pinned by `*_holds_*`/`*_accepts_a_vertical_resize*` stability tests (drift asserts over 20 frames).
+- The dock self-resize bug had a SECOND act (2026-07-02): the exact-fill fix held under kittest's default fonts
+  but broke under the app's real fonts/theme (row heights differ; content spilled ~2px/frame; in the shipped app
+  repaints are pointer-driven → "grows only while moving the mouse"). Two durable lessons: (1) any test about
+  measured sizes MUST run under `fonts::install` + `apply_theme` — default-font harnesses wave these bugs
+  through; (2) the CLASS fix is the persisted-size guard in `views::dock_panel`: after `show_inside`, write the
+  pre-frame height back into `PanelState` (via `insert_persisted`) unless `read_response(id.with("__resize"))`
+  reports a genuine drag — content measurement can then never change a resizable panel's size.
