@@ -551,9 +551,11 @@ fn button_row(ui: &mut egui::Ui, gap: f32, weights: &[f32], mut cell: impl FnMut
 /// `1px #2E2E2E` group separators). The divider colour is deliberately subtle against the `panelAlt` bar, so the
 /// GROUPING is carried by the extra air around it: the strip plus the toolbar gap on either side gives ~21px
 /// between groups versus the 6px within one, which reads as separation even where the hairline itself is faint.
-fn toolbar_divider(ui: &mut egui::Ui, palette: Palette) {
-  let (rect, _) = ui.allocate_exact_size(Vec2::new(Metrics::TOOLBAR_DIVIDER_W, Metrics::TOOLBAR_CONTROL_H),
-    egui::Sense::hover());
+fn toolbar_divider(ui: &mut egui::Ui, palette: Palette, compact: bool) {
+  // Compact halves the strip's air: the icon-form bar exists precisely because width ran out, and the icons'
+  // own gaps already separate the groups legibly at that density.
+  let strip_w = if compact { 3.0 } else { Metrics::TOOLBAR_DIVIDER_W };
+  let (rect, _) = ui.allocate_exact_size(Vec2::new(strip_w, Metrics::TOOLBAR_CONTROL_H), egui::Sense::hover());
   let center = rect.center();
   let half = 22.0 * 0.5;
   ui.painter().vline(center.x, (center.y - half)..=(center.y + half), egui::Stroke::new(1.0, palette.divider));
@@ -622,16 +624,40 @@ fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) {
   ui.painter().circle_filled(rect.center(), diameter * 0.5, color);
 }
 
+/// The toolbar's self-measured fit, persisted in egui temp memory across frames: whether the bar renders in
+/// COMPACT form (secondary controls collapse to icon glyphs) and the width the FULL form was last measured to
+/// need. Immediate mode cannot know before layout whether the full labels fit — label widths depend on the
+/// locale (Swedish "Inställningar"/"Nödstopp" overflow widths English clears) — so the bar renders, measures its
+/// real extent, and stores the verdict for the NEXT frame: the standard immediate-mode responsive pattern. The
+/// full requirement is only re-measured while rendering full, so after a label change (locale switch, a
+/// connect/disconnect swapping the port group) it refreshes the next time the bar expands; until then the stored
+/// measurement stands, which can cost at most one corrective flip.
+#[derive(Clone, Copy, Default)]
+struct ToolbarFit {
+  /// Whether the bar currently renders icon-form secondary controls.
+  compact: bool,
+  /// The total width (px) the FULL-labelled form last measured itself to need, including both edge paddings.
+  full_needs: f32,
+}
+
 /// Render the 40px main toolbar: the connect group, Open, the Run/Hold/Stop segmented transport group, Home,
-/// Settings, and the right-aligned machine-state badge (design §03).
+/// Settings, and the right-aligned machine-state badge (design §03). Self-measuring: when the full labels
+/// cannot fit the bar's width, the SECONDARY controls (identify, open, transport, simulate, home, settings)
+/// collapse to icon glyphs with their full labels on hover — the primary actions (connect/disconnect) and the
+/// safety-critical state badge always keep their full form. See [`ToolbarFit`].
 pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
+  let fit_id = egui::Id::new("toolbar-fit");
+  let mut fit: ToolbarFit = ui.ctx().data(|d| d.get_temp(fit_id)).unwrap_or_default();
+  let compact = fit.compact;
   // 1px bottom divider under the bar (design §03's `border-bottom:1px #2E2E2E`), painted along the panel edge.
   let bar = ui.max_rect();
   ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, palette.divider));
   // `horizontal_centered` vertically centres the 26px controls in the 40px bar, giving the design's even
-  // breathing room above and below rather than the top-aligned look the plain `horizontal` produced.
-  ui.horizontal_centered(|ui| {
+  // breathing room above and below rather than the top-aligned look the plain `horizontal` produced. The closure
+  // reports the LTR content's right edge and the right-aligned cluster's left edge, so the bar can measure
+  // whether its content actually fit this frame.
+  let (ltr_end, rtl_left) = ui.horizontal_centered(|ui| {
     // Toolbar controls are 26px tall with 10px side-padding and a 6px gap (design §03); set the region spacing
     // up front so every button/combo in the strip inherits the bar's sizing rather than the panel default.
     ui.spacing_mut().item_spacing.x = Metrics::TOOLBAR_GAP;
@@ -658,91 +684,146 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
     } else {
       // Port dropdown + refresh + identify + connect, only meaningful while disconnected. Each row shows the
       // (cu-preferred) path and, when known, a short USB product / «likely Galdr» hint so the board stands out.
-      egui::ComboBox::from_id_salt("port")
-        // A fixed width keeps the connect group stable while ports of different path lengths come and go —
-        // otherwise the whole toolbar re-flows every time the dropdown selection changes.
-        .width(200.0)
-        .selected_text(if state.selected_port.is_empty() {
-          crate::tr!("port-choose")
-        } else {
-          state.selected_port.clone()
-        })
-        .show_ui(ui, |ui| {
-          for port in &state.ports {
-            // The selectable label carries the path; the hint (if any) trails it dimmed so the row stays
-            // scannable while flagging the likely board.
-            let label = match port.hint() {
-              Some(hint) => format!("{}  ·  {hint}", port.path),
-              None => port.path.clone(),
-            };
-            ui.selectable_value(&mut state.selected_port, port.path.clone(), label);
-          }
-        });
+      // The combo lives in a FIXED-WIDTH child ui: `ComboBox::width` is only a MINIMUM and `truncate` bounds to
+      // `ui.available_width()` — in an open toolbar row that is the whole bar, so a long path would grow the
+      // button past any requested width. Capping the child's width makes the truncation real, which is what
+      // keeps the connect group stable as ports come and go AND lets compact actually shrink it (the dropdown
+      // rows still show every path whole).
+      let combo_w = if compact { 120.0 } else { 200.0 };
+      ui.allocate_ui_with_layout(
+        Vec2::new(combo_w, Metrics::TOOLBAR_CONTROL_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+          ui.set_max_width(combo_w);
+          egui::ComboBox::from_id_salt("port")
+            .width(combo_w)
+            .truncate()
+            .selected_text(if state.selected_port.is_empty() {
+              crate::tr!("port-choose")
+            } else {
+              state.selected_port.clone()
+            })
+            .show_ui(ui, |ui| {
+              for port in &state.ports {
+                // The selectable label carries the path; the hint (if any) trails it dimmed so the row stays
+                // scannable while flagging the likely board.
+                let label = match port.hint() {
+                  Some(hint) => format!("{}  ·  {hint}", port.path),
+                  None => port.path.clone(),
+                };
+                ui.selectable_value(&mut state.selected_port, port.path.clone(), label);
+              }
+            });
+        },
+      );
+      // Compact thins the two icon buttons' side padding too — every pixel of the connect group counts at the
+      // minimum width. Scoped: the padding is restored before the (text) Connect button below.
+      let full_pad = ui.spacing().button_padding;
+      if compact {
+        ui.spacing_mut().button_padding.x = 5.0;
+      }
       if ui.button("⟳").on_hover_text(crate::tr!("tip-refresh-ports")).clicked() {
         sink.push(Intent::RefreshPorts);
       }
       let has_port = !state.selected_port.is_empty();
       // Identify actively probes the selected port for grblHAL. It is opt-in (opening toggles the board's
-      // auto-reset line) and never part of a refresh, so it sits behind its own button.
+      // auto-reset line) and never part of a refresh, so it sits behind its own button. Compact: a magnifier
+      // glyph (probe/inspect), with the full label folded into the hover.
+      let identify_label = if compact { "🔍".to_string() } else { crate::tr!("btn-identify") };
       if ui
-        .add_enabled(has_port, egui::Button::new(crate::tr!("btn-identify")))
-        .on_hover_text(crate::tr!("tip-identify"))
+        .add_enabled(has_port, egui::Button::new(identify_label))
+        .on_hover_text(compact_tip(compact, crate::tr!("btn-identify"), crate::tr!("tip-identify")))
         .clicked()
       {
         sink.push(Intent::IdentifyPort { path: state.selected_port.clone() });
       }
+      ui.spacing_mut().button_padding = full_pad;
       if ui.add_enabled(has_port, egui::Button::new(crate::tr!("btn-connect"))).clicked() {
         sink.push(Intent::Connect { path: state.selected_port.clone(), baud: state.baud });
       }
     }
 
-    toolbar_divider(ui, palette);
+    toolbar_divider(ui, palette, compact);
 
-    if ui.button(crate::tr!("btn-open")).on_hover_text(crate::tr!("tip-open")).clicked()
+    let open_label = if compact { "🗁".to_string() } else { crate::tr!("btn-open") };
+    if ui
+      .button(open_label)
+      .on_hover_text(compact_tip(compact, crate::tr!("btn-open"), crate::tr!("tip-open")))
+      .clicked()
       && let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "ngc", "tap"]).pick_file()
     {
       sink.push(Intent::OpenProgram(path));
     }
 
-    toolbar_divider(ui, palette);
-    transport_group(ui, view, state, sink);
-    toolbar_divider(ui, palette);
+    toolbar_divider(ui, palette, compact);
+    transport_group(ui, view, state, compact, sink);
+    toolbar_divider(ui, palette, compact);
 
     // Home runs the firmware homing cycle; safe to offer whenever connected and not already moving. Drawn as a
     // ghost button (transparent rest, design §03) so it reads as a secondary action beside the framed groups.
+    // Compact keeps just the ⌂ glyph the full label already leads with.
     let badge = view.badge_state();
     let can_home = connected && !matches!(badge, BadgeState::Run | BadgeState::Jog | BadgeState::Home);
     let home_color = if can_home { palette.text_dim } else { palette.text_disabled };
-    let home = egui::Button::new(RichText::new(crate::tr!("btn-home")).color(home_color)).fill(Color32::TRANSPARENT);
-    if ui.add_enabled(can_home, home).on_hover_text(crate::tr!("tip-home")).clicked() {
+    let home_label = if compact { "⌂".to_string() } else { crate::tr!("btn-home") };
+    let home = egui::Button::new(RichText::new(home_label).color(home_color)).fill(Color32::TRANSPARENT);
+    if ui
+      .add_enabled(can_home, home)
+      .on_hover_text(compact_tip(compact, crate::tr!("btn-home"), crate::tr!("tip-home")))
+      .clicked()
+    {
       sink.push(Intent::Home);
     }
 
     // Settings takes the same ghost treatment as Home: the two sit together as secondary chrome actions beside
     // the framed connect/transport groups, and a filled Settings next to a ghost Home read as two accidental
-    // styles rather than one deliberate pair.
+    // styles rather than one deliberate pair. Compact: the 🛠 wrench (firmware/machine settings — deliberately
+    // distinct from the ⚙ app-settings gear beside the badge).
+    let settings_label = if compact { "🛠".to_string() } else { crate::tr!("btn-settings") };
     let settings =
-      egui::Button::new(RichText::new(crate::tr!("btn-settings")).color(palette.text_dim)).fill(Color32::TRANSPARENT);
-    if ui.add(settings).on_hover_text(crate::tr!("tip-settings")).clicked() {
+      egui::Button::new(RichText::new(settings_label).color(palette.text_dim)).fill(Color32::TRANSPARENT);
+    if ui
+      .add(settings)
+      .on_hover_text(compact_tip(compact, crate::tr!("btn-settings"), crate::tr!("tip-settings")))
+      .clicked()
+    {
       state.settings_open = !state.settings_open;
     }
+    // The LTR content ends here; its right edge is one half of the fit measurement.
+    let ltr_end = ui.min_rect().right();
 
     // Right-aligned state badge so it is always visible regardless of toolbar width. The leading space is the
     // bar's right-edge padding (`padding:0 10px`, design §03), mirroring the inset at the left edge. The ⚙ gear
     // (the APP settings dialog — language/theme, distinct from the firmware Settings) sits just left of the badge
-    // as ghost chrome.
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      ui.add_space(Metrics::TOOLBAR_PAD_X);
-      state_badge(ui, view, state);
-      // Icon-tight padding: the bar is genuinely full at the 800px minimum window, and the gear at the standard
-      // 10px button padding collided with the Settings button there. 4px keeps it a comfortable ~22px target.
-      ui.spacing_mut().button_padding = Vec2::new(4.0, 0.0);
-      let gear = egui::Button::new(RichText::new("⚙").size(14.0).color(palette.text_dim)).fill(Color32::TRANSPARENT);
-      if ui.add(gear).on_hover_text(crate::tr!("tip-app-settings")).clicked() {
-        state.app_settings_open = !state.app_settings_open;
-      }
-    });
-  });
+    // as ghost chrome. The closure reports its content's LEFT edge — the other half of the fit measurement.
+    let rtl_left = ui
+      .with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(Metrics::TOOLBAR_PAD_X);
+        state_badge(ui, view, state);
+        // Icon-tight padding: the bar is genuinely full at the 800px minimum window, and the gear at the standard
+        // 10px button padding collided with the Settings button there. 4px keeps it a comfortable ~22px target.
+        ui.spacing_mut().button_padding = Vec2::new(4.0, 0.0);
+        let gear =
+          egui::Button::new(RichText::new("⚙").size(14.0).color(palette.text_dim)).fill(Color32::TRANSPARENT);
+        if ui.add(gear).on_hover_text(crate::tr!("tip-app-settings")).clicked() {
+          state.app_settings_open = !state.app_settings_open;
+        }
+        ui.min_rect().left()
+      })
+      .inner;
+    (ltr_end, rtl_left)
+  })
+  .inner;
+
+  // The fit verdict for the NEXT frame: while rendering FULL, record what the full form actually needs (LTR
+  // width + one gap + the right cluster's width); in either form, compact exactly when that requirement exceeds
+  // the bar. Stored in temp memory so the flip lands next frame without a relayout mid-pass.
+  let full_span = (ltr_end - bar.left()) + Metrics::TOOLBAR_GAP + (bar.right() - rtl_left);
+  if !compact {
+    fit.full_needs = full_span;
+  }
+  fit.compact = fit.full_needs > bar.width();
+  ui.ctx().data_mut(|d| d.insert_temp(fit_id, fit));
 
   // Fabulous mode: lay a thin Pride rainbow along the toolbar's bottom edge, overpainting the divider. Drawn
   // after the bar's content so it sits on top, and bookended by the matching band on the status bar.
@@ -755,22 +836,34 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
   }
 }
 
+/// The hover text for a toolbar control: in compact (icon-only) form the full label leads the explanation so
+/// the glyph is never the only name the operator gets; in full form the explanation stands alone (the label is
+/// already on the button).
+fn compact_tip(compact: bool, label: String, tip: String) -> String {
+  if compact { format!("{label} — {tip}") } else { tip }
+}
+
 /// The Run/Hold/Stop segmented group plus a separate Abort control. The leading segment starts a stream (Idle) or
 /// resumes (Hold); Hold issues a feed-hold; Stop issues the GRACEFUL program stop (`0x86` — decelerate, flush,
 /// return to Idle, no alarm); the standalone Abort issues the HARD soft-reset (`0x18` → `ALARM:3`). Enable/emphasis
-/// come from the pure [`TransportGroup`] matrix so the view stays a renderer.
-pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
+/// come from the pure [`TransportGroup`] matrix so the view stays a renderer. In `compact` form (the toolbar
+/// could not fit its full labels — see [`ToolbarFit`]) the segments render their transport glyphs alone, with the
+/// full translated labels on hover; the colour coding (green run / amber stop / red abort) is unchanged, so the
+/// safety semantics never depend on the text fitting.
+pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, compact: bool,
+  sink: &mut IntentSink) {
   let palette = state.style.palette;
   use egui::CornerRadius;
   let group = TransportGroup::for_state(view.badge_state(), !state.program.is_empty());
 
-  let run_label = if group.run_is_resume {
+  let run_full = if group.run_is_resume {
     crate::tr!("transport-resume")
   } else if group.run_active {
     crate::tr!("transport-running")
   } else {
     crate::tr!("transport-run")
   };
+  let run_label = if compact { "▶".to_string() } else { run_full.clone() };
   // Joined segmented group (design §03): the three buttons abut with no gap and only the outer corners are
   // rounded — Run rounds its left, Stop its right, Hold stays square.
   let r = Metrics::CONTROL_RADIUS;
@@ -786,21 +879,31 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   if group.run_active {
     run_button = run_button.fill(palette.inset);
   }
-  if ui.add_enabled(group.run_enabled, run_button).clicked() {
+  let mut run_resp = ui.add_enabled(group.run_enabled, run_button);
+  if compact {
+    // Icon-only: the full (state-dependent) label rides on hover so ▶ is never the only name the control has.
+    run_resp = run_resp.on_hover_text(run_full);
+  }
+  if run_resp.clicked() {
     sink.push(Intent::RunOrResume);
   }
-  let hold = egui::Button::new(crate::tr!("transport-hold")).corner_radius(mid);
-  if ui.add_enabled(group.hold_enabled, hold).on_hover_text(crate::tr!("tip-hold")).clicked() {
+  let hold_label = if compact { "⏸".to_string() } else { crate::tr!("transport-hold") };
+  let hold = egui::Button::new(hold_label).corner_radius(mid);
+  if ui
+    .add_enabled(group.hold_enabled, hold)
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-hold"), crate::tr!("tip-hold")))
+    .clicked()
+  {
     sink.push(Intent::Realtime(RealtimeCommand::FeedHold));
   }
   // Stop is now the GRACEFUL program stop (`0x86`): the everyday "stop the job cleanly" button. It decelerates to a
   // block boundary, flushes the queue and returns to Idle with no alarm, so it reads as a normal-weight control
   // (amber, not danger-red) — the hard reset lives in the separate Abort button beside the group.
-  let stop = egui::Button::new(RichText::new(crate::tr!("transport-stop")).color(palette.state_hold))
-    .corner_radius(right);
+  let stop_label = if compact { "■".to_string() } else { crate::tr!("transport-stop") };
+  let stop = egui::Button::new(RichText::new(stop_label).color(palette.state_hold)).corner_radius(right);
   if ui
     .add_enabled(group.stop_enabled, stop)
-    .on_hover_text(crate::tr!("tip-stop"))
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-stop"), crate::tr!("tip-stop")))
     .clicked()
   {
     sink.push(Intent::Realtime(RealtimeCommand::ProgramStop));
@@ -812,11 +915,12 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   // Abort / E-stop: the HARD soft-reset (`0x18` → `ALARM:3`). Visually distinct — danger-red, fully rounded, set
   // apart from the segmented group — and available the instant a transport is attached (even mid-handshake), so the
   // operator always has an emergency reset. The graceful Stop above is the routine control; this is the panic stop.
-  let abort = egui::Button::new(RichText::new(crate::tr!("transport-abort")).color(palette.state_alarm))
-    .corner_radius(Metrics::CONTROL_RADIUS);
+  let abort_label = if compact { "⏹".to_string() } else { crate::tr!("transport-abort") };
+  let abort =
+    egui::Button::new(RichText::new(abort_label).color(palette.state_alarm)).corner_radius(Metrics::CONTROL_RADIUS);
   if ui
     .add_enabled(group.abort_enabled, abort)
-    .on_hover_text(crate::tr!("tip-abort"))
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-abort"), crate::tr!("tip-abort")))
     .clicked()
   {
     sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
@@ -829,11 +933,11 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   let sim_color = if has_program { palette.text_dim } else { palette.text_disabled };
   // `≈` (approximately equal) — an "estimate" glyph Roboto actually covers. The earlier `∿` (sine wave) is in
   // neither vendored face nor egui's fallback fonts, so it rendered as a tofu box on every platform.
-  let simulate = egui::Button::new(RichText::new(crate::tr!("transport-simulate")).color(sim_color))
-    .fill(Color32::TRANSPARENT);
+  let sim_label = if compact { "≈".to_string() } else { crate::tr!("transport-simulate") };
+  let simulate = egui::Button::new(RichText::new(sim_label).color(sim_color)).fill(Color32::TRANSPARENT);
   if ui
     .add_enabled(has_program, simulate)
-    .on_hover_text(crate::tr!("tip-simulate"))
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-simulate"), crate::tr!("tip-simulate")))
     .clicked()
   {
     sink.push(Intent::Simulate);

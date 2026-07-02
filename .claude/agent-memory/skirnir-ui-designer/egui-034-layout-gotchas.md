@@ -31,3 +31,11 @@ egui 0.34 behaviors verified the hard way in skirnir (each caused a visible bug 
   snapshots must render at 1×; 2× is fine for static shots.
 - egui's colour-picker popup IS drivable headlessly: swatches are `Role::ColorWell`, the popup's R/G/B channels
   are `Role::SpinButton`s appended after existing ones; `focus()` + `type_text("255")` + Enter commits a channel.
+- `ComboBox::width` is only a MINIMUM, and `.truncate()` bounds to `ui.available_width()` — in an open row the
+  button still grows to the full selected text. To actually cap a combo, wrap it in a fixed-size
+  `allocate_ui_with_layout` child + `set_max_width`; then `.width` + `.truncate()` behave.
+- The toolbar is locale-responsive via the immediate-mode self-measure pattern (`views::ToolbarFit` in temp
+  memory): render full, measure LTR end + RTL cluster extent, flip to icon-form next frame when the full labels
+  can't fit. Swedish overflows the 800px minimum (and disconnected-sv even 1280) where English fits. The compact
+  fit invariant is asserted in `snapshot_toolbar` — a longer future translation fails there, not silently.
+- Glyph notes: `🗁` (open folder) renders well in egui's emoji font; `📂` renders as an odd angled shape.

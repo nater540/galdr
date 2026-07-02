@@ -130,6 +130,12 @@ pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: su
     .show_inside(ui, |ui| views::toolbar(ui, &state.view, &mut state.ui, &mut sink));
   if state.view.banner.is_some() {
     egui::Panel::top("banner").show_inside(ui, |ui| views::alarm_banner(ui, palette, &state.view, &mut sink));
+  } else if state.view.badge_state() == crate::app::badge::BadgeState::Tool {
+    // Mirror the shell's M6 tool-change affordance: with no fault latched but the firmware held for a manual
+    // tool change, the prominent banner takes the same top slot (this branch was missing from the mirror — the
+    // tool-change state was unrenderable in snapshots until the sv-SE layout pass needed it).
+    egui::Panel::top("tool_change")
+      .show_inside(ui, |ui| views::tool_change_banner(ui, palette, &state.view, &mut sink));
   }
   egui::Panel::bottom("status")
     .exact_size(Metrics::STATUS_BAR_H)
@@ -169,9 +175,12 @@ pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: su
 pub(crate) fn build_shell_harness(
   state: HarnessState, size: egui::Vec2, time: super::progress::TimeEstimate,
 ) -> Harness<'static, HarnessState> {
-  // The toolbar labels go through `tr!`; seed the global registry so they render as words, not raw keys. Errors
-  // are ignored — a bundled-locale parse failure would already fail the i18n unit tests.
-  let _ = crate::i18n::init();
+  // The toolbar labels go through `tr!`; seed the global registry so they render as words, not raw keys —
+  // WITHOUT resetting an already-selected language (`init` resets to en-US, which would clobber the locale a
+  // sv-SE snapshot just pinned). Errors are ignored — a bundled parse failure already fails the i18n unit tests.
+  if crate::i18n::languages().is_empty() || crate::i18n::get_language().is_empty() {
+    let _ = crate::i18n::init();
+  }
   let palette = state.ui.style.palette;
   let harness = Harness::builder().with_size(size).build_ui_state(
     move |ui, state: &mut HarnessState| shell_layout(ui, state, time),
@@ -243,7 +252,7 @@ pub(crate) fn build_transport_group_harness(state: HarnessState) -> Harness<'sta
       |ui, state: &mut HarnessState| {
         ui.horizontal(|ui| {
           let mut sink = IntentSink::new();
-          views::transport_group(ui, &state.view, &state.ui, &mut sink);
+          views::transport_group(ui, &state.view, &state.ui, false, &mut sink);
           state.intents.extend(sink.drain());
         });
       },
@@ -782,6 +791,46 @@ mod tests {
       "the created theme becomes active: {intents:?}"
     );
     assert!(harness.state().ui.theme_name_draft.is_empty(), "the name draft clears once created");
+  }
+
+  #[test]
+  fn the_toolbar_collapses_to_icon_form_when_the_full_labels_cannot_fit() {
+    // The self-measuring toolbar: at a width where the full labels cannot fit (locale-dependent — Swedish
+    // "Inställningar"/"Nödstopp" overflow the 800px minimum window, and even English overflows at 640), the
+    // secondary controls collapse to icon glyphs instead of overlapping the state badge. The bar renders full
+    // once, measures, and flips — so the verdict lands by the second frame.
+    let state = HarnessState::new(view_idle(), UiState::default());
+    let mut harness = build_shell_harness(state, egui::vec2(640.0, 500.0), zero_time());
+    harness.run_steps(3);
+    assert!(
+      harness.query_by_label("🛠").is_some(),
+      "at 640px the firmware-settings control must collapse to its 🛠 icon form"
+    );
+    assert!(
+      harness.query_by_label("Settings").is_none(),
+      "the full Settings label must be gone in compact form (it cannot fit)"
+    );
+    // The compact controls must actually clear each other and the right-aligned cluster — no overlap: the
+    // firmware-settings icon ends left of the app-settings gear, which ends left of the badge, all on-screen.
+    let settings = harness.get_by_label("🛠").rect();
+    let gear = harness.get_by_label("⚙").rect();
+    assert!(
+      settings.right() <= gear.left() + 1.0,
+      "compact settings ({}) must not overlap the gear ({})",
+      settings.right(),
+      gear.left()
+    );
+    assert!(gear.right() <= 640.0, "the right cluster must stay inside the window");
+  }
+
+  #[test]
+  fn the_toolbar_keeps_full_labels_when_they_fit() {
+    // The flip side: at a comfortable width the bar stays in its full labelled form — no icon-only degradation.
+    let state = HarnessState::new(view_idle(), UiState::default());
+    let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+    harness.run_steps(3);
+    assert!(harness.query_by_label("Settings").is_some(), "at 1280px the full Settings label fits and shows");
+    assert!(harness.query_by_label("🛠").is_none(), "no icon-only degradation when the full labels fit");
   }
 
   #[test]

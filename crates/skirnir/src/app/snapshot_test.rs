@@ -14,6 +14,8 @@
 //! real job file. Each state is rendered through [`super::ui_test::shell_layout`], the shared mirror of the real
 //! shell's panel arrangement, with the app's fonts and theme applied so the pixels match the live window.
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use eframe::egui;
 
 use super::progress::TimeEstimate;
@@ -26,6 +28,35 @@ use crate::transport::ports::PortInfo;
 
 /// The default window size the snapshots render at — the config's default window, a typical laptop fit.
 const DEFAULT_SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
+
+/// The application's minimum window size (`with_min_inner_size` in `shell::run`) — the tightest layout every
+/// locale must survive, which is where the longer Swedish labels are most likely to crowd or clip.
+const MIN_SIZE: egui::Vec2 = egui::vec2(800.0, 500.0);
+
+/// Serialises snapshot rendering across the parallel test threads AND pins the process-global i18n locale for
+/// the render's whole duration: `tr!` resolves against ONE global registry, so a Swedish render racing an
+/// English one would corrupt both. Every snapshot helper takes this guard before building its harness and holds
+/// it through the `snapshot` call; dropping it restores `en-US` so no test leaks a locale into the next.
+static RENDER_LOCK: Mutex<()> = Mutex::new(());
+
+/// The held render lock + the locale reset on drop. See [`render_in`].
+struct LocaleGuard<'l>(#[allow(dead_code)] MutexGuard<'l, ()>);
+
+impl Drop for LocaleGuard<'_> {
+  fn drop(&mut self) {
+    crate::i18n::set_language(crate::i18n::EN_US);
+  }
+}
+
+/// Take the render lock and select `locale` on the global i18n registry (seeding the bundles first — `init`
+/// also resets the language, hence the explicit select afterwards). A poisoned lock is recovered, not
+/// propagated: the inner unit state cannot be corrupt, and one failed snapshot must not cascade.
+fn render_in(locale: &str) -> LocaleGuard<'static> {
+  let guard = RENDER_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+  let _ = crate::i18n::init();
+  crate::i18n::set_language(locale);
+  LocaleGuard(guard)
+}
 
 /// A tiny, obviously-fake fixture program: a 20 mm square at Z−0.5 with a lead-in, small enough to eyeball in
 /// the toolpath viewport and the Program tab. Never a real job file.
@@ -88,8 +119,19 @@ fn alarm_view() -> ViewState {
   view
 }
 
+/// A mid-job M6 manual tool change: the firmware holds in `Tool` and the shell learned the awaited tool from
+/// `$G`, so the tool-change banner and the TOOL badge render.
+fn tool_change_view() -> ViewState {
+  let mut view = ViewState::default();
+  view.connection = ConnectionState::Streaming;
+  apply_status(&mut view, "Tool|MPos:12.500,20.000,-1.200|WCO:2.000,3.000,1.000");
+  view.current_tool = Some(3);
+  view
+}
+
 /// Render one shell state offscreen and snapshot it. `name` becomes `tests/snapshots/<name>.png`.
-fn snapshot_shell(name: &str, size: egui::Vec2, view: ViewState, ui: UiState, time: TimeEstimate) {
+fn snapshot_shell(name: &str, size: egui::Vec2, view: ViewState, ui: UiState, time: TimeEstimate, locale: &str) {
+  let _locale = render_in(locale);
   let state = HarnessState::new(view, ui);
   let mut harness = build_shell_harness(state, size, time);
   // Two settle frames: the first lays out with the freshly-installed fonts/theme, the second is steady-state.
@@ -104,10 +146,10 @@ fn no_time() -> TimeEstimate {
 
 /// Render JUST the 40px toolbar at 2× pixel density and snapshot it — the close-up for glyph/spacing review,
 /// where the full-window shots are too coarse to judge padding and icon rendering.
-fn snapshot_toolbar(name: &str, width: f32, view: ViewState, ui: UiState) {
+fn snapshot_toolbar(name: &str, width: f32, view: ViewState, ui: UiState, locale: &str) {
   use super::intent::IntentSink;
   use super::metrics::Metrics;
-  let _ = crate::i18n::init();
+  let _locale = render_in(locale);
   let palette = ui.style.palette;
   let state = HarnessState::new(view, ui);
   // kittest hosts the closure inside a default `CentralPanel` whose frame insets content by 8px on every side,
@@ -130,14 +172,29 @@ fn snapshot_toolbar(name: &str, width: f32, view: ViewState, ui: UiState) {
   super::fonts::install(&harness.ctx);
   super::shell::apply_theme(&harness.ctx, &palette, 1.0);
   harness.run_steps(2);
+  // Fit invariant, checked in every locale/width this helper renders: when the bar is in compact (icon) form,
+  // even its leanest content must genuinely clear the right-aligned gear/badge cluster. A future longer
+  // translation that overflows compact must fail HERE, loudly, not ship as a silent overlap.
+  {
+    use egui_kittest::kittest::Queryable;
+    if let Some(settings_icon) = harness.query_by_label("🛠") {
+      let settings_right = settings_icon.rect().right();
+      let gear_left = harness.get_by_label("⚙").rect().left();
+      assert!(
+        settings_right <= gear_left + 1.0,
+        "compact toolbar content (ends {settings_right}) overlaps the right cluster (starts {gear_left}) — \
+         this locale/width needs design work, not a silent overlap"
+      );
+    }
+  }
   harness.snapshot(name);
 }
 
 /// Render the bottom dock (via the real `views::dock_panel`) at 2× density — the close-up for console/MDI review.
-fn snapshot_dock(name: &str, view: ViewState, ui: UiState) {
+fn snapshot_dock(name: &str, view: ViewState, ui: UiState, locale: &str) {
   use super::intent::IntentSink;
   use super::metrics::Metrics;
-  let _ = crate::i18n::init();
+  let _locale = render_in(locale);
   let palette = ui.style.palette;
   let state = HarnessState::new(view, ui);
   let time = no_time();
@@ -169,21 +226,21 @@ fn snapshot_dock_console_2x() {
   view.apply(Event::Response(Response::Ok));
   view.apply(Event::Response(Response::Message("MSG:Fixture message".to_string())));
   view.apply(Event::Response(Response::Error(20)));
-  snapshot_dock("dock_console_2x", view, fixture_ui());
+  snapshot_dock("dock_console_2x", view, fixture_ui(), crate::i18n::EN_US);
 }
 
 #[test]
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
 fn snapshot_dock_console_disconnected_2x() {
   // Disconnected: the MDI field and Send are disabled and the hint tells the operator why.
-  snapshot_dock("dock_console_disconnected_2x", ViewState::default(), UiState::default());
+  snapshot_dock("dock_console_disconnected_2x", ViewState::default(), UiState::default(), crate::i18n::EN_US);
 }
 
 /// Render the app settings dialog BODY at 2× density against a given config. The floating window chrome is
 /// egui-standard; the body is what carries our layout, so it is snapshotted directly for determinism.
-fn snapshot_app_settings(name: &str, config: crate::config::Config, ui: UiState) {
+fn snapshot_app_settings(name: &str, config: crate::config::Config, ui: UiState, locale: &str) {
   use super::intent::IntentSink;
-  let _ = crate::i18n::init();
+  let _locale = render_in(locale);
   let palette = ui.style.palette;
   let state = HarnessState::new(ViewState::default(), ui);
   let mut harness = egui_kittest::Harness::builder()
@@ -207,7 +264,7 @@ fn snapshot_app_settings(name: &str, config: crate::config::Config, ui: UiState)
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
 fn snapshot_app_settings_builtin_2x() {
   // A built-in theme is active: the general rows, the create-theme row, and the read-only hint (no pickers).
-  snapshot_app_settings("app_settings_builtin_2x", crate::config::Config::default(), UiState::default());
+  snapshot_app_settings("app_settings_builtin_2x", crate::config::Config::default(), UiState::default(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -218,7 +275,7 @@ fn snapshot_app_settings_user_theme_2x() {
   let theme = crate::config::ThemeOverride::from_palette(&super::theme::Palette::default_dark());
   config.appearance.themes.insert("fixture-theme".to_string(), theme);
   config.appearance.active_theme = "fixture-theme".to_string();
-  snapshot_app_settings("app_settings_user_theme_2x", config, UiState::default());
+  snapshot_app_settings("app_settings_user_theme_2x", config, UiState::default(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -229,7 +286,7 @@ fn snapshot_app_settings_picker_open() {
   use super::intent::IntentSink;
   use egui::accesskit::Role;
   use egui_kittest::kittest::Queryable;
-  let _ = crate::i18n::init();
+  let _locale = render_in(crate::i18n::EN_US);
   let mut config = crate::config::Config::default();
   let theme = crate::config::ThemeOverride::from_palette(&super::theme::Palette::default_dark());
   config.appearance.themes.insert("fixture-theme".to_string(), theme);
@@ -283,13 +340,13 @@ fn snapshot_shell_idle_custom_theme() {
   assert!(notice.is_none(), "the fixture theme must resolve cleanly: {notice:?}");
   let mut ui = fixture_ui();
   ui.style.palette = palette;
-  snapshot_shell("shell_idle_custom_theme", DEFAULT_SIZE, idle_view(), ui, no_time());
+  snapshot_shell("shell_idle_custom_theme", DEFAULT_SIZE, idle_view(), ui, no_time(), crate::i18n::EN_US);
 }
 
 #[test]
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
 fn snapshot_toolbar_idle_2x() {
-  snapshot_toolbar("toolbar_idle_2x", 1280.0, idle_view(), fixture_ui());
+  snapshot_toolbar("toolbar_idle_2x", 1280.0, idle_view(), fixture_ui(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -298,7 +355,7 @@ fn snapshot_toolbar_disconnected_2x() {
   let mut ui = UiState::default();
   ui.ports = vec![PortInfo::bare("/dev/cu.usbmodemFAKE1")];
   ui.selected_port = "/dev/cu.usbmodemFAKE1".to_string();
-  snapshot_toolbar("toolbar_disconnected_2x", 1280.0, ViewState::default(), ui);
+  snapshot_toolbar("toolbar_disconnected_2x", 1280.0, ViewState::default(), ui, crate::i18n::EN_US);
 }
 
 #[test]
@@ -308,13 +365,13 @@ fn snapshot_shell_disconnected() {
   let mut ui = UiState::default();
   ui.ports = vec![PortInfo::bare("/dev/cu.usbmodemFAKE1")];
   ui.selected_port = "/dev/cu.usbmodemFAKE1".to_string();
-  snapshot_shell("shell_disconnected", DEFAULT_SIZE, ViewState::default(), ui, no_time());
+  snapshot_shell("shell_disconnected", DEFAULT_SIZE, ViewState::default(), ui, no_time(), crate::i18n::EN_US);
 }
 
 #[test]
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
 fn snapshot_shell_idle() {
-  snapshot_shell("shell_idle", DEFAULT_SIZE, idle_view(), fixture_ui(), no_time());
+  snapshot_shell("shell_idle", DEFAULT_SIZE, idle_view(), fixture_ui(), no_time(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -322,13 +379,13 @@ fn snapshot_shell_idle() {
 fn snapshot_shell_idle_narrow() {
   // The minimum supported window (the app's min inner size is 800×500): everything must still fit or degrade
   // gracefully — no clipped controls, no unpainted strips.
-  snapshot_shell("shell_idle_narrow", egui::vec2(800.0, 500.0), idle_view(), fixture_ui(), no_time());
+  snapshot_shell("shell_idle_narrow", MIN_SIZE, idle_view(), fixture_ui(), no_time(), crate::i18n::EN_US);
 }
 
 #[test]
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
 fn snapshot_shell_idle_wide() {
-  snapshot_shell("shell_idle_wide", egui::vec2(1680.0, 950.0), idle_view(), fixture_ui(), no_time());
+  snapshot_shell("shell_idle_wide", egui::vec2(1680.0, 950.0), idle_view(), fixture_ui(), no_time(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -339,7 +396,7 @@ fn snapshot_shell_idle_rotary() {
   let mut view = ViewState::default();
   view.connection = ConnectionState::Idle;
   apply_status(&mut view, "Idle|MPos:12.500,20.000,-1.200,45.000|WCO:2.000,3.000,1.000,0.000|FS:0,0|Ov:100,100,100");
-  snapshot_shell("shell_idle_rotary", DEFAULT_SIZE, view, fixture_ui(), no_time());
+  snapshot_shell("shell_idle_rotary", DEFAULT_SIZE, view, fixture_ui(), no_time(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -352,14 +409,14 @@ fn snapshot_shell_streaming() {
     remaining: Some(std::time::Duration::from_secs(75)),
     total: Some(std::time::Duration::from_secs(126)),
   };
-  snapshot_shell("shell_streaming", DEFAULT_SIZE, streaming_view(total), ui, time);
+  snapshot_shell("shell_streaming", DEFAULT_SIZE, streaming_view(total), ui, time, crate::i18n::EN_US);
 }
 
 #[test]
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
 fn snapshot_shell_alarm() {
   // The safety-critical state: the alarm banner and badge must be unmissable, and jog/run controls disabled.
-  snapshot_shell("shell_alarm", DEFAULT_SIZE, alarm_view(), fixture_ui(), no_time());
+  snapshot_shell("shell_alarm", DEFAULT_SIZE, alarm_view(), fixture_ui(), no_time(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -368,7 +425,7 @@ fn snapshot_shell_idle_light_slate() {
   // The alternate built-in chromes must hold up too: same layout, lighter surfaces, same semantic accents.
   let mut ui = fixture_ui();
   ui.style.palette = super::theme::Palette::light_slate();
-  snapshot_shell("shell_idle_light_slate", DEFAULT_SIZE, idle_view(), ui, no_time());
+  snapshot_shell("shell_idle_light_slate", DEFAULT_SIZE, idle_view(), ui, no_time(), crate::i18n::EN_US);
 }
 
 #[test]
@@ -376,5 +433,68 @@ fn snapshot_shell_idle_light_slate() {
 fn snapshot_shell_idle_midnight() {
   let mut ui = fixture_ui();
   ui.style.palette = super::theme::Palette::midnight();
-  snapshot_shell("shell_idle_midnight", DEFAULT_SIZE, idle_view(), ui, no_time());
+  snapshot_shell("shell_idle_midnight", DEFAULT_SIZE, idle_view(), ui, no_time(), crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_tool_change() {
+  // The M6 hold: the tool-change banner takes the top slot and the badge reads TOOL — previously unrenderable
+  // in snapshots (the harness mirror lacked the banner branch), added alongside the sv-SE layout pass.
+  snapshot_shell("shell_tool_change", DEFAULT_SIZE, tool_change_view(), fixture_ui(), no_time(), crate::i18n::EN_US);
+}
+
+// ── Swedish (sv-SE) layout verification ─────────────────────────────────────────────────────────────────────
+// Swedish labels run measurably longer than English ("Inställningar", "Koppla från", "VERKTYGSBYTE",
+// "⌂ Referens"); these variants pin the tight layouts — the toolbar at the 800px minimum, the full min-size
+// shell, and the banner states — so a translation edit that overflows a fixed panel shows up as a pixel diff.
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_toolbar_sv_idle_min_2x() {
+  snapshot_toolbar("toolbar_sv_idle_min_2x", MIN_SIZE.x, idle_view(), fixture_ui(), crate::i18n::SV_SE);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_toolbar_sv_disconnected_min_2x() {
+  // The widest toolbar content: the port dropdown + Identifiera + Anslut alongside the full transport group.
+  let mut ui = UiState::default();
+  ui.ports = vec![PortInfo::bare("/dev/cu.usbmodemFAKE1")];
+  ui.selected_port = "/dev/cu.usbmodemFAKE1".to_string();
+  snapshot_toolbar("toolbar_sv_disconnected_min_2x", MIN_SIZE.x, ViewState::default(), ui, crate::i18n::SV_SE);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_sv_idle_min() {
+  // The whole window at the 800×500 minimum in Swedish: the fixed 268/286px columns hold the longest strings
+  // (probe/wizard buttons like "Avkänn Z → sätt arbetsnollpunkt"), so wraps/clipping show up here first.
+  snapshot_shell("shell_sv_idle_min", MIN_SIZE, idle_view(), fixture_ui(), no_time(), crate::i18n::SV_SE);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_sv_tool_change() {
+  // VERKTYGSBYTE is the longest badge label by far; the tool banner carries the longest sentence strings.
+  snapshot_shell("shell_sv_tool_change", DEFAULT_SIZE, tool_change_view(), fixture_ui(), no_time(),
+    crate::i18n::SV_SE);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_sv_alarm() {
+  // The alarm banner's Swedish action row ("Lås upp $X" / "Mjuk återställning" / "Stäng") plus the LARM badge.
+  snapshot_shell("shell_sv_alarm", DEFAULT_SIZE, alarm_view(), fixture_ui(), no_time(), crate::i18n::SV_SE);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_app_settings_sv_2x() {
+  // The dialog's Swedish labels ("Programinställningar" rows, "Skapa från aktuellt", "osparade ändringar").
+  let mut config = crate::config::Config::default();
+  let theme = crate::config::ThemeOverride::from_palette(&super::theme::Palette::default_dark());
+  config.appearance.themes.insert("fixture-theme".to_string(), theme);
+  config.appearance.active_theme = "fixture-theme".to_string();
+  snapshot_app_settings("app_settings_sv_2x", config, UiState::default(), crate::i18n::SV_SE);
 }

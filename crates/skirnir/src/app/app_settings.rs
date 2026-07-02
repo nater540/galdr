@@ -191,6 +191,8 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
     }
     if dirty {
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        // A hair of trailing air so the (longer in Swedish) marker never kisses or clips the right edge.
+        ui.add_space(4.0);
         ui.label(RichText::new(crate::tr!("app-settings-unsaved")).size(10.5).color(palette.state_hold));
       });
     }
