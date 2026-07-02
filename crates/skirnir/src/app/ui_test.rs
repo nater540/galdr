@@ -114,57 +114,14 @@ pub(crate) fn build_docked_panel_harness(
     )
 }
 
-/// Lay out the FULL application shell exactly as [`super::SkirnirApp`]'s frame does — toolbar, alarm banner,
-/// status bar, bottom dock, the fixed left/right columns, and the central toolpath viewport — driven by a
-/// [`HarnessState`] instead of the live app (no engine, no runtime, no I/O). This is the shared surface for
-/// whole-window tests: the snapshot suite renders it offscreen and diffs the pixels, and interaction tests can
-/// drive pointer input against the real panel geometry. Mirrors `SkirnirApp::ui`'s layout; if the shell's panel
-/// arrangement changes, change this in step (the snapshot baselines will flag any drift on the next run).
+/// Lay out the FULL application shell exactly as [`super::SkirnirApp`]'s frame does, driven by a
+/// [`HarnessState`] instead of the live app (no engine, no runtime, no I/O). A THIN wrapper over
+/// [`views::shell_panels`] — the very function the shell renders — with fixture panel data, so the harness IS
+/// the real layout by construction and cannot drift from the app (the earlier hand-copied mirror silently lost
+/// the tool-change banner branch, exactly the failure mode this closes).
 pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: super::progress::TimeEstimate) {
-  use crate::app::metrics::Metrics;
-  let palette = state.ui.style.palette;
   let mut sink = IntentSink::new();
-  egui::Panel::top("toolbar")
-    .exact_size(Metrics::TOOLBAR_H)
-    .frame(egui::Frame::NONE.fill(palette.panel_alt))
-    .show_inside(ui, |ui| views::toolbar(ui, &state.view, &mut state.ui, &mut sink));
-  if state.view.banner.is_some() {
-    egui::Panel::top("banner").show_inside(ui, |ui| views::alarm_banner(ui, palette, &state.view, &mut sink));
-  } else if state.view.badge_state() == crate::app::badge::BadgeState::Tool {
-    // Mirror the shell's M6 tool-change affordance: with no fault latched but the firmware held for a manual
-    // tool change, the prominent banner takes the same top slot (this branch was missing from the mirror — the
-    // tool-change state was unrenderable in snapshots until the sv-SE layout pass needed it).
-    egui::Panel::top("tool_change")
-      .show_inside(ui, |ui| views::tool_change_banner(ui, palette, &state.view, &mut sink));
-  }
-  egui::Panel::bottom("status")
-    .exact_size(Metrics::STATUS_BAR_H)
-    .show_inside(ui, |ui| views::status_bar(ui, &state.view, &state.ui));
-  views::dock_panel(ui, &state.view, &mut state.ui, time, None, &mut sink);
-  let column_frame = egui::Frame::NONE.fill(palette.panel);
-  egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
-    .show_inside(ui, |ui| {
-      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        views::dro(ui, &state.view, &mut state.ui, &mut sink);
-        ui.separator();
-        views::jog(ui, &state.view, &mut state.ui, &mut sink);
-      });
-    });
-  egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
-    .show_inside(ui, |ui| {
-      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        views::overrides(ui, &state.view, &mut state.ui, &mut sink);
-        ui.separator();
-        views::probe(ui, &state.view, &mut state.ui, &mut sink);
-        ui.separator();
-        views::rotary_center(ui, &state.view, &mut state.ui, None, false, &mut sink);
-        ui.separator();
-        views::verify_measure(ui, &state.view, &mut state.ui, None, &mut sink);
-      });
-    });
-  egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
-    views::toolpath(ui, &state.view, &mut state.ui);
-  });
+  views::shell_panels(ui, &state.view, &mut state.ui, views::ShellPanelsData::bare(time), &mut sink);
   state.intents.extend(sink.drain());
 }
 
@@ -859,6 +816,34 @@ mod tests {
       gear.left()
     );
     assert!(gear.right() <= 640.0, "the right cluster must stay inside the window");
+  }
+
+  #[test]
+  fn the_toolbar_recovers_from_compact_when_the_full_form_shrinks_to_fit() {
+    // The shrink direction of the self-measuring toolbar: the DISCONNECTED bar (port combo + refresh + identify
+    // + connect) is far wider than the connected one, so at 900px it must go compact — and after CONNECTING
+    // (the whole group collapses to one Disconnect button) the full labels fit again and the bar must return to
+    // them. The stored full-form measurement is only refreshed while rendering full, so without invalidating it
+    // on a content change the bar stayed icon-only forever at this width (the stuck-compact bug).
+    let mut ui = UiState::default();
+    ui.ports = vec![crate::transport::ports::PortInfo::bare("/dev/cu.usbmodemFAKE1")];
+    ui.selected_port = "/dev/cu.usbmodemFAKE1".to_string();
+    let state = HarnessState::new(ViewState::default(), ui); // Disconnected.
+    let mut harness = build_shell_harness(state, egui::vec2(900.0, 500.0), zero_time());
+    harness.run_steps(3);
+    assert!(
+      harness.query_by_label("🛠").is_some(),
+      "precondition: the disconnected bar must be compact at 900px (if this fails, retune the test width)"
+    );
+
+    // Connect: the port group collapses to a single Disconnect button — the full form now fits.
+    harness.state_mut().view = view_idle();
+    harness.run_steps(3);
+    assert!(
+      harness.query_by_label("Settings").is_some(),
+      "after connecting, the full labels fit at 900px and the bar must RECOVER from compact"
+    );
+    assert!(harness.query_by_label("🛠").is_none(), "the icon form must be gone once the full form fits again");
   }
 
   #[test]

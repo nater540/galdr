@@ -586,8 +586,17 @@ fn state_badge(ui: &mut egui::Ui, view: &ViewState, state_ui: &mut UiState) {
     ui.horizontal(|ui| {
       let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
       let draw_dot = |ui: &mut egui::Ui| {
-        dot(ui, color, Metrics::BADGE_DOT);
-        ui.add_space(2.0);
+        // The 2px spacer must land BETWEEN the dot and the label. The cursor advances leftward under RTL and
+        // the dot is drawn AFTER the label there, so the spacer goes before the dot (i.e. on its label side);
+        // in LTR the dot leads and the spacer follows it. A trailing spacer under RTL ended up on the chip's
+        // far LEFT edge — outside the dot — instead of separating it from the label.
+        if rtl {
+          ui.add_space(2.0);
+          dot(ui, color, Metrics::BADGE_DOT);
+        } else {
+          dot(ui, color, Metrics::BADGE_DOT);
+          ui.add_space(2.0);
+        }
       };
       let draw_label = |ui: &mut egui::Ui| {
         ui.label(RichText::new(crate::tr!(state.label_key())).color(text_color).strong());
@@ -624,20 +633,158 @@ fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) {
   ui.painter().circle_filled(rect.center(), diameter * 0.5, color);
 }
 
+/// Everything the shell threads into the window-panel grid beyond the view/ui state: the dock's stream clock and
+/// ETA qualifier, plus the right column's wizard/sweep borrows. The whole-window test harness passes
+/// [`ShellPanelsData::bare`] (a fixture clock, no wizard state), so the app and the harness drive the SAME
+/// [`shell_panels`] layout and cannot drift.
+pub struct ShellPanelsData<'a> {
+  /// The stream's elapsed/ETA estimate the dock clock renders.
+  pub time: super::progress::TimeEstimate,
+  /// The "(default settings)" / pause-count caveats riding beside the dock ETA when a simulation drives it.
+  pub eta_qualifier: Option<EtaQualifier>,
+  /// The running rotary center-finder's pure state, if one is active.
+  pub wizard: Option<&'a super::rotary_center::WizardState>,
+  /// Whether a rotary center was persisted in the profile (the no-run panel offers a one-click re-apply).
+  pub has_saved_center: bool,
+  /// The running Phase 2 sweep and which wizard owns it, if one is active.
+  pub sweep: Option<(&'a super::angle_sweep::AngleSweep, super::view_state::ProbeKind)>,
+}
+
+impl ShellPanelsData<'_> {
+  /// The harness/fixture form: the given clock, no ETA qualifier, and no wizard/sweep state.
+  pub fn bare(time: super::progress::TimeEstimate) -> Self {
+    ShellPanelsData { time, eta_qualifier: None, wizard: None, has_saved_center: false, sweep: None }
+  }
+}
+
+/// Lay out the ENTIRE window-panel arrangement — toolbar, alarm/tool-change banner, status bar, bottom dock,
+/// the fixed left/right columns, and the central toolpath viewport — into the window's root `Ui`. This is THE
+/// single description of the app's frame: `SkirnirApp::ui` calls it with live shell state and the whole-window
+/// test harness calls it with fixtures, so the two can never drift (the harness used to hand-copy this
+/// arrangement, and the copy silently lost the tool-change banner branch — the failure mode this extraction
+/// makes structurally impossible). The ctx-level floating windows (firmware settings, app settings, confirm
+/// modals) are NOT part of the panel grid and stay with the shell.
+pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, data: ShellPanelsData<'_>,
+  sink: &mut IntentSink) {
+  let palette = state.style.palette;
+
+  // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content. It
+  // carries the `panelAlt` (#222222) surface — a shade lighter than the panels below — so the toolbar reads as
+  // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
+  egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
+    .frame(egui::Frame::NONE.fill(palette.panel_alt))
+    .show_inside(ui, |ui| {
+      toolbar(ui, view, state, sink);
+    });
+
+  if view.banner.is_some() {
+    egui::Panel::top("banner").show_inside(ui, |ui| {
+      alarm_banner(ui, palette, view, sink);
+    });
+  } else if view.badge_state() == BadgeState::Tool {
+    // No fault is latched, but the firmware is held for an M6 manual tool change: surface the prominent
+    // tool-change affordance in the same top slot (a fault banner, if any, takes precedence above). The Resume
+    // action routes through the existing cycle-start path, not a second control. The banner names the tool from
+    // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
+    egui::Panel::top("tool_change").show_inside(ui, |ui| {
+      tool_change_banner(ui, palette, view, sink);
+    });
+  }
+
+  // The status bar is a fixed 24px mono strip (design §03).
+  egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |ui| {
+    status_bar(ui, view, state);
+  });
+
+  // The bottom dock spans the full window width under the body grid (design §03: a single dock hosting the
+  // Console and Program tabs across all three columns). It must be laid out BEFORE the side panels so it
+  // claims the full width and the columns rise only above it; the status bar, declared earlier, stays below.
+  dock_panel(ui, view, state, data.time, data.eta_qualifier, sink);
+
+  // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
+  // Settings) columns are exact widths, not resizable, so the layout matches the mock regardless of window
+  // size. Program no longer lives in the right column — it is a dock tab now (design §03).
+  //
+  // Each panel is given a zero-inner-margin `Frame` (panel-filled) rather than egui's default side-panel frame
+  // (`Margin::symmetric(8, 2)`). The default 8px L/R inset would shrink the usable column to 252px while the
+  // section headers and DRO/Jog bodies already own their padding (`HEADER_PAD_X`, `DRO_PAD`, `JOG_PAD`), so the
+  // content overran the clipped 252px and the rightmost controls ("Zero XYZ", the Z± column) were cut off. With
+  // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
+  let column_frame = egui::Frame::NONE.fill(palette.panel);
+  egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
+    .show_inside(ui, |ui| {
+      // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
+      // area shrink to the widest child, which otherwise leaves an unfilled strip on the column's inner edge.
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        dro(ui, view, state, sink);
+        ui.separator();
+        jog(ui, view, state, sink);
+      });
+    });
+
+  egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
+    .show_inside(ui, |ui| {
+      // `auto_shrink([false, false])`: fill the full fixed column width and height so the content never
+      // collapses to its natural size and leaves a bare strip beside it. Settings live only in the toolbar's
+      // Settings window now, not as a right-column section.
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        overrides(ui, view, state, sink);
+        ui.separator();
+        probe(ui, view, state, sink);
+        ui.separator();
+        // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
+        // the center lives in skirnir state); a borrow keeps the view a pure render of it.
+        rotary_center(ui, view, state, data.wizard, data.has_saved_center, sink);
+        ui.separator();
+        // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
+        verify_measure(ui, view, state, data.sweep, sink);
+      });
+    });
+
+  // The central toolpath panel takes a zero-margin frame too. egui's default central-panel frame insets the
+  // content by 8px on every side, which left a black gutter between the left column's right edge and the
+  // viewport (the user-flagged band). With no margin the viewport sits flush against both columns — exactly the
+  // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
+  // its own `INSET` canvas over the rect, so the frame fill never shows through.
+  egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
+    toolpath(ui, view, state);
+  });
+}
+
 /// The toolbar's self-measured fit, persisted in egui temp memory across frames: whether the bar renders in
 /// COMPACT form (secondary controls collapse to icon glyphs) and the width the FULL form was last measured to
 /// need. Immediate mode cannot know before layout whether the full labels fit — label widths depend on the
 /// locale (Swedish "Inställningar"/"Nödstopp" overflow widths English clears) — so the bar renders, measures its
-/// real extent, and stores the verdict for the NEXT frame: the standard immediate-mode responsive pattern. The
-/// full requirement is only re-measured while rendering full, so after a label change (locale switch, a
-/// connect/disconnect swapping the port group) it refreshes the next time the bar expands; until then the stored
-/// measurement stands, which can cost at most one corrective flip.
+/// real extent, and stores the verdict for the NEXT frame: the standard immediate-mode responsive pattern.
+///
+/// The full requirement can only be re-MEASURED while rendering full, so the stored value carries a
+/// [`Self::fingerprint`] of the content that produced it (locale, transport attachment, badge label — the inputs
+/// that change the labels' widths). When the fingerprint no longer matches, the measurement is stale and is
+/// DISCARDED, forcing one full-form measuring frame. Without this, a requirement that SHRANK while compact —
+/// connecting (the wide port group becomes one Disconnect button), switching to a shorter locale — was never
+/// re-measured and the bar stayed icon-only forever at that width (the stuck-compact bug). Either direction now
+/// costs at most one corrective flip after a content change.
 #[derive(Clone, Copy, Default)]
 struct ToolbarFit {
   /// Whether the bar currently renders icon-form secondary controls.
   compact: bool,
   /// The total width (px) the FULL-labelled form last measured itself to need, including both edge paddings.
   full_needs: f32,
+  /// Hash of the label-width-driving content [`Self::full_needs`] was measured under; a mismatch invalidates it.
+  fingerprint: u64,
+}
+
+/// Hash the inputs that determine the toolbar's full-form label widths: the active locale (every label), whether
+/// a transport is attached (the port combo + refresh/identify/connect group swaps for one Disconnect button),
+/// and the badge label (INAKTIV vs VERKTYGSBYTE differ by ~80px in Swedish). The port PATH is excluded — the
+/// combo is width-capped and truncating, so a different path never changes the bar's requirement.
+fn toolbar_content_fingerprint(view: &ViewState) -> u64 {
+  use std::hash::{Hash, Hasher};
+  let mut hasher = std::hash::DefaultHasher::new();
+  crate::i18n::get_language().hash(&mut hasher);
+  view.connection.has_transport().hash(&mut hasher);
+  view.badge_state().label_key().hash(&mut hasher);
+  hasher.finish()
 }
 
 /// Render the 40px main toolbar: the connect group, Open, the Run/Hold/Stop segmented transport group, Home,
@@ -649,6 +796,13 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
   let palette = state.style.palette;
   let fit_id = egui::Id::new("toolbar-fit");
   let mut fit: ToolbarFit = ui.ctx().data(|d| d.get_temp(fit_id)).unwrap_or_default();
+  let fingerprint = toolbar_content_fingerprint(view);
+  if fit.fingerprint != fingerprint {
+    // The labels that size the bar changed (locale, connect state, badge): the stored full-form measurement no
+    // longer describes them. Discard it and render FULL this frame to re-measure, so a shrunk requirement can
+    // recover to full labels instead of sticking icon-only (and a grown one flips compact next frame).
+    fit = ToolbarFit { compact: false, full_needs: 0.0, fingerprint };
+  }
   let compact = fit.compact;
   // 1px bottom divider under the bar (design §03's `border-bottom:1px #2E2E2E`), painted along the panel edge.
   let bar = ui.max_rect();
@@ -2001,11 +2155,6 @@ fn verify_readings_table(ui: &mut egui::Ui, palette: Palette, s: &super::angle_s
   }
 }
 
-/// Render the bottom dock (design §03): one surface hosting the Console and Program tabs. The shared tab strip
-/// switches `state.active_tab`, the strip's right edge carries the §03 progress readout (acked/total · 260px
-/// bar · percent) for whichever tab is active, and the body below renders the selected tab. Keeping both tabs
-/// in one dock matches the mock, where Console and Program share the 200px dock rather than sitting in
-/// separate panels.
 /// Lay out the bottom dock as its window panel: the full-width strip under the body grid that hosts [`dock`]'s
 /// tab strip + console/program body. Extracted from the shell (and shared with the whole-window test harness) so
 /// the panel's geometry — its height policy and collapse behaviour — lives in exactly one place and cannot drift
@@ -2036,6 +2185,12 @@ pub fn dock_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time
     });
 }
 
+/// Render the bottom dock's CONTENT (design §03): one surface hosting the Console and Program tabs. The shared
+/// tab strip switches `state.active_tab`, the strip's right edge carries the §03 progress readout (acked/total ·
+/// 260px bar · percent) plus the collapse toggle for whichever tab is active, and the body below renders the
+/// selected tab. Keeping both tabs in one dock matches the mock, where Console and Program share a single dock
+/// rather than sitting in separate panels. The hosting window panel — height policy, drag-resize, collapse — is
+/// [`dock_panel`]; this draws only what lives inside it.
 pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
   eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
   let palette = state.style.palette;

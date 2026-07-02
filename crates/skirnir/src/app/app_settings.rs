@@ -25,7 +25,11 @@ const BUILTIN_THEMES: [&str; 3] = ["default", "light-slate", "midnight"];
 /// driving the Save button and its marker.
 pub fn window(ctx: &egui::Context, state: &mut UiState, config: &Config, dirty: bool, sink: &mut IntentSink) {
   let mut open = state.app_settings_open;
+  // The explicit `.id()` keeps egui's remembered position/size keyed on a STABLE token: without it the id
+  // derives from the translated title — and THIS dialog is where the operator switches language, so the window
+  // would jump back to its default placement the instant a new locale was picked.
   egui::Window::new(crate::tr!("app-settings-title"))
+    .id(egui::Id::new("app-settings-window"))
     .open(&mut open)
     .resizable(true)
     .default_size([400.0, 520.0])

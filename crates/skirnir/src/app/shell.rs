@@ -1870,10 +1870,6 @@ impl eframe::App for SkirnirApp {
     //    edges. We reach the `Context` (for repaint scheduling and the settings window) via `ui.ctx()`.
     let mut sink = super::intent::IntentSink::new();
     let ctx = ui.ctx().clone();
-    use super::metrics::Metrics;
-    // The active palette resolved from the config (or the default). `Palette` is `Copy`, so snapshot it once for
-    // this frame's panel-frame fills and the banner views, rather than re-borrowing `self.ui` under each closure.
-    let palette = self.ui.style.palette;
 
     // Lift global hotkeys out of egui's per-frame input and turn them into intents (jog by arrows/PageUp-Down,
     // Escape to cancel/abort, hold/resume). Only fire when no text field has keyboard focus, so typing a line
@@ -1888,107 +1884,37 @@ impl eframe::App for SkirnirApp {
       self.reload_config(&ctx);
     }
 
-    // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content. It
-    // carries the `panelAlt` (#222222) surface — a shade lighter than the panels below — so the toolbar reads as
-    // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
-    egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
-      .frame(egui::Frame::NONE.fill(palette.panel_alt))
-      .show_inside(ui, |ui| {
-        views::toolbar(ui, &self.view, &mut self.ui, &mut sink);
-      });
-
-    if self.view.banner.is_some() {
-      egui::Panel::top("banner").show_inside(ui, |ui| {
-        views::alarm_banner(ui, palette, &self.view, &mut sink);
-      });
-    } else if self.view.badge_state() == super::badge::BadgeState::Tool {
-      // No fault is latched, but the firmware is held for an M6 manual tool change: surface the prominent
-      // tool-change affordance in the same top slot (a fault banner, if any, takes precedence above). The Resume
-      // action routes through the existing cycle-start path, not a second control. The banner names the tool from
-      // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
-      egui::Panel::top("tool_change").show_inside(ui, |ui| {
-        views::tool_change_banner(ui, palette, &self.view, &mut sink);
-      });
-    }
-
-    // The status bar is a fixed 24px mono strip (design §03).
-    egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |ui| {
-      views::status_bar(ui, &self.view, &self.ui);
-    });
-
-    // The bottom dock spans the full window width under the body grid (design §03: a single dock hosting the
-    // Console and Program tabs across all three columns). It must be laid out BEFORE the side panels so it
-    // claims the full width and the columns rise only above it; the status bar, declared earlier, stays below.
-    // The panel itself (height policy, collapse behaviour) lives in `views::dock_panel`, shared with the
-    // whole-window test harness so the geometry cannot drift between the app and its tests.
-    // Project the stream's elapsed/ETA from the start stamp and the live acked/total, so the dock can show the
-    // design's `m:ss / m:ss` clock. When no stream is timing this is the zero estimate (both times absent).
-    let time = self.stream_time();
-    // The ETA qualifier — "(default settings)" and any modeled operator pauses — rides alongside the clock when a
-    // simulation is stored, so the operator can read the figure with its caveats. `None` falls back to no qualifier.
-    let eta_qualifier = self.eta_qualifier();
-    views::dock_panel(ui, &self.view, &mut self.ui, time, eta_qualifier, &mut sink);
-
-    // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
-    // Settings) columns are exact widths, not resizable, so the layout matches the mock regardless of window
-    // size. Program no longer lives in the right column — it is a dock tab now (design §03).
-    //
-    // Each panel is given a zero-inner-margin `Frame` (panel-filled) rather than egui's default side-panel frame
-    // (`Margin::symmetric(8, 2)`). The default 8px L/R inset would shrink the usable column to 252px while the
-    // section headers and DRO/Jog bodies already own their padding (`HEADER_PAD_X`, `DRO_PAD`, `JOG_PAD`), so the
-    // content overran the clipped 252px and the rightmost controls ("Zero XYZ", the Z± column) were cut off. With
-    // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
-    let column_frame = egui::Frame::NONE.fill(palette.panel);
-    egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
-      .show_inside(ui, |ui| {
-        // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
-        // area shrink to the widest child, which otherwise leaves an unfilled strip on the column's inner edge.
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-          views::dro(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          views::jog(ui, &self.view, &mut self.ui, &mut sink);
-        });
-      });
-
-    egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
-      .show_inside(ui, |ui| {
-        // `auto_shrink([false, false])`: fill the full fixed column width and height so the content never
-        // collapses to its natural size and leaves a bare strip beside it. Settings live only in the toolbar's
-        // Settings window now, not as a right-column section.
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-          views::overrides(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          views::probe(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
-          // the center lives in skirnir state); pass a borrow so the view stays a pure render of it.
-          let wizard = self.wizard.as_ref().map(|run| &run.state);
-          // Whether a center was persisted last session (DOC-11 §1.3): the no-run panel offers a one-click
-          // re-apply so a restart restores the found center without re-probing.
-          let has_saved_center = self.profile.rotary.is_some();
-          views::rotary_center(ui, &self.view, &mut self.ui, wizard, has_saved_center, &mut sink);
-          ui.separator();
-          // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
-          let sweep = self.sweep.as_ref().map(|run| (&run.sweep, run.kind));
-          views::verify_measure(ui, &self.view, &mut self.ui, sweep, &mut sink);
-        });
-      });
-
-    // The central toolpath panel takes a zero-margin frame too. egui's default central-panel frame insets the
-    // content by 8px on every side, which left a black gutter between the left column's right edge and the
-    // viewport (the user-flagged band). With no margin the viewport sits flush against both columns — exactly the
-    // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
-    // its own `INSET` canvas over the rect, so the frame fill never shows through.
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
-      views::toolpath(ui, &self.view, &mut self.ui);
-    });
+    // The entire window-panel arrangement — toolbar, banners, status bar, dock, columns, viewport — is the
+    // shared [`views::shell_panels`], the SAME function the whole-window test harness renders, so the app and
+    // its snapshots/interaction tests can never drift (the harness's hand-copied mirror once silently lost the
+    // tool-change banner branch). Only the ctx-level floating windows below stay shell-owned.
+    // The dock clock projects the stream's elapsed/ETA from the start stamp and the live acked/total; the ETA
+    // qualifier — "(default settings)" and any modeled operator pauses — rides alongside it when a simulation is
+    // stored, so the operator reads the figure with its caveats.
+    let data = views::ShellPanelsData {
+      time: self.stream_time(),
+      eta_qualifier: self.eta_qualifier(),
+      // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so the
+      // center lives in skirnir state); a borrow keeps the view a pure render of it.
+      wizard: self.wizard.as_ref().map(|run| &run.state),
+      // Whether a center was persisted last session (DOC-11 §1.3): the no-run panel offers a one-click
+      // re-apply so a restart restores the found center without re-probing.
+      has_saved_center: self.profile.rotary.is_some(),
+      // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
+      sweep: self.sweep.as_ref().map(|run| (&run.sweep, run.kind)),
+    };
+    views::shell_panels(ui, &self.view, &mut self.ui, data, &mut sink);
 
     if self.ui.settings_open {
       let mut open = self.ui.settings_open;
       // Give the window a real default size and let it resize in both axes; the settings list inside fills the
       // available height (see `settings`), so dragging the bottom edge actually grows the list rather than
       // snapping back to a fixed content height (the prior vertical-resize stall).
-      egui::Window::new(crate::tr!("settings-window-title")).open(&mut open).resizable(true)
+      // The explicit `.id()` keeps egui's remembered position/size keyed on a STABLE token: without it the id
+      // derives from the translated title, so switching language "forgot" where the operator had dragged the
+      // window and snapped it back to the default placement.
+      egui::Window::new(crate::tr!("settings-window-title")).id(egui::Id::new("firmware-settings-window"))
+        .open(&mut open).resizable(true)
         .default_size([340.0, 460.0]).show(&ctx, |ui| {
         views::settings(ui, &self.view, &mut self.ui, &mut sink);
       });

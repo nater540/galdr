@@ -26,3 +26,10 @@ the regression net and the review artifact (Read the PNGs directly — they rend
   needs a `WCO:` field or the default WPos view shows `—` dashes.
 
 Related: [[egui-034-layout-gotchas]]
+
+Update (2026-07-02): the harness no longer mirrors the shell — `views::shell_panels` (+ `ShellPanelsData`) is the
+ONE panel-layout function both `SkirnirApp::ui` and `ui_test::shell_layout` call, so drift is structurally
+impossible. `UPDATE_SNAPSHOTS=1` leaves `.old.png`/`.diff.png` artifacts next to the baselines — delete them
+before reporting/committing. The toolbar's `ToolbarFit` now carries a content fingerprint (locale, transport
+attachment, badge label) that invalidates the stored full-form measurement, so the bar recovers from icon form
+when its requirement shrinks (connect, shorter locale).
