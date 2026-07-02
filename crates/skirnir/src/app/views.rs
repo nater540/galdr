@@ -2457,18 +2457,28 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     .collect();
 
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-  // Reserve the manual-command (MDI) row's height BEFORE the log scroll area, so the scroll area fills only the
-  // space ABOVE it rather than the whole panel. The log uses `auto_shrink([false, false])`, which expands to consume
-  // all remaining height of the parent `Ui`; inside the pinned 200px dock panel that left zero room for the input
-  // row laid out beneath it, pushing the MDI field below the panel floor where it was clipped away entirely (the
-  // "no text input on the Console tab" bug). Capping the scroll area's `max_height` to `available − input row`
-  // (plus the inter-row spacing) keeps the field on-screen with its full height. `max(0)` guards a panel too short
-  // to hold both — the input row then wins and the log collapses, which is the safer failure (the operator can
-  // still type) than the reverse. The input row itself is drawn after the scroll area, in the reserved gap.
-  let spacing_y = ui.spacing().item_spacing.y;
-  let input_row_h = Metrics::MDI_ROW_H + spacing_y;
-  let log_max_h = (ui.available_height() - input_row_h).max(0.0);
-  let scroll = ScrollArea::vertical().auto_shrink([false, false]).max_height(log_max_h)
+  // The manual-command (MDI) strip is ANCHORED AS AN INNER BOTTOM PANEL, and the log then fills the remainder
+  // exactly. This shape is load-bearing twice over:
+  // - A resizable egui panel persists its CONTENT's measured rect as next frame's panel size, so the previous
+  //   `available − reserved` arithmetic — off by a sub-pixel of font-metric rounding — fed its error back 1:1
+  //   and the dock crept larger a pixel every few frames with no input at all (the user-reported self-resizing
+  //   console). With the strip panel-pinned and the log filling to it, the content always measures EXACTLY the
+  //   panel height and the stored size is a fixed point.
+  // - The strip can never be pushed below the dock floor by a greedy fill-height scroll area (the older
+  //   vanished-MDI bug the reservation arithmetic was originally added for) — the panel owns its space.
+  // Height budget: the strip's real height is FRACTIONAL (the mono text row is ~15.125px, so the field is
+  // ~32.125px) while panel geometry is whole pixels. The inner panel pins its content's MIN height to
+  // `exact − margins`, so as long as that min EXCEEDS the fractional content, the strip's measured rect lands on
+  // exactly the panel's own edges and the dock's stored size is stable. The +5 (4px top breathing room between
+  // the last log row and the strip, +1px of headroom over the fraction) buys ~0.9px of slack; if a font-metric
+  // change ever eats it, the drift stability test fails loudly rather than the dock creeping again.
+  egui::Panel::bottom("dock-mdi")
+    .exact_size(Metrics::MDI_ROW_H + 5.0)
+    .resizable(false)
+    .show_separator_line(false)
+    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 4, bottom: 0 }))
+    .show_inside(ui, |ui| mdi_strip(ui, view, state, sink));
+  let scroll = ScrollArea::vertical().auto_shrink([false, false])
     .stick_to_bottom(state.auto_scroll).show_rows(
     ui,
     row_height,
@@ -2497,10 +2507,15 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     }
   });
 
-  // Manual command entry (MDI): a recessed command-line strip — inset fill with a hairline recess border, a blue
-  // `›` prompt echoing the console's sent-line chevron, a frameless MONOSPACE field (commands are code, and the
-  // field should read like the log it feeds), and the Send button as the row's one filled-accent action. Sends
-  // on Enter or the button, only while connected; ↑/↓ recall previously sent lines ([`super::mdi::MdiHistory`]).
+}
+
+/// The manual-command entry (MDI) strip: a recessed command line — inset fill with a hairline recess border, a
+/// blue `›` prompt echoing the console's sent-line chevron, a frameless MONOSPACE field (commands are code, and
+/// the field should read like the log it feeds), and the Send button as the row's one filled-accent action.
+/// Sends on Enter or the button, only while connected; ↑/↓ recall previously sent lines
+/// ([`super::mdi::MdiHistory`]). Hosted by [`console_body`]'s inner bottom panel, which pins it to the dock floor.
+fn mdi_strip(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
   let connected = view.connection.is_connected();
   egui::Frame::new()
     .fill(palette.inset)

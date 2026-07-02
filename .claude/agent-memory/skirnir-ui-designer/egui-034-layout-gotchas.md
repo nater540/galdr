@@ -39,3 +39,10 @@ egui 0.34 behaviors verified the hard way in skirnir (each caused a visible bug 
   can't fit. Swedish overflows the 800px minimum (and disconnected-sv even 1280) where English fits. The compact
   fit invariant is asserted in `snapshot_toolbar` — a longer future translation fails there, not silently.
 - Glyph notes: `🗁` (open folder) renders well in egui's emoji font; `📂` renders as an odd angled shape.
+- Two resize-fight mechanisms (2026-07-02, both user-reported): (1) a RESIZABLE panel stores its CONTENT's
+  measured rect as next frame's size, so fractional content (mono row 15.125px) that spills past the panel makes
+  it creep 0.125px/frame; fix = anchor trailing rows in an inner `exact_size` bottom panel with ≥1px headroom —
+  the panel machinery's `set_min_height(exact − margins)` then pins the measured rect to the panel edges exactly.
+  (2) egui snaps a resizable WINDOW's height back to content height, so short non-filling dialog content makes
+  vertical drags revert instantly; fix = content that always fills (bottom-anchored save row + fill scroll).
+  Both pinned by `*_holds_*`/`*_accepts_a_vertical_resize*` stability tests (drift asserts over 20 frames).

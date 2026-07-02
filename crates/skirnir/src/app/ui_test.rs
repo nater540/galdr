@@ -872,6 +872,181 @@ mod tests {
   }
 
   #[test]
+  fn the_console_dock_holds_its_size_across_frames_without_input() {
+    // The user-reported "console keeps resizing itself": a resizable egui panel PERSISTS its CONTENT's measured
+    // rect as next frame's panel size (`PanelState { rect }.store`), so any console body that does not exactly
+    // fill the panel feeds its error back 1:1 and the dock creeps frame over frame with no input at all. The
+    // tab strip's top edge must stay put across many idle frames.
+    let mut ui = UiState::default();
+    ui.active_tab = views::DockTab::Console;
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_docked_panel_harness(state, zero_time());
+    harness.run_steps(3); // settle fonts/theme and the first stored panel size.
+    let top_before = harness.get_by_label("Console").rect().top();
+    harness.run_steps(20);
+    let top_after = harness.get_by_label("Console").rect().top();
+    assert!(
+      (top_after - top_before).abs() <= 0.5,
+      "the dock must hold its size with no input: strip top drifted {top_before} -> {top_after} over 20 frames"
+    );
+  }
+
+  #[test]
+  fn the_console_dock_holds_a_manually_dragged_size() {
+    // The other half of the report: a size the operator SET must stick. Drag the dock's top edge up, then run
+    // many uneventful frames — the dragged size must survive them, not be fought back frame by frame.
+    let mut ui = UiState::default();
+    ui.active_tab = views::DockTab::Console;
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_docked_panel_harness(state, zero_time());
+    harness.run_steps(3);
+    let dock_top = 600.0 - 8.0 - Metrics::STATUS_BAR_H - Metrics::DOCK_H;
+    let handle = egui::pos2(450.0, dock_top);
+    let target = egui::pos2(450.0, dock_top - 80.0);
+    harness.hover_at(handle);
+    harness.drag_at(handle);
+    harness.hover_at(egui::pos2(450.0, dock_top - 40.0));
+    harness.hover_at(target);
+    harness.drop_at(target);
+    harness.run();
+    let top_after_drag = harness.get_by_label("Console").rect().top();
+    harness.run_steps(20);
+    let top_later = harness.get_by_label("Console").rect().top();
+    assert!(
+      (top_later - top_after_drag).abs() <= 0.5,
+      "a dragged dock size must stick: strip top drifted {top_after_drag} -> {top_later} over 20 frames"
+    );
+  }
+
+  #[test]
+  fn the_app_settings_window_holds_its_size_across_frames() {
+    // The dialog half of the report: the app-settings window (rendered as the REAL ctx-level `Window`, with the
+    // tall user-theme picker content) must keep a stable rect across uneventful frames — not auto-grow or
+    // auto-shrink in a content/size feedback loop.
+    ensure_locales_seeded();
+    let mut config = crate::config::Config::default();
+    let theme = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::default_dark());
+    config.appearance.themes.insert("fixture-theme".to_string(), theme);
+    config.appearance.active_theme = "fixture-theme".to_string();
+    let mut ui = UiState::default();
+    ui.app_settings_open = true;
+    let state = HarnessState::new(ViewState::default(), ui);
+    let mut harness = Harness::builder().with_size(egui::vec2(760.0, 820.0)).build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        crate::app::app_settings::window(ui.ctx(), &mut state.ui, &config, true, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    );
+    harness.run_steps(5);
+    let window_id = egui::Id::new("app-settings-window");
+    let rect_before = harness
+      .ctx
+      .memory(|m| m.area_rect(window_id))
+      .expect("the app settings window must have an area rect");
+    harness.run_steps(20);
+    let rect_after = harness
+      .ctx
+      .memory(|m| m.area_rect(window_id))
+      .expect("the app settings window must still be open");
+    assert!(
+      (rect_after.height() - rect_before.height()).abs() <= 0.5
+        && (rect_after.width() - rect_before.width()).abs() <= 0.5,
+      "the window must hold its size across frames: {rect_before:?} -> {rect_after:?} over 20 frames"
+    );
+  }
+
+  #[test]
+  fn the_app_settings_window_holds_a_manually_dragged_size() {
+    // The dialog half of the report, drag direction: resize the REAL window by its bottom-right corner, then run
+    // many uneventful frames — the dragged size must stick, not be fought back by content-driven auto-sizing.
+    ensure_locales_seeded();
+    let mut config = crate::config::Config::default();
+    let theme = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::default_dark());
+    config.appearance.themes.insert("fixture-theme".to_string(), theme);
+    config.appearance.active_theme = "fixture-theme".to_string();
+    let mut ui = UiState::default();
+    ui.app_settings_open = true;
+    let state = HarnessState::new(ViewState::default(), ui);
+    let mut harness = Harness::builder().with_size(egui::vec2(760.0, 860.0)).build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        crate::app::app_settings::window(ui.ctx(), &mut state.ui, &config, true, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    );
+    harness.run_steps(5);
+    let window_id = egui::Id::new("app-settings-window");
+    let rect = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
+    // Drag the bottom-right resize corner 60px out both ways.
+    let corner = rect.right_bottom() - egui::vec2(2.0, 2.0);
+    let target = corner + egui::vec2(60.0, 60.0);
+    harness.hover_at(corner);
+    harness.drag_at(corner);
+    harness.hover_at(corner + egui::vec2(30.0, 30.0));
+    harness.hover_at(target);
+    harness.drop_at(target);
+    harness.run();
+    let dragged = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
+    assert!(
+      dragged.height() > rect.height() + 30.0,
+      "precondition: the corner drag must actually grow the window ({rect:?} -> {dragged:?})"
+    );
+    harness.run_steps(20);
+    let later = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
+    assert!(
+      (later.height() - dragged.height()).abs() <= 0.5 && (later.width() - dragged.width()).abs() <= 0.5,
+      "a dragged window size must stick: {dragged:?} -> {later:?} over 20 frames"
+    );
+  }
+
+  #[test]
+  fn the_app_settings_window_accepts_a_vertical_resize_with_a_builtin_theme() {
+    // THE dialog defect the user hit: with a BUILT-IN theme active the dialog's content was short and did not
+    // fill, and egui snaps a resizable window's height back to its content's natural height — so a manual
+    // vertical resize was overridden the moment the mouse released ("it immediately starts resizing again").
+    // The content now always fills the window (save row anchored at the bottom, editor/hint region filling), so
+    // a height drag must both TAKE and STICK.
+    ensure_locales_seeded();
+    let config = crate::config::Config::default(); // built-in "default" theme — the short-content case.
+    let mut ui = UiState::default();
+    ui.app_settings_open = true;
+    let state = HarnessState::new(ViewState::default(), ui);
+    let mut harness = Harness::builder().with_size(egui::vec2(760.0, 860.0)).build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = IntentSink::new();
+        crate::app::app_settings::window(ui.ctx(), &mut state.ui, &config, true, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    );
+    harness.run_steps(5);
+    let window_id = egui::Id::new("app-settings-window");
+    let rect = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
+    let corner = rect.right_bottom() - egui::vec2(2.0, 2.0);
+    let target = corner + egui::vec2(60.0, 80.0);
+    harness.hover_at(corner);
+    harness.drag_at(corner);
+    harness.hover_at(corner + egui::vec2(30.0, 40.0));
+    harness.hover_at(target);
+    harness.drop_at(target);
+    harness.run();
+    let dragged = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
+    assert!(
+      dragged.height() > rect.height() + 40.0,
+      "the vertical drag must TAKE with a built-in theme ({rect:?} -> {dragged:?})"
+    );
+    harness.run_steps(20);
+    let later = harness.ctx.memory(|m| m.area_rect(window_id)).expect("window area rect");
+    assert!(
+      (later.height() - dragged.height()).abs() <= 0.5,
+      "the dragged height must STICK: {dragged:?} -> {later:?} over 20 frames"
+    );
+  }
+
+  #[test]
   fn the_theme_name_field_matches_the_height_of_the_button_beside_it() {
     // The user-flagged inconsistency: text inputs must sit at the same control height as adjacent buttons. The
     // "new theme name…" field and its "Create from current" button share a row, so their heights must agree.

@@ -126,17 +126,48 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
 
   ui.add_space(4.0);
 
+  // The save row is ANCHORED AS AN INNER BOTTOM PANEL and the editor/hint region below FILLS the remainder, so
+  // the dialog's content always expands to exactly the height the window is given. This is what makes a MANUAL
+  // window resize stick: egui snaps a resizable window's height back to its content's natural height, so with a
+  // built-in theme active (short, non-filling content) a vertical drag was overridden the instant the mouse
+  // released (the user-reported self-resizing dialog). Content that fills makes any dragged size a fixed point —
+  // the window opens at its default size and only the operator changes it. The panel also keeps the save
+  // controls on-screen regardless of the picker list's length (the greedy-scroll lesson), replacing the earlier
+  // reserved-height arithmetic.
+  egui::Panel::bottom("app-settings-save")
+    .exact_size(Metrics::PANEL_CONTROL_H + 16.0)
+    .resizable(false)
+    .show_separator_line(false)
+    .frame(egui::Frame::NONE)
+    .show_inside(ui, |ui| {
+      ui.separator();
+      // The explicit save boundary: nothing writes the operator-owned config.json implicitly. The unsaved marker
+      // rides on the right; Save is disabled when there is nothing to write.
+      ui.horizontal(|ui| {
+        let save = egui::Button::new(RichText::new(crate::tr!("app-settings-save")).color(palette.text))
+          .fill(palette.accent);
+        if ui.add_enabled(dirty, save).on_hover_text(crate::tr!("app-settings-save-hint")).clicked() {
+          sink.push(Intent::SaveConfig);
+        }
+        if dirty {
+          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // A hair of trailing air so the (longer in Swedish) marker never kisses or clips the right edge.
+            ui.add_space(4.0);
+            ui.label(RichText::new(crate::tr!("app-settings-unsaved")).size(10.5).color(palette.state_hold));
+          });
+        }
+      });
+    });
+
   // The colour editor: only a USER theme is editable (built-ins live in code). Each picker edits a clone of the
   // active entry; any change this frame is pushed once as a whole-theme upsert so the shell re-resolves live.
+  // `auto_shrink([false, false])`: the list FILLS down to the anchored save row (see above — the fill is what
+  // keeps the window's size stable), scrolling internally when the tokens outgrow it.
   match config.appearance.themes.get(config.appearance.active_theme.as_str()) {
     Some(theme) => {
       let mut edited = theme.clone();
       let mut changed = false;
-      // Cap the picker list to the space ABOVE the save row, or the fill-remaining scroll area pushes the save
-      // controls below the window floor where they clip away (the same greedy-scroll lesson as the console MDI).
-      let save_row_h = Metrics::PANEL_CONTROL_H + 24.0;
-      let list_max_h = (ui.available_height() - save_row_h).max(60.0);
-      egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(list_max_h).show(ui, |ui| {
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         // Fall back to the ACTIVE resolved palette for any token the (possibly hand-edited, sparse) theme leaves
         // unset, so its picker starts from the colour actually on screen. Same order as `color_entries_mut`.
         let mut resolved = ThemeOverride::from_palette(&palette);
@@ -187,26 +218,6 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, config: &Config, dirty: bool
       ui.label(RichText::new(crate::tr!("app-settings-builtin-hint")).size(11.0).color(palette.text_dim));
     }
   }
-
-  ui.add_space(8.0);
-  ui.separator();
-
-  // The explicit save boundary: nothing writes the operator-owned config.json implicitly. The unsaved marker
-  // rides on the left; Save is disabled when there is nothing to write.
-  ui.horizontal(|ui| {
-    let save = egui::Button::new(RichText::new(crate::tr!("app-settings-save")).color(palette.text))
-      .fill(palette.accent);
-    if ui.add_enabled(dirty, save).on_hover_text(crate::tr!("app-settings-save-hint")).clicked() {
-      sink.push(Intent::SaveConfig);
-    }
-    if dirty {
-      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        // A hair of trailing air so the (longer in Swedish) marker never kisses or clips the right edge.
-        ui.add_space(4.0);
-        ui.label(RichText::new(crate::tr!("app-settings-unsaved")).size(10.5).color(palette.state_hold));
-      });
-    }
-  });
 }
 
 /// A human-readable name for a locale tag in the language picker. Known bundled locales get their native names;
