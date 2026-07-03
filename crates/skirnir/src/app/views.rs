@@ -128,6 +128,10 @@ pub struct UiState {
   pub spindle_override_drag: super::overrides::OverrideFeedback,
   /// The manual-command input buffer in the console.
   pub console_input: String,
+  /// The MDI recall history (↑/↓ in the command field steps through previously sent lines, shell-style). The
+  /// navigation/dedupe/draft policy is the pure [`super::mdi::MdiHistory`]; the console body only feeds it key
+  /// presses and submitted lines. Session-scoped — deliberately not persisted.
+  pub mdi_history: super::mdi::MdiHistory,
   /// Probe depth (mm, travelled downward as a positive magnitude here; the shell negates it).
   pub probe_depth: f64,
   /// Probe feed rate (mm/min).
@@ -152,8 +156,12 @@ pub struct UiState {
   pub verify_start_angle: f64,
   /// The Phase 2 runout report's number of evenly-spaced angles (N ≥ 2).
   pub verify_runout_n: usize,
-  /// Whether the settings window is open.
+  /// Whether the FIRMWARE settings window (`$$`) is open.
   pub settings_open: bool,
+  /// Whether the APP settings dialog (language/theme/font scale — [`super::app_settings`]) is open.
+  pub app_settings_open: bool,
+  /// The in-progress name for a new user theme in the app settings dialog, kept across frames while typing.
+  pub theme_name_draft: String,
   /// The setting currently being edited in the panel, as `(number, edit_buffer)`, or `None` when no row is in
   /// edit mode. Held here so the in-progress text survives the immediate-mode frames of an edit; leaving the
   /// field (Enter or focus-loss) stages the value into [`Self::settings_staging`] and clears this, so a value is
@@ -187,8 +195,14 @@ pub struct UiState {
   /// read an earlier line. `None` until the first followed line; cleared when a new program is loaded.
   pub program_followed_line: Option<usize>,
   /// Whether the bottom dock is collapsed to just its tab strip, hiding the console/program body so the toolpath
-  /// and panels reclaim the space. Defaults to expanded (the design opens the dock at its full 200px height).
+  /// and panels reclaim the space. Defaults to expanded.
   pub dock_collapsed: bool,
+  /// The central viewport/console split (an egui_tiles tree), built lazily on the first expanded frame from
+  /// [`Self::dock_fraction`] and held here so the operator's divider drag survives frames and collapse cycles.
+  pub central_split: Option<super::dock_tiles::CentralSplit>,
+  /// The dock's share of the central region (`0..1`), mirrored out of the live split each frame so the profile
+  /// can persist it and a fresh split (or next launch) reopens at the operator's chosen ratio.
+  pub dock_fraction: f32,
   /// Whether "fabulous" mode — the hidden Pride-month accent — is on, painting a thin rainbow band along the
   /// toolbar and status bar. A pure cosmetic flourish that never touches the machine; off by default and
   /// transient (not persisted), toggled by the [`Self::register_fabulous_click`] badge easter egg.
@@ -253,6 +267,7 @@ impl Default for UiState {
       feed_override_drag: super::overrides::OverrideFeedback::default(),
       spindle_override_drag: super::overrides::OverrideFeedback::default(),
       console_input: String::new(),
+      mdi_history: super::mdi::MdiHistory::default(),
       probe_depth: 10.0,
       probe_feed: 50.0,
       plate_thickness: 1.0,
@@ -263,6 +278,8 @@ impl Default for UiState {
       verify_start_angle: 0.0,
       verify_runout_n: 4,
       settings_open: false,
+      app_settings_open: false,
+      theme_name_draft: String::new(),
       editing_setting: None,
       settings_staging: super::settings_staging::SettingsStaging::new(),
       pending_settings_action: None,
@@ -274,6 +291,8 @@ impl Default for UiState {
       setting_descriptions: super::setting_help::SettingDescriptions::bundled(),
       active_tab: DockTab::default(),
       dock_collapsed: false,
+      central_split: None,
+      dock_fraction: super::dock_tiles::DEFAULT_DOCK_FRACTION,
       program_followed_line: None,
       fabulous: false,
       fabulous_click_streak: 0,
@@ -295,6 +314,7 @@ impl UiState {
       rotary_dowel_diameter: prefs.rotary_dowel_diameter,
       rotary_index_angle: prefs.rotary_index_angle,
       rotary_bench: prefs.rotary_bench,
+      dock_fraction: prefs.dock_fraction,
       ..UiState::default()
     }
   }
@@ -535,12 +555,16 @@ fn button_row(ui: &mut egui::Ui, gap: f32, weights: &[f32], mut cell: impl FnMut
   }
 }
 
-/// A thin vertical divider for the toolbar: a 1px line at the design's ~22px height with the toolbar gap of
-/// breathing room either side, replacing egui's full-height `separator()` so the toolbar groups read as
-/// distinct without the bar feeling crammed (the user-flagged toolbar styling, design §03's `1px #2E2E2E`
-/// group separators).
-fn toolbar_divider(ui: &mut egui::Ui, palette: Palette) {
-  let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, Metrics::TOOLBAR_CONTROL_H), egui::Sense::hover());
+/// A thin vertical divider for the toolbar: a 1px line at the design's ~22px height, centred in a wider strip
+/// of breathing room, replacing egui's full-height `separator()` (the user-flagged toolbar styling, design §03's
+/// `1px #2E2E2E` group separators). The divider colour is deliberately subtle against the `panelAlt` bar, so the
+/// GROUPING is carried by the extra air around it: the strip plus the toolbar gap on either side gives ~21px
+/// between groups versus the 6px within one, which reads as separation even where the hairline itself is faint.
+fn toolbar_divider(ui: &mut egui::Ui, palette: Palette, compact: bool) {
+  // Compact halves the strip's air: the icon-form bar exists precisely because width ran out, and the icons'
+  // own gaps already separate the groups legibly at that density.
+  let strip_w = if compact { 3.0 } else { Metrics::TOOLBAR_DIVIDER_W };
+  let (rect, _) = ui.allocate_exact_size(Vec2::new(strip_w, Metrics::TOOLBAR_CONTROL_H), egui::Sense::hover());
   let center = rect.center();
   let half = 22.0 * 0.5;
   ui.painter().vline(center.x, (center.y - half)..=(center.y + half), egui::Stroke::new(1.0, palette.divider));
@@ -558,17 +582,48 @@ fn state_badge(ui: &mut egui::Ui, view: &ViewState, state_ui: &mut UiState) {
   };
   let margin = egui::Margin { left: Metrics::BADGE_PAD.x as i8, right: Metrics::BADGE_PAD.x as i8,
     top: Metrics::BADGE_PAD.y as i8, bottom: Metrics::BADGE_PAD.y as i8 };
+  // The chip's parts in VISUAL left-to-right order: the dot leads, the label carries, and (while moving) the
+  // realized feed/speed trails. egui's `horizontal` PRESERVES the embedding direction — the toolbar right-aligns
+  // the badge through a right-to-left closure, where the first-added item lands rightmost — so the parts are fed
+  // in direction-matched order below. (Forcing a left-to-right child instead either claims the whole remaining
+  // bar width (`with_layout`) or grows past the window edge (a zero-sized `allocate_ui_with_layout`), so
+  // direction-aware ordering inside the inherited layout is the shape that stays content-sized.)
+  let feed_speed = matches!(state, BadgeState::Run | BadgeState::Jog)
+    .then(|| view.status.as_ref().and_then(|s| s.feed_speed))
+    .flatten();
   let resp = chip_frame(ui, fill, border, margin, |ui| {
     ui.horizontal(|ui| {
-      dot(ui, color, Metrics::BADGE_DOT);
-      ui.add_space(2.0);
-      ui.label(RichText::new(state.label()).color(text_color).strong());
-      // The realized feed/speed rides along on the badge while a report is in hand and the machine is moving.
-      if matches!(state, BadgeState::Run | BadgeState::Jog)
-        && let Some((feed, rpm, _)) = view.status.as_ref().and_then(|s| s.feed_speed)
-      {
-        ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5)
-          .color(palette.text_dim));
+      let rtl = ui.layout().main_dir() == egui::Direction::RightToLeft;
+      let draw_dot = |ui: &mut egui::Ui| {
+        // The 2px spacer must land BETWEEN the dot and the label. The cursor advances leftward under RTL and
+        // the dot is drawn AFTER the label there, so the spacer goes before the dot (i.e. on its label side);
+        // in LTR the dot leads and the spacer follows it. A trailing spacer under RTL ended up on the chip's
+        // far LEFT edge — outside the dot — instead of separating it from the label.
+        if rtl {
+          ui.add_space(2.0);
+          dot(ui, color, Metrics::BADGE_DOT);
+        } else {
+          dot(ui, color, Metrics::BADGE_DOT);
+          ui.add_space(2.0);
+        }
+      };
+      let draw_label = |ui: &mut egui::Ui| {
+        ui.label(RichText::new(crate::tr!(state.label_key())).color(text_color).strong());
+      };
+      let draw_suffix = |ui: &mut egui::Ui| {
+        if let Some((feed, rpm, _)) = feed_speed {
+          ui.label(RichText::new(format!("F {feed:.0} · S {rpm:.0}")).monospace().size(10.5)
+            .color(palette.text_dim));
+        }
+      };
+      if rtl {
+        draw_suffix(ui);
+        draw_label(ui);
+        draw_dot(ui);
+      } else {
+        draw_dot(ui);
+        draw_label(ui);
+        draw_suffix(ui);
       }
     });
   });
@@ -587,21 +642,237 @@ fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) {
   ui.painter().circle_filled(rect.center(), diameter * 0.5, color);
 }
 
+/// Everything the shell threads into the window-panel grid beyond the view/ui state: the dock's stream clock and
+/// ETA qualifier, plus the right column's wizard/sweep borrows. The whole-window test harness passes
+/// [`ShellPanelsData::bare`] (a fixture clock, no wizard state), so the app and the harness drive the SAME
+/// [`shell_panels`] layout and cannot drift.
+pub struct ShellPanelsData<'a> {
+  /// The stream's elapsed/ETA estimate the dock clock renders.
+  pub time: super::progress::TimeEstimate,
+  /// The "(default settings)" / pause-count caveats riding beside the dock ETA when a simulation drives it.
+  pub eta_qualifier: Option<EtaQualifier>,
+  /// The running rotary center-finder's pure state, if one is active.
+  pub wizard: Option<&'a super::rotary_center::WizardState>,
+  /// Whether a rotary center was persisted in the profile (the no-run panel offers a one-click re-apply).
+  pub has_saved_center: bool,
+  /// The running Phase 2 sweep and which wizard owns it, if one is active.
+  pub sweep: Option<(&'a super::angle_sweep::AngleSweep, super::view_state::ProbeKind)>,
+}
+
+impl ShellPanelsData<'_> {
+  /// The harness/fixture form: the given clock, no ETA qualifier, and no wizard/sweep state.
+  pub fn bare(time: super::progress::TimeEstimate) -> Self {
+    ShellPanelsData { time, eta_qualifier: None, wizard: None, has_saved_center: false, sweep: None }
+  }
+}
+
+/// Render `content` into a DETACHED child ui pinned to exactly the caller's remaining rect, then claim that
+/// rect. A child ui's overflow never expands its parent, so whatever the content measures — fractional font
+/// rows, a hand-laid row a hair too wide, a future widget — the caller's own measured size stays exactly its
+/// allocated rect. This is the side columns' containment: under egui 0.35 a panel whose content measures wider
+/// than the panel re-anchors its stored rect on the overflowed edge and shifts the central-region cursor over
+/// the column (the clipped-labels bug); with containment that class of overflow is clipped where it happens and
+/// can never move layout. (The same principle the panel machinery itself applies via clip — but the measurement
+/// escape is only sealed by the detached child.)
+fn contained(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+  let rect = ui.available_rect_before_wrap();
+  let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::top_down(Align::Min)));
+  child.set_clip_rect(rect.intersect(child.clip_rect()));
+  content(&mut child);
+  ui.allocate_rect(rect, egui::Sense::hover());
+}
+
+/// Lay out the ENTIRE window-panel arrangement — toolbar, alarm/tool-change banner, status bar, bottom dock,
+/// the fixed left/right columns, and the central toolpath viewport — into the window's root `Ui`. This is THE
+/// single description of the app's frame: `SkirnirApp::ui` calls it with live shell state and the whole-window
+/// test harness calls it with fixtures, so the two can never drift (the harness used to hand-copy this
+/// arrangement, and the copy silently lost the tool-change banner branch — the failure mode this extraction
+/// makes structurally impossible). The ctx-level floating windows (firmware settings, app settings, confirm
+/// modals) are NOT part of the panel grid and stay with the shell.
+pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, data: ShellPanelsData<'_>,
+  sink: &mut IntentSink) {
+  let palette = state.style.palette;
+
+  // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content. It
+  // carries the `panelAlt` (#222222) surface — a shade lighter than the panels below — so the toolbar reads as
+  // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
+  egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
+    .frame(egui::Frame::NONE.fill(palette.panel_alt))
+    .show(ui, |ui| {
+      toolbar(ui, view, state, sink);
+    });
+
+  if view.banner.is_some() {
+    egui::Panel::top("banner").show(ui, |ui| {
+      alarm_banner(ui, palette, view, sink);
+    });
+  } else if view.badge_state() == BadgeState::Tool {
+    // No fault is latched, but the firmware is held for an M6 manual tool change: surface the prominent
+    // tool-change affordance in the same top slot (a fault banner, if any, takes precedence above). The Resume
+    // action routes through the existing cycle-start path, not a second control. The banner names the tool from
+    // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
+    egui::Panel::top("tool_change").show(ui, |ui| {
+      tool_change_banner(ui, palette, view, sink);
+    });
+  }
+
+  // The status bar is a fixed 24px mono strip (design §03).
+  egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show(ui, |ui| {
+    status_bar(ui, view, state);
+  });
+
+  // COLLAPSED, the dock is just its tab strip: a fixed, hand-rolled bottom panel spanning the full window width
+  // (exact-sized, so no resize machinery is in play). EXPANDED, the dock lives in the central egui_tiles split
+  // below — so it is laid out AFTER the side columns and spans the viewport width, not the window width, and
+  // the columns run the full height between toolbar and status bar.
+  if state.dock_collapsed {
+    egui::Panel::bottom("dock-collapsed").resizable(false).exact_size(Metrics::DOCK_COLLAPSED_H)
+      .show(ui, |ui| {
+        dock(ui, view, state, data.time, data.eta_qualifier, sink);
+      });
+  }
+
+  // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
+  // Settings) columns are exact widths, not resizable, so the layout matches the mock regardless of window
+  // size. Program no longer lives in the right column — it is a dock tab now (design §03).
+  //
+  // Each panel is given a zero-inner-margin `Frame` (panel-filled) rather than egui's default side-panel frame
+  // (`Margin::symmetric(8, 2)`). The default 8px L/R inset would shrink the usable column to 252px while the
+  // section headers and DRO/Jog bodies already own their padding (`HEADER_PAD_X`, `DRO_PAD`, `JOG_PAD`), so the
+  // content overran the clipped 252px and the rightmost controls ("Zero XYZ", the Z± column) were cut off. With
+  // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
+  let column_frame = egui::Frame::NONE.fill(palette.panel);
+  egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
+    .show(ui, |ui| contained(ui, |ui| {
+      // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
+      // area shrink to the widest child, which otherwise leaves an unfilled strip on the column's inner edge.
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Cap the content width to the column: a vertical scroll area REMEMBERS its content size, so a single
+        // frame where a full-width allocation (the section header bars) reads a transiently wide
+        // `available_width` ratchets the content wider forever — and under egui 0.35 a side panel whose content
+        // overflows its width re-anchors its measured rect on the overflowed edge, shifting the central region
+        // over the column (the clipped-labels bug). A hard cap makes the ratchet impossible.
+        ui.set_max_width(Metrics::LEFT_COL_W);
+        dro(ui, view, state, sink);
+        ui.separator();
+        jog(ui, view, state, sink);
+      });
+    }));
+
+  egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
+    .show(ui, |ui| contained(ui, |ui| {
+      // `auto_shrink([false, false])`: fill the full fixed column width and height so the content never
+      // collapses to its natural size and leaves a bare strip beside it. Settings live only in the toolbar's
+      // Settings window now, not as a right-column section.
+      egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Same content-width cap as the left column (see there): the ratchet bug manifested HERE first, as the
+        // overrides header allocating a transiently-wide row and pushing the whole column off-window.
+        ui.set_max_width(Metrics::RIGHT_COL_W);
+        overrides(ui, view, state, sink);
+        ui.separator();
+        probe(ui, view, state, sink);
+        ui.separator();
+        // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
+        // the center lives in skirnir state); a borrow keeps the view a pure render of it.
+        rotary_center(ui, view, state, data.wizard, data.has_saved_center, sink);
+        ui.separator();
+        // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
+        verify_measure(ui, view, state, data.sweep, sink);
+      });
+    }));
+
+  // The central region takes a zero-margin frame (egui's default central-panel frame insets 8px on every side,
+  // which left a black gutter beside the columns — the user-flagged band). Collapsed: the toolpath alone fills
+  // it. Expanded: the egui_tiles [viewport | dock] split fills it — the split ratio is share-based state the
+  // operator owns via the divider drag, and pane content structurally cannot feed back into it (the resizable-
+  // panel self-resize bug class this replaced). The split is TAKEN OUT of the state for the render so the tiles
+  // behavior can borrow the rest of the `UiState`, then put back with the (possibly dragged) fraction mirrored
+  // for the profile to persist.
+  egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show(ui, |ui| {
+    if state.dock_collapsed {
+      toolpath(ui, view, state);
+    } else {
+      let mut split = state
+        .central_split
+        .take()
+        .unwrap_or_else(|| super::dock_tiles::CentralSplit::new(state.dock_fraction));
+      split.ui(ui, view, state, data.time, data.eta_qualifier, sink);
+      state.dock_fraction = split.dock_fraction();
+      state.central_split = Some(split);
+    }
+  });
+}
+
+/// The toolbar's self-measured fit, persisted in egui temp memory across frames: whether the bar renders in
+/// COMPACT form (secondary controls collapse to icon glyphs) and the width the FULL form was last measured to
+/// need. Immediate mode cannot know before layout whether the full labels fit — label widths depend on the
+/// locale (Swedish "Inställningar"/"Nödstopp" overflow widths English clears) — so the bar renders, measures its
+/// real extent, and stores the verdict for the NEXT frame: the standard immediate-mode responsive pattern.
+///
+/// The full requirement can only be re-MEASURED while rendering full, so the stored value carries a
+/// [`Self::fingerprint`] of the content that produced it (locale, transport attachment, badge label — the inputs
+/// that change the labels' widths). When the fingerprint no longer matches, the measurement is stale and is
+/// DISCARDED, forcing one full-form measuring frame. Without this, a requirement that SHRANK while compact —
+/// connecting (the wide port group becomes one Disconnect button), switching to a shorter locale — was never
+/// re-measured and the bar stayed icon-only forever at that width (the stuck-compact bug). Either direction now
+/// costs at most one corrective flip after a content change.
+#[derive(Clone, Copy, Default)]
+struct ToolbarFit {
+  /// Whether the bar currently renders icon-form secondary controls.
+  compact: bool,
+  /// The total width (px) the FULL-labelled form last measured itself to need, including both edge paddings.
+  full_needs: f32,
+  /// Hash of the label-width-driving content [`Self::full_needs`] was measured under; a mismatch invalidates it.
+  fingerprint: u64,
+}
+
+/// Hash the inputs that determine the toolbar's full-form label widths: the active locale (every label), whether
+/// a transport is attached (the port combo + refresh/identify/connect group swaps for one Disconnect button),
+/// and the badge label (INAKTIV vs VERKTYGSBYTE differ by ~80px in Swedish). The port PATH is excluded — the
+/// combo is width-capped and truncating, so a different path never changes the bar's requirement.
+fn toolbar_content_fingerprint(view: &ViewState) -> u64 {
+  use std::hash::{Hash, Hasher};
+  let mut hasher = std::hash::DefaultHasher::new();
+  crate::i18n::get_language().hash(&mut hasher);
+  view.connection.has_transport().hash(&mut hasher);
+  view.badge_state().label_key().hash(&mut hasher);
+  hasher.finish()
+}
+
 /// Render the 40px main toolbar: the connect group, Open, the Run/Hold/Stop segmented transport group, Home,
-/// Settings, and the right-aligned machine-state badge (design §03).
+/// Settings, and the right-aligned machine-state badge (design §03). Self-measuring: when the full labels
+/// cannot fit the bar's width, the SECONDARY controls (identify, open, transport, simulate, home, settings)
+/// collapse to icon glyphs with their full labels on hover — the primary actions (connect/disconnect) and the
+/// safety-critical state badge always keep their full form. See [`ToolbarFit`].
 pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
+  let fit_id = egui::Id::new("toolbar-fit");
+  let mut fit: ToolbarFit = ui.ctx().data(|d| d.get_temp(fit_id)).unwrap_or_default();
+  let fingerprint = toolbar_content_fingerprint(view);
+  if fit.fingerprint != fingerprint {
+    // The labels that size the bar changed (locale, connect state, badge): the stored full-form measurement no
+    // longer describes them. Discard it and render FULL this frame to re-measure, so a shrunk requirement can
+    // recover to full labels instead of sticking icon-only (and a grown one flips compact next frame).
+    fit = ToolbarFit { compact: false, full_needs: 0.0, fingerprint };
+  }
+  let compact = fit.compact;
   // 1px bottom divider under the bar (design §03's `border-bottom:1px #2E2E2E`), painted along the panel edge.
   let bar = ui.max_rect();
   ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, palette.divider));
   // `horizontal_centered` vertically centres the 26px controls in the 40px bar, giving the design's even
-  // breathing room above and below rather than the top-aligned look the plain `horizontal` produced.
-  ui.horizontal_centered(|ui| {
+  // breathing room above and below rather than the top-aligned look the plain `horizontal` produced. The closure
+  // reports the LTR content's right edge and the right-aligned cluster's left edge, so the bar can measure
+  // whether its content actually fit this frame.
+  let (ltr_end, rtl_left) = ui.horizontal_centered(|ui| {
     // Toolbar controls are 26px tall with 10px side-padding and a 6px gap (design §03); set the region spacing
     // up front so every button/combo in the strip inherits the bar's sizing rather than the panel default.
     ui.spacing_mut().item_spacing.x = Metrics::TOOLBAR_GAP;
     ui.spacing_mut().button_padding = Metrics::TOOLBAR_BUTTON_PAD;
     ui.spacing_mut().interact_size.y = Metrics::TOOLBAR_CONTROL_H;
+    // The bar's own horizontal padding (`padding:0 10px`, design §03): the panel frame is margin-free (the
+    // divider must span edge to edge), so the strip insets its first item here and its last in the right-to-left
+    // closure below. `add_space` moves the cursor directly — no item gap rides along with it.
+    ui.add_space(Metrics::TOOLBAR_PAD_X);
     // Gate the teardown affordance on whether a transport is ATTACHED, not on whether the board is fully ready.
     // A connect that stalls in `Connecting` (the ESP32-S3 can fail to volunteer readiness) still holds the OS port
     // open; without a Disconnect here the operator could not release the FD short of killing the process, blocking
@@ -619,68 +890,146 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
     } else {
       // Port dropdown + refresh + identify + connect, only meaningful while disconnected. Each row shows the
       // (cu-preferred) path and, when known, a short USB product / «likely Galdr» hint so the board stands out.
-      egui::ComboBox::from_id_salt("port")
-        .selected_text(if state.selected_port.is_empty() { "Choose port…" } else { &state.selected_port })
-        .show_ui(ui, |ui| {
-          for port in &state.ports {
-            // The selectable label carries the path; the hint (if any) trails it dimmed so the row stays
-            // scannable while flagging the likely board.
-            let label = match port.hint() {
-              Some(hint) => format!("{}  ·  {hint}", port.path),
-              None => port.path.clone(),
-            };
-            ui.selectable_value(&mut state.selected_port, port.path.clone(), label);
-          }
-        });
-      if ui.button("⟳").on_hover_text("Refresh ports").clicked() {
+      // The combo lives in a FIXED-WIDTH child ui: `ComboBox::width` is only a MINIMUM and `truncate` bounds to
+      // `ui.available_width()` — in an open toolbar row that is the whole bar, so a long path would grow the
+      // button past any requested width. Capping the child's width makes the truncation real, which is what
+      // keeps the connect group stable as ports come and go AND lets compact actually shrink it (the dropdown
+      // rows still show every path whole).
+      let combo_w = if compact { 120.0 } else { 200.0 };
+      ui.allocate_ui_with_layout(
+        Vec2::new(combo_w, Metrics::TOOLBAR_CONTROL_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+          ui.set_max_width(combo_w);
+          egui::ComboBox::from_id_salt("port")
+            .width(combo_w)
+            .truncate()
+            .selected_text(if state.selected_port.is_empty() {
+              crate::tr!("port-choose")
+            } else {
+              state.selected_port.clone()
+            })
+            .show_ui(ui, |ui| {
+              for port in &state.ports {
+                // The selectable label carries the path; the hint (if any) trails it dimmed so the row stays
+                // scannable while flagging the likely board.
+                let label = match port.hint() {
+                  Some(hint) => format!("{}  ·  {hint}", port.path),
+                  None => port.path.clone(),
+                };
+                ui.selectable_value(&mut state.selected_port, port.path.clone(), label);
+              }
+            });
+        },
+      );
+      // Compact thins the two icon buttons' side padding too — every pixel of the connect group counts at the
+      // minimum width. Scoped: the padding is restored before the (text) Connect button below.
+      let full_pad = ui.spacing().button_padding;
+      if compact {
+        ui.spacing_mut().button_padding.x = 5.0;
+      }
+      if ui.button("⟳").on_hover_text(crate::tr!("tip-refresh-ports")).clicked() {
         sink.push(Intent::RefreshPorts);
       }
       let has_port = !state.selected_port.is_empty();
       // Identify actively probes the selected port for grblHAL. It is opt-in (opening toggles the board's
-      // auto-reset line) and never part of a refresh, so it sits behind its own button.
+      // auto-reset line) and never part of a refresh, so it sits behind its own button. Compact: a magnifier
+      // glyph (probe/inspect), with the full label folded into the hover.
+      let identify_label = if compact { "🔍".to_string() } else { crate::tr!("btn-identify") };
       if ui
-        .add_enabled(has_port, egui::Button::new(crate::tr!("btn-identify")))
-        .on_hover_text("Probe the selected port for grblHAL (sends ?/$I)")
+        .add_enabled(has_port, egui::Button::new(identify_label))
+        .on_hover_text(compact_tip(compact, crate::tr!("btn-identify"), crate::tr!("tip-identify")))
         .clicked()
       {
         sink.push(Intent::IdentifyPort { path: state.selected_port.clone() });
       }
+      ui.spacing_mut().button_padding = full_pad;
       if ui.add_enabled(has_port, egui::Button::new(crate::tr!("btn-connect"))).clicked() {
         sink.push(Intent::Connect { path: state.selected_port.clone(), baud: state.baud });
       }
     }
 
-    toolbar_divider(ui, palette);
+    toolbar_divider(ui, palette, compact);
 
-    if ui.button(crate::tr!("btn-open")).on_hover_text("Load a G-code program").clicked()
+    let open_label = if compact { "🗁".to_string() } else { crate::tr!("btn-open") };
+    if ui
+      .button(open_label)
+      .on_hover_text(compact_tip(compact, crate::tr!("btn-open"), crate::tr!("tip-open")))
+      .clicked()
       && let Some(path) = rfd::FileDialog::new().add_filter("G-code", &["gcode", "nc", "ngc", "tap"]).pick_file()
     {
       sink.push(Intent::OpenProgram(path));
     }
 
-    toolbar_divider(ui, palette);
-    transport_group(ui, view, state, sink);
-    toolbar_divider(ui, palette);
+    toolbar_divider(ui, palette, compact);
+    transport_group(ui, view, state, compact, sink);
+    toolbar_divider(ui, palette, compact);
 
     // Home runs the firmware homing cycle; safe to offer whenever connected and not already moving. Drawn as a
     // ghost button (transparent rest, design §03) so it reads as a secondary action beside the framed groups.
+    // Compact keeps just the ⌂ glyph the full label already leads with.
     let badge = view.badge_state();
     let can_home = connected && !matches!(badge, BadgeState::Run | BadgeState::Jog | BadgeState::Home);
     let home_color = if can_home { palette.text_dim } else { palette.text_disabled };
-    let home = egui::Button::new(RichText::new(crate::tr!("btn-home")).color(home_color)).fill(Color32::TRANSPARENT);
-    if ui.add_enabled(can_home, home).on_hover_text("Run homing cycle ($H)").clicked() {
+    let home_label = if compact { "⌂".to_string() } else { crate::tr!("btn-home") };
+    let home = egui::Button::new(RichText::new(home_label).color(home_color)).fill(Color32::TRANSPARENT);
+    if ui
+      .add_enabled(can_home, home)
+      .on_hover_text(compact_tip(compact, crate::tr!("btn-home"), crate::tr!("tip-home")))
+      .clicked()
+    {
       sink.push(Intent::Home);
     }
 
-    if ui.button(crate::tr!("btn-settings")).clicked() {
+    // Settings takes the same ghost treatment as Home: the two sit together as secondary chrome actions beside
+    // the framed connect/transport groups, and a filled Settings next to a ghost Home read as two accidental
+    // styles rather than one deliberate pair. Compact: the 🛠 wrench (firmware/machine settings — deliberately
+    // distinct from the ⚙ app-settings gear beside the badge).
+    let settings_label = if compact { "🛠".to_string() } else { crate::tr!("btn-settings") };
+    let settings =
+      egui::Button::new(RichText::new(settings_label).color(palette.text_dim)).fill(Color32::TRANSPARENT);
+    if ui
+      .add(settings)
+      .on_hover_text(compact_tip(compact, crate::tr!("btn-settings"), crate::tr!("tip-settings")))
+      .clicked()
+    {
       state.settings_open = !state.settings_open;
     }
+    // The LTR content ends here; its right edge is one half of the fit measurement.
+    let ltr_end = ui.min_rect().right();
 
-    // Right-aligned state badge so it is always visible regardless of toolbar width.
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      state_badge(ui, view, state);
-    });
-  });
+    // Right-aligned state badge so it is always visible regardless of toolbar width. The leading space is the
+    // bar's right-edge padding (`padding:0 10px`, design §03), mirroring the inset at the left edge. The ⚙ gear
+    // (the APP settings dialog — language/theme, distinct from the firmware Settings) sits just left of the badge
+    // as ghost chrome. The closure reports its content's LEFT edge — the other half of the fit measurement.
+    let rtl_left = ui
+      .with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(Metrics::TOOLBAR_PAD_X);
+        state_badge(ui, view, state);
+        // Icon-tight padding: the bar is genuinely full at the 800px minimum window, and the gear at the standard
+        // 10px button padding collided with the Settings button there. 4px keeps it a comfortable ~22px target.
+        ui.spacing_mut().button_padding = Vec2::new(4.0, 0.0);
+        let gear =
+          egui::Button::new(RichText::new("⚙").size(14.0).color(palette.text_dim)).fill(Color32::TRANSPARENT);
+        if ui.add(gear).on_hover_text(crate::tr!("tip-app-settings")).clicked() {
+          state.app_settings_open = !state.app_settings_open;
+        }
+        ui.min_rect().left()
+      })
+      .inner;
+    (ltr_end, rtl_left)
+  })
+  .inner;
+
+  // The fit verdict for the NEXT frame: while rendering FULL, record what the full form actually needs (LTR
+  // width + one gap + the right cluster's width); in either form, compact exactly when that requirement exceeds
+  // the bar. Stored in temp memory so the flip lands next frame without a relayout mid-pass.
+  let full_span = (ltr_end - bar.left()) + Metrics::TOOLBAR_GAP + (bar.right() - rtl_left);
+  if !compact {
+    fit.full_needs = full_span;
+  }
+  fit.compact = fit.full_needs > bar.width();
+  ui.ctx().data_mut(|d| d.insert_temp(fit_id, fit));
 
   // Fabulous mode: lay a thin Pride rainbow along the toolbar's bottom edge, overpainting the divider. Drawn
   // after the bar's content so it sits on top, and bookended by the matching band on the status bar.
@@ -693,22 +1042,34 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
   }
 }
 
+/// The hover text for a toolbar control: in compact (icon-only) form the full label leads the explanation so
+/// the glyph is never the only name the operator gets; in full form the explanation stands alone (the label is
+/// already on the button).
+fn compact_tip(compact: bool, label: String, tip: String) -> String {
+  if compact { format!("{label} — {tip}") } else { tip }
+}
+
 /// The Run/Hold/Stop segmented group plus a separate Abort control. The leading segment starts a stream (Idle) or
 /// resumes (Hold); Hold issues a feed-hold; Stop issues the GRACEFUL program stop (`0x86` — decelerate, flush,
 /// return to Idle, no alarm); the standalone Abort issues the HARD soft-reset (`0x18` → `ALARM:3`). Enable/emphasis
-/// come from the pure [`TransportGroup`] matrix so the view stays a renderer.
-pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
+/// come from the pure [`TransportGroup`] matrix so the view stays a renderer. In `compact` form (the toolbar
+/// could not fit its full labels — see [`ToolbarFit`]) the segments render their transport glyphs alone, with the
+/// full translated labels on hover; the colour coding (green run / amber stop / red abort) is unchanged, so the
+/// safety semantics never depend on the text fitting.
+pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiState, compact: bool,
+  sink: &mut IntentSink) {
   let palette = state.style.palette;
   use egui::CornerRadius;
   let group = TransportGroup::for_state(view.badge_state(), !state.program.is_empty());
 
-  let run_label = if group.run_is_resume {
-    "▶ Resume"
+  let run_full = if group.run_is_resume {
+    crate::tr!("transport-resume")
   } else if group.run_active {
-    "▶ Running"
+    crate::tr!("transport-running")
   } else {
-    "▶ Run"
+    crate::tr!("transport-run")
   };
+  let run_label = if compact { "▶".to_string() } else { run_full.clone() };
   // Joined segmented group (design §03): the three buttons abut with no gap and only the outer corners are
   // rounded — Run rounds its left, Stop its right, Hold stays square.
   let r = Metrics::CONTROL_RADIUS;
@@ -724,20 +1085,31 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   if group.run_active {
     run_button = run_button.fill(palette.inset);
   }
-  if ui.add_enabled(group.run_enabled, run_button).clicked() {
+  let mut run_resp = ui.add_enabled(group.run_enabled, run_button);
+  if compact {
+    // Icon-only: the full (state-dependent) label rides on hover so ▶ is never the only name the control has.
+    run_resp = run_resp.on_hover_text(run_full);
+  }
+  if run_resp.clicked() {
     sink.push(Intent::RunOrResume);
   }
-  let hold = egui::Button::new("⏸ Hold").corner_radius(mid);
-  if ui.add_enabled(group.hold_enabled, hold).on_hover_text("Feed hold (!)").clicked() {
+  let hold_label = if compact { "⏸".to_string() } else { crate::tr!("transport-hold") };
+  let hold = egui::Button::new(hold_label).corner_radius(mid);
+  if ui
+    .add_enabled(group.hold_enabled, hold)
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-hold"), crate::tr!("tip-hold")))
+    .clicked()
+  {
     sink.push(Intent::Realtime(RealtimeCommand::FeedHold));
   }
   // Stop is now the GRACEFUL program stop (`0x86`): the everyday "stop the job cleanly" button. It decelerates to a
   // block boundary, flushes the queue and returns to Idle with no alarm, so it reads as a normal-weight control
   // (amber, not danger-red) — the hard reset lives in the separate Abort button beside the group.
-  let stop = egui::Button::new(RichText::new("■ Stop").color(palette.state_hold)).corner_radius(right);
+  let stop_label = if compact { "■".to_string() } else { crate::tr!("transport-stop") };
+  let stop = egui::Button::new(RichText::new(stop_label).color(palette.state_hold)).corner_radius(right);
   if ui
     .add_enabled(group.stop_enabled, stop)
-    .on_hover_text("Stop the job cleanly (0x86) — decelerate, flush, return to Idle")
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-stop"), crate::tr!("tip-stop")))
     .clicked()
   {
     sink.push(Intent::Realtime(RealtimeCommand::ProgramStop));
@@ -749,11 +1121,12 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   // Abort / E-stop: the HARD soft-reset (`0x18` → `ALARM:3`). Visually distinct — danger-red, fully rounded, set
   // apart from the segmented group — and available the instant a transport is attached (even mid-handshake), so the
   // operator always has an emergency reset. The graceful Stop above is the routine control; this is the panic stop.
-  let abort = egui::Button::new(RichText::new("⏹ Abort").color(palette.state_alarm))
-    .corner_radius(Metrics::CONTROL_RADIUS);
+  let abort_label = if compact { "⏹".to_string() } else { crate::tr!("transport-abort") };
+  let abort =
+    egui::Button::new(RichText::new(abort_label).color(palette.state_alarm)).corner_radius(Metrics::CONTROL_RADIUS);
   if ui
     .add_enabled(group.abort_enabled, abort)
-    .on_hover_text("Emergency hard reset (0x18) — aborts to ALARM and resets the controller")
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-abort"), crate::tr!("tip-abort")))
     .clicked()
   {
     sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
@@ -764,10 +1137,13 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
   // reads as a secondary, non-machine action set apart from the run controls. Disabled (greyed) with no program.
   let has_program = !state.program.is_empty();
   let sim_color = if has_program { palette.text_dim } else { palette.text_disabled };
-  let simulate = egui::Button::new(RichText::new("∿ Simulate").color(sim_color)).fill(Color32::TRANSPARENT);
+  // `≈` (approximately equal) — an "estimate" glyph Roboto actually covers. The earlier `∿` (sine wave) is in
+  // neither vendored face nor egui's fallback fonts, so it rendered as a tofu box on every platform.
+  let sim_label = if compact { "≈".to_string() } else { crate::tr!("transport-simulate") };
+  let simulate = egui::Button::new(RichText::new(sim_label).color(sim_color)).fill(Color32::TRANSPARENT);
   if ui
     .add_enabled(has_program, simulate)
-    .on_hover_text("Estimate job time from the machine settings (no motion — host-only)")
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-simulate"), crate::tr!("tip-simulate")))
     .clicked()
   {
     sink.push(Intent::Simulate);
@@ -780,7 +1156,7 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   let palette = state.style.palette;
   header_bar(
     ui, palette,
-    |ui| header_title(ui, palette, "Digital Readout"),
+    |ui| header_title(ui, palette, &crate::tr!("hdr-dro")),
     |ui| {
       // The WPos/MPos toggle sits inside the header bar (design §03); the small joined buttons pick which
       // coordinate the big readout shows. The design defaults to WPos. `right_to_left` lays MPos then WPos so
@@ -794,15 +1170,21 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
 
   egui::Frame::new().inner_margin(Metrics::DRO_PAD).show(ui, |ui| {
   let (machine, work) = view.dro();
+  // A rotary-enabled firmware reports 4-field positions (DOC-10); grow the readout an A row (in degrees) exactly
+  // when the report carries one, so a plain 3-axis board never shows a phantom rotary. The shared
+  // `reported_axis_count` is the same gate the jog pad's A column uses, so the two never disagree about the rotary.
+  let axis_count = view.reported_axis_count();
   let shown = if state.show_machine_pos { machine.as_ref() } else { work.as_ref() };
-  let axes = [Axis::X, Axis::Y, Axis::Z];
-  for (index, axis) in axes.iter().enumerate() {
+  let axes: &[Axis] =
+    if axis_count >= 4 { &[Axis::X, Axis::Y, Axis::Z, Axis::A] } else { &[Axis::X, Axis::Y, Axis::Z] };
+  for axis in axes {
     ui.horizontal(|ui| {
       ui.label(RichText::new(axis.letter().to_string()).size(Metrics::DRO_LETTER).strong()
         .color(palette.axis_color(*axis)));
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new("mm").monospace().size(Metrics::DRO_UNIT).color(palette.text_disabled));
-        ui.label(big_axis_value(palette, shown, index));
+        let unit = if *axis == Axis::A { "°" } else { "mm" };
+        ui.label(RichText::new(unit).monospace().size(Metrics::DRO_UNIT).color(palette.text_disabled));
+        ui.label(big_axis_value(palette, shown, axis.index()));
       });
     });
     ui.add_space(Metrics::DRO_ROW_GAP - ui.spacing().item_spacing.y);
@@ -820,11 +1202,11 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
     // (at the default, "Zero XYZ" had no room and wrapped onto two lines inside its slot).
     ui.spacing_mut().button_padding = Vec2::new(6.0, 0.0);
     button_row(ui, 6.0, &[1.0, 1.0, 1.0, 1.4], |ui, index, rect| {
-      let (label, axes, primary): (&str, Vec<Axis>, bool) = match index {
-        0 => ("X", vec![Axis::X], false),
-        1 => ("Y", vec![Axis::Y], false),
-        2 => ("Z", vec![Axis::Z], false),
-        _ => ("Zero XYZ", Vec::new(), true),
+      let (label, axes, primary): (String, Vec<Axis>, bool) = match index {
+        0 => ("X".to_string(), vec![Axis::X], false),
+        1 => ("Y".to_string(), vec![Axis::Y], false),
+        2 => ("Z".to_string(), vec![Axis::Z], false),
+        _ => (crate::tr!("btn-zero-xyz"), Vec::new(), true),
       };
       // Size the label to the design's ~11.5px and never wrap: the placed cell is narrow, and at egui's larger
       // default button font "Zero XYZ" wrapped onto two lines inside its slot. `Extend` keeps it one line.
@@ -860,8 +1242,8 @@ pub fn dro(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
     egui::Frame::new().fill(palette.inset).inner_margin(egui::Margin::symmetric(10, 6)).corner_radius(2.0)
       .show(ui, |ui| {
         ui.horizontal(|ui| {
-          ui.label(RichText::new("TOOL").monospace().size(10.5).color(palette.text_dim));
-          let label = if tool == 0 { "none".to_string() } else { format!("T{tool}") };
+          ui.label(RichText::new(crate::tr!("lbl-tool")).monospace().size(10.5).color(palette.text_dim));
+          let label = if tool == 0 { crate::tr!("dro-tool-none") } else { format!("T{tool}") };
           ui.label(RichText::new(label).monospace().size(10.5).color(palette.text));
         });
       });
@@ -886,7 +1268,7 @@ fn endstop_chips(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
   let pins = view.pins;
   ui.horizontal(|ui| {
     ui.spacing_mut().item_spacing.x = 4.0;
-    ui.label(RichText::new("LIMITS").size(Metrics::HEADER_TEXT).color(palette.text_dim)
+    ui.label(RichText::new(crate::tr!("lbl-limits")).size(Metrics::HEADER_TEXT).color(palette.text_dim)
       .extra_letter_spacing(Metrics::HEADER_TEXT * Metrics::HEADER_TRACKING_EM));
     for (letter, asserted) in [("X", pins.limit_x), ("Y", pins.limit_y), ("Z", pins.limit_z)] {
       endstop_chip(ui, palette, letter, asserted);
@@ -910,7 +1292,8 @@ fn endstop_chip(ui: &mut egui::Ui, palette: Palette, letter: &str, asserted: boo
     if asserted {
       label = label.strong();
     }
-    ui.label(label).on_hover_text(if asserted { "Limit switch asserted" } else { "Limit clear" });
+    ui.label(label)
+      .on_hover_text(if asserted { crate::tr!("tip-limit-asserted") } else { crate::tr!("tip-limit-clear") });
   });
 }
 
@@ -942,10 +1325,10 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
   // The Jog header carries the cancel affordance on the right, matching the mock's "esc · cancel" hint.
   header_bar(
     ui, palette,
-    |ui| header_title(ui, palette, "Jog"),
+    |ui| header_title(ui, palette, &crate::tr!("hdr-jog")),
     |ui| {
-      if ui.add(egui::Button::new(RichText::new("esc · cancel").size(10.0).color(palette.text_disabled))
-        .fill(Color32::TRANSPARENT)).on_hover_text("Jog cancel (0x85)").clicked()
+      if ui.add(egui::Button::new(RichText::new(crate::tr!("jog-esc-cancel")).size(10.0).color(palette.text_disabled))
+        .fill(Color32::TRANSPARENT)).on_hover_text(crate::tr!("tip-jog-cancel")).clicked()
       {
         sink.push(Intent::Realtime(RealtimeCommand::JogCancel));
       }
@@ -960,15 +1343,23 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       // their 32px squares and the segmented step chips past their slots, overflowing the 232px jog body. A tight
       // 6px gutter keeps every button's content inside its allocation (within the design's 4–8px dense range).
       ui.spacing_mut().button_padding.x = 6.0;
-      // The pad: a 3×3 XY arrow grid of 32px cells (design §03) with a Z± column alongside, mirroring the
-      // physical axes — Y+ top, X∓ flanking the centre, Y− bottom; Z+ / Z / Z− stacked to the right.
-      // Derive the Z column's width from the row's own width here, not `available_width()` mid-row: after the
-      // grid, the running layout reports a stale (too-large) remaining width, which sized the Z column wide
+      // The pad: a 3×3 XY arrow grid of 32px cells (design §03) with Z± and rotary A± columns alongside,
+      // mirroring the physical axes — Y+ top, X∓ flanking the centre, Y− bottom; Z+/Z/Z− then A+/A/A− stacked to
+      // the right (the A column is the DOC-10 rotary, jogging in degrees under the degrees-as-mm convention).
+      // Derive the columns' width from the row's own width here, not `available_width()` mid-row: after the
+      // grid, the running layout reports a stale (too-large) remaining width, which sized the fill column wide
       // enough to overflow the 268px column and leave an unpainted gap beside the panel. The grid spans three
-      // 32px cells with two inter-cell gaps; the Z column then fills what remains after the grid and the 16px
-      // inter-column gap (a `JOG_GAP` item space, the `JOG_GAP*2` separator, and a second `JOG_GAP` item space).
+      // 32px cells with two inter-cell gaps; the Z and A columns then split what remains after the grid, the
+      // 16px inter-column gap (a `JOG_GAP` item space, the `JOG_GAP*2` separator, and a second `JOG_GAP` item
+      // space), and the `JOG_GAP` between the two columns.
+      // The rotary A column is shown ONLY when the firmware reports a 4-field position (the same gate the DRO's A
+      // row uses). On a 3-axis board an A jog would emit `$J=...A...`, which the firmware rejects with `error:N` and
+      // then holds the stream in the error state — so we must not even offer it. With no A column the Z column takes
+      // the whole fill so no empty gap is left where A would sit.
+      let has_rotary = view.has_rotary_axis();
       let xy_width = 3.0 * Metrics::JOG_CELL + 2.0 * Metrics::JOG_GAP;
-      let zw = (ui.available_width() - xy_width - Metrics::JOG_GAP * 4.0).max(Metrics::JOG_CELL);
+      let fill = (ui.available_width() - xy_width - Metrics::JOG_GAP * 5.0).max(2.0 * Metrics::JOG_CELL);
+      let zw = if has_rotary { (fill / 2.0).floor() } else { fill };
       ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(Metrics::JOG_GAP);
         let gap = Vec2::splat(Metrics::JOG_GAP);
@@ -994,16 +1385,25 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
           jog_z(ui, "Z", zw, state, sink, None);
           jog_z(ui, "Z−", zw, state, sink, Some((Axis::Z, Dir::Neg)));
         });
+        if has_rotary {
+          ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = Metrics::JOG_GAP;
+            jog_z(ui, "A+", zw, state, sink, Some((Axis::A, Dir::Pos)));
+            jog_z(ui, "A", zw, state, sink, None);
+            jog_z(ui, "A−", zw, state, sink, Some((Axis::A, Dir::Neg)));
+          });
+        }
       });
 
-      // Step selector (design §03: segmented quick steps) and the jog feed rate.
+      // Step selector (design §03: segmented quick steps) and the jog feed rate. The step drives X/Y/Z in mm and
+      // the rotary A in degrees (DOC-10's degrees-as-mm convention), so the label names both units.
       ui.add_space(8.0);
-      ui.label(RichText::new("Step (mm)").size(10.5).color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("jog-step-label")).size(10.5).color(palette.text_dim));
       ui.add_space(2.0);
       step_selector(ui, state);
       ui.add_space(6.0);
       ui.horizontal(|ui| {
-        ui.label(RichText::new("Feed").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("lbl-feed")).size(11.0).color(palette.text_dim));
         ui.add(egui::DragValue::new(&mut state.jog_feed).speed(10.0).range(1.0..=10_000.0).suffix(" mm/min"));
       });
     });
@@ -1050,14 +1450,14 @@ fn step_selector(ui: &mut egui::Ui, state: &mut UiState) {
           !state.jog_continuous && (state.jog_step - JOG_STEPS[index]).abs() < f64::EPSILON
         };
         let (fill, text) = if active { (palette.widget_active, palette.accent) } else { (palette.panel, palette.text_dim) };
-        let label = if is_cont { "cont".to_string() } else { format!("{}", JOG_STEPS[index]) };
+        let label = if is_cont { crate::tr!("jog-cont") } else { format!("{}", JOG_STEPS[index]) };
         let button = egui::Button::new(RichText::new(label).monospace().size(11.0).color(text))
           .fill(fill)
           .corner_radius(0.0)
           .wrap_mode(egui::TextWrapMode::Extend);
         let response = ui.put(rect, button);
         let response = if is_cont {
-          response.on_hover_text("Continuous jog: hold a direction to move, release to stop")
+          response.on_hover_text(crate::tr!("tip-jog-cont"))
         } else {
           response
         };
@@ -1159,7 +1559,7 @@ fn emit_jog(response: &egui::Response, state: &UiState, sink: &mut IntentSink, a
 pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
   use super::overrides::OverrideAxis;
-  section_header(ui, palette, "Overrides");
+  section_header(ui, palette, &crate::tr!("hdr-overrides"));
   // The cached override survives reports that omit the intermittent `Ov:` field, so the handle/steppers do not
   // snap to 100% on every Ov-less poll. See [`ViewState::overrides`].
   let (feed, rapid, spindle) = view.overrides();
@@ -1168,28 +1568,37 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   let enabled = view.connection.is_connected();
 
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    override_axis(ui, palette, "Feed", OverrideAxis::Feed, feed, enabled, &mut state.feed_override_drag, sink,
+    override_axis(ui, palette, &crate::tr!("lbl-feed"), OverrideAxis::Feed, feed, enabled,
+      &mut state.feed_override_drag, sink,
       RealtimeCommand::FeedOverrideMinus1, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
       RealtimeCommand::FeedOverridePlus10, RealtimeCommand::FeedOverridePlus1);
     ui.add_space(4.0);
-    override_axis(ui, palette, "Spindle", OverrideAxis::Spindle, spindle, enabled, &mut state.spindle_override_drag, sink,
+    override_axis(ui, palette, &crate::tr!("lbl-spindle"), OverrideAxis::Spindle, spindle, enabled,
+      &mut state.spindle_override_drag, sink,
       RealtimeCommand::SpindleOverrideMinus1, RealtimeCommand::SpindleOverrideMinus10,
       RealtimeCommand::SpindleOverrideReset, RealtimeCommand::SpindleOverridePlus10,
       RealtimeCommand::SpindleOverridePlus1);
     ui.add_space(4.0);
 
-    // Rapid override is preset-only in grbl (100/50/25), so it gets buttons rather than a slider.
+    // Rapid override is preset-only in grbl (100/50/25), so it gets buttons rather than a slider. The three
+    // buttons are RIGHT-ALIGNED and the label TRUNCATES into whatever remains: laid left-to-right, the Swedish
+    // "Snabbmatning 100%" pushed the row ~18px past the 286px column — and under egui 0.35 a side panel whose
+    // content overflows its width shifts the whole central-region cursor and paints the viewport OVER the
+    // column's edge (the measured-rect clamp re-anchors on the overflowed edge). A width-proof row cannot
+    // regress that way in any locale; the column-overflow regression test guards the class.
     ui.horizontal(|ui| {
-      ui.label(format!("Rapid {rapid:>3}%"));
-      if ui.button("100").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::RapidOverrideReset));
-      }
-      if ui.button("50").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::RapidOverride50));
-      }
-      if ui.button("25").clicked() {
-        sink.push(Intent::Realtime(RealtimeCommand::RapidOverride25));
-      }
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.button("25").clicked() {
+          sink.push(Intent::Realtime(RealtimeCommand::RapidOverride25));
+        }
+        if ui.button("50").clicked() {
+          sink.push(Intent::Realtime(RealtimeCommand::RapidOverride50));
+        }
+        if ui.button("100").clicked() {
+          sink.push(Intent::Realtime(RealtimeCommand::RapidOverrideReset));
+        }
+        ui.add(egui::Label::new(crate::tr!("ov-rapid", { pct: format!("{rapid:>3}") })).truncate());
+      });
     });
 
     // Realized feed/speed from the latest report: what the machine is actually doing after overrides.
@@ -1198,11 +1607,11 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
       egui::Frame::new().fill(palette.inset).inner_margin(egui::Margin::symmetric(12, 8)).corner_radius(2.0)
         .show(ui, |ui| {
           ui.horizontal(|ui| {
-            ui.label(RichText::new("Realized F").size(10.5).color(palette.text_dim));
+            ui.label(RichText::new(crate::tr!("ov-realized-feed")).size(10.5).color(palette.text_dim));
             ui.label(RichText::new(format!("{feed:.0} mm/min")).monospace().color(palette.text));
           });
           ui.horizontal(|ui| {
-            ui.label(RichText::new("Realized S").size(10.5).color(palette.text_dim));
+            ui.label(RichText::new(crate::tr!("ov-realized-speed")).size(10.5).color(palette.text_dim));
             let shown = actual.unwrap_or(rpm);
             ui.label(RichText::new(format!("{shown:.0} RPM")).monospace().color(palette.text));
           });
@@ -1319,23 +1728,19 @@ fn override_axis(ui: &mut egui::Ui, palette: Palette, label: &str, axis: super::
   });
 
   // The stepper row: fine ±1% (the new control) flanks coarse ±10% around a reset-to-100%. Gated on the same
-  // live link as the slider — a relative override byte is a no-op with nothing connected to act on it.
+  // live link as the slider — a relative override byte is a no-op with nothing connected to act on it. Placed
+  // via [`button_row`] at exact, width-splitting rects: five free-flowing buttons at the default padding are
+  // intrinsically ~283px wide — wider than the column's inner width — which was invisible under egui 0.34
+  // (silently clipped) but shifts the whole central region under 0.35 (see the rapid-row comment above). The
+  // split row always fits by construction.
   ui.add_enabled_ui(enabled, |ui| {
-    ui.horizontal(|ui| {
-      if ui.button("−10").clicked() {
-        sink.push(Intent::Realtime(minus10));
-      }
-      if ui.button("−1").clicked() {
-        sink.push(Intent::Realtime(minus1));
-      }
-      if ui.button("100").clicked() {
-        sink.push(Intent::Realtime(reset));
-      }
-      if ui.button("+1").clicked() {
-        sink.push(Intent::Realtime(plus1));
-      }
-      if ui.button("+10").clicked() {
-        sink.push(Intent::Realtime(plus10));
+    let commands = [minus10, minus1, reset, plus1, plus10];
+    let labels = ["−10", "−1", "100", "+1", "+10"];
+    button_row(ui, 6.0, &[1.0; 5], |ui, index, rect| {
+      let text = RichText::new(labels[index]).size(11.5);
+      let button = egui::Button::new(text).wrap_mode(egui::TextWrapMode::Extend);
+      if ui.put(rect, button).clicked() {
+        sink.push(Intent::Realtime(commands[index]));
       }
     });
   });
@@ -1377,26 +1782,25 @@ pub(crate) mod slider_rect_probe {
 /// Render the probe panel: depth/feed/plate inputs and a "Probe Z" action that the shell sequences.
 pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
-  section_header(ui, palette, "Probe Z · no plate");
+  section_header(ui, palette, &crate::tr!("hdr-probe"));
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    ui.label(RichText::new("No-touch-plate Z zero. Lower until continuity, set Z = 0.").size(11.0)
-      .color(palette.text_dim));
+    ui.label(RichText::new(crate::tr!("probe-intro")).size(11.0).color(palette.text_dim));
     ui.add_space(4.0);
     let enabled = view.connection == ConnectionState::Idle;
     ui.add_enabled_ui(enabled, |ui| {
       egui::Grid::new("probe").num_columns(2).show(ui, |ui| {
-        ui.label("Depth");
+        ui.label(crate::tr!("lbl-depth"));
         ui.add(egui::DragValue::new(&mut state.probe_depth).speed(0.5).range(0.1..=200.0).suffix(" mm"));
         ui.end_row();
-        ui.label("Feed");
+        ui.label(crate::tr!("lbl-feed"));
         ui.add(egui::DragValue::new(&mut state.probe_feed).speed(5.0).range(1.0..=500.0).suffix(" mm/min"));
         ui.end_row();
-        ui.label("Plate");
+        ui.label(crate::tr!("lbl-plate"));
         ui.add(egui::DragValue::new(&mut state.plate_thickness).speed(0.05).range(0.0..=20.0).suffix(" mm"));
         ui.end_row();
       });
       // The primary probe action is a full-width button, per the design's right-column treatment.
-      let probe_button = egui::Button::new("Probe Z → set work-zero");
+      let probe_button = egui::Button::new(crate::tr!("btn-probe-z"));
       if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0), probe_button).clicked() {
         sink.push(Intent::ProbeZ {
           depth: state.probe_depth,
@@ -1425,7 +1829,7 @@ fn probe_result(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
   };
   ui.add_space(6.0);
   if op.awaiting {
-    ui.label(RichText::new("Probing… awaiting result").size(11.0).color(palette.text_dim));
+    ui.label(RichText::new(crate::tr!("msg-probing-awaiting")).size(11.0).color(palette.text_dim));
     return;
   }
   match op.last.as_ref() {
@@ -1433,12 +1837,13 @@ fn probe_result(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
       // Show the machine-coordinate contact point (X, Y, Z, then any rotary axis) at 3 decimals, the PRB report
       // precision. A short green confirmation reads as "done" without re-reading the console.
       let coords = position.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", ");
-      ui.label(RichText::new(format!("Contact at [{coords}]")).size(11.0).color(palette.state_run));
-      ui.label(RichText::new("Work-Z set.").size(11.0).color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("probe-contact", { coords: coords })).size(11.0).color(palette.state_run));
+      ui.label(RichText::new(crate::tr!("probe-work-z-set")).size(11.0).color(palette.text_dim));
     }
     Some(ProbeOutcome::Failure { reason }) => {
-      ui.label(RichText::new(format!("Probe failed: {reason}")).size(11.0).color(palette.state_alarm));
-      ui.label(RichText::new("Work-Z unchanged.").size(11.0).color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("probe-failed", { reason: reason.clone() })).size(11.0)
+        .color(palette.state_alarm));
+      ui.label(RichText::new(crate::tr!("probe-work-z-unchanged")).size(11.0).color(palette.text_dim));
     }
     // Resolved but no outcome recorded — unreachable in practice (resolving always sets `last`), but render
     // nothing rather than assume.
@@ -1455,28 +1860,26 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   wizard: Option<&super::rotary_center::WizardState>, has_saved_center: bool, sink: &mut IntentSink) {
   let palette = state.style.palette;
   use super::rotary_center::WizardStep;
-  section_header(ui, palette, "Rotary center-finder");
+  section_header(ui, palette, &crate::tr!("hdr-rotary-center"));
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     let Some(w) = wizard else {
       // No run: collect the dowel diameter + index angle and offer Start. Only meaningful while idle/connected,
       // but the inputs stay editable so the operator can set up before connecting.
-      ui.label(RichText::new("Find the A centerline from a known-diameter dowel clamped concentric.").size(11.0)
-        .color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("rotary-intro")).size(11.0).color(palette.text_dim));
       ui.add_space(4.0);
       egui::Grid::new("rotary_setup").num_columns(2).show(ui, |ui| {
-        ui.label("Dowel ⌀");
+        ui.label(crate::tr!("lbl-dowel-dia"));
         ui.add(egui::DragValue::new(&mut state.rotary_dowel_diameter).speed(0.1).range(0.1..=100.0).suffix(" mm"));
         ui.end_row();
-        ui.label("A angle");
+        ui.label(crate::tr!("lbl-a-angle"));
         ui.add(egui::DragValue::new(&mut state.rotary_index_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
         ui.end_row();
         // The side-probe Z is SAFETY-CRITICAL and setup-specific, so it lives in the always-visible setup rather
         // than the collapsed bench section: every center-finder run descends a side touch to it, and a wrong value
         // crashes into the part or misses the flank (finding #13). Editing it re-arms the confirmation below.
-        ui.label("Side-probe Z");
+        ui.label(crate::tr!("lbl-side-probe-z"));
         if ui.add(egui::DragValue::new(&mut state.rotary_bench.side_probe_z).speed(0.1).range(-300.0..=0.0)
-          .suffix(" mm")).on_hover_text("Machine-Z the side (X/Y) touches descend to — must lie within the dowel's \
-          Z-extent. A wrong value will crash into the part or miss the flank.").changed()
+          .suffix(" mm")).on_hover_text(crate::tr!("tip-side-probe-z")).changed()
         {
           state.rotary_side_probe_confirmed = false;
         }
@@ -1489,12 +1892,12 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       // conservative placeholder; an untuned descent is a crash risk, so the operator must confirm before a run.
       ui.add_space(4.0);
       ui.checkbox(&mut state.rotary_side_probe_confirmed,
-        RichText::new(format!("Side-probe Z {:.3} mm is set for this dowel", state.rotary_bench.side_probe_z))
+        RichText::new(crate::tr!("rotary-side-confirm", { z: format!("{:.3}", state.rotary_bench.side_probe_z) }))
           .size(11.0).color(palette.text_dim));
       let enabled = view.connection == ConnectionState::Idle && state.rotary_side_probe_confirmed;
       ui.add_enabled_ui(enabled, |ui| {
         if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0),
-          egui::Button::new("Start center-finder")).clicked()
+          egui::Button::new(crate::tr!("btn-start-center"))).clicked()
         {
           sink.push(Intent::RotaryCenterStart {
             dowel_diameter: state.rotary_dowel_diameter,
@@ -1509,7 +1912,7 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
         ui.add_space(4.0);
         ui.add_enabled_ui(enabled, |ui| {
           if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0),
-            egui::Button::new("Apply saved center")).clicked()
+            egui::Button::new(crate::tr!("btn-apply-saved-center"))).clicked()
           {
             sink.push(Intent::ApplySavedRotaryCenter);
           }
@@ -1529,17 +1932,17 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
     let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
     match w.step {
       WizardStep::EnterDowel => {
-        ui.label(RichText::new("Jog to the −Y face approach, then probe.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("rotary-step-enter-dowel")).size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle && !probing, |ui| {
-          if ui.add_sized(full, egui::Button::new("Probe Y (left side)")).clicked() {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-probe-y-left"))).clicked() {
             sink.push(Intent::RotaryCenterProbe);
           }
         });
       }
       WizardStep::ReadyYRight => {
-        ui.label(RichText::new("Jog to the +Y face approach, then probe.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("rotary-step-ready-yright")).size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle && !probing, |ui| {
-          if ui.add_sized(full, egui::Button::new("Probe Y (right side)")).clicked() {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-probe-y-right"))).clicked() {
             sink.push(Intent::RotaryCenterProbe);
           }
         });
@@ -1547,45 +1950,44 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       WizardStep::MoveToYc => {
         // ONLY the move is offered here — the top probe is locked until the move has actually been sent (the
         // wizard then advances to MovedToYc). This is the UI half of the type-enforced "move before top" order.
-        ui.label(RichText::new("Move to the Y center before probing the top.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("rotary-step-move-yc")).size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle, |ui| {
-          if ui.add_sized(full, egui::Button::new("Move to Y center")).clicked() {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-move-yc"))).clicked() {
             sink.push(Intent::RotaryCenterMoveToYc);
           }
         });
       }
       WizardStep::MovedToYc => {
         // The move was sent; now (and only now) the top probe is offered.
-        ui.label(RichText::new("At the Y center. Probe the dowel top.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("rotary-step-moved-yc")).size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle && !probing, |ui| {
-          if ui.add_sized(full, egui::Button::new("Probe Z (dowel top)")).clicked() {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-probe-z-top"))).clicked() {
             sink.push(Intent::RotaryCenterProbe);
           }
         });
       }
       WizardStep::Review => {
-        ui.label(RichText::new("Center found. Write it to the active WCS (Y/Z only).").size(11.0)
-          .color(palette.state_run));
+        ui.label(RichText::new(crate::tr!("rotary-step-review")).size(11.0).color(palette.state_run));
         // The operator picks which feature work-Z0 lands on. Y0 is always the axis centerline; only Z is
         // selectable. Defaults to the axis centerline (wrap-machining convention).
         rotary_z_datum_picker(ui, palette, w, sink);
         ui.add_enabled_ui(idle, |ui| {
-          if ui.add_sized(full, egui::Button::new("Write center → WCS (G10 L2)")).clicked() {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-write-center"))).clicked() {
             sink.push(Intent::RotaryCenterWriteWcs);
           }
         });
       }
       WizardStep::Aborted => {
-        let reason = w.abort_reason.as_deref().unwrap_or("cancelled");
-        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(palette.state_alarm));
+        let reason = w.abort_reason.clone().unwrap_or_else(|| crate::tr!("reason-cancelled"));
+        ui.label(RichText::new(crate::tr!("msg-aborted", { reason: reason })).size(11.0).color(palette.state_alarm));
       }
       // The probing steps await a result (the probe panel shows it); only Cancel is offered here.
       WizardStep::ProbeYLeft | WizardStep::ProbeYRight | WizardStep::ProbeZTop => {
-        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
       }
     }
     ui.add_space(4.0);
-    if ui.add_sized(full, egui::Button::new("Cancel")).clicked() {
+    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
       sink.push(Intent::RotaryCenterCancel);
     }
   });
@@ -1598,27 +2000,27 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
 fn rotary_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
   let palette = state.style.palette;
   let p = &mut state.rotary_bench;
-  egui::CollapsingHeader::new(RichText::new("Bench params").size(11.0).color(palette.text_dim))
+  egui::CollapsingHeader::new(RichText::new(crate::tr!("hdr-bench-params")).size(11.0).color(palette.text_dim))
     .id_salt("rotary_bench_params")
     .show(ui, |ui| {
       egui::Grid::new("rotary_bench").num_columns(2).show(ui, |ui| {
-        ui.label("Clearance Z");
+        ui.label(crate::tr!("lbl-clearance-z"));
         ui.add(egui::DragValue::new(&mut p.clearance_mm).speed(0.1).range(-300.0..=0.0).suffix(" mm"))
-          .on_hover_text("Machine-Z retract above the dowel before the A index (G53).");
+          .on_hover_text(crate::tr!("tip-clearance-z"));
         ui.end_row();
         // Side-probe Z is intentionally NOT here — it is hoisted into the always-visible setup grid above (finding
         // #13) because it is the crash-risk parameter and must be confirmed before a run, not buried in a collapse.
-        ui.label("Settle");
+        ui.label(crate::tr!("lbl-settle"));
         ui.add(egui::DragValue::new(&mut p.settle_secs).speed(0.05).range(0.0..=10.0).suffix(" s"))
-          .on_hover_text("Dwell after the A index so backlash/oscillation damps out before the probe.");
+          .on_hover_text(crate::tr!("tip-settle"));
         ui.end_row();
-        ui.label("Feed");
+        ui.label(crate::tr!("lbl-feed"));
         ui.add(egui::DragValue::new(&mut p.feed).speed(1.0).range(1.0..=2000.0).suffix(" mm/min"))
-          .on_hover_text("Probe feed for the G38.2 touch.");
+          .on_hover_text(crate::tr!("tip-bench-feed"));
         ui.end_row();
-        ui.label("Depth");
+        ui.label(crate::tr!("lbl-depth"));
         ui.add(egui::DragValue::new(&mut p.depth_mm).speed(0.1).range(0.1..=200.0).suffix(" mm"))
-          .on_hover_text("How far the probe advances seeking contact before it gives up (alarms).");
+          .on_hover_text(crate::tr!("tip-bench-depth"));
         ui.end_row();
       });
     });
@@ -1630,21 +2032,24 @@ fn rotary_run_readings(ui: &mut egui::Ui, palette: Palette, w: &super::rotary_ce
   let dim = |ui: &mut egui::Ui, text: String| {
     ui.label(RichText::new(text).size(11.0).color(palette.text_dim));
   };
-  dim(ui, format!("Dowel ⌀ {:.3} mm · A {:.1}°", w.dowel_diameter, w.index_angle_deg));
+  dim(ui, crate::tr!("rotary-reading-dowel",
+    { dia: format!("{:.3}", w.dowel_diameter), angle: format!("{:.1}", w.index_angle_deg) }));
   if let Some(y) = w.y_left {
-    dim(ui, format!("Y left  {y:.3}"));
+    dim(ui, crate::tr!("rotary-reading-y-left", { v: format!("{y:.3}") }));
   }
   if let Some(y) = w.y_right {
-    dim(ui, format!("Y right {y:.3}"));
+    dim(ui, crate::tr!("rotary-reading-y-right", { v: format!("{y:.3}") }));
   }
   if let Some(yc) = w.y_center() {
-    ui.label(RichText::new(format!("Y center {yc:.3}")).size(11.0).color(palette.text));
+    ui.label(RichText::new(crate::tr!("rotary-reading-y-center", { v: format!("{yc:.3}") })).size(11.0)
+      .color(palette.text));
   }
   if let Some(z) = w.z_top {
-    dim(ui, format!("Z top   {z:.3}"));
+    dim(ui, crate::tr!("rotary-reading-z-top", { v: format!("{z:.3}") }));
   }
   if let Some(zc) = w.z_center() {
-    ui.label(RichText::new(format!("Z center {zc:.3}")).size(11.0).color(palette.text));
+    ui.label(RichText::new(crate::tr!("rotary-reading-z-center", { v: format!("{zc:.3}") })).size(11.0)
+      .color(palette.text));
   }
 }
 
@@ -1654,25 +2059,25 @@ fn rotary_run_readings(ui: &mut egui::Ui, palette: Palette, w: &super::rotary_ce
 fn rotary_z_datum_picker(ui: &mut egui::Ui, palette: Palette, w: &super::rotary_center::WizardState, sink: &mut IntentSink) {
   use super::rotary_center::ZDatum;
   ui.add_space(4.0);
-  ui.label(RichText::new("Work-Z0 datum").size(11.0).color(palette.text_dim));
+  ui.label(RichText::new(crate::tr!("lbl-z0-datum")).size(11.0).color(palette.text_dim));
   ui.horizontal(|ui| {
     let axis = w.z_datum == ZDatum::AxisCenterline;
     let top = w.z_datum == ZDatum::TopSurface;
-    if ui.selectable_label(axis, "Axis centerline").clicked() && !axis {
+    if ui.selectable_label(axis, crate::tr!("z-datum-axis")).clicked() && !axis {
       sink.push(Intent::RotaryCenterSetZDatum(ZDatum::AxisCenterline));
     }
-    if ui.selectable_label(top, "Top surface").clicked() && !top {
+    if ui.selectable_label(top, crate::tr!("z-datum-top")).clicked() && !top {
       sink.push(Intent::RotaryCenterSetZDatum(ZDatum::TopSurface));
     }
   });
   // One-line clarification of the selected datum, plus the Z value the G10 will carry.
   let (desc, z) = match w.z_datum {
-    ZDatum::AxisCenterline => ("Z0 at the rotary axis (Z_top − D/2).", w.z_datum_value()),
-    ZDatum::TopSurface => ("Z0 at the probed top surface (Z_top).", w.z_datum_value()),
+    ZDatum::AxisCenterline => (crate::tr!("z-datum-axis-desc"), w.z_datum_value()),
+    ZDatum::TopSurface => (crate::tr!("z-datum-top-desc"), w.z_datum_value()),
   };
   ui.label(RichText::new(desc).size(11.0).color(palette.text_dim));
   if let Some(z) = z {
-    ui.label(RichText::new(format!("G10 will set Z {z:.3}")).size(11.0).color(palette.text_dim));
+    ui.label(RichText::new(crate::tr!("z-datum-g10", { z: format!("{z:.3}") })).size(11.0).color(palette.text_dim));
   }
 }
 
@@ -1687,27 +2092,27 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   use super::angle_sweep::SweepStep;
   use super::intent::{Axis, Dir};
   use super::view_state::ProbeKind;
-  section_header(ui, palette, "Verify · measure");
+  section_header(ui, palette, &crate::tr!("hdr-verify"));
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
     let idle = view.connection == ConnectionState::Idle;
     let Some((s, kind)) = sweep else {
       // No run: collect the shared start angle + (for runout) N, and offer both Start actions.
-      ui.label(RichText::new("180°-flip verify or N-angle runout, probing −Y.").size(11.0).color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("verify-intro")).size(11.0).color(palette.text_dim));
       ui.add_space(4.0);
       egui::Grid::new("verify_setup").num_columns(2).show(ui, |ui| {
-        ui.label("Start A");
+        ui.label(crate::tr!("lbl-start-a"));
         ui.add(egui::DragValue::new(&mut state.verify_start_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
         ui.end_row();
-        ui.label("Runout N");
+        ui.label(crate::tr!("lbl-runout-n"));
         ui.add(egui::DragValue::new(&mut state.verify_runout_n).range(2..=36));
         ui.end_row();
       });
       ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new("Start 180°-flip verify")).clicked() {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-start-flip"))).clicked() {
           sink.push(Intent::FlipVerifyStart { angle_deg: state.verify_start_angle, axis: Axis::Y, dir: Dir::Neg });
         }
-        if ui.add_sized(full, egui::Button::new("Start runout report")).clicked() {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-start-runout"))).clicked() {
           sink.push(Intent::RunoutStart {
             n: state.verify_runout_n,
             start_deg: state.verify_start_angle,
@@ -1720,34 +2125,35 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
     };
 
     let title = match kind {
-      ProbeKind::FlipVerify => "180°-flip verify",
-      ProbeKind::Runout => "Runout report",
-      _ => "Verify",
+      ProbeKind::FlipVerify => crate::tr!("verify-title-flip"),
+      ProbeKind::Runout => crate::tr!("verify-title-runout"),
+      _ => crate::tr!("verify-title-generic"),
     };
     ui.label(RichText::new(title).size(11.0).color(palette.text));
     verify_readings_table(ui, palette, s);
     ui.add_space(6.0);
     match s.step() {
       SweepStep::Ready => {
-        ui.label(RichText::new(format!("Jog the approach for touch {} of {}, then probe.",
-          s.current_touch_number(), s.total_touches())).size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("verify-ready",
+          { current: s.current_touch_number() as i64, total: s.total_touches() as i64 }))
+          .size(11.0).color(palette.text_dim));
         ui.add_enabled_ui(idle, |ui| {
-          if ui.add_sized(full, egui::Button::new("Probe this angle")).clicked() {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-probe-angle"))).clicked() {
             sink.push(Intent::SweepProbe);
           }
         });
       }
       SweepStep::Probing => {
-        ui.label(RichText::new("Probing… awaiting result.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
       }
       SweepStep::Done => verify_done(ui, state, s, kind, idle, full, sink),
       SweepStep::Aborted => {
-        let reason = s.abort_reason().unwrap_or("cancelled");
-        ui.label(RichText::new(format!("Aborted: {reason}")).size(11.0).color(palette.state_alarm));
+        let reason = s.abort_reason().map(String::from).unwrap_or_else(|| crate::tr!("reason-cancelled"));
+        ui.label(RichText::new(crate::tr!("msg-aborted", { reason: reason })).size(11.0).color(palette.state_alarm));
       }
     }
     ui.add_space(4.0);
-    if ui.add_sized(full, egui::Button::new("Cancel")).clicked() {
+    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
       sink.push(Intent::SweepCancel);
     }
   });
@@ -1764,27 +2170,27 @@ fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &super::angle_sweep::
   match kind {
     ProbeKind::FlipVerify => {
       let Some(result) = FlipResult::from_readings(s.probe_axis(), s.readings()) else {
-        ui.label(RichText::new("Flip verify needs two readings.").size(11.0).color(palette.state_alarm));
+        ui.label(RichText::new(crate::tr!("verify-flip-need-two")).size(11.0).color(palette.state_alarm));
         return;
       };
-      ui.label(RichText::new(format!("Residual eccentricity {:.3} mm.", result.error()))
+      ui.label(RichText::new(crate::tr!("verify-residual", { mm: format!("{:.3}", result.error()) }))
         .size(11.0).color(palette.state_run));
-      ui.label(RichText::new("Apply shifts the active WCS origin on this axis by the residual.")
-        .size(11.0).color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("verify-apply-desc")).size(11.0).color(palette.text_dim));
       ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new("Apply correction → WCS (G10 L2)")).clicked() {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-apply-correction"))).clicked() {
           sink.push(Intent::FlipVerifyWriteCorrection);
         }
       });
     }
     ProbeKind::Runout => match RunoutReport::from_readings(s.readings()) {
       Some(r) => {
-        ui.label(RichText::new(format!("TIR {:.3} mm · eccentricity {:.3} mm ({} pts)", r.tir, r.eccentricity,
-          r.count)).size(11.0).color(palette.state_run));
-        ui.label(RichText::new("Read-only — no offset written.").size(11.0).color(palette.text_dim));
+        ui.label(RichText::new(crate::tr!("verify-runout-result",
+          { tir: format!("{:.3}", r.tir), ecc: format!("{:.3}", r.eccentricity), count: r.count as i64 }))
+          .size(11.0).color(palette.state_run));
+        ui.label(RichText::new(crate::tr!("verify-runout-readonly")).size(11.0).color(palette.text_dim));
       }
       None => {
-        ui.label(RichText::new("Runout needs at least two readings.").size(11.0).color(palette.state_alarm));
+        ui.label(RichText::new(crate::tr!("verify-runout-need-two")).size(11.0).color(palette.state_alarm));
       }
     },
     _ => {}
@@ -1804,16 +2210,47 @@ fn verify_readings_table(ui: &mut egui::Ui, palette: Palette, s: &super::angle_s
   }
 }
 
-/// Render the bottom dock (design §03): one surface hosting the Console and Program tabs. The shared tab strip
-/// switches `state.active_tab`, the strip's right edge carries the §03 progress readout (acked/total · 260px
-/// bar · percent) for whichever tab is active, and the body below renders the selected tab. Keeping both tabs
-/// in one dock matches the mock, where Console and Program share the 200px dock rather than sitting in
-/// separate panels.
+/// Debug probe: the rect the dock CONTENT last rendered into, recorded by [`dock`] each frame and read by the
+/// shell's `SKIRNIR_SIZE_TRACE` instrument and the stability tests. Stored in egui TEMP MEMORY (per-context, so
+/// parallel test harnesses cannot race each other's readings), same side-channel idea as `slider_rect_probe` —
+/// the dock body is not an AccessKit-labelled widget.
+pub(crate) mod dock_rect_probe {
+  use eframe::egui;
+
+  fn key() -> egui::Id {
+    egui::Id::new("skirnir-dock-rect-probe")
+  }
+
+  /// Record this frame's dock region rect on its context.
+  pub fn record(ctx: &egui::Context, rect: egui::Rect) {
+    ctx.data_mut(|d| d.insert_temp(key(), rect));
+  }
+
+  /// The most recently recorded dock region rect on this context, if the dock has rendered.
+  pub fn last(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp(key()))
+  }
+}
+
+/// Render the bottom dock's CONTENT (design §03): one surface hosting the Console and Program tabs. The shared
+/// tab strip switches `state.active_tab`, the strip's right edge carries the §03 progress readout (acked/total ·
+/// 260px bar · percent) plus the collapse toggle for whichever tab is active, and the body below renders the
+/// selected tab. Keeping both tabs in one dock matches the mock, where Console and Program share a single dock
+/// rather than sitting in separate panels. The hosting geometry — the egui_tiles split when expanded, the fixed
+/// collapsed strip otherwise — lives in [`shell_panels`]/[`super::dock_tiles`]; this draws only the content.
 pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: super::progress::TimeEstimate,
   eta_qualifier: Option<EtaQualifier>, sink: &mut IntentSink) {
+  // Record the dock region's rect for the SKIRNIR_SIZE_TRACE debug instrument and the stability tests
+  // (implementation-agnostic: this is the region the dock actually rendered into, whatever container hosts it).
+  dock_rect_probe::record(ui.ctx(), ui.max_rect());
   let palette = state.style.palette;
   let active = state.active_tab;
-  let tabs = [("Console", active == DockTab::Console), ("Program", active == DockTab::Program)];
+  let console_label = crate::tr!("tab-console");
+  let program_label = crate::tr!("tab-program");
+  let tabs = [
+    (console_label.as_str(), active == DockTab::Console),
+    (program_label.as_str(), active == DockTab::Program),
+  ];
   let progress = view.progress;
   let collapsed = state.dock_collapsed;
   // The strip's right closure lays out right-to-left, so widgets are drawn outermost-right first. The collapse
@@ -1848,7 +2285,7 @@ pub fn dock(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, time: supe
 /// height so it sits centred in the 30px bar. Returns whether it was clicked this frame.
 fn dock_collapse_toggle(ui: &mut egui::Ui, palette: Palette, collapsed: bool) -> bool {
   let label = dock_toggle_label(collapsed);
-  let hint = if collapsed { "Expand dock" } else { "Collapse dock" };
+  let hint = if collapsed { crate::tr!("tip-expand-dock") } else { crate::tr!("tip-collapse-dock") };
   // Square icon button matching the strip's control height, transparent at rest like the §02 icon-button state
   // (the same ghost treatment as the ⚙ settings and jog-cancel buttons), so it reads as chrome, not a tab. Zero
   // the button padding for this region: the global `BUTTON_PAD` (6px vertical) plus the glyph would inflate the
@@ -1949,11 +2386,10 @@ fn dock_eta_qualifier(ui: &mut egui::Ui, palette: Palette, qualifier: EtaQualifi
 fn eta_qualifier_text(qualifier: EtaQualifier) -> Option<String> {
   let mut parts: Vec<String> = Vec::new();
   if qualifier.default_settings {
-    parts.push("(default settings)".to_string());
+    parts.push(crate::tr!("eta-default-settings"));
   }
   if qualifier.pauses > 0 {
-    let noun = if qualifier.pauses == 1 { "line" } else { "lines" };
-    parts.push(format!("pauses at {} {noun}", qualifier.pauses));
+    parts.push(crate::tr!("eta-pauses", { count: qualifier.pauses as i64 }));
   }
   if parts.is_empty() { None } else { Some(parts.join(" · ")) }
 }
@@ -2055,8 +2491,8 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   // tabs, so the toggle moves into the body where it only applies to the console).
   ui.horizontal(|ui| {
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-      ui.checkbox(&mut state.auto_scroll, "auto-scroll");
-      ui.checkbox(&mut state.verbose, "verbose");
+      ui.checkbox(&mut state.auto_scroll, crate::tr!("console-auto-scroll"));
+      ui.checkbox(&mut state.verbose, crate::tr!("console-verbose"));
     });
   });
 
@@ -2071,18 +2507,30 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
     .collect();
 
   let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-  // Reserve the manual-command (MDI) row's height BEFORE the log scroll area, so the scroll area fills only the
-  // space ABOVE it rather than the whole panel. The log uses `auto_shrink([false, false])`, which expands to consume
-  // all remaining height of the parent `Ui`; inside the pinned 200px dock panel that left zero room for the input
-  // row laid out beneath it, pushing the MDI field below the panel floor where it was clipped away entirely (the
-  // "no text input on the Console tab" bug). Capping the scroll area's `max_height` to `available − input row`
-  // (plus the inter-row spacing) keeps the field on-screen with its full height. `max(0)` guards a panel too short
-  // to hold both — the input row then wins and the log collapses, which is the safer failure (the operator can
-  // still type) than the reverse. The input row itself is drawn after the scroll area, in the reserved gap.
-  let spacing_y = ui.spacing().item_spacing.y;
-  let input_row_h = Metrics::PANEL_CONTROL_H + spacing_y;
-  let log_max_h = (ui.available_height() - input_row_h).max(0.0);
-  let scroll = ScrollArea::vertical().auto_shrink([false, false]).max_height(log_max_h)
+  // The manual-command (MDI) strip is ANCHORED AS AN INNER BOTTOM PANEL, and the log then fills the remainder
+  // exactly. This shape is load-bearing twice over:
+  // - A resizable egui panel persists its CONTENT's measured rect as next frame's panel size, so the previous
+  //   `available − reserved` arithmetic — off by a sub-pixel of font-metric rounding — fed its error back 1:1
+  //   and the dock crept larger a pixel every few frames with no input at all (the user-reported self-resizing
+  //   console). With the strip panel-pinned and the log filling to it, the content always measures EXACTLY the
+  //   panel height and the stored size is a fixed point.
+  // - The strip can never be pushed below the dock floor by a greedy fill-height scroll area (the older
+  //   vanished-MDI bug the reservation arithmetic was originally added for) — the panel owns its space.
+  // Height budget: the strip's real height depends on the font stack (the mono row is ~15.1px under the test
+  // fonts but taller under the app's JetBrains Mono + themed spacing), so the slot carries generous headroom —
+  // 4px top breathing room between the last log row and the strip plus slack over the tallest observed content.
+  // Content that still outgrew the slot would clip at the pane floor, NOT resize anything: the dock's height is
+  // a share of the egui_tiles split, which pane content structurally cannot alter.
+  egui::Panel::bottom("dock-mdi")
+    .exact_size(Metrics::MDI_ROW_H + 8.0)
+    .resizable(false)
+    .show_separator_line(false)
+    .frame(egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 0, top: 4, bottom: 0 }))
+    .show(ui, |ui| mdi_strip(ui, view, state, sink));
+  // `min_scrolled_height(0)`: egui's 64px default floor would force the log BELOW the reserved space at the
+  // split's minimum pane height and paint it over the MDI strip; the log may shrink to a sliver instead — it
+  // still scrolls, and the MDI line always stays whole.
+  let scroll = ScrollArea::vertical().auto_shrink([false, false]).min_scrolled_height(0.0)
     .stick_to_bottom(state.auto_scroll).show_rows(
     ui,
     row_height,
@@ -2105,44 +2553,89 @@ fn console_body(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
   // catch the secondary click, so the menu is reliable on a sparse or empty console.
   let console_rect = scroll.inner_rect;
   ui.interact(console_rect, ui.id().with("console_context"), egui::Sense::click()).context_menu(|ui| {
-    if ui.button("Clear").clicked() {
+    if ui.button(crate::tr!("btn-clear")).clicked() {
       sink.push(Intent::ClearConsole);
       ui.close();
     }
   });
 
-  // Manual command entry: the input fills the row to the left of a fixed-width Send button (design §03 command
-  // line), sending on Enter or the button, only while connected.
-  ui.horizontal(|ui| {
-    let connected = view.connection.is_connected();
-    let send_w = Metrics::SEND_PAD_X * 2.0 + 32.0;
-    // Give the field an EXPLICIT width — the row's available width minus the Send button and one inter-widget gap —
-    // floored at a usable minimum. The previous layout drew the Send button first inside a nested
-    // `with_layout(right_to_left)` child, which claims the WHOLE remaining row width; the field added afterward with
-    // `desired_width(INFINITY)` then had zero width left and collapsed to an invisible sliver (the empty gap beside
-    // Send). Sizing the field first, left to right, and letting the button take the remainder keeps the box visible
-    // and usable even when empty. `MDI_FIELD_MIN_W` guards a narrow dock so the field never vanishes again.
-    let gap = ui.spacing().item_spacing.x;
-    let field_w = (ui.available_width() - send_w - gap).max(MDI_FIELD_MIN_W);
-    let response = ui.add_enabled(connected, egui::TextEdit::singleline(&mut state.console_input)
-      .hint_text("$$, G0 X0, …").desired_width(field_w));
-    let send_clicked = ui.add_enabled_ui(connected, |ui| {
-      ui.add_sized(Vec2::new(send_w, Metrics::PANEL_CONTROL_H), egui::Button::new("Send")).clicked()
-    }).inner;
-    // Submit on Enter (the field loses focus carrying the Enter press) or the Send button. The decision — gated on
-    // the link being up and the field holding a non-blank line — is the pure [`should_submit_mdi`] so it is unit-
-    // tested without a window; only the actual take/push/refocus side effects stay here.
-    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-    if should_submit_mdi(connected, enter || send_clicked, &state.console_input) {
-      // Clear the field as we take the line so the next command starts fresh, and re-focus for the operator to keep
-      // typing. The line is a normal G-code/`$` command: it goes through the engine's LINE-BUFFERED send path
-      // (`Intent::SendLine` → `send_line` → `Command::SendLine`), counted against the RX buffer like any streamed
-      // line — NOT a real-time single byte (those are `Command::Realtime`, reserved for `?`/`!`/`~`/`0x18`/jog-cancel).
-      let line = std::mem::take(&mut state.console_input);
-      sink.push(Intent::SendLine(line));
-      response.request_focus();
-    }
-  });
+}
+
+/// The manual-command entry (MDI) strip: a recessed command line — inset fill with a hairline recess border, a
+/// blue `›` prompt echoing the console's sent-line chevron, a frameless MONOSPACE field (commands are code, and
+/// the field should read like the log it feeds), and the Send button as the row's one filled-accent action.
+/// Sends on Enter or the button, only while connected; ↑/↓ recall previously sent lines
+/// ([`super::mdi::MdiHistory`]). Hosted by [`console_body`]'s inner bottom panel, which pins it to the dock floor.
+fn mdi_strip(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
+  let connected = view.connection.is_connected();
+  egui::Frame::new()
+    .fill(palette.inset)
+    .stroke(egui::Stroke::new(1.0, palette.border_recess))
+    .corner_radius(Metrics::CONTROL_RADIUS)
+    .inner_margin(egui::Margin::symmetric(8, 4))
+    .show(ui, |ui| {
+      ui.horizontal(|ui| {
+        let prompt_color = if connected { palette.log_sent } else { palette.text_disabled };
+        ui.label(RichText::new("›").monospace().size(13.0).color(prompt_color));
+        let send_w = Metrics::SEND_PAD_X * 2.0 + 32.0;
+        // Give the field an EXPLICIT width — the row's available width minus the Send button and one inter-widget
+        // gap — floored at a usable minimum. (A trailing widget added after a full-width field would otherwise be
+        // pushed out, and a field added after a right-to-left child collapses to a sliver — both prior bugs.)
+        // `MDI_FIELD_MIN_W` guards a narrow dock so the field never vanishes.
+        let gap = ui.spacing().item_spacing.x;
+        let field_w = (ui.available_width() - send_w - gap).max(MDI_FIELD_MIN_W);
+        let hint = if connected { "$$, G0 X0, …".to_string() } else { crate::tr!("mdi-hint-disconnected") };
+        // A TRANSPARENT frame (the strip's inset frame is the visible chrome) whose vertical margin is what
+        // actually sizes the field: TextEdit height = row height + frame margins (its `min_size.y` is ignored).
+        // The margin is computed from the mono row height so the field lands on EXACTLY the 22px control height
+        // of the Send button beside it — inputs and buttons share one height (the user-flagged mismatch).
+        let mono_row = ui.text_style_height(&egui::TextStyle::Monospace);
+        let field_frame = egui::Frame::new()
+          .inner_margin(Metrics::text_field_margin(mono_row, 0))
+          .fill(Color32::TRANSPARENT);
+        let response = ui.add_enabled(connected, egui::TextEdit::singleline(&mut state.console_input)
+          .frame(field_frame)
+          .font(egui::TextStyle::Monospace)
+          .hint_text(hint)
+          .desired_width(field_w));
+        // ↑/↓ recall while the field holds focus: swap the buffer for the neighbouring history entry. The
+        // navigation policy (dedupe, clamping, the draft stash) is the pure `MdiHistory`; a single-line TextEdit
+        // has no use of its own for vertical arrows, so borrowing them is safe.
+        if response.has_focus() {
+          let (up, down) =
+            ui.input(|i| (i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown)));
+          if up {
+            if let Some(previous) = state.mdi_history.up(&state.console_input) {
+              state.console_input = previous;
+            }
+          } else if down && let Some(next) = state.mdi_history.down() {
+            state.console_input = next;
+          }
+        }
+        let send_clicked = ui.add_enabled_ui(connected, |ui| {
+          // The one filled-accent control on the strip: Send is the row's action, everything else is entry.
+          let send = egui::Button::new(RichText::new(crate::tr!("btn-send")).size(11.5).color(palette.text))
+            .fill(palette.accent);
+          ui.add_sized(Vec2::new(send_w, Metrics::PANEL_CONTROL_H), send).clicked()
+        }).inner;
+        // Submit on Enter (the field loses focus carrying the Enter press) or the Send button. The decision —
+        // gated on the link being up and the field holding a non-blank line — is the pure [`should_submit_mdi`]
+        // so it is unit-tested without a window; only the take/record/push/refocus side effects stay here.
+        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if should_submit_mdi(connected, enter || send_clicked, &state.console_input) {
+          // Clear the field as we take the line so the next command starts fresh, record it for ↑ recall, and
+          // re-focus for the operator to keep typing. The line is a normal G-code/`$` command: it goes through the
+          // engine's LINE-BUFFERED send path (`Intent::SendLine` → `send_line` → `Command::SendLine`), counted
+          // against the RX buffer like any streamed line — NOT a real-time single byte (those are
+          // `Command::Realtime`, reserved for `?`/`!`/`~`/`0x18`/jog-cancel).
+          let line = std::mem::take(&mut state.console_input);
+          state.mdi_history.push(&line);
+          sink.push(Intent::SendLine(line));
+          response.request_focus();
+        }
+      });
+    });
 }
 
 /// Whether a manual-command (MDI) line typed in the console should be submitted this frame: only when the link is
@@ -2199,16 +2692,17 @@ pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
     let port = if state.selected_port.is_empty() { "—" } else { &state.selected_port };
     ui.label(RichText::new(port).monospace().size(10.5).color(palette.text_dim));
     ui.label(RichText::new("·").color(palette.text_disabled));
-    ui.label(RichText::new(badge.label()).monospace().size(10.5).color(palette.text));
+    ui.label(RichText::new(crate::tr!(badge.label_key())).monospace().size(10.5).color(palette.text));
 
     if !view.last_wco.is_empty() {
       ui.label(RichText::new("·").color(palette.text_disabled));
-      ui.label(RichText::new("WCO set").monospace().size(10.5).color(palette.text_dim));
+      ui.label(RichText::new(crate::tr!("status-wco-set")).monospace().size(10.5).color(palette.text_dim));
     }
     if view.progress.total > 0 {
       ui.label(RichText::new("·").color(palette.text_disabled));
       let pct = (view.progress.fraction() * 100.0).round() as u32;
-      ui.label(RichText::new(format!("Ln {} / {} · {pct}%", view.progress.acked, view.progress.total))
+      ui.label(RichText::new(crate::tr!("status-line",
+        { acked: view.progress.acked as i64, total: view.progress.total as i64, pct: pct as i64 }))
         .monospace().size(10.5).color(palette.text_dim));
     }
     if let Some((feed, rpm, _)) = view.status.as_ref().and_then(|s| s.feed_speed) {
@@ -2231,9 +2725,11 @@ pub fn alarm_banner(ui: &mut egui::Ui, palette: Palette, view: &ViewState, sink:
   // run every repaint while the banner is shown, so we take ONLY the description via the borrowing accessor — it
   // hands back a `'static` borrow on the static path (no per-frame allocation) and clones only on an override.
   let (headline, detail, is_alarm) = match banner {
-    Banner::Alarm(code) => (format!("⚠ ALARM:{code}"), view.codes.alarm_description(*code), true),
+    Banner::Alarm(code) => {
+      (crate::tr!("banner-alarm", { code: *code as i64 }), view.codes.alarm_description(*code), true)
+    }
     Banner::StreamError(code) => {
-      (format!("⚠ error:{code} — stream halted"), view.codes.error_description(*code), false)
+      (crate::tr!("banner-error", { code: *code as i64 }), view.codes.error_description(*code), false)
     }
   };
   egui::Frame::new()
@@ -2247,15 +2743,16 @@ pub fn alarm_banner(ui: &mut egui::Ui, palette: Palette, view: &ViewState, sink:
           ui.label(RichText::new(detail).size(11.5).color(palette.text_dim));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-          if ui.button("Dismiss").clicked() {
+          if ui.button(crate::tr!("btn-dismiss")).clicked() {
             sink.push(Intent::DismissBanner);
           }
-          let reset = egui::Button::new(RichText::new("Soft reset").color(Color32::WHITE)).fill(palette.state_alarm);
-          if ui.add(reset).on_hover_text("Soft reset (0x18)").clicked() {
+          let reset = egui::Button::new(RichText::new(crate::tr!("btn-soft-reset")).color(Color32::WHITE))
+            .fill(palette.state_alarm);
+          if ui.add(reset).on_hover_text(crate::tr!("tip-soft-reset")).clicked() {
             sink.push(Intent::Realtime(RealtimeCommand::SoftReset));
           }
           // Only an alarm offers the $X unlock; a stream error clears on reset / `$` / an empty line.
-          if is_alarm && ui.button("Unlock $X").on_hover_text("Clear the alarm lock").clicked() {
+          if is_alarm && ui.button(crate::tr!("btn-unlock")).on_hover_text(crate::tr!("tip-unlock")).clicked() {
             sink.push(Intent::SendLine("$X".to_string()));
           }
         });
@@ -2269,8 +2766,8 @@ pub fn alarm_banner(ui: &mut egui::Ui, palette: Palette, view: &ViewState, sink:
 /// shell's integration tests can assert the exact banner copy for a resolved tool.
 pub(crate) fn tool_change_headline(current_tool: Option<u32>) -> String {
   match current_tool {
-    Some(tool) if tool != 0 => format!("🔧 Tool change: insert T{tool}, then Resume"),
-    _ => "🔧 Tool change: insert the tool, then Resume".to_string(),
+    Some(tool) if tool != 0 => crate::tr!("banner-tool-with", { tool: tool as i64 }),
+    _ => crate::tr!("banner-tool-generic"),
   }
 }
 
@@ -2290,14 +2787,14 @@ pub fn tool_change_banner(ui: &mut egui::Ui, palette: Palette, view: &ViewState,
       ui.horizontal(|ui| {
         ui.vertical(|ui| {
           ui.label(RichText::new(&headline).color(palette.state_check).strong());
-          ui.label(RichText::new("The machine is paused for a manual tool change (M6). Insert the tool and press \
-            Resume (cycle-start) to continue.").size(11.5).color(palette.text_dim));
+          ui.label(RichText::new(crate::tr!("banner-tool-detail")).size(11.5).color(palette.text_dim));
         });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
           // Resume reuses the single run/resume intent — the same `~` cycle-start the toolbar's Resume segment and
           // the keyboard hotkey issue — so there is exactly one resume pathway.
-          let resume = egui::Button::new(RichText::new("▶ Resume").color(Color32::WHITE)).fill(palette.state_run);
-          if ui.add(resume).on_hover_text("Resume after the tool change (cycle-start, ~)").clicked() {
+          let resume = egui::Button::new(RichText::new(crate::tr!("transport-resume")).color(Color32::WHITE))
+            .fill(palette.state_run);
+          if ui.add(resume).on_hover_text(crate::tr!("tip-resume-tool")).clicked() {
             sink.push(Intent::RunOrResume);
           }
         });
@@ -2799,21 +3296,20 @@ pub fn settings_action_needs_confirm(staging: &super::settings_staging::Settings
 /// the firmware's `$$`/`$ES` replies; editing a value writes it back via [`Intent::WriteSetting`].
 pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
-  ui.label("Connection");
+  ui.label(crate::tr!("lbl-connection"));
   ui.horizontal(|ui| {
-    ui.label("Baud");
+    ui.label(crate::tr!("lbl-baud"));
     ui.add(egui::DragValue::new(&mut state.baud).speed(100.0).range(BAUD_RANGE));
   });
   ui.separator();
   ui.horizontal(|ui| {
-    ui.label(RichText::new("Firmware settings").color(palette.text));
+    ui.label(RichText::new(crate::tr!("hdr-firmware-settings")).color(palette.text));
     settings_save_button(ui, view, state, sink);
     settings_refresh_button(ui, view, state, sink);
   });
   // The explicit-Save model: edits stage locally and only reach the controller on Save. The note also flags that
   // some settings (e.g. `$22` homing) take effect only after the next reset, so a saved value may look inert.
-  ui.label(RichText::new("Edits stage locally — Save writes them. Some settings (e.g. $22 homing) apply on the \
-    next reset.").size(10.0).color(palette.text_dim));
+  ui.label(RichText::new(crate::tr!("settings-stage-note")).size(10.0).color(palette.text_dim));
   ui.add_space(4.0);
   settings_list(ui, view, state);
 }
@@ -2824,9 +3320,13 @@ pub fn settings(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: 
 fn settings_save_button(ui: &mut egui::Ui, view: &ViewState, state: &UiState, sink: &mut IntentSink) {
   let connected = !matches!(view.connection, ConnectionState::Disconnected | ConnectionState::Connecting);
   let dirty = !state.settings_staging.is_empty();
-  let label = if dirty { format!("Save ({})", state.settings_staging.len()) } else { "Save".to_string() };
+  let label = if dirty {
+    crate::tr!("settings-save-n", { count: state.settings_staging.len() as i64 })
+  } else {
+    crate::tr!("settings-save")
+  };
   ui.add_enabled_ui(connected && dirty, |ui| {
-    if ui.button(label).on_hover_text("Write every staged setting to the controller").clicked() {
+    if ui.button(label).on_hover_text(crate::tr!("tip-settings-save")).clicked() {
       sink.push(Intent::SaveSettings);
     }
   });
@@ -2839,7 +3339,7 @@ fn settings_save_button(ui: &mut egui::Ui, view: &ViewState, state: &UiState, si
 fn settings_refresh_button(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let connected = !matches!(view.connection, ConnectionState::Disconnected | ConnectionState::Connecting);
   ui.add_enabled_ui(connected, |ui| {
-    if ui.button("Refresh ($$)").on_hover_text("Fetch $$ values and $ES labels from the controller").clicked() {
+    if ui.button(crate::tr!("settings-refresh")).on_hover_text(crate::tr!("tip-settings-refresh")).clicked() {
       if settings_action_needs_confirm(&state.settings_staging) {
         // Defer the fetch behind the discard modal when edits are staged; the modal emits it on confirm so the
         // request never silently clobbers staged edits without the operator's say-so.
@@ -2865,14 +3365,14 @@ pub fn setting_tooltip_meta(row: &SettingRow) -> Vec<String> {
     lines.push(meta.name.clone());
   }
   if !meta.unit.is_empty() {
-    lines.push(format!("Unit: {}", meta.unit));
+    lines.push(crate::tr!("setting-unit", { unit: meta.unit.as_str() }));
   }
   // The advertised bounds, shown as whichever ends the firmware gave: a full `min..max`, or a one-sided `≥ min` /
   // `≤ max` when only one end was enumerated.
   match (&meta.min, &meta.max) {
-    (Some(min), Some(max)) => lines.push(format!("Range: {min}..{max}")),
-    (Some(min), None) => lines.push(format!("Range: ≥ {min}")),
-    (None, Some(max)) => lines.push(format!("Range: ≤ {max}")),
+    (Some(min), Some(max)) => lines.push(crate::tr!("setting-range", { min: min.as_str(), max: max.as_str() })),
+    (Some(min), None) => lines.push(crate::tr!("setting-range-min", { min: min.as_str() })),
+    (None, Some(max)) => lines.push(crate::tr!("setting-range-max", { max: max.as_str() })),
     (None, None) => {}
   }
   lines
@@ -2920,8 +3420,7 @@ pub fn settings_tooltip_ui(
 fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   let palette = state.style.palette;
   if view.settings.is_empty() {
-    ui.label(RichText::new("No settings loaded — Refresh to fetch the controller's $$ / $ES.").size(11.0)
-      .color(palette.text_dim));
+    ui.label(RichText::new(crate::tr!("settings-none")).size(11.0).color(palette.text_dim));
     return;
   }
   // The staged edit (if any) is applied after the row loop so we never mutate `editing_setting` mid-borrow.
@@ -2929,6 +3428,9 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   // `auto_shrink([false, false])`: fill the host's available height so the surrounding Settings window resizes
   // vertically instead of snapping back to a fixed list height.
   egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    // Dense table rows: land the value buttons on the 22px control height (3px vertical padding on ~15px text)
+    // so they match the computed-margin edit field — one control height per row, not two.
+    ui.spacing_mut().button_padding.y = 3.0;
     egui::Grid::new("settings_list").num_columns(3).spacing([8.0, 4.0]).striped(true).show(ui, |ui| {
       for row in view.settings.rows() {
         let dirty = state.settings_staging.is_dirty(row.number);
@@ -2960,7 +3462,12 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
         let editing_this = matches!(&state.editing_setting, Some((n, _)) if *n == row.number);
         if editing_this {
           if let Some((_, buffer)) = state.editing_setting.as_mut() {
-            let resp = ui.add(egui::TextEdit::singleline(buffer).desired_width(72.0));
+            // The computed margin lands the edit field on the same 22px control height as the value buttons in
+            // this column, so entering edit mode does not jiggle the row height.
+            let body_row = ui.text_style_height(&egui::TextStyle::Body);
+            let resp = ui.add(egui::TextEdit::singleline(buffer)
+              .margin(Metrics::text_field_margin(body_row, 4))
+              .desired_width(72.0));
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let abandoned = ui.input(|i| i.key_pressed(egui::Key::Escape));
             // Leave edit mode on any of: Enter, Escape (abandon), or focus moving elsewhere. Enter and focus-loss
@@ -2975,7 +3482,7 @@ fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
             .or_else(|| row.value.clone()).unwrap_or_else(|| "—".to_string());
           let value_color = if dirty { palette.accent_motion } else { palette.text };
           if ui.add(egui::Button::new(RichText::new(shown).monospace().size(11.0).color(value_color))
-            .fill(palette.inset)).on_hover_text("Click to edit").clicked()
+            .fill(palette.inset)).on_hover_text(crate::tr!("tip-setting-edit")).clicked()
           {
             // Seed the buffer from what the row currently shows (staged value if dirty, else live).
             let seed = state.settings_staging.staged_value(row.number).map(str::to_string)
@@ -3007,18 +3514,18 @@ pub fn settings_discard_confirm(ctx: &egui::Context, state: &mut UiState) -> Opt
   let action = state.pending_settings_action?;
   let n = state.settings_staging.len();
   let mut resolved = None;
-  egui::Window::new("Discard unsaved changes?")
+  egui::Window::new(crate::tr!("settings-discard-title"))
     .collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-      ui.label(format!("Discard {n} unsaved change(s)?"));
+      ui.label(crate::tr!("settings-discard-body", { count: n as i64 }));
       ui.add_space(8.0);
       ui.horizontal(|ui| {
-        if ui.button("Discard").clicked() {
+        if ui.button(crate::tr!("btn-discard")).clicked() {
           // Throw the staged edits away, then let the caller carry out the deferred action against clean state.
           state.settings_staging.clear();
           state.pending_settings_action = None;
           resolved = Some(action);
         }
-        if ui.button("Cancel (Keep editing)").clicked() {
+        if ui.button(crate::tr!("btn-keep-editing")).clicked() {
           // Abort the refresh/close; the staged edits and the dialog stay exactly as they were.
           state.pending_settings_action = None;
         }
@@ -3033,6 +3540,9 @@ mod tests {
 
   #[test]
   fn eta_qualifier_text_joins_the_default_settings_flag_and_the_pause_count() {
+    // The qualifier parts resolve through `tr!`, so seed the bundled en-US registry first (idempotent).
+    let _lang = crate::i18n::lock_global_for_test();
+    let _ = crate::i18n::init();
     // Nothing to qualify (real settings, no pauses): no text at all, so the dock shows the clock alone.
     assert_eq!(eta_qualifier_text(EtaQualifier { default_settings: false, pauses: 0 }), None);
     // Default settings only.
@@ -3167,7 +3677,10 @@ mod tests {
 
   #[test]
   fn tooltip_meta_lists_name_unit_and_full_range() {
-    // The full case: name, unit, and a two-sided range all enumerated.
+    // The full case: name, unit, and a two-sided range all enumerated. The unit/range lines resolve through `tr!`,
+    // so seed the bundled en-US registry first (idempotent) or they would come back as raw keys.
+    let _lang = crate::i18n::lock_global_for_test();
+    let _ = crate::i18n::init();
     let row = row_with_meta(110, "Max rate", "mm/min", Some("0"), Some("10000"));
     let lines = setting_tooltip_meta(&row);
     assert_eq!(lines, vec!["Max rate".to_string(), "Unit: mm/min".to_string(), "Range: 0..10000".to_string()]);
@@ -3176,7 +3689,9 @@ mod tests {
   #[test]
   fn tooltip_meta_handles_a_one_sided_range_and_a_unitless_setting() {
     // Only a max advertised, and no unit (a unitless bitmask like a status-report mask): the unit line is omitted
-    // and the range is shown one-sided.
+    // and the range is shown one-sided. The range line resolves through `tr!`, so seed the registry first.
+    let _lang = crate::i18n::lock_global_for_test();
+    let _ = crate::i18n::init();
     let row = row_with_meta(10, "Report mask", "", None, Some("255"));
     let lines = setting_tooltip_meta(&row);
     assert_eq!(lines, vec!["Report mask".to_string(), "Range: ≤ 255".to_string()]);
@@ -3361,6 +3876,9 @@ mod tests {
 
   #[test]
   fn the_tool_change_headline_names_a_real_tool_and_falls_back_otherwise() {
+    // The headline resolves through `tr!`, so seed the bundled en-US registry first (idempotent).
+    let _lang = crate::i18n::lock_global_for_test();
+    let _ = crate::i18n::init();
     // A real tool number is named so the operator knows which tool to fit.
     assert_eq!(tool_change_headline(Some(3)), "🔧 Tool change: insert T3, then Resume");
     // `T0` (no tool) and an unreported tool both use the generic prompt rather than naming a misleading number.

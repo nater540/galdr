@@ -122,6 +122,21 @@ pub struct Prefs {
   /// parse on the missing field.
   #[serde(default)]
   pub rotary_bench: crate::app::rotary_probe::RotaryProbeParams,
+  /// The console dock's share of the central region (`0..1`) — the operator's dragged split ratio, restored on
+  /// the next launch. `#[serde(default = ...)]` so a profile written before the tiles split still loads.
+  #[serde(default = "default_dock_fraction")]
+  pub dock_fraction: f32,
+}
+
+/// The fraction of the central region the console dock opens with on a fresh profile (~200px of a typical
+/// ~660px central region, the design's dock height as closely as a share-based split can express it). Lives
+/// here (not in the gui-gated `dock_tiles`) because the profile compiles in `--no-default-features` builds too;
+/// the gui side re-exports it.
+pub const DEFAULT_DOCK_FRACTION: f32 = 0.3;
+
+/// The serde default for [`Prefs::dock_fraction`] on profiles that predate the tiles split.
+fn default_dock_fraction() -> f32 {
+  DEFAULT_DOCK_FRACTION
 }
 
 impl Default for Prefs {
@@ -133,6 +148,7 @@ impl Default for Prefs {
       rotary_dowel_diameter: 6.0,
       rotary_index_angle: 0.0,
       rotary_bench: crate::app::rotary_probe::RotaryProbeParams::default(),
+      dock_fraction: DEFAULT_DOCK_FRACTION,
     }
   }
 }
@@ -272,6 +288,7 @@ mod tests {
         baud: 250_000,
         rotary_dowel_diameter: 10.0,
         rotary_index_angle: 45.0,
+        dock_fraction: 0.42,
         rotary_bench: crate::app::rotary_probe::RotaryProbeParams {
           clearance_mm: -3.0,
           settle_secs: 0.75,

@@ -229,12 +229,15 @@ impl Palette {
     }
   }
 
-  /// The axis-letter colour used in the DRO and the viewport HUD: X green, Y blue, Z amber (design §03).
+  /// The axis-letter colour used in the DRO and the viewport HUD: X green, Y blue, Z amber (design §03), and the
+  /// rotary A violet — the check/settings accent, distinct from all three linear axes so a 4-axis readout scans
+  /// at a glance.
   pub fn axis_color(&self, axis: Axis) -> Color32 {
     match axis {
       Axis::X => self.state_run,
       Axis::Y => self.state_idle,
       Axis::Z => self.state_hold,
+      Axis::A => self.state_check,
     }
   }
 
@@ -300,11 +303,13 @@ mod tests {
   }
 
   #[test]
-  fn axis_colors_follow_xyz_green_blue_amber() {
+  fn axis_colors_follow_xyz_green_blue_amber_and_a_violet() {
     let p = Palette::default_dark();
     assert_eq!(p.axis_color(Axis::X), p.state_run);
     assert_eq!(p.axis_color(Axis::Y), p.state_idle);
     assert_eq!(p.axis_color(Axis::Z), p.state_hold);
+    // The rotary A takes the violet accent: distinct from all three linear axes so a 4-axis DRO scans at a glance.
+    assert_eq!(p.axis_color(Axis::A), p.state_check);
   }
 
   #[test]

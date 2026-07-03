@@ -18,6 +18,9 @@ pub enum Axis {
   Y,
   /// Z axis.
   Z,
+  /// The rotary A axis (DOC-10, coordinated rotary about X). Its "distance" is DEGREES under the firmware's
+  /// degrees-as-mm convention, so a `$J=` A jog carries the angle in the A word and the feed in °/min.
+  A,
 }
 
 impl Axis {
@@ -27,16 +30,19 @@ impl Axis {
       Axis::X => 'X',
       Axis::Y => 'Y',
       Axis::Z => 'Z',
+      Axis::A => 'A',
     }
   }
 
-  /// The index of this axis in a machine-coordinate position vector (X=0, Y=1, Z=2), matching the `[PRB:]` /
-  /// `MPos:` report order. Used to pull the radial reading for the probed axis out of a `ProbeResult` position.
+  /// The index of this axis in a machine-coordinate position vector (X=0, Y=1, Z=2, A=3), matching the `[PRB:]` /
+  /// `MPos:` report order (DOC-10's 4-field form when the rotary is enabled). Used to pull the reading for the
+  /// probed axis out of a `ProbeResult` position and the A angle out of a 4-axis DRO vector.
   pub fn index(self) -> usize {
     match self {
       Axis::X => 0,
       Axis::Y => 1,
       Axis::Z => 2,
+      Axis::A => 3,
     }
   }
 }
@@ -177,6 +183,23 @@ pub enum Intent {
   FlipVerifyWriteCorrection,
   /// Cancel the running Phase 2 sweep, discarding its state.
   SweepCancel,
+
+  // ── App settings dialog ─────────────────────────────────────────────────────────────────────────────────
+  /// Switch the UI language to the given BCP-47 locale (e.g. `sv-SE`): the shell selects it on the global i18n
+  /// registry (labels re-resolve next frame — immediate mode) and records it in the config's `ui.language`.
+  SetLanguage(String),
+  /// Select the active appearance theme by name (a built-in or a user theme). The shell records it in the
+  /// config, re-resolves the palette, and re-skins the live window.
+  SetActiveTheme(String),
+  /// Set the global UI font scale (1.0 = the design's sizes). Held to a sane range by the shell.
+  SetFontScale(f32),
+  /// Create or replace the named user theme in the config's `appearance.themes`. Carries the config's theme
+  /// type, so it exists only in gui builds (the `config` module is `gui`-gated).
+  #[cfg(feature = "gui")]
+  UpsertTheme { name: String, theme: crate::config::ThemeOverride },
+  /// Persist the in-memory app config to `config.json` (atomic write). The explicit save boundary for the app
+  /// settings dialog — nothing writes the operator-owned file implicitly.
+  SaveConfig,
 }
 
 /// Build a `G10 L20 P0` line that sets the active work-coordinate system's offset so each listed axis reads
@@ -330,8 +353,23 @@ mod tests {
   fn axis_letters_and_dir_signs() {
     assert_eq!(Axis::X.letter(), 'X');
     assert_eq!(Axis::Z.letter(), 'Z');
+    assert_eq!(Axis::A.letter(), 'A');
     assert_eq!(Dir::Pos.sign(), 1.0);
     assert_eq!(Dir::Neg.sign(), -1.0);
+  }
+
+  #[test]
+  fn the_rotary_a_axis_indexes_the_fourth_position_field() {
+    // DOC-10: a rotary-enabled firmware reports 4-field positions `x,y,z,a`; the A axis reads the fourth.
+    assert_eq!(Axis::A.index(), 3);
+  }
+
+  #[test]
+  fn jog_line_forms_a_rotary_a_move_in_degrees_as_mm() {
+    // DOC-10's degrees-as-mm convention: an A jog is the same `$J=G91 G21` relative move with the A word carrying
+    // degrees, and F in degrees/min. The wire form must not differ from a linear jog except in the axis letter.
+    assert_eq!(jog_line(Axis::A, Dir::Pos, 5.0, 500.0), "$J=G91 G21 A5.000 F500");
+    assert_eq!(jog_line(Axis::A, Dir::Neg, 0.1, 200.0), "$J=G91 G21 A-0.100 F200");
   }
 
   #[test]

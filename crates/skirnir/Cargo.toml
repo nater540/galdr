@@ -22,7 +22,7 @@ path = "src/main.rs"
 # `--no-default-features` build (e.g. CI logic checks) is headless and loopback-only.
 [features]
 default = ["gui", "serial"]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe", "dep:rfd", "dep:egui_tiles"]
 serial = ["dep:tokio-serial"]
 
 [dependencies]
@@ -64,7 +64,7 @@ unic-langid   = "0.9"
 # The egui application framework, gated behind `gui`. We use the lightweight glow (OpenGL) backend rather than
 # wgpu — a 2D toolpath `Painter` needs nothing heavier — and drop accesskit / web-screen-reader. `x11` and
 # `wayland` cover both Linux display stacks. egui itself is consumed via `eframe::egui` (no direct dep).
-eframe = { version = "0.34.3", optional = true, default-features = false, features = [
+eframe = { version = "0.35", optional = true, default-features = false, features = [
   "default_fonts",
   "glow",
   "x11",
@@ -73,15 +73,24 @@ eframe = { version = "0.34.3", optional = true, default-features = false, featur
 # Native open/save file dialogs (G-code load) via the XDG Desktop Portal. 0.17 dropped its tokio runtime, so
 # there is no runtime conflict with our tokio dependency.
 rfd = { version = "0.17.2", optional = true }
+# The viewport/console split is an egui_tiles tree (rerun-io's tiling layout engine). Adopted by user decision
+# after three hand-rolled resizable-panel fixes went green in the harness but kept self-resizing on the desktop:
+# tiles sizes panes top-down from SHARES, so pane content can never feed back into the split. Only the central
+# viewport/dock divider is tiles-managed — the fixed chrome (toolbar, banners, status bar, columns) stays
+# hand-rolled and deliberately non-rearrangeable (dragging is disabled via `Behavior`). Pinned to 0.15 (the
+# egui 0.34 match; 0.16 needs egui 0.35). `serde` is off — the dock share persists through `profile.ron`.
+egui_tiles = { version = "0.16", optional = true, default-features = false }
 
 [dev-dependencies]
-# The egui UI test harness (kittest + AccessKit), version-matched to egui 0.34. We deliberately take it with
-# NO default features: the `wgpu`/`snapshot` features pull a GPU backend for image-snapshot tests, which we do
-# not use yet — our UI tests drive real pointer interaction over egui's tessellation only, so they run
-# headless/CI-clean with no GPU. Image-snapshot (pixel-diff) tests would need the `wgpu` feature and are a
-# later add. The harness + its tests are `#[cfg(all(test, feature = "gui"))]` (they need `eframe::egui`), so
-# they compile only for the gui-featured test build; a `--no-default-features` test run skips them.
-egui_kittest = { version = "0.34.3", default-features = false }
+# The egui UI test harness (kittest + AccessKit), version-matched to egui 0.34. The interaction tests drive
+# real pointer input over egui's tessellation only and run headless/CI-clean with no GPU. The `wgpu` +
+# `snapshot` features additionally enable the IMAGE-snapshot path (`src/app/snapshot_test.rs`): offscreen
+# wgpu renders diffed against committed PNG baselines under `tests/snapshots/`. Those tests are `#[ignore]`d
+# so a plain `cargo test` (and GPU-less CI) never requires a GPU — run them explicitly with
+# `cargo test -p skirnir -- --ignored snapshot` (and `UPDATE_SNAPSHOTS=1` to regenerate baselines). The
+# harness + its tests are `#[cfg(all(test, feature = "gui"))]` (they need `eframe::egui`), so they compile
+# only for the gui-featured test build; a `--no-default-features` test run skips them.
+egui_kittest = { version = "0.35", default-features = false, features = ["wgpu", "snapshot"] }
 # The current-thread runtime + test macro are enough to drive the async engine tests; paused-time helpers
 # come from the `time` feature already enabled above.
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "io-util", "time", "test-util"] }

@@ -177,6 +177,14 @@ pub struct SkirnirApp {
   /// `~/.config/skirnir/config.json`. The seam that keeps the config wiring hermetically testable, like
   /// [`Self::profile_path_override`].
   config_path_override: Option<std::path::PathBuf>,
+  /// Whether the in-memory config carries edits (language/theme/font-scale changes from the app settings dialog)
+  /// not yet written to `config.json`. Drives the dialog's unsaved-changes marker and its Save button; cleared by
+  /// a successful [`Intent::SaveConfig`]. The file is operator-owned, so nothing writes it implicitly.
+  config_dirty: bool,
+  /// Whether an appearance edit this frame still needs the LIVE egui context re-skinned (`apply_theme` needs the
+  /// `Context`, which intent handlers do not carry). The pure half — re-resolving the palette into `UiState` — is
+  /// applied immediately in the handler; `ui()` consumes this flag right after the intent drain.
+  appearance_dirty: bool,
 }
 
 /// Which probe-flow "slot" owns the shared latch, for the mutual-cancel guard. Exactly one may be armed at a
@@ -303,6 +311,8 @@ impl SkirnirApp {
       profile_path_override: None,
       config,
       config_path_override: None,
+      config_dirty: false,
+      appearance_dirty: false,
     };
     // Install the loaded tooltip descriptions over the bundled default the `from_prefs` UI came up with.
     app.ui.setting_descriptions = descriptions;
@@ -639,6 +649,69 @@ impl SkirnirApp {
       Intent::SweepProbe => self.sweep_probe(),
       Intent::FlipVerifyWriteCorrection => self.flip_verify_write_correction(),
       Intent::SweepCancel => self.sweep_cancel(),
+      Intent::SetLanguage(locale) => self.set_language(locale),
+      Intent::SetActiveTheme(name) => {
+        self.config.appearance.active_theme = name;
+        self.mark_appearance_changed();
+      }
+      Intent::SetFontScale(scale) => {
+        // Hold the scale to the same range `apply_theme` clamps to, so the config never records a value the
+        // window will refuse to render at.
+        self.config.appearance.font_scale = crate::config::clamp_font_scale(scale);
+        self.mark_appearance_changed();
+      }
+      Intent::UpsertTheme { name, theme } => {
+        self.config.appearance.themes.insert(name, theme);
+        self.mark_appearance_changed();
+      }
+      Intent::SaveConfig => self.save_config(),
+    }
+  }
+
+  /// Switch the UI language: select the locale on the global i18n registry (every `tr!` label re-resolves next
+  /// frame — immediate mode needs no relayout pass) and record it in the config so the choice persists once the
+  /// operator saves.
+  fn set_language(&mut self, locale: String) {
+    crate::i18n::set_language(&locale);
+    self.config.ui.language = locale;
+    self.config_dirty = true;
+  }
+
+  /// Record that an appearance edit happened: re-resolve the palette/toolpath style into the view state NOW (the
+  /// pure half, so the next frame's views already render the new colours and tests observe it synchronously) and
+  /// flag the context re-skin for `ui()` (the egui half, which needs the `Context`).
+  ///
+  /// Deliberately does NOT re-flatten the toolpath: an appearance edit (theme colours, active theme, font scale)
+  /// only changes render STYLE, never geometry — arc density (`toolpath.arc_step_deg`) is not an appearance field
+  /// and changes only via a config reload (F5), which does its own [`Self::reload_config`] reflow. Reflowing here
+  /// re-parsed the whole program on EVERY colour-picker drag frame (a full `parse_xy_path` over every line) for no
+  /// geometric change; the cached geometry is already correct under an unchanged arc density.
+  fn mark_appearance_changed(&mut self) {
+    self.config_dirty = true;
+    self.appearance_dirty = true;
+    apply_appearance(&mut self.ui, &self.config);
+  }
+
+  /// Write the in-memory config to `config.json` (the test-injected override path when set). Surfaces the outcome
+  /// as a console notice; a success clears the dialog's unsaved-changes marker. Note the write re-serialises the
+  /// whole file, so hand-authored comments/formatting in an operator-edited config are not preserved.
+  fn save_config(&mut self) {
+    let result = match &self.config_path_override {
+      Some(path) => crate::config::save_to(&self.config, path),
+      None => crate::config::save(&self.config),
+    };
+    match result {
+      Ok(()) => {
+        self.config_dirty = false;
+        match &self.config_path_override {
+          Some(path) => self.notice(format!("saved config to {}", path.display())),
+          None => match crate::config::config_path() {
+            Some(path) => self.notice(format!("saved config to {}", path.display())),
+            None => self.notice("saved config".to_string()),
+          },
+        }
+      }
+      Err(reason) => self.notice(format!("could not save config: {reason}")),
     }
   }
 
@@ -1681,6 +1754,7 @@ impl SkirnirApp {
       rotary_dowel_diameter: self.ui.rotary_dowel_diameter,
       rotary_index_angle: self.ui.rotary_index_angle,
       rotary_bench: self.ui.rotary_bench,
+      dock_fraction: self.ui.dock_fraction,
     };
   }
 
@@ -1793,14 +1867,10 @@ impl eframe::App for SkirnirApp {
 
     // 2. Build the frame. Views push intents into a per-frame sink; we act on them after layout so a view
     //    never mutates engine state mid-render. eframe 0.34 hands us the root `Ui`; panels are laid out into
-    //    it with `show_inside`, and the central panel is what remains after the docked panels claim their
+    //    it with `show`, and the central panel is what remains after the docked panels claim their
     //    edges. We reach the `Context` (for repaint scheduling and the settings window) via `ui.ctx()`.
     let mut sink = super::intent::IntentSink::new();
     let ctx = ui.ctx().clone();
-    use super::metrics::Metrics;
-    // The active palette resolved from the config (or the default). `Palette` is `Copy`, so snapshot it once for
-    // this frame's panel-frame fills and the banner views, rather than re-borrowing `self.ui` under each closure.
-    let palette = self.ui.style.palette;
 
     // Lift global hotkeys out of egui's per-frame input and turn them into intents (jog by arrows/PageUp-Down,
     // Escape to cancel/abort, hold/resume). Only fire when no text field has keyboard focus, so typing a line
@@ -1815,112 +1885,48 @@ impl eframe::App for SkirnirApp {
       self.reload_config(&ctx);
     }
 
-    // The toolbar is a fixed 40px bar (design §03); pin it so it neither collapses nor grows with content. It
-    // carries the `panelAlt` (#222222) surface — a shade lighter than the panels below — so the toolbar reads as
-    // distinct chrome rather than blending into the body (the design's toolbar fill, previously the panel grey).
-    egui::Panel::top("toolbar").exact_size(Metrics::TOOLBAR_H)
-      .frame(egui::Frame::NONE.fill(palette.panel_alt))
-      .show_inside(ui, |ui| {
-        views::toolbar(ui, &self.view, &mut self.ui, &mut sink);
-      });
+    // The entire window-panel arrangement — toolbar, banners, status bar, dock, columns, viewport — is the
+    // shared [`views::shell_panels`], the SAME function the whole-window test harness renders, so the app and
+    // its snapshots/interaction tests can never drift (the harness's hand-copied mirror once silently lost the
+    // tool-change banner branch). Only the ctx-level floating windows below stay shell-owned.
+    // The dock clock projects the stream's elapsed/ETA from the start stamp and the live acked/total; the ETA
+    // qualifier — "(default settings)" and any modeled operator pauses — rides alongside it when a simulation is
+    // stored, so the operator reads the figure with its caveats.
+    let data = views::ShellPanelsData {
+      time: self.stream_time(),
+      eta_qualifier: self.eta_qualifier(),
+      // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so the
+      // center lives in skirnir state); a borrow keeps the view a pure render of it.
+      wizard: self.wizard.as_ref().map(|run| &run.state),
+      // Whether a center was persisted last session (DOC-11 §1.3): the no-run panel offers a one-click
+      // re-apply so a restart restores the found center without re-probing.
+      has_saved_center: self.profile.rotary.is_some(),
+      // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
+      sweep: self.sweep.as_ref().map(|run| (&run.sweep, run.kind)),
+    };
+    views::shell_panels(ui, &self.view, &mut self.ui, data, &mut sink);
 
-    if self.view.banner.is_some() {
-      egui::Panel::top("banner").show_inside(ui, |ui| {
-        views::alarm_banner(ui, palette, &self.view, &mut sink);
-      });
-    } else if self.view.badge_state() == super::badge::BadgeState::Tool {
-      // No fault is latched, but the firmware is held for an M6 manual tool change: surface the prominent
-      // tool-change affordance in the same top slot (a fault banner, if any, takes precedence above). The Resume
-      // action routes through the existing cycle-start path, not a second control. The banner names the tool from
-      // `view.current_tool` — the firmware answers `$G` during the hold (the shell nudges it on the transition).
-      egui::Panel::top("tool_change").show_inside(ui, |ui| {
-        views::tool_change_banner(ui, palette, &self.view, &mut sink);
-      });
+    // SKIRNIR_SIZE_TRACE=1: log the dock region's geometry every frame it CHANGES, and force continuous
+    // repaints so frame-paced effects reproduce without anyone wiggling the mouse. This is the desktop-truth
+    // instrument for the self-resizing-dock investigation — the kittest harness said green three times while
+    // the shipped binary disagreed, so the confirmation pass now runs in the REAL eframe loop. Env-gated and
+    // near-free when off; deliberately left in place so the operator can run a verification pass themselves.
+    if std::env::var_os("SKIRNIR_SIZE_TRACE").is_some() {
+      size_trace(&ctx, &self.ui);
+      ctx.request_repaint();
     }
-
-    // The status bar is a fixed 24px mono strip (design §03).
-    egui::Panel::bottom("status").exact_size(Metrics::STATUS_BAR_H).show_inside(ui, |ui| {
-      views::status_bar(ui, &self.view, &self.ui);
-    });
-
-    // The bottom dock spans the full window width under the body grid (design §03: a single 200px dock hosting
-    // the Console and Program tabs across all three columns). It must be laid out BEFORE the side panels so it
-    // claims the full width and the columns rise only above it; the status bar, declared earlier, stays below.
-    // Pin the height with `exact_size` (like the toolbar/status bars) rather than `resizable` + `default_size`:
-    // the dock's body uses a fill-remaining `ScrollArea` (`auto_shrink([false, false])`), and on a resizable
-    // panel that height-feedback resolves the panel to most of the window on first layout. Pinning gives a
-    // deterministic 200px so the viewport reclaims the rest, and collapsing shrinks it to just the tab strip.
-    let dock_h = Metrics::dock_height(self.ui.dock_collapsed);
-    // Project the stream's elapsed/ETA from the start stamp and the live acked/total, so the dock can show the
-    // design's `m:ss / m:ss` clock. When no stream is timing this is the zero estimate (both times absent).
-    let time = self.stream_time();
-    // The ETA qualifier — "(default settings)" and any modeled operator pauses — rides alongside the clock when a
-    // simulation is stored, so the operator can read the figure with its caveats. `None` falls back to no qualifier.
-    let eta_qualifier = self.eta_qualifier();
-    egui::Panel::bottom("dock").resizable(false).exact_size(dock_h).show_inside(ui, |ui| {
-      views::dock(ui, &self.view, &mut self.ui, time, eta_qualifier, &mut sink);
-    });
-
-    // The design body grid is a fixed `268px | 1fr | 286px`: the left (DRO + Jog) and right (Overrides + Probe +
-    // Settings) columns are exact widths, not resizable, so the layout matches the mock regardless of window
-    // size. Program no longer lives in the right column — it is a dock tab now (design §03).
-    //
-    // Each panel is given a zero-inner-margin `Frame` (panel-filled) rather than egui's default side-panel frame
-    // (`Margin::symmetric(8, 2)`). The default 8px L/R inset would shrink the usable column to 252px while the
-    // section headers and DRO/Jog bodies already own their padding (`HEADER_PAD_X`, `DRO_PAD`, `JOG_PAD`), so the
-    // content overran the clipped 252px and the rightmost controls ("Zero XYZ", the Z± column) were cut off. With
-    // the margin zeroed the full 268/286 is usable and the views' own padding sets the gutters the design intends.
-    let column_frame = egui::Frame::NONE.fill(palette.panel);
-    egui::Panel::left("controls").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame)
-      .show_inside(ui, |ui| {
-        // `auto_shrink([false, false])` pins the content to the full 268px column instead of letting the scroll
-        // area shrink to the widest child, which otherwise leaves an unfilled strip on the column's inner edge.
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-          views::dro(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          views::jog(ui, &self.view, &mut self.ui, &mut sink);
-        });
-      });
-
-    egui::Panel::right("rightcol").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame)
-      .show_inside(ui, |ui| {
-        // `auto_shrink([false, false])`: fill the full fixed column width and height so the content never
-        // collapses to its natural size and leaves a bare strip beside it. Settings live only in the toolbar's
-        // Settings window now, not as a right-column section.
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-          views::overrides(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          views::probe(ui, &self.view, &mut self.ui, &mut sink);
-          ui.separator();
-          // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
-          // the center lives in skirnir state); pass a borrow so the view stays a pure render of it.
-          let wizard = self.wizard.as_ref().map(|run| &run.state);
-          // Whether a center was persisted last session (DOC-11 §1.3): the no-run panel offers a one-click
-          // re-apply so a restart restores the found center without re-probing.
-          let has_saved_center = self.profile.rotary.is_some();
-          views::rotary_center(ui, &self.view, &mut self.ui, wizard, has_saved_center, &mut sink);
-          ui.separator();
-          // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
-          let sweep = self.sweep.as_ref().map(|run| (&run.sweep, run.kind));
-          views::verify_measure(ui, &self.view, &mut self.ui, sweep, &mut sink);
-        });
-      });
-
-    // The central toolpath panel takes a zero-margin frame too. egui's default central-panel frame insets the
-    // content by 8px on every side, which left a black gutter between the left column's right edge and the
-    // viewport (the user-flagged band). With no margin the viewport sits flush against both columns — exactly the
-    // design's `268 | 1fr | 286` grid, where the columns abut the viewport with no gap. The toolpath view paints
-    // its own `INSET` canvas over the rect, so the frame fill never shows through.
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(palette.inset)).show_inside(ui, |ui| {
-      views::toolpath(ui, &self.view, &mut self.ui);
-    });
 
     if self.ui.settings_open {
       let mut open = self.ui.settings_open;
       // Give the window a real default size and let it resize in both axes; the settings list inside fills the
       // available height (see `settings`), so dragging the bottom edge actually grows the list rather than
       // snapping back to a fixed content height (the prior vertical-resize stall).
-      egui::Window::new("Settings").open(&mut open).resizable(true).default_size([340.0, 460.0]).show(&ctx, |ui| {
+      // The explicit `.id()` keeps egui's remembered position/size keyed on a STABLE token: without it the id
+      // derives from the translated title, so switching language "forgot" where the operator had dragged the
+      // window and snapped it back to the default placement.
+      egui::Window::new(crate::tr!("settings-window-title")).id(egui::Id::new("firmware-settings-window"))
+        .open(&mut open).resizable(true)
+        .default_size([340.0, 460.0]).show(&ctx, |ui| {
         views::settings(ui, &self.view, &mut self.ui, &mut sink);
       });
       // The window's `X` set `open` false. With unsaved edits staged, defer the close behind the discard
@@ -1941,9 +1947,23 @@ impl eframe::App for SkirnirApp {
       }
     }
 
+    // The app settings dialog (language / theme / font scale / theme editor), toggled from the toolbar gear.
+    // Drawn before the intent drain so an edit made this frame is acted on this frame.
+    if self.ui.app_settings_open {
+      super::app_settings::window(&ctx, &mut self.ui, &self.config, self.config_dirty, &mut sink);
+    }
+
     // 3. Act on the intents the views emitted this frame, in order.
     for intent in sink.drain() {
       self.handle_intent(intent);
+    }
+
+    // 3a. An appearance intent re-resolved the palette into the view state (the pure half, in the handler); the
+    //     LIVE context re-skin needs the `Context`, so it happens here, once, on the flag's edge.
+    if self.appearance_dirty {
+      self.appearance_dirty = false;
+      let (palette, _) = self.config.palette();
+      apply_theme(&ctx, &palette, self.config.appearance.font_scale);
     }
 
     // 3b. Service a held continuous jog: a JogStart this frame (or an earlier one still held) streams its next
@@ -2002,6 +2022,33 @@ fn is_probe_cycle_state(state: crate::protocol::RunState) -> bool {
   // resolves the latch via the Alarm/Error path, so `probe_finished` is never consulted on that path. `Check` and
   // `Unknown` are likewise treated as not-finished (conservative). Only `Idle` is a clean completion.
   !matches!(state, RunState::Idle)
+}
+
+/// The `SKIRNIR_SIZE_TRACE=1` frame hook: print the dock region's rect (recorded by [`views::dock`] via
+/// [`super::views::dock_rect_probe`]) whenever it changes between frames, with the frame counter and the live
+/// `pixels_per_point`. Chatty by design — an unsolicited line here IS the self-resizing bug reproducing in the
+/// real eframe loop, which the offscreen harness failed to catch three times. Debug instrumentation only.
+fn size_trace(ctx: &egui::Context, ui_state: &UiState) {
+  use std::sync::Mutex;
+  use std::sync::atomic::{AtomicU64, Ordering};
+  static FRAME: AtomicU64 = AtomicU64::new(0);
+  static LAST: Mutex<Option<egui::Rect>> = Mutex::new(None);
+  let frame = FRAME.fetch_add(1, Ordering::Relaxed);
+  let now = super::views::dock_rect_probe::last(ctx);
+  let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+  if let Some(now) = now
+    && *last != Some(now)
+  {
+    eprintln!(
+      "[size-trace] frame {frame}: dock rect {:?} -> [{:.3},{:.3}]..[{:.3},{:.3}] h={:.3} (ppp {}, collapsed {})",
+      last.map(|r| r.height()),
+      now.min.x, now.min.y, now.max.x, now.max.y,
+      now.height(),
+      ctx.pixels_per_point(),
+      ui_state.dock_collapsed,
+    );
+    *last = Some(now);
+  }
 }
 
 /// Build the tokio runtime and launch the eframe window. This is the binary's GUI entry point; `expect` is
@@ -2227,7 +2274,8 @@ mod config_wiring_tests {
 /// rounding, and the 1px divider stroke. The design maps 1:1 onto these fields. `font_scale` (1.0 = the design's
 /// sizes) is applied as the global zoom, held to a sane range so a config typo cannot make the UI unreadable.
 /// Driven by the config-resolved palette so a theme change re-skins the whole window from one call.
-fn apply_theme(ctx: &egui::Context, palette: &Palette, font_scale: f32) {
+/// `pub(crate)` so the snapshot harness can skin its offscreen context identically to the real window.
+pub(crate) fn apply_theme(ctx: &egui::Context, palette: &Palette, font_scale: f32) {
   use eframe::egui::{CornerRadius, Stroke};
   use super::metrics::Metrics;
 
@@ -2240,7 +2288,7 @@ fn apply_theme(ctx: &egui::Context, palette: &Palette, font_scale: f32) {
   spacing.interact_size.y = Metrics::PANEL_CONTROL_H; // §01 spacing legend: 22px control row.
   ctx.set_global_style(style);
   // Apply the UI font scale as the global zoom; clamp so a hand-edited extreme cannot shrink/blow up the UI.
-  ctx.set_zoom_factor(font_scale.clamp(0.5, 2.5));
+  ctx.set_zoom_factor(crate::config::clamp_font_scale(font_scale));
 
   let mut visuals = egui::Visuals::dark();
   visuals.panel_fill = palette.panel;
@@ -2364,6 +2412,83 @@ mod tests {
     assert!(app.reconnect_at.is_none(), "a deliberate disconnect must not schedule a reconnect");
   }
 
+  /// App-settings intents mutate the config, mark it dirty, and (for appearance) re-resolve the palette into the
+  /// view state synchronously — the ctx-level re-skin is deferred to `ui()` via `appearance_dirty`, but the pure
+  /// half must be observable immediately so the next frame's views already render the new colours.
+  #[test]
+  fn a_theme_upsert_does_not_reflow_the_toolpath() {
+    // A colour-picker drag emits `UpsertTheme` every changed frame; that must NOT re-flatten the whole program
+    // (a full `parse_xy_path` over every line) — colour edits never change geometry. We flatten an arc at a COARSE
+    // density, then make the config's arc density much finer so a reflow WOULD be detectable (more chords), then
+    // fire a theme upsert. The cached geometry must stay coarse, proving the appearance path no longer reflows.
+    let (mut app, _controller) = app_with_engine();
+    app.ui.style.toolpath = crate::config::ToolpathConfig { arc_step_deg: 45.0, ..Default::default() }.resolve();
+    app.ui.set_program(vec!["G0 X10 Y0".to_string(), "G2 X0 Y10 I-10 J0".to_string()], None);
+    let before = app.ui.toolpath_segment_count();
+
+    // A finer arc density in the config: were the appearance path to reflow, it would re-flatten the arc into MANY
+    // more chords at this density — so an unchanged count is proof the theme edit did not reparse the program.
+    app.config.toolpath.arc_step_deg = 3.0;
+    let theme = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::midnight());
+    app.handle_intent(Intent::UpsertTheme { name: "fixture".to_string(), theme });
+
+    assert_eq!(
+      app.ui.toolpath_segment_count(), before,
+      "a theme upsert must not re-flatten the toolpath at the config's (now finer) arc density",
+    );
+  }
+
+  #[test]
+  fn appearance_intents_update_the_config_and_resolve_the_palette_immediately() {
+    // This test drives `SetLanguage`, which mutates the process-global i18n registry — serialize on the shared guard
+    // so it can never race the i18n module's own global-locale tests (finding: several independent locks).
+    let _lang = crate::i18n::lock_global_for_test();
+    let (mut app, _controller) = app_with_engine();
+    assert!(!app.config_dirty, "a fresh app starts with no unsaved config edits");
+
+    app.handle_intent(Intent::SetActiveTheme("midnight".to_string()));
+    assert_eq!(app.config.appearance.active_theme, "midnight");
+    assert_eq!(app.ui.style.palette, crate::app::theme::Palette::midnight(), "the palette re-resolves in-handler");
+    assert!(app.config_dirty && app.appearance_dirty, "an appearance edit marks both flags");
+
+    // The font scale is held to the range the window can actually render at (a wild value would blow up zoom).
+    app.handle_intent(Intent::SetFontScale(9.0));
+    assert_eq!(app.config.appearance.font_scale, 2.5, "the scale clamps to the apply_theme range");
+
+    // A created user theme lands in the config and, once active, wins resolution over its base.
+    let theme = crate::config::ThemeOverride::from_palette(&crate::app::theme::Palette::light_slate());
+    app.handle_intent(Intent::UpsertTheme { name: "fixture-theme".to_string(), theme });
+    app.handle_intent(Intent::SetActiveTheme("fixture-theme".to_string()));
+    assert_eq!(app.ui.style.palette, crate::app::theme::Palette::light_slate(), "the user theme resolves");
+
+    // The language choice is recorded in the config (the global i18n switch is exercised by the i18n tests; using
+    // the default locale here keeps this test from mutating shared global state under a parallel runner).
+    app.handle_intent(Intent::SetLanguage("en-US".to_string()));
+    assert_eq!(app.config.ui.language, "en-US");
+  }
+
+  /// `SaveConfig` writes the in-memory config to the (test-overridden) path atomically, clears the dirty marker,
+  /// and the file round-trips to the same config.
+  #[test]
+  fn save_config_persists_to_the_override_path_and_clears_dirty() {
+    let (mut app, _controller) = app_with_engine();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let dir = std::env::temp_dir().join(format!("skirnir-test-config-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("config.json");
+    app.config_path_override = Some(path.clone());
+
+    app.handle_intent(Intent::SetActiveTheme("midnight".to_string()));
+    assert!(app.config_dirty);
+    app.handle_intent(Intent::SaveConfig);
+    assert!(!app.config_dirty, "a successful save clears the unsaved marker");
+
+    let (loaded, notices) = crate::config::load_from(&path);
+    assert!(notices.is_empty(), "the saved file must load back cleanly: {notices:?}");
+    assert_eq!(loaded.appearance.active_theme, "midnight", "the saved file carries the edit");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
   /// The tool the tool-change banner would name: the firmware-reported `current_tool`, the single authoritative
   /// source the banner reads directly. A test helper so a test can assert the banner's data source without driving
   /// a real egui frame (the banner is a pure render of this value).
@@ -2377,6 +2502,10 @@ mod tests {
   /// hold; the banner must then name the reported tool.
   #[test]
   fn the_tool_change_banner_names_the_tool_from_the_g_answer_during_a_streaming_hold() {
+    // The final assertion reads the banner copy through `tr!`, so pin the global locale to en-US under the shared
+    // guard: this test must see the English string regardless of any concurrent locale-switching test.
+    let _lang = crate::i18n::lock_global_for_test();
+    let _ = crate::i18n::init();
     let (mut app, mut controller) = app_with_engine();
     // Complete the handshake to Idle (the banner is the readiness signal), then drain its writes (including the
     // connect-time `$G` seed) so we assert only on the traffic the hold provokes.

@@ -50,6 +50,21 @@ impl ColorSpec {
     Color32::from_rgba_unmultiplied(self.r, self.g, self.b, self.a)
   }
 
+  /// The spec's channels as an UNmultiplied `[r, g, b, a]`. This is the representation egui's
+  /// `color_edit_button_srgba_unmultiplied` reads and writes, so the colour editor round-trips through this array
+  /// with no premultiply step — the fix for the picker corrupting translucent colours (see [`Self::from_srgba_unmultiplied`]).
+  pub const fn to_srgba_unmultiplied(self) -> [u8; 4] {
+    [self.r, self.g, self.b, self.a]
+  }
+
+  /// Build a spec from an UNmultiplied `[r, g, b, a]` — the exact inverse of [`Self::to_srgba_unmultiplied`]. Used by
+  /// the theme colour editor: `color_edit_button_srgba_unmultiplied` hands back unmultiplied channels, so capturing
+  /// them straight into a spec keeps a picked colour EXACT, unlike going through a premultiplied [`Color32`] (which
+  /// darkens any alpha < 255 on every round-trip). What lands in `config.json` is what the operator picked.
+  pub const fn from_srgba_unmultiplied(rgba: [u8; 4]) -> Self {
+    ColorSpec { r: rgba[0], g: rgba[1], b: rgba[2], a: rgba[3] }
+  }
+
   /// Parse a `"#RRGGBB"` / `"#RRGGBBAA"` hex string (case-insensitive, leading `#` optional) into a spec. Returns
   /// `None` for any malformed input — a wrong length, a non-hex digit — so the caller can fall back to a default
   /// rather than the whole config failing. Never panics. A 6-digit value is fully opaque; an 8-digit value carries
@@ -162,6 +177,34 @@ mod tests {
       let reparsed = ColorSpec::parse(&spec.to_hex()).expect("its own hex parses back");
       assert_eq!(spec, reparsed, "{raw} must survive a hex round-trip");
     }
+  }
+
+  #[test]
+  fn a_translucent_picked_color_survives_pick_spec_save_load_exactly() {
+    // Regression for the colour-picker premultiplied-alpha bug: the theme editor now edits UNmultiplied [r,g,b,a]
+    // (`color_edit_button_srgba_unmultiplied`), which maps 1:1 to `ColorSpec`. Simulate the full pipeline a picked
+    // colour takes — pick (unmultiplied array) → spec → save (hex) → load (parse) → back to the array — and assert
+    // the channels never drift, for an alpha < 255 colour (where the old premultiplied round-trip decayed to black).
+    for picked in [[0x0E, 0x86, 0xD4, 0x80], [0xFF, 0x7A, 0x1A, 0x01], [0x12, 0x34, 0x56, 0xFE]] {
+      let spec = ColorSpec::from_srgba_unmultiplied(picked);
+      assert_eq!(spec.to_srgba_unmultiplied(), picked, "pick → spec → readback is exact");
+      let loaded = ColorSpec::parse(&spec.to_hex()).expect("the saved hex parses back");
+      assert_eq!(loaded, spec, "save → load must not drift the channels");
+      assert_eq!(loaded.to_srgba_unmultiplied(), picked, "the loaded colour still reads back the picked channels");
+    }
+  }
+
+  #[test]
+  fn the_premultiplied_color32_capture_is_lossy_for_translucent_colors() {
+    // Documents WHY the editor must NOT capture through `Color32`: `from_color32(to_color32(spec))` re-applies alpha
+    // (`Color32` stores premultiplied channels), darkening a translucent colour on every round-trip — the bug that
+    // decayed picked colours toward black. The unmultiplied path above avoids this entirely.
+    let spec = ColorSpec { r: 0x0E, g: 0x86, b: 0xD4, a: 0x80 };
+    let via_color32 = ColorSpec::from_color32(spec.to_color32());
+    assert_ne!(via_color32, spec, "the premultiplied Color32 round-trip must be shown lossy for alpha < 255");
+    // The unmultiplied readback of the same Color32 is the correct capture and stays close to the original.
+    let via_unmultiplied = ColorSpec::from_srgba_unmultiplied(spec.to_color32().to_srgba_unmultiplied());
+    assert_eq!(via_unmultiplied.a, spec.a, "the unmultiplied capture preserves alpha exactly");
   }
 
   #[test]

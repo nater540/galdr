@@ -19,6 +19,7 @@ pub mod angle_sweep;
 pub mod badge;
 pub mod flip_verify;
 pub mod intent;
+pub mod mdi;
 pub mod overrides;
 pub mod preview;
 pub mod probe_flow;
@@ -41,6 +42,10 @@ pub use settings_staging::SettingsStaging;
 pub use view_state::{Banner, CONSOLE_CAPACITY, LogLine, LogSource, Progress, ViewState};
 
 #[cfg(feature = "gui")]
+pub mod app_settings;
+#[cfg(feature = "gui")]
+pub mod dock_tiles;
+#[cfg(feature = "gui")]
 pub mod fonts;
 #[cfg(feature = "gui")]
 pub mod metrics;
@@ -55,6 +60,11 @@ pub mod views;
 /// to add UI tests; it hosts the override-slider regression tests.
 #[cfg(all(test, feature = "gui"))]
 mod ui_test;
+
+/// The `#[ignore]`d GPU image-snapshot suite: offscreen wgpu renders of the full shell diffed against committed
+/// PNG baselines. See its module docs for how to run/regenerate.
+#[cfg(all(test, feature = "gui"))]
+mod snapshot_test;
 
 #[cfg(feature = "gui")]
 pub use shell::{SkirnirApp, run};

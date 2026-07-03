@@ -37,9 +37,49 @@ CLI + GUI). Modeled on the `egui-i18n` crate's `i18n` module API shape but impro
 **Wiring (where it plugs into the app):** `config.ui.language` (UiConfig in config/sections.rs, default
 `i18n::EN_US`, serde-default so old configs fill it) is the persisted locale. `app::shell::run()` calls
 `i18n::init()` (failure → console notice, never panic) then `i18n::set_language(&config.ui.language)` before the
-first frame. First `tr!` call site = the top toolbar buttons in `views::toolbar` (Disconnect/Cancel/Identify/
-Connect/Open…/⌂ Home/Settings via `crate::tr!("btn-*")`); the Run/Hold/Stop segmented transport group is NOT
-wired yet. To localize more UI, follow that toolbar pattern + add keys to en-US.ftl.
+first frame. The runtime language switch (app-settings ComboBox → `Intent::SetLanguage` → `shell::set_language`)
+needs NO relayout — immediate mode re-resolves every `tr!` next frame — so routing a string through `tr!` is all
+it takes to make it switch live.
+
+**Coverage is now COMPREHENSIVE (as of the sv-SE polish pass):** essentially all persistent UI chrome in
+`views.rs`, `app_settings.rs`, and the settings-window title in `shell.rs` is routed through `tr!` — toolbar +
+tooltips, transport group, DRO, jog, overrides, probe, both rotary/verify wizards, dock/console/program chrome,
+status bar, alarm + tool-change banners, firmware-settings dialog + tooltips + discard modal, and the theme
+color-editor group headers. Key-naming prefixes in the `.ftl`: `btn-*`, `tip-*` (hover), `lbl-*`, `hdr-*`
+(section/panel headers), `badge-*`, `transport-*`, `probe-*`/`rotary-*`/`verify-*` (wizards), `settings-*`,
+`console-*`/`tab-*`/`eta-*` (dock), `banner-*`, `status-*`, `theme-group-*`, `app-settings-*`. Shared labels
+(`lbl-feed`/`lbl-depth`/`btn-cancel-wizard`/`msg-probing-awaiting-dot`/`reason-cancelled`) are reused across sites.
+
+**Conventions that matter for the next person:**
+- **Keep en-US values BYTE-IDENTICAL to the old hardcoded strings.** The GPU snapshot suite renders in en-US;
+  identical text = zero baseline churn (verified: all 17 snapshots pass untouched after the conversion).
+- `BadgeState` has BOTH `label()` (`&'static str`, untranslated reference, kept for off-screen/tests) and
+  `label_key()` (the `badge-*` i18n key); views render `tr!(badge.label_key())`. A badge.rs test asserts the
+  en-US value == `label()` via an ISOLATED `Translator` (not the global registry) so it never races global tests.
+- **Pure functions that now call `tr!` depend on the global registry.** Any unit test exercising them must
+  `let _ = crate::i18n::init();` first, or `tr!` returns the raw key. Live examples: `eta_qualifier_text`,
+  `tool_change_headline`, `setting_tooltip_meta` (their tests were updated to seed the registry).
+- `tab_strip` still takes `&[(&str,bool)]`; translate into locals then pass `.as_str()` (don't widen its sig).
+- Intentionally UNtranslated (documented in en-US.ftl header): grbl/GCode protocol tokens, units, axis letters,
+  raw console echo, the `--cli` diagnostic log, AND the scrolling console activity-log notices in shell.rs
+  (log-shaped, intermixed with untranslatable machine echo). Language endonyms ("English (US)"/"Svenska") stay
+  in their own language per i18n convention.
+
+**Coverage TESTS (i18n/mod.rs tests):** `every_bundled_locale_declares_the_same_message_ids` (parity: no missing,
+no orphans — extracts top-level ids by scanning column-0 `key =` lines) and
+`every_bundled_locale_resolves_every_key_without_falling_back_to_the_id` (each locale formats every key with a
+superset of dummy args — catches a present-but-broken value that would render as its key). Add a string ⇒ add it
+to BOTH `.ftl` or these fail.
+
+**TEST-RACE GUARD (code-review finding, 2026-07-02):** `tr!` resolves against ONE process-global registry, so any
+test that mutates the global language (`init`/`set_language`/shell `SetLanguage`) OR asserts a locale-specific
+`tr!`/label result must serialize on the SINGLE shared guard `crate::i18n::lock_global_for_test()` (pub(crate),
+`#[cfg(test)]`, in i18n/mod.rs). Do NOT add a new mutex — the bug was exactly that (snapshot suite had its own
+`RENDER_LOCK` separate from the i18n module's guard, so a Swedish render raced the global-locale test). Users of
+the shared guard: i18n mod tests, `snapshot_test::render_in` (holds it + resets to en-US on drop), the shell
+appearance/SetLanguage + streaming-tool-change tests, the 4 views pure-fn tests. Harness builders seed locales via
+`ui_test::ensure_locales_seeded()` (inits ONLY when the registry is empty — never flips an already-selected
+locale), so they don't need to hold the guard. Empirically validated 30× at `RUST_TEST_THREADS=16`, 0 flakes.
 
 **Deps (aligned):** fluent 0.17 -> fluent-bundle 0.16 -> unic-langid 0.9 / intl-memoizer 0.5. Bundles use
 `FluentBundle::new_concurrent` + `intl_memoizer::concurrent::IntlLangMemoizer` so Translator is Send+Sync.

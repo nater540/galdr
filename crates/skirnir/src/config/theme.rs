@@ -21,6 +21,18 @@ use crate::app::theme::Palette;
 /// The built-in theme name used as the universal fallback and the default `base` for a user override.
 pub const DEFAULT_THEME: &str = "default";
 
+/// The accepted range for the global UI font scale ([`AppearanceConfig::font_scale`]). The SINGLE source of truth
+/// for both the settings-dialog slider and the apply-time clamp: a mismatch (a 0.5..=2.0 slider against a 0.5..=2.5
+/// clamp) let egui's default always-clamp slider silently rewrite an in-range hand-edited value the instant the
+/// dialog opened, then mark the config unsaved. Keep every font-scale bound derived from this one constant.
+pub const FONT_SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.5;
+
+/// Clamp a font scale to [`FONT_SCALE_RANGE`]. Used at every site that accepts a scale (the intent handler and the
+/// apply-time zoom) so none can drift from the range the slider offers.
+pub fn clamp_font_scale(scale: f32) -> f32 {
+  scale.clamp(*FONT_SCALE_RANGE.start(), *FONT_SCALE_RANGE.end())
+}
+
 /// The appearance section of the config: which theme is active, a global font scale, and the user-defined themes.
 /// Built-in themes are NOT listed here (they live in code); `themes` carries only operator-authored overrides.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -263,6 +275,36 @@ impl ThemeOverride {
     base
   }
 
+  /// Capture a resolved [`Palette`] back into a FULLY-KEYED override: every colour field `Some`, `base: None`.
+  /// This is how the in-app theme editor materialises a new user theme — it snapshots whatever palette is active
+  /// into concrete per-token values, so every colour picker has a real value to edit and the theme no longer
+  /// depends on its base changing underneath it. Generated from the single [`palette_color_fields!`] list, so a
+  /// new palette token extends this automatically.
+  pub fn from_palette(palette: &Palette) -> Self {
+    macro_rules! capture {
+      ($($field:ident),+ $(,)?) => {
+        ThemeOverride {
+          base: None,
+          $($field: Some(ColorSpec::from_color32(palette.$field)),)+
+        }
+      };
+    }
+    palette_color_fields!(capture)
+  }
+
+  /// Every colour slot as `(token name, mutable slot)`, in the palette's declaration order — the theme editor's
+  /// iteration surface, so the picker list is generated from the same single [`palette_color_fields!`] list as the
+  /// resolution logic and can never miss a token. The name is the `Palette` field ident (also the config's JSON
+  /// key), so what the editor shows is exactly what the file says.
+  pub fn color_entries_mut(&mut self) -> Vec<(&'static str, &mut Option<ColorSpec>)> {
+    macro_rules! entries {
+      ($($field:ident),+ $(,)?) => {
+        vec![$((stringify!($field), &mut self.$field),)+]
+      };
+    }
+    palette_color_fields!(entries)
+  }
+
   /// Whether EVERY overridable colour field is `Some` — i.e. this override names every token, not just a subset.
   /// Used to guard the bundled `config.default.json`'s self-documenting template theme: if a new palette token is
   /// added but the template entry is not extended, this returns `false` and the asset test fails, so the template
@@ -282,6 +324,18 @@ impl ThemeOverride {
 mod tests {
   use super::*;
   use eframe::egui::Color32;
+
+  #[test]
+  fn font_scale_range_and_clamp_share_one_source_and_admit_the_full_span() {
+    // Regression for the slider/clamp range mismatch: a valid scale ABOVE the old 2.0 slider max (e.g. 2.4) must be
+    // accepted unchanged — the settings slider and `clamp_font_scale` both derive from `FONT_SCALE_RANGE`, so the
+    // dialog can no longer silently rewrite a hand-edited 2.4 down to 2.0 the moment it opens.
+    assert!(FONT_SCALE_RANGE.contains(&2.4), "2.4 is a valid, accepted scale");
+    assert_eq!(clamp_font_scale(2.4), 2.4, "an in-range scale passes through unchanged");
+    // The clamp holds out-of-range values to the shared bounds.
+    assert_eq!(clamp_font_scale(9.0), *FONT_SCALE_RANGE.end(), "an above-range scale clamps to the max");
+    assert_eq!(clamp_font_scale(0.1), *FONT_SCALE_RANGE.start(), "a below-range scale clamps to the min");
+  }
 
   #[test]
   fn the_default_appearance_resolves_to_the_default_dark_palette_with_no_notice() {
@@ -435,6 +489,42 @@ mod tests {
     assert_eq!(notice, None, "a self-referential `base: \"default\"` must resolve cleanly, not trip the depth guard");
     assert_eq!(palette.accent_motion, Color32::from_rgb(0xFF, 0x00, 0xFF), "the override applies");
     assert_eq!(palette.panel, Palette::default_dark().panel, "unset fields inherit the built-in default");
+  }
+
+  #[test]
+  fn from_palette_captures_every_token_and_reproduces_the_palette_over_any_base() {
+    // The editor's materialise step: capturing midnight must yield a fully-keyed override that resolves back to
+    // exactly midnight even over a completely different base — no token may leak through from the base.
+    let captured = ThemeOverride::from_palette(&Palette::midnight());
+    assert!(captured.all_color_fields_set(), "a captured palette must name every token");
+    assert_eq!(captured.base, None, "a captured theme carries no base dependency");
+    assert_eq!(captured.apply_over(Palette::light_slate()), Palette::midnight(),
+      "applying the capture over an unrelated base must reproduce the captured palette exactly");
+  }
+
+  #[test]
+  fn color_entries_mut_iterates_every_token_with_its_config_key_name() {
+    // The editor iterates `color_entries_mut`; if it missed a token the picker list would silently go stale. A
+    // fully-keyed override must expose all-Some entries, unique names, and clearing one through the entry must
+    // clear the real field.
+    let mut theme = ThemeOverride::from_palette(&Palette::default_dark());
+    let mut names: Vec<&'static str> = Vec::new();
+    for (name, slot) in theme.color_entries_mut() {
+      assert!(slot.is_some(), "a captured theme exposes a concrete value for {name}");
+      names.push(name);
+    }
+    let count = names.len();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), count, "token names must be unique");
+    assert!(names.contains(&"accent") && names.contains(&"toolpath_cut"), "names are the Palette field idents");
+    // Mutating through an entry hits the real field.
+    for (name, slot) in theme.color_entries_mut() {
+      if name == "accent" {
+        *slot = ColorSpec::parse("#123456");
+      }
+    }
+    assert_eq!(theme.accent, ColorSpec::parse("#123456"));
   }
 
   #[test]

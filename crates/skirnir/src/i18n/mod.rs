@@ -157,19 +157,26 @@ macro_rules! tr {
   }};
 }
 
+/// A process-wide serialization guard for ANY test — in this module or elsewhere in the crate — that touches the
+/// GLOBAL i18n registry (via [`init`], [`set_language`], or the shell's `SetLanguage` intent) or asserts a
+/// locale-specific `tr!` result. `tr!` resolves against ONE global registry, so a test that sets a non-default
+/// locale and a test that reads the default one must not run concurrently — they race on the shared active-language
+/// slot (an empirically-reproduced flake). Every such test holds THIS single guard for its whole body, giving the
+/// crate one serialization point instead of several independent mutexes that did not exclude one another (the
+/// snapshot suite's own render lock vs. this module's former private guard). Hold it: `let _guard = ...;`.
+#[cfg(test)]
+pub(crate) fn lock_global_for_test() -> std::sync::MutexGuard<'static, ()> {
+  static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+  GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::sync::Mutex;
-
-  // The global registry is one process-wide singleton, so the few tests that touch it must not run
-  // concurrently with one another. They serialize on this guard and re-`init` so each starts from a known
-  // state. (The exhaustive behavioral coverage lives in `fluent.rs` against isolated `Translator`s.)
-  static GLOBAL_GUARD: Mutex<()> = Mutex::new(());
 
   #[test]
   fn init_seeds_bundled_en_us() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(get_language(), EN_US);
     assert_eq!(get_fallback(), EN_US);
@@ -179,7 +186,7 @@ mod tests {
 
   #[test]
   fn tr_macro_interpolates_named_args() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(tr!("stream-progress", { current: 42, total: 100 }), "Streaming line 42 of 100");
     // Trailing comma in the argument list is accepted.
@@ -189,14 +196,14 @@ mod tests {
 
   #[test]
   fn tr_macro_handles_missing_key_via_key_itself() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(tr!("totally-unknown-key"), "totally-unknown-key");
   }
 
   #[test]
   fn bundled_ports_found_selector_is_wired() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("bundled en-US must be valid");
     assert_eq!(tr!("ports-found", { count: 0 }), "No serial ports found");
     assert_eq!(tr!("ports-found", { count: 1 }), "1 serial port found");
@@ -232,7 +239,7 @@ mod tests {
     assert_eq!(t.translate("btn-cancel", &none()), "Avbryt");
     assert_eq!(t.translate("btn-identify", &none()), "Identifiera");
     assert_eq!(t.translate("btn-open", &none()), "Öppna…");
-    assert_eq!(t.translate("btn-home", &none()), "⌂ Hemma");
+    assert_eq!(t.translate("btn-home", &none()), "⌂ Referens");
     assert_eq!(t.translate("btn-settings", &none()), "Inställningar");
 
     // The interpolated line and each plural variant resolve in Swedish too.
@@ -261,9 +268,77 @@ mod tests {
     assert_eq!(t.translate("stream-progress", &progress), "Streaming line 42 of 100");
   }
 
+  /// Collect the top-level Fluent message ids declared in a `.ftl` source. A message entry begins in column 0
+  /// (`key = value`); comments (`#`), blank lines, and the indented continuation / select-variant lines are not
+  /// new ids. Used by the coverage test to assert every locale declares the same keys — no gaps, no orphans.
+  fn top_level_message_ids(ftl: &str) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for line in ftl.lines() {
+      if line.is_empty() || line.starts_with('#') || line.starts_with(char::is_whitespace) {
+        continue;
+      }
+      let Some((key, _)) = line.split_once('=') else { continue };
+      let key = key.trim();
+      // A Fluent identifier is a leading ASCII letter then letters/digits/`-`/`_`; anything else (e.g. a stray
+      // brace or select line that slipped through) is not a message id.
+      if !key.is_empty()
+        && key.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+      {
+        ids.insert(key.to_string());
+      }
+    }
+    ids
+  }
+
+  #[test]
+  fn every_bundled_locale_declares_the_same_message_ids() {
+    // The source locale is en-US; every sibling must translate exactly its keys — none missing (an untranslated
+    // string) and none orphaned (a key with no en-US source, usually a rename left behind). This is what keeps a
+    // new string from silently shipping English-only, and a deleted string from leaving dead translations.
+    let en = top_level_message_ids(EN_US_FTL);
+    assert!(!en.is_empty(), "en-US must declare message ids");
+    for (locale, content) in BUNDLED_LOCALES {
+      if *locale == EN_US {
+        continue;
+      }
+      let other = top_level_message_ids(content);
+      let missing: Vec<&String> = en.difference(&other).collect();
+      let orphan: Vec<&String> = other.difference(&en).collect();
+      assert!(missing.is_empty(), "{locale} is missing keys present in en-US: {missing:?}");
+      assert!(orphan.is_empty(), "{locale} has orphan keys absent from en-US: {orphan:?}");
+    }
+  }
+
+  #[test]
+  fn every_bundled_locale_resolves_every_key_without_falling_back_to_the_id() {
+    // Beyond key parity, each locale must actually FORMAT every message — a present-but-broken value (e.g. a
+    // malformed selector) would surface as the key itself at runtime. Resolve each key against each locale as the
+    // sole loaded bundle (no fallback) and assert the result is neither empty nor the bare key.
+    let en = top_level_message_ids(EN_US_FTL);
+    for (locale, content) in BUNDLED_LOCALES {
+      let mut t = Translator::new();
+      t.load_text(locale, content).expect("a bundled locale must parse");
+      t.set_language(locale);
+      // No fallback: a miss returns the key, which the assertion below catches.
+      for key in &en {
+        // Supply a superset of the interpolation args any message might reference, so a formatted value never
+        // renders as the key merely for want of an argument.
+        let mut args = fluent::FluentArgs::new();
+        for name in ["count", "current", "total", "pct", "code", "tool", "reason", "coords", "z", "dia",
+          "angle", "v", "mm", "tir", "ecc", "unit", "min", "max", "port", "acked"] {
+          args.set(name, 1);
+        }
+        let value = t.translate(key, &args);
+        assert!(!value.is_empty(), "{locale}:{key} formatted to an empty string");
+        assert_ne!(&value, key, "{locale}:{key} did not resolve (rendered as its own key)");
+      }
+    }
+  }
+
   #[test]
   fn init_loads_both_locales_and_swedish_is_selectable_globally() {
-    let _g = GLOBAL_GUARD.lock().unwrap_or_else(PoisonError::into_inner);
+    let _g = lock_global_for_test();
     init().expect("the bundled locales must be valid");
     let mut langs = languages();
     langs.sort();

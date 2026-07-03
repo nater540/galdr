@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 pub use color::ColorSpec;
 pub use sections::{ConnectionConfig, ReconnectSection, ToolpathConfig, ToolpathStyle, UiConfig};
-pub use theme::{AppearanceConfig, ThemeOverride, builtin_palette};
+pub use theme::{AppearanceConfig, FONT_SCALE_RANGE, ThemeOverride, builtin_palette, clamp_font_scale};
 
 use crate::app::theme::Palette;
 

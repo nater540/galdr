@@ -116,6 +116,27 @@ impl BadgeState {
       BadgeState::Error => "ERROR",
     }
   }
+
+  /// The i18n message key for this state's badge label (see `assets/i18n/*.ftl`). The views resolve this through
+  /// `tr!` so the badge word is localized; [`Self::label`] remains the untranslated reference used off-screen (and
+  /// by tests). Kept in lock-step with `label` by the exhaustive test below.
+  pub fn label_key(self) -> &'static str {
+    match self {
+      BadgeState::Disconnected => "badge-disconnected",
+      BadgeState::Connecting => "badge-connecting",
+      BadgeState::Idle => "badge-idle",
+      BadgeState::Run => "badge-run",
+      BadgeState::Jog => "badge-jog",
+      BadgeState::Hold => "badge-hold",
+      BadgeState::Home => "badge-home",
+      BadgeState::Door => "badge-door",
+      BadgeState::Check => "badge-check",
+      BadgeState::Sleep => "badge-sleep",
+      BadgeState::Tool => "badge-tool",
+      BadgeState::Alarm => "badge-alarm",
+      BadgeState::Error => "badge-error",
+    }
+  }
 }
 
 /// Which segment of the toolbar Run/Hold/Stop group is the active (emphasised) one, and whether the group is
@@ -294,6 +315,35 @@ mod tests {
     let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
     assert_eq!(labels.len(), unique.len(), "labels must be unique per state");
     assert!(labels.iter().all(|l| l == &l.to_uppercase()), "labels are uppercase");
+  }
+
+  #[test]
+  fn every_badge_label_key_resolves_to_its_reference_label_in_en_us() {
+    // The views render `label_key()` through `tr!`, so the en-US value MUST equal the untranslated reference
+    // `label()` — otherwise a rename drifts the shipped English badge from the tested one. Checked against an
+    // isolated bundle (not the global registry) so this stays deterministic and never races the global tests.
+    let mut t = crate::i18n::Translator::new();
+    t.load_text(crate::i18n::EN_US, crate::i18n::EN_US_FTL).expect("bundled en-US must parse");
+    t.set_language(crate::i18n::EN_US);
+    let states = [
+      BadgeState::Disconnected,
+      BadgeState::Connecting,
+      BadgeState::Idle,
+      BadgeState::Run,
+      BadgeState::Jog,
+      BadgeState::Hold,
+      BadgeState::Home,
+      BadgeState::Door,
+      BadgeState::Check,
+      BadgeState::Sleep,
+      BadgeState::Tool,
+      BadgeState::Alarm,
+      BadgeState::Error,
+    ];
+    for state in states {
+      let args = crate::i18n::fluent::FluentArgs::new();
+      assert_eq!(t.translate(state.label_key(), &args), state.label(), "en-US badge value for {state:?}");
+    }
   }
 
   #[test]
