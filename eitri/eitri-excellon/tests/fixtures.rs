@@ -11,7 +11,7 @@ use eitri_excellon::{DrillHit, ExcellonImage, ZeroSuppression, parse_excellon};
 use geo::algorithm::area::Area;
 
 fn fixture(name: &str) -> String {
-  let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/excellon").join(name);
+  let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/synthetic/excellon").join(name);
   std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 

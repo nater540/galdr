@@ -11,7 +11,7 @@ use eitri_gerber::{GerberImage, parse_gerber};
 use geo::algorithm::area::Area;
 
 fn fixture(name: &str) -> String {
-  let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/gerber").join(name);
+  let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../fixtures/synthetic/gerber").join(name);
   std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
