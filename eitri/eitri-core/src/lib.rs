@@ -9,14 +9,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod coord;
 pub mod error;
 pub mod precision;
 pub mod progress;
 pub mod transform;
 pub mod units;
 
+pub use coord::{CoordDecodeError, ZeroOmission, decode_zero_omitted};
 pub use error::{Error, Result};
-pub use precision::{GCODE_DECIMALS, INTEGER_SCALE, SIMPLIFY_TOLERANCE_MM};
+pub use precision::{CHORD_TOLERANCE_MM, GCODE_DECIMALS, INTEGER_SCALE, SIMPLIFY_TOLERANCE_MM};
 pub use progress::{CancelToken, ProgressEvent, ProgressReporter};
 pub use transform::Affine;
 pub use units::{Length, Unit};

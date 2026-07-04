@@ -107,59 +107,29 @@ impl CoordinateFormat {
     }
   }
 
-  /// Total digit width of a full (unomitted) coordinate field.
-  fn total_digits(&self) -> usize {
-    self.integer_digits as usize + self.decimal_digits as usize
-  }
-
   /// Decode one coordinate word into its numeric value **in file units** (the `MO` unit; the caller scales to mm).
-  /// Handles a leading sign, an explicit decimal point (tolerated even though RS-274X forbids it), and the
-  /// leading/trailing zero-omission padding.
+  /// Delegates the sign / explicit-decimal / zero-omission arithmetic to the shared `eitri_core` decoder so the
+  /// Gerber and Excellon parsers cannot drift apart, attaching this parser's line-aware error on failure.
   pub fn decode(&self, word: &str, line: usize) -> Result<f64> {
-    let word = word.trim();
-    if word.is_empty() {
-      return Err(GerberError::Syntax { line, message: "empty coordinate word".to_string() });
-    }
-
-    let (sign, digits) = match word.strip_prefix('-') {
-      Some(rest) => (-1.0, rest),
-      None => (1.0, word.strip_prefix('+').unwrap_or(word)),
+    let omission = match self.zero_omission {
+      ZeroOmission::Leading => eitri_core::ZeroOmission::Leading,
+      ZeroOmission::Trailing => eitri_core::ZeroOmission::Trailing,
     };
-
-    // Explicit decimal point: trust it directly and ignore the implied format.
-    if digits.contains('.') {
-      let value: f64 = digits.parse().map_err(|_| GerberError::Syntax {
-        line,
-        message: format!("invalid decimal coordinate '{word}'"),
-      })?;
-      return Ok(sign * value);
-    }
-
-    if !digits.chars().all(|c| c.is_ascii_digit()) {
-      return Err(GerberError::Syntax { line, message: format!("non-numeric coordinate '{word}'") });
-    }
-
-    let scale = 10f64.powi(self.decimal_digits as i32);
-    let magnitude = match self.zero_omission {
-      // Leading omission: the digits are already right-aligned to the LSB, so the integer value divided by
-      // 10^decimals is the coordinate — no padding needed.
-      ZeroOmission::Leading => digits.parse::<u64>().map(|n| n as f64 / scale),
-      // Trailing omission: the digits are left-aligned to the MSB, so right-pad to the full field width first.
-      ZeroOmission::Trailing => {
-        let total = self.total_digits();
-        let padded = if digits.len() < total {
-          format!("{:0<width$}", digits, width = total)
-        } else {
-          digits.to_string()
-        };
-        padded.parse::<u64>().map(|n| n as f64 / scale)
-      }
-    };
-
-    magnitude
-      .map(|m| sign * m)
-      .map_err(|_| GerberError::Syntax { line, message: format!("coordinate '{word}' out of range") })
+    eitri_core::decode_zero_omitted(word, self.integer_digits, self.decimal_digits, omission)
+      .map_err(|err| decode_error(word, line, err))
   }
+}
+
+/// Map a shared decode failure onto this parser's line-aware syntax error, preserving the original messages.
+fn decode_error(word: &str, line: usize, err: eitri_core::CoordDecodeError) -> GerberError {
+  use eitri_core::CoordDecodeError as E;
+  let message = match err {
+    E::Empty => "empty coordinate word".to_string(),
+    E::InvalidDecimal => format!("invalid decimal coordinate '{word}'"),
+    E::NonNumeric => format!("non-numeric coordinate '{word}'"),
+    E::OutOfRange => format!("coordinate '{word}' out of range"),
+  };
+  GerberError::Syntax { line, message }
 }
 
 #[cfg(test)]

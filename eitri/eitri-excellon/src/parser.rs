@@ -5,11 +5,10 @@
 //! slots built from `G00`/`M15`/`G01`/`M16` motion — only `G85` canned slots are assembled here. See §5.
 
 use std::collections::BTreeMap;
-use std::f64::consts::TAU;
 
 use eitri_core::{CancelToken, ProgressEvent, ProgressReporter, Unit};
-use eitri_geo::{CapStyle, buffer_path};
-use geo_types::{Coord, LineString, MultiPolygon, Polygon};
+use eitri_geo::{CapStyle, buffer_path, circle_polygon};
+use geo_types::{Coord, LineString, MultiPolygon};
 
 use crate::error::{ExcellonError, Result};
 use crate::format::{NumberFormat, ZeroSuppression};
@@ -106,7 +105,9 @@ pub fn parse_excellon(
       continue;
     }
 
-    // Tool definition: T<n>C<dia> (may appear in header or body). Selection: bare T<n>.
+    // Tool definition: T<n>C<dia> (may appear in header or body). Selection: bare T<n>. A body line may also both
+    // select a tool AND carry a coordinate hit in one block (T<n>X..Y..), so after selecting we drill if the tail
+    // has coordinates — otherwise the hit would be silently dropped.
     if let Some(rest) = line.strip_prefix('T') {
       let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
       if let Ok(number) = digits.parse::<u32>() {
@@ -119,8 +120,12 @@ pub fn parse_excellon(
             message: format!("invalid tool diameter in '{line}'"),
           })?;
           tools.insert(number, Tool { diameter: diameter * format.unit.mm_per_unit() });
-        } else {
-          current_tool = Some(number);
+          continue;
+        }
+        // Bare selection, or a combined select-and-drill line: select, then process the hit if coordinates follow.
+        current_tool = Some(number);
+        if tail.contains('X') || tail.contains('Y') {
+          process_hit(tail, line_no, &format, &tools, current_tool, &mut x, &mut y, &mut hits)?;
         }
         continue;
       }
@@ -260,18 +265,6 @@ fn parse_digit_spec(spec: &str) -> Option<(u8, u8)> {
   Some((int, dec))
 }
 
-/// A filled circle approximated by a polygon — used to render drill points as geometry.
-fn circle_polygon(cx: f64, cy: f64, r: f64) -> Polygon<f64> {
-  let n = 48usize;
-  let ring: Vec<Coord<f64>> = (0..n)
-    .map(|i| {
-      let a = TAU * (i as f64) / (n as f64);
-      Coord { x: cx + r * a.cos(), y: cy + r * a.sin() }
-    })
-    .collect();
-  Polygon::new(LineString(ring), Vec::new())
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -369,8 +362,22 @@ mod tests {
     let src = "M48\nMETRIC,LZ,3.3\nT1C2.0\n%\nT1\nX000000Y000000\nM30\n";
     let img = parse(src, None);
     let geom = img.hit_geometry(&img.hits[0]).unwrap().unwrap();
-    // 2mm tool -> r1 -> area ~ pi.
-    assert!((geom.unsigned_area() - std::f64::consts::PI).abs() < 0.02, "area {}", geom.unsigned_area());
+    // 2mm tool -> r1 -> area ~ pi. The adaptive builder facets to the shared chord tolerance (an inscribed polygon
+    // sits slightly under the true area), so allow the same slack the Gerber-side circle tests use.
+    assert!((geom.unsigned_area() - std::f64::consts::PI).abs() < 0.05, "area {}", geom.unsigned_area());
+  }
+
+  #[test]
+  fn large_drill_facets_adaptively_like_the_gerber_side() {
+    // Finding #10: a 6 mm drill (radius 3) must use the shared adaptive chord-tolerance circle, not a hard-coded 48
+    // segments. Its facet count exceeds 48 and matches the Gerber-side circle builder for the same radius.
+    let src = "M48\nMETRIC,LZ,3.3\nT1C6.0\n%\nT1\nX000000Y000000\nM30\n";
+    let img = parse(src, None);
+    let geom = img.hit_geometry(&img.hits[0]).unwrap().unwrap();
+    let facets = geom.0[0].exterior().0.len();
+    let reference = circle_polygon(0.0, 0.0, 3.0).exterior().0.len();
+    assert_eq!(facets, reference, "excellon drill must facet like the gerber-side circle");
+    assert!(facets > 48, "a 6 mm drill should exceed the old fixed 48 facets, got {facets}");
   }
 
   #[test]
@@ -386,5 +393,21 @@ mod tests {
     let src = "M48\nMETRIC,LZ,3.3\n%\nX1000Y1000\nM30\n";
     let err = parse_excellon(src, None, &ProgressReporter::silent(), &CancelToken::new());
     assert!(err.is_err());
+  }
+
+  #[test]
+  fn combined_tool_select_and_coordinate_line_drills() {
+    // Finding #7: a line that both selects a tool and carries coordinates (T1X..Y..) must set the tool AND drill —
+    // the old code selected the tool then `continue`d, silently dropping the hit.
+    let src = "M48\nMETRIC,LZ,3.3\nT1C0.8\n%\nT1X010000Y005000\nM30\n";
+    let img = parse(src, None);
+    assert_eq!(img.hits.len(), 1, "the combined select+coordinate line must emit a hit");
+    match img.hits[0] {
+      DrillHit::Drill { tool, x, y } => {
+        assert_eq!(tool, 1);
+        assert!((x - 10.0).abs() < 1e-6 && (y - 5.0).abs() < 1e-6, "hit at ({x}, {y})");
+      }
+      other => panic!("expected a drill, got {other:?}"),
+    }
   }
 }

@@ -28,6 +28,16 @@ pub enum GerberError {
     message: String,
   },
 
+  /// A geometrically malformed construct — e.g. an arc with no centre offset (mirrors the firmware's `error:33`).
+  /// Distinct from a syntax slip: the tokens are well-formed but describe no valid geometry.
+  #[error("invalid geometry on line {line}: {message}")]
+  InvalidGeometry {
+    /// 1-based source line number.
+    line: usize,
+    /// Why the geometry is invalid.
+    message: String,
+  },
+
   /// A coordinate word appeared before the `FS` format-specification block that decodes it.
   #[error("coordinate seen before the format specification (FS) was set")]
   MissingFormat,

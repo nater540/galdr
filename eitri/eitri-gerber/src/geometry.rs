@@ -1,42 +1,19 @@
 //! Pure polygon builders for aperture shapes and the affine helpers macro primitives lean on.
 //!
 //! Curves are flattened to line segments at a fixed chord tolerance (curved apertures are approximated by
-//! polygons, matching how Shapely/FlatCAM buffer output is consumed downstream). Nothing here touches a geometry
-//! backend — these are direct constructions; boolean composition happens one layer up.
+//! polygons, matching how Shapely/FlatCAM buffer output is consumed downstream). The circle builder and its
+//! adaptive facet count live in `eitri-geo` and are re-exported here so the Gerber and Excellon front ends facet
+//! circles identically. Nothing here touches a geometry backend — these are direct constructions; boolean
+//! composition happens one layer up.
 
 use std::f64::consts::TAU;
 
 use eitri_core::Affine;
 use geo_types::{Coord, LineString, MultiPolygon, Polygon};
 
-/// Maximum chord deviation (mm) allowed when flattening a circular arc into segments.
-pub const CHORD_TOLERANCE_MM: f64 = 0.005;
-
-/// Number of segments needed to approximate an arc of the given radius and absolute sweep within
-/// [`CHORD_TOLERANCE_MM`]. Clamped to a sane range so tiny or huge radii stay well-behaved.
-pub fn arc_segment_count(radius: f64, sweep_abs: f64) -> usize {
-  if radius <= 0.0 || sweep_abs <= 0.0 {
-    return 8;
-  }
-  let tol = CHORD_TOLERANCE_MM.min(radius * 0.5);
-  let max_step = 2.0 * (1.0 - tol / radius).clamp(-1.0, 1.0).acos();
-  if max_step <= f64::EPSILON {
-    return 512;
-  }
-  ((sweep_abs / max_step).ceil() as usize).clamp(8, 512)
-}
-
-/// A filled circle of radius `r` centred at `(cx, cy)`, flattened to a polygon.
-pub fn circle_polygon(cx: f64, cy: f64, r: f64) -> Polygon<f64> {
-  let n = arc_segment_count(r, TAU);
-  let ring: Vec<Coord<f64>> = (0..n)
-    .map(|i| {
-      let a = TAU * (i as f64) / (n as f64);
-      Coord { x: cx + r * a.cos(), y: cy + r * a.sin() }
-    })
-    .collect();
-  Polygon::new(LineString(ring), Vec::new())
-}
+// The circle builder and its adaptive facet count are shared across the parsers — re-exported from `eitri-geo` so
+// existing `crate::geometry::{circle_polygon, arc_segment_count}` call sites keep resolving.
+pub use eitri_geo::{arc_segment_count, circle_polygon};
 
 /// An axis-aligned rectangle `width × height` centred at `(cx, cy)`.
 pub fn rectangle_polygon(cx: f64, cy: f64, width: f64, height: f64) -> Polygon<f64> {

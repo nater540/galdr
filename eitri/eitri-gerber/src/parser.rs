@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::f64::consts::TAU;
 
 use eitri_core::{CancelToken, ProgressEvent, ProgressReporter, Unit};
-use eitri_geo::{CapStyle, DefaultBackend, GeoBackend, buffer_path};
+use eitri_geo::{CapStyle, DefaultBackend, GeoBackend, buffer_path, ring_interior_point};
 use geo_types::{Coord, LineString, MultiPolygon, Polygon};
 
 use crate::aperture::{Aperture, parse_ad};
@@ -103,6 +103,9 @@ struct Interpreter<'a> {
   macros: BTreeMap<String, MacroDef>,
   current_aperture: Option<u32>,
   interp: InterpMode,
+  // The last D01/D02/D03 operation, retained so a coordinate line that omits its operation code repeats it (RS-274X
+  // operation codes are modal). `None` until the first explicit operation.
+  modal_op: Option<u32>,
   polarity: Polarity,
   x: f64,
   y: f64,
@@ -123,6 +126,7 @@ impl<'a> Interpreter<'a> {
       macros: BTreeMap::new(),
       current_aperture: None,
       interp: InterpMode::Linear,
+      modal_op: None,
       polarity: Polarity::Dark,
       x: 0.0,
       y: 0.0,
@@ -183,8 +187,24 @@ impl<'a> Interpreter<'a> {
           other => return Err(GerberError::Syntax { line, message: format!("unknown polarity '{other}'") }),
         };
       }
-      // X2 attributes and aperture transforms: accepted and ignored (documented deferral).
-      "TF" | "TA" | "TO" | "TD" | "LM" | "LR" | "LS" | "IN" | "LN" | "IP" | "AS" | "MI" | "OF" | "SF" => {}
+      // X2 attributes, aperture transforms, and pure annotations: accepted and ignored (documented deferral).
+      "TF" | "TA" | "TO" | "TD" | "LM" | "LR" | "LS" | "IN" | "LN" => {}
+      "IP" => {
+        // Image polarity. Positive is the default and a genuine no-op. Negative inverts the whole image
+        // (copper<->clearance) against an unbounded background, which we do not implement — refuse loudly rather
+        // than pass inverted-meaning geometry through unchanged.
+        match &first[2..] {
+          "POS" => {}
+          "NEG" => return Err(GerberError::Unsupported { line, message: "negative image polarity (IPNEG)".to_string() }),
+          other => return Err(GerberError::Syntax { line, message: format!("unknown image polarity '{other}'") }),
+        }
+      }
+      // Deprecated whole-image transforms that mirror/offset/scale/swap the coordinate data. Ignoring them would
+      // silently misplace every primitive, so refuse loudly (they are rare and disproportionate to implement).
+      "MI" => return Err(GerberError::Unsupported { line, message: "image mirror (MI) is not supported".to_string() }),
+      "OF" => return Err(GerberError::Unsupported { line, message: "image offset (OF) is not supported".to_string() }),
+      "SF" => return Err(GerberError::Unsupported { line, message: "image scale (SF) is not supported".to_string() }),
+      "AS" => return Err(GerberError::Unsupported { line, message: "axis select (AS) is not supported".to_string() }),
       // Constructs that would silently change geometry if ignored — refuse loudly instead.
       "SR" => return Err(GerberError::Unsupported { line, message: "step-repeat (SR) is not supported".to_string() }),
       "AB" => return Err(GerberError::Unsupported { line, message: "aperture blocks (AB) are not supported".to_string() }),
@@ -205,6 +225,7 @@ impl<'a> Interpreter<'a> {
     let mut i_off: Option<f64> = None;
     let mut j_off: Option<f64> = None;
     let mut operation: Option<u32> = None;
+    let mut has_coord = false;
 
     for (letter, value) in &words {
       match letter {
@@ -220,21 +241,31 @@ impl<'a> Interpreter<'a> {
             operation = Some(d);
           }
         }
-        'X' => new_x = self.decode(line, value)?,
-        'Y' => new_y = self.decode(line, value)?,
-        'I' => i_off = Some(self.decode(line, value)?),
-        'J' => j_off = Some(self.decode(line, value)?),
+        'X' => { new_x = self.decode(line, value)?; has_coord = true; }
+        'Y' => { new_y = self.decode(line, value)?; has_coord = true; }
+        'I' => { i_off = Some(self.decode(line, value)?); has_coord = true; }
+        'J' => { j_off = Some(self.decode(line, value)?); has_coord = true; }
         'M' => { /* M00/M01/M02 — end of file / stop; nothing to accumulate. */ }
         other => return Err(GerberError::Syntax { line, message: format!("unexpected word letter '{other}'") }),
       }
     }
 
-    if let Some(op) = operation {
-      self.operate(line, op, new_x, new_y, i_off, j_off)?;
-    } else {
-      // A bare coordinate move with no D-op keeps the modal point in sync (some files emit this).
-      self.x = new_x;
-      self.y = new_y;
+    // Operation codes are modal: an explicit D01/D02/D03 sets the mode; a coordinate line that omits the D-word
+    // repeats the last one. A line with no coordinate data (aperture-select or G/M only) triggers no operation.
+    match operation {
+      Some(op) => {
+        self.modal_op = Some(op);
+        self.operate(line, op, new_x, new_y, i_off, j_off)?;
+      }
+      None if has_coord => match self.modal_op {
+        Some(op) => self.operate(line, op, new_x, new_y, i_off, j_off)?,
+        // Coordinate data before any operation code was ever set: just track the modal point.
+        None => {
+          self.x = new_x;
+          self.y = new_y;
+        }
+      },
+      None => {}
     }
     Ok(())
   }
@@ -275,7 +306,7 @@ impl<'a> Interpreter<'a> {
       1 => {
         // Draw / interpolate.
         if self.in_region {
-          self.region_interpolate(tx, ty, i, j);
+          self.region_interpolate(line, tx, ty, i, j)?;
         } else {
           self.stroke(line, tx, ty, i, j)?;
         }
@@ -306,10 +337,15 @@ impl<'a> Interpreter<'a> {
   }
 
   /// Stroke a draw from the current point to `(tx, ty)` with the current aperture, adding the band as a primitive.
+  /// Only a circular aperture can meaningfully stroke; any other aperture is refused loudly (see
+  /// [`Aperture::stroke_radius`]) rather than silently emitting a wrong-width or empty band.
   fn stroke(&mut self, line: usize, tx: f64, ty: f64, i: Option<f64>, j: Option<f64>) -> Result<()> {
     let code = self.current_aperture.ok_or(GerberError::Syntax { line, message: "draw with no aperture selected".to_string() })?;
-    let radius = self.apertures[&code].stroke_radius();
-    let path = self.interpolated_path(tx, ty, i, j);
+    let radius = self.apertures[&code].stroke_radius().ok_or_else(|| GerberError::Unsupported {
+      line,
+      message: "stroke (D01) with a non-circular aperture (only circular apertures may draw)".to_string(),
+    })?;
+    let path = self.interpolated_path(line, tx, ty, i, j)?;
     let band = buffer_path(&LineString(path), radius, CapStyle::Round)?;
     self.push_multipolygon(band);
     Ok(())
@@ -333,13 +369,14 @@ impl<'a> Interpreter<'a> {
   }
 
   /// Append the interpolated points (current point excluded, target included) to the region contour.
-  fn region_interpolate(&mut self, tx: f64, ty: f64, i: Option<f64>, j: Option<f64>) {
+  fn region_interpolate(&mut self, line: usize, tx: f64, ty: f64, i: Option<f64>, j: Option<f64>) -> Result<()> {
     if self.region_current.is_empty() {
       self.region_current.push(Coord { x: self.x, y: self.y });
     }
-    let path = self.interpolated_path(tx, ty, i, j);
+    let path = self.interpolated_path(line, tx, ty, i, j)?;
     // path[0] is the current point (already present); push the rest.
     self.region_current.extend(path.into_iter().skip(1));
+    Ok(())
   }
 
   fn finish_region_contour(&mut self) {
@@ -360,12 +397,20 @@ impl<'a> Interpreter<'a> {
   }
 
   /// The polyline from the current point to `(tx, ty)`: a straight segment when linear, a flattened arc otherwise.
-  fn interpolated_path(&self, tx: f64, ty: f64, i: Option<f64>, j: Option<f64>) -> Vec<Coord<f64>> {
+  /// A `G02`/`G03` arc with neither `I` nor `J` is malformed (radius zero, no centre) — reject it as invalid
+  /// geometry rather than silently degenerating it into a straight chord (mirrors the firmware's `error:33`).
+  fn interpolated_path(&self, line: usize, tx: f64, ty: f64, i: Option<f64>, j: Option<f64>) -> Result<Vec<Coord<f64>>> {
     match self.interp {
-      InterpMode::Linear => vec![Coord { x: self.x, y: self.y }, Coord { x: tx, y: ty }],
+      InterpMode::Linear => Ok(vec![Coord { x: self.x, y: self.y }, Coord { x: tx, y: ty }]),
       InterpMode::ClockwiseArc | InterpMode::CounterClockwiseArc => {
+        if i.is_none() && j.is_none() {
+          return Err(GerberError::InvalidGeometry {
+            line,
+            message: "circular interpolation (G02/G03) with neither I nor J offset".to_string(),
+          });
+        }
         let ccw = matches!(self.interp, InterpMode::CounterClockwiseArc);
-        flatten_arc(self.x, self.y, tx, ty, i.unwrap_or(0.0), j.unwrap_or(0.0), ccw)
+        Ok(flatten_arc(self.x, self.y, tx, ty, i.unwrap_or(0.0), j.unwrap_or(0.0), ccw))
       }
     }
   }
@@ -456,18 +501,25 @@ fn flatten_arc(sx: f64, sy: f64, ex: f64, ey: f64, i: f64, j: f64, ccw: bool) ->
 }
 
 /// Assemble region contours into filled polygons using even-odd nesting: a contour enclosed by an even number of
-/// others is solid, an odd number makes it a hole of the nearest enclosing solid.
+/// others is solid, an odd number makes it a hole of the nearest enclosing solid. Containment is probed with a
+/// robust interior point (see [`eitri_geo::ring_interior_point`]) — a concave contour's vertex mean can fall
+/// outside the contour and silently flip the depth parity, corrupting the nesting.
 fn assemble_region(contours: Vec<Vec<Coord<f64>>>) -> Vec<Polygon<f64>> {
   let rings: Vec<LineString<f64>> = contours.into_iter().map(LineString).collect();
-  let reps: Vec<Coord<f64>> = rings.iter().map(representative_point).collect();
+  let reps: Vec<Option<Coord<f64>>> = rings.iter().map(ring_interior_point).collect();
 
-  // depth[k] = how many other rings contain ring k's representative point.
+  // depth[k] = how many other rings contain ring k's representative point. A ring with no valid interior point
+  // (degenerate) is skipped entirely below, so its depth is irrelevant.
   let depths: Vec<usize> = (0..rings.len())
-    .map(|k| (0..rings.len()).filter(|&m| m != k && point_in_ring(reps[k], &rings[m])).count())
+    .map(|k| match reps[k] {
+      Some(p) => (0..rings.len()).filter(|&m| m != k && point_in_ring(p, &rings[m])).count(),
+      None => 0,
+    })
     .collect();
 
   let mut polygons = Vec::new();
   for (k, ring) in rings.iter().enumerate() {
+    let Some(_) = reps[k] else { continue }; // degenerate ring contributes no fill
     if depths[k] % 2 != 0 {
       continue; // odd depth => a hole, attached below to its enclosing solid
     }
@@ -475,19 +527,14 @@ fn assemble_region(contours: Vec<Vec<Coord<f64>>>) -> Vec<Polygon<f64>> {
     let holes: Vec<LineString<f64>> = rings
       .iter()
       .enumerate()
-      .filter(|&(m, _)| m != k && depths[m] == depths[k] + 1 && point_in_ring(reps[m], ring))
+      .filter(|&(m, _)| {
+        m != k && depths[m] == depths[k] + 1 && reps[m].is_some_and(|pm| point_in_ring(pm, ring))
+      })
       .map(|(_, r)| r.clone())
       .collect();
     polygons.push(Polygon::new(ring.clone(), holes));
   }
   polygons
-}
-
-/// The mean of a ring's vertices — a representative interior point for simple (convex-ish) contours.
-fn representative_point(ring: &LineString<f64>) -> Coord<f64> {
-  let n = ring.0.len().max(1) as f64;
-  let (sx, sy) = ring.0.iter().fold((0.0, 0.0), |(sx, sy), c| (sx + c.x, sy + c.y));
-  Coord { x: sx / n, y: sy / n }
 }
 
 /// Ray-casting point-in-polygon test against a ring's vertices.
@@ -548,6 +595,30 @@ mod tests {
   }
 
   #[test]
+  fn concave_region_outer_is_not_demoted_by_a_bad_representative_point() {
+    // Finding #2: even-odd region nesting must probe each contour with a point that is genuinely inside it. Here a
+    // concave outer (a U: a 10x10 square minus a top-middle notch) and a small disjoint square sitting in that notch.
+    // The U contour's VERTEX MEAN is (5, 6.25) — in the notch, and inside the square — so the old mean-of-vertices
+    // probe counted the U as enclosed (odd depth) and demoted it to a (bogus) hole of the square, collapsing two
+    // solids into one malformed polygon. A robust interior point lands in the U's body, keeping both as solids.
+    let coord = |x: f64, y: f64| Coord { x, y };
+    let u = vec![
+      coord(0.0, 0.0), coord(10.0, 0.0), coord(10.0, 10.0), coord(7.0, 10.0),
+      coord(7.0, 5.0), coord(3.0, 5.0), coord(3.0, 10.0), coord(0.0, 10.0),
+    ];
+    let square = vec![coord(4.0, 6.0), coord(6.0, 6.0), coord(6.0, 7.0), coord(4.0, 7.0)];
+
+    // Precondition: the U contour's vertex mean lands inside the square (the exact trap the fix removes).
+    let n = u.len() as f64;
+    let mean = Coord { x: u.iter().map(|c| c.x).sum::<f64>() / n, y: u.iter().map(|c| c.y).sum::<f64>() / n };
+    assert!(point_in_ring(mean, &LineString(square.clone())), "precondition: U's vertex mean falls in the square");
+
+    let polys = assemble_region(vec![u, square]);
+    assert_eq!(polys.len(), 2, "the U and the square must remain two disjoint solids");
+    assert!(polys.iter().all(|p| p.interiors().is_empty()), "neither disjoint solid should carry a spurious hole");
+  }
+
+  #[test]
   fn lp_clear_subtracts_from_dark() {
     // Dark 10x10 region, then a clear 4x4 region inside: 100 - 16 = 84.
     let src = concat!(
@@ -587,5 +658,70 @@ mod tests {
   #[test]
   fn coordinate_before_fs_errors() {
     assert!(parse_gerber("X100Y100D02*\n", &ProgressReporter::silent(), &CancelToken::new()).is_err());
+  }
+
+  fn try_parse(src: &str) -> Result<GerberImage> {
+    parse_gerber(src, &ProgressReporter::silent(), &CancelToken::new())
+  }
+
+  #[test]
+  fn negative_image_polarity_is_refused_loudly() {
+    // Finding #1: %IPNEG*% inverts the whole image; we do not implement it, so it must error rather than pass the
+    // image through with its copper/clearance meaning silently inverted. Positive polarity stays a no-op.
+    let neg = try_parse("%FSLAX36Y36*%\n%MOMM*%\n%IPNEG*%\nM02*\n");
+    assert!(matches!(neg, Err(GerberError::Unsupported { .. })), "IPNEG must be refused, got {neg:?}");
+    let pos = try_parse("%FSLAX36Y36*%\n%MOMM*%\n%IPPOS*%\n%ADD10C,1*%\nD10*\nX0Y0D03*\nM02*\n");
+    assert!(pos.is_ok(), "IPPOS is the default and must parse, got {pos:?}");
+  }
+
+  #[test]
+  fn image_transforms_are_refused_loudly() {
+    // Finding #1: MI/OF/SF/AS move, mirror, scale or swap the whole image; ignoring them misplaces every primitive.
+    for cmd in ["%MIA1B0*%", "%OFA5B0*%", "%SFA2B2*%", "%ASAXBY*%"] {
+      let src = format!("%FSLAX36Y36*%\n%MOMM*%\n{cmd}\nM02*\n");
+      let err = try_parse(&src);
+      assert!(matches!(err, Err(GerberError::Unsupported { .. })), "{cmd} must be refused, got {err:?}");
+    }
+  }
+
+  #[test]
+  fn stroke_with_a_macro_aperture_errors_not_empty() {
+    // Finding #4: a D01 draw with a macro aperture selected used to yield no copper (stroke_radius returned 0). A
+    // non-circular aperture cannot meaningfully stroke, so it must be refused loudly.
+    let src = concat!(
+      "%FSLAX36Y36*%\n%MOMM*%\n",
+      "%AMROUND*\n1,1,$1,0,0*%\n",
+      "%ADD10ROUND,3*%\n",
+      "D10*\nX0Y0D02*\nX1000000Y0D01*\nM02*\n"
+    );
+    let err = try_parse(src);
+    assert!(matches!(err, Err(GerberError::Unsupported { .. })), "macro stroke must be refused, got {err:?}");
+  }
+
+  #[test]
+  fn arc_with_no_offset_is_invalid_geometry() {
+    // Finding #5: a G02/G03 with neither I nor J is malformed (no centre). It must error, not degenerate silently
+    // into a straight chord.
+    let src = concat!(
+      "%FSLAX36Y36*%\n%MOMM*%\n%ADD10C,1*%\n",
+      "D10*\nX5000000Y0D02*\nG02*\nX0Y0D01*\nM02*\n"
+    );
+    let err = try_parse(src);
+    assert!(matches!(err, Err(GerberError::InvalidGeometry { .. })), "arc with no I/J must error, got {err:?}");
+  }
+
+  #[test]
+  fn operation_code_is_modal_across_coordinate_lines() {
+    // Finding #6: a bare coordinate line after `…D01*` repeats the previous operation (a stroke), not a move. Here a
+    // stroke to (1,0) then a bare line to (2,0) must produce ONE continuous capsule from x=0 to x=2, not stop at 1.
+    let src = concat!(
+      "%FSLAX36Y36*%\n%MOMM*%\n%ADD10C,1*%\n",
+      "D10*\nX0Y0D02*\nX1000000Y0D01*\nX2000000Y0*\nM02*\n"
+    );
+    let img = parse(src);
+    // Capsule 0->2 with a 1mm round aperture: 2*1 + pi*0.25 ~= 2.785. A single stroke to x=1 would be ~1.785.
+    assert!((img.copper.unsigned_area() - 2.785).abs() < 0.05, "area {}", img.copper.unsigned_area());
+    let (_, _, maxx, _) = img.bounds().unwrap();
+    assert!((maxx - 2.5).abs() < 0.05, "the modal stroke must reach x=2 (maxx {maxx})");
   }
 }

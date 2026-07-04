@@ -30,15 +30,14 @@ pub enum Aperture {
 }
 
 impl Aperture {
-  /// The nominal radius to use when this aperture strokes a draw (`D01`). Round apertures give an exact stroke;
-  /// others use half their smallest dimension as a best-effort radius (draws with non-round apertures are a
-  /// deprecated corner of the spec and rare in practice).
-  pub fn stroke_radius(&self) -> f64 {
+  /// The radius to stroke a draw (`D01`) with, if this aperture can meaningfully stroke one. Only a circular
+  /// aperture yields a well-defined stroke width; rectangle/obround/polygon/macro strokes are a deprecated, ill-
+  /// defined corner of RS-274X, so they return `None` and the caller refuses loudly rather than emitting a
+  /// wrong-width or empty band. (The prior code returned `0.0` for a macro, silently dropping the copper.)
+  pub fn stroke_radius(&self) -> Option<f64> {
     match self {
-      Aperture::Circle { diameter, .. } => diameter / 2.0,
-      Aperture::Rectangle { width, height, .. } | Aperture::Obround { width, height, .. } => width.min(*height) / 2.0,
-      Aperture::Polygon { diameter, .. } => diameter / 2.0,
-      Aperture::Macro { .. } => 0.0,
+      Aperture::Circle { diameter, .. } => Some(diameter / 2.0),
+      _ => None,
     }
   }
 

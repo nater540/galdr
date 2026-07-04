@@ -1,0 +1,8 @@
+; Finding #10: a large drill facets adaptively to the chord tolerance, not a fixed 48
+M48
+METRIC,LZ,3.3
+T1C6.0
+%
+T1
+X000000Y000000
+M30

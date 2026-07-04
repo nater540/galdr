@@ -66,14 +66,16 @@ pub(crate) fn paths_to_multipolygon(paths: Paths<EitriScale>) -> MultiPolygon<f6
     outers.into_iter().map(|(_, ext)| (ext, Vec::new())).collect();
 
   for hole in holes {
-    let probe = representative_point(&hole);
+    // A robust interior point is essential here: a concave hole's vertex mean can fall outside a concave outer,
+    // which would drop a real hole. See [`crate::interior::ring_interior_point`].
+    let Some(probe) = crate::interior::ring_interior_point(&hole) else { continue };
     if let Some((ext, hole_bucket)) = assembled.iter_mut().find(|(ext, _)| {
       Polygon::new(ext.clone(), Vec::new()).contains(&probe)
     }) {
       let _ = ext; // The matched outer's holes bucket is what we extend.
       hole_bucket.push(hole);
     }
-    // A hole with no containing outer is dropped: it cannot form a valid polygon on its own.
+    // A hole with no valid interior point or no containing outer is dropped: it cannot form a valid polygon alone.
   }
 
   MultiPolygon(assembled.into_iter().map(|(ext, holes)| Polygon::new(ext, holes)).collect())
@@ -92,15 +94,6 @@ fn signed_area(ring: &[(f64, f64)]) -> f64 {
     acc += x1 * y2 - x2 * y1;
   }
   acc / 2.0
-}
-
-/// A representative interior point of a ring: the mean of its vertices. Adequate for the convex-ish holes offset
-/// output produces; a full point-in-polygon-safe representative point is a later-phase refinement.
-fn representative_point(ring: &LineString<f64>) -> Coord<f64> {
-  let coords = &ring.0;
-  let n = coords.len().max(1) as f64;
-  let (sx, sy) = coords.iter().fold((0.0, 0.0), |(sx, sy), c| (sx + c.x, sy + c.y));
-  Coord { x: sx / n, y: sy / n }
 }
 
 /// Build a closed `LineString` from `(x, y)` tuples (`geo_types` closes it on `Polygon::new`).
@@ -124,5 +117,32 @@ mod tests {
     assert!(signed_area(&ccw) > 0.0);
     assert!(signed_area(&cw) < 0.0);
     assert!((signed_area(&ccw).abs() - 4.0).abs() < 1e-9);
+  }
+
+  #[test]
+  fn concave_outer_keeps_a_hole_whose_vertex_mean_escapes_it() {
+    // Finding #3: a hole nested in a concave outer must survive. Here the outer is a U (a 10x10 square with a
+    // top-middle notch removed); the hole is a U-shaped band following the outer's arms. The band's vertex mean
+    // lands in the notch — outside the outer — so the old mean-of-vertices probe dropped the hole entirely.
+    let outer: Vec<(f64, f64)> =
+      vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (7.0, 10.0), (7.0, 5.0), (3.0, 5.0), (3.0, 10.0), (0.0, 10.0)];
+    // Clockwise (negative area) so `paths_to_multipolygon` classifies it as a hole, not an outer.
+    let hole: Vec<(f64, f64)> =
+      vec![(2.0, 9.0), (2.0, 2.0), (8.0, 2.0), (8.0, 9.0), (9.0, 9.0), (9.0, 1.0), (1.0, 1.0), (1.0, 9.0)];
+
+    // The vertex mean of the hole band lands at (5, 5.25) — inside the notch, outside the outer U.
+    let mean_x = hole.iter().map(|p| p.0).sum::<f64>() / hole.len() as f64;
+    let mean_y = hole.iter().map(|p| p.1).sum::<f64>() / hole.len() as f64;
+    let outer_poly = Polygon::new(tuples_to_linestring(&outer), Vec::new());
+    assert!(
+      !outer_poly.contains(&Coord { x: mean_x, y: mean_y }),
+      "precondition: hole vertex mean ({mean_x}, {mean_y}) must fall outside the concave outer"
+    );
+
+    let paths: Paths<EitriScale> = vec![outer, hole].into();
+    let mp = paths_to_multipolygon(paths);
+
+    assert_eq!(mp.0.len(), 1, "one outer polygon expected");
+    assert_eq!(mp.0[0].interiors().len(), 1, "the nested hole must be preserved, not dropped");
   }
 }

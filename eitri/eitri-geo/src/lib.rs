@@ -19,6 +19,8 @@ mod default_backend;
 
 pub mod arc;
 pub mod buffer;
+pub mod flatten;
+pub mod interior;
 pub mod winding;
 
 #[cfg(feature = "geos")]
@@ -31,6 +33,8 @@ use eitri_core::Result;
 pub use arc::{ArcPolyline, ArcVertex, offset_arc};
 pub use buffer::{CapStyle, buffer_path};
 pub use default_backend::DefaultBackend;
+pub use flatten::{arc_segment_count, circle_polygon};
+pub use interior::ring_interior_point;
 
 #[cfg(feature = "geos")]
 pub use geos_backend::GeosBackend;

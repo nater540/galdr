@@ -76,3 +76,26 @@ fn g85_slot_is_a_segment_with_buffered_geometry() {
   let geom = img.hit_geometry(&img.hits[0]).unwrap().unwrap();
   assert!((geom.unsigned_area() - (6.0 + std::f64::consts::PI * 0.25)).abs() < 0.05, "area {}", geom.unsigned_area());
 }
+
+#[test]
+fn combined_tool_select_and_coordinate_line_drills() {
+  // Finding #7: a `T1X..Y..` line must select the tool AND drill; the old code dropped the hit.
+  let img = parse("combined_tool_hit.drl");
+  assert_eq!(img.hits.len(), 1, "the combined select+coordinate line must emit a hit");
+  match img.hits[0] {
+    DrillHit::Drill { tool, x, y } => {
+      assert_eq!(tool, 1);
+      assert!((x - 10.0).abs() < 1e-6 && (y - 5.0).abs() < 1e-6, "hit at ({x}, {y})");
+    }
+    other => panic!("expected drill, got {other:?}"),
+  }
+}
+
+#[test]
+fn large_drill_facets_adaptively() {
+  // Finding #10: a 6mm drill uses the shared adaptive circle builder, so it exceeds the old fixed 48 facets.
+  let img = parse("large_drill.drl");
+  let geom = img.hit_geometry(&img.hits[0]).unwrap().unwrap();
+  let facets = geom.0[0].exterior().0.len();
+  assert!(facets > 48, "a 6mm drill should exceed the old fixed 48 facets, got {facets}");
+}

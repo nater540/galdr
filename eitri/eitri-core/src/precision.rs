@@ -8,6 +8,10 @@
 /// CAM scales, large enough to drop the redundant vertices that boolean/offset backends emit.
 pub const SIMPLIFY_TOLERANCE_MM: f64 = 0.005;
 
+/// Maximum chord deviation (millimetres) allowed when flattening a circular arc into straight segments. Small
+/// enough to be invisible at CAM scales; drives the adaptive facet count in `eitri_geo::circle_polygon`.
+pub const CHORD_TOLERANCE_MM: f64 = 0.005;
+
 /// Number of decimal places used when formatting coordinates into G-code (millimetres). One place per micron.
 pub const GCODE_DECIMALS: usize = 4;
 

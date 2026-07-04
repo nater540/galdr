@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use eitri_core::{CancelToken, ProgressReporter};
-use eitri_gerber::{GerberImage, parse_gerber};
+use eitri_gerber::{GerberError, GerberImage, parse_gerber};
 
 use geo::algorithm::area::Area;
 
@@ -17,6 +17,10 @@ fn fixture(name: &str) -> String {
 
 fn parse(name: &str) -> GerberImage {
   parse_gerber(&fixture(name), &ProgressReporter::silent(), &CancelToken::new()).expect("parse")
+}
+
+fn try_parse(name: &str) -> Result<GerberImage, GerberError> {
+  parse_gerber(&fixture(name), &ProgressReporter::silent(), &CancelToken::new())
 }
 
 #[test]
@@ -61,4 +65,32 @@ fn macro_thermal_flash_has_a_hole() {
 fn region_with_clear_area_is_dark_minus_clear() {
   let img = parse("region_with_clear.gbr");
   assert!((img.copper.unsigned_area() - 84.0).abs() < 1e-3, "area {}", img.copper.unsigned_area());
+}
+
+#[test]
+fn modal_draw_repeats_the_operation_code() {
+  // Finding #6: the bare `X2000000Y0*` line repeats the preceding D01, so the stroke runs the full 0..2, reaching
+  // x=2.5 with the 1mm round aperture rather than stopping at x=1.5.
+  let img = parse("modal_draw.gbr");
+  assert!((img.copper.unsigned_area() - 2.785).abs() < 0.05, "area {}", img.copper.unsigned_area());
+  let (_, _, maxx, _) = img.bounds().expect("bounds");
+  assert!((maxx - 2.5).abs() < 0.05, "the modal stroke must reach x=2 (maxx {maxx})");
+}
+
+#[test]
+fn macro_stroke_is_refused_loudly() {
+  // Finding #4: a D01 draw with a macro aperture selected must error, not emit empty copper.
+  assert!(matches!(try_parse("macro_stroke_refused.gbr"), Err(GerberError::Unsupported { .. })));
+}
+
+#[test]
+fn arc_without_offset_is_invalid_geometry() {
+  // Finding #5: a G02 arc with neither I nor J must error, not degenerate into a straight chord.
+  assert!(matches!(try_parse("arc_no_offset.gbr"), Err(GerberError::InvalidGeometry { .. })));
+}
+
+#[test]
+fn negative_image_polarity_is_refused_loudly() {
+  // Finding #1: %IPNEG*% inverts the whole image; we refuse it rather than pass inverted-meaning geometry through.
+  assert!(matches!(try_parse("image_neg_refused.gbr"), Err(GerberError::Unsupported { .. })));
 }

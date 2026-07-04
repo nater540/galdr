@@ -57,56 +57,34 @@ impl NumberFormat {
     NumberFormat { unit, integer_digits, decimal_digits, zero_suppression: ZeroSuppression::Leading }
   }
 
-  fn total_digits(&self) -> usize {
-    self.integer_digits as usize + self.decimal_digits as usize
-  }
-
-  /// Decode one coordinate word into a value **in file units**. Handles a sign, an explicit decimal point, and the
-  /// zero-suppression padding.
+  /// Decode one coordinate word into a value **in file units**. Delegates the sign / explicit-decimal /
+  /// zero-omission arithmetic to the shared `eitri_core` decoder (the same routine the Gerber parser uses), so the
+  /// two cannot drift, and attaches this parser's line-aware error on failure.
   pub fn decode(&self, word: &str, line: usize) -> Result<f64> {
-    let word = word.trim();
-    if word.is_empty() {
-      return Err(ExcellonError::Syntax { line, message: "empty coordinate word".to_string() });
-    }
-    let (sign, digits) = match word.strip_prefix('-') {
-      Some(rest) => (-1.0, rest),
-      None => (1.0, word.strip_prefix('+').unwrap_or(word)),
+    let omission = match self.zero_suppression {
+      ZeroSuppression::Leading => eitri_core::ZeroOmission::Leading,
+      ZeroSuppression::Trailing => eitri_core::ZeroOmission::Trailing,
     };
-
-    if digits.contains('.') {
-      let value: f64 = digits.parse().map_err(|_| ExcellonError::Syntax {
-        line,
-        message: format!("invalid decimal coordinate '{word}'"),
-      })?;
-      return Ok(sign * value);
-    }
-
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-      return Err(ExcellonError::Syntax { line, message: format!("non-numeric coordinate '{word}'") });
-    }
-
-    let scale = 10f64.powi(self.decimal_digits as i32);
-    let magnitude = match self.zero_suppression {
-      ZeroSuppression::Leading => digits.parse::<u64>().map(|n| n as f64 / scale),
-      ZeroSuppression::Trailing => {
-        let total = self.total_digits();
-        let padded = if digits.len() < total {
-          format!("{:0<width$}", digits, width = total)
-        } else {
-          digits.to_string()
-        };
-        padded.parse::<u64>().map(|n| n as f64 / scale)
-      }
-    };
-    magnitude
-      .map(|m| sign * m)
-      .map_err(|_| ExcellonError::Syntax { line, message: format!("coordinate '{word}' out of range") })
+    eitri_core::decode_zero_omitted(word, self.integer_digits, self.decimal_digits, omission)
+      .map_err(|err| decode_error(word, line, err))
   }
 
   /// Convert a decoded file-unit value to millimetres.
   pub fn to_mm(&self, value: f64) -> f64 {
     value * self.unit.mm_per_unit()
   }
+}
+
+/// Map a shared decode failure onto this parser's line-aware syntax error, preserving the original messages.
+fn decode_error(word: &str, line: usize, err: eitri_core::CoordDecodeError) -> ExcellonError {
+  use eitri_core::CoordDecodeError as E;
+  let message = match err {
+    E::Empty => "empty coordinate word".to_string(),
+    E::InvalidDecimal => format!("invalid decimal coordinate '{word}'"),
+    E::NonNumeric => format!("non-numeric coordinate '{word}'"),
+    E::OutOfRange => format!("coordinate '{word}' out of range"),
+  };
+  ExcellonError::Syntax { line, message }
 }
 
 #[cfg(test)]
