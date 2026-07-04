@@ -18,6 +18,7 @@ mod convert;
 mod default_backend;
 
 pub mod arc;
+pub mod buffer;
 pub mod winding;
 
 #[cfg(feature = "geos")]
@@ -28,6 +29,7 @@ use geo_types::{MultiPolygon, Polygon};
 use eitri_core::Result;
 
 pub use arc::{ArcPolyline, ArcVertex, offset_arc};
+pub use buffer::{CapStyle, buffer_path};
 pub use default_backend::DefaultBackend;
 
 #[cfg(feature = "geos")]

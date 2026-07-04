@@ -1,5 +1,6 @@
 [package]
 name = "eitri-excellon"
+description = "Excellon drill parser: tool table plus drill/slot hits, with number-format inference and override."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,3 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eitri-core = { workspace = true }
+eitri-geo = { workspace = true }
+geo-types = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+geo = { workspace = true }

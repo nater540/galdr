@@ -1,0 +1,9 @@
+G04 Aperture macro: a thermal-relief pad flashed at the origin. Exercises the AM interpreter + a macro flash.*
+%FSLAX46Y46*%
+%MOMM*%
+%AMTHERMAL*
+7,0,0,$1,$2,$3,0*%
+%ADD10THERMAL,8X5X1*%
+D10*
+X0Y0D03*
+M02*
