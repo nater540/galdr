@@ -27,6 +27,8 @@ rust-version = "1.85"
 # Internal crates.
 eitri-core = { path = "eitri-core" }
 eitri-geo = { path = "eitri-geo" }
+eitri-gerber = { path = "eitri-gerber" }
+eitri-excellon = { path = "eitri-excellon" }
 
 # Shared third-party. Versions are pinned centrally so every crate agrees on one resolution.
 # Boolean ops (union/difference/intersection/unary_union) run through `geo`, which delegates to `i_overlay`
@@ -39,6 +41,9 @@ geo-types = "0.7"
 clipper2 = "0.6"
 cavalier_contours = "0.7"
 geos = "11"
+# Data-parallel per-polygon isolation and per-tool drill ordering. Independent geometry-backend calls fan out
+# across a rayon pool; the backends do their own per-call allocation so there is no cross-thread shared state.
+rayon = "1"
 
 [profile.release]
 # CAM boolean/offset work is compute-bound; keep release fully optimized for the bench numbers to mean something.
