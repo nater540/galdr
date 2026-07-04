@@ -1,0 +1,11 @@
+[package]
+name = "eitri-core"
+description = "Eitri shared primitives: checked length units, affine transforms, precision constants, errors, progress/cancel."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

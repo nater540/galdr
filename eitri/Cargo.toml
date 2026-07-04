@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+  "eitri-core",
+  "eitri-geo",
+  "eitri-gerber",
+  "eitri-excellon",
+  "eitri-import",
+  "eitri-cam",
+  "eitri-gcode",
+  "eitri-project",
+  "eitri-script",
+  "eitri-app",
+]
+
+# Eitri is a self-contained nested workspace inside the Galdr repo. It is deliberately NOT a member of the root
+# galdr workspace so the firmware/skirnir build stays untouched; build it with `--manifest-path eitri/Cargo.toml`.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nater540/galdr"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates.
+eitri-core = { path = "eitri-core" }
+eitri-geo = { path = "eitri-geo" }
+
+# Shared third-party. Versions are pinned centrally so every crate agrees on one resolution.
+# Boolean ops (union/difference/intersection/unary_union) run through `geo`, which delegates to `i_overlay`
+# internally (transitive i_overlay 4.5.x) — so i_overlay is the boolean workhorse without a duplicate direct pin.
+# Offsetting uses `clipper2` (integer space, one shared scale factor from eitri-core); `cavalier_contours` gives
+# arc-preserving polyline offsets. `geos` is the optional Shapely-parity backend, gated behind eitri-geo's feature.
+thiserror = "2"
+geo = "0.33"
+geo-types = "0.7"
+clipper2 = "0.6"
+cavalier_contours = "0.7"
+geos = "11"
+
+[profile.release]
+# CAM boolean/offset work is compute-bound; keep release fully optimized for the bench numbers to mean something.
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,26 @@
+[package]
+name = "eitri-geo"
+description = "Eitri geometry backend: CAM-shaped offsetting, boolean ops, simplification, and winding normalization."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eitri-core = { workspace = true }
+geo = { workspace = true }
+geo-types = { workspace = true }
+clipper2 = { workspace = true }
+cavalier_contours = { workspace = true }
+# Optional Shapely-parity backend. Enabling this feature links the `geos` crate, which needs a system GEOS
+# (libgeos_c) at build time; the default build needs no C/C++ GEOS. Full impl lands in a later phase — Phase 1
+# ships a compiling stub behind the flag.
+geos = { workspace = true, optional = true }
+
+[features]
+default = []
+geos = ["dep:geos"]
+
+[dev-dependencies]
+eitri-core = { workspace = true }
