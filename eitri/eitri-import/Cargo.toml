@@ -7,3 +7,18 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eitri-core.workspace = true
+eitri-geo.workspace = true
+eitri-gcode = { path = "../eitri-gcode" }
+geo-types.workspace = true
+thiserror.workspace = true
+
+# SVG import: usvg normalizes the tree, resolves transforms/styling, and exposes flattened path geometry we then
+# reduce to polylines at the shared chord tolerance. It carries tiny_skia_path, which supplies the path segments.
+usvg = "0.47"
+
+# DXF import: a pure-Rust reader for LINE/LWPOLYLINE/POLYLINE/ARC/CIRCLE (and more we skip loudly).
+dxf = "0.6"
+
+[dev-dependencies]
+eitri-cam.workspace = true

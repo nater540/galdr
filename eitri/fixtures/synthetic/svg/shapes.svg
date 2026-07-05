@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50" width="100" height="100">
+  <!-- viewBox 0..50 rendered into a 100x100 viewport => a resolved 2x user-unit scale. Every shape sits under a
+       translate(5,5) group, so import must resolve group transform THEN the viewBox scale. Exercises: a straight
+       LINE, a cubic Bezier (curve flattening), an elliptical-arc path command (usvg lowers arcs to beziers), and
+       a closed RECT (closed-subpath -> polygon). -->
+  <g transform="translate(5,5)">
+    <line x1="0" y1="0" x2="10" y2="0" stroke="black" fill="none"/>
+    <path d="M 0 10 C 0 0 10 0 10 10" stroke="black" fill="none"/>
+    <path d="M 0 20 A 5 5 0 0 1 10 20" stroke="black" fill="none"/>
+    <rect x="0" y="30" width="10" height="8" fill="black"/>
+  </g>
+</svg>

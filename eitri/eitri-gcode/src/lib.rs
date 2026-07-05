@@ -13,8 +13,9 @@
 //! test is a direct assertion that the emitter cannot produce something the firmware would reject.
 //!
 //! The provenance is FlatCAM's `CNCjob` class and its `preprocessors/` directory; no FlatCAM code is used, only its
-//! architecture (per-controller hook modules → a Rust trait). A G-code read-back **lexer** is planned to live here
-//! for `eitri-import` (Phase 6) to reuse; it is deferred until that phase consumes it.
+//! architecture (per-controller hook modules → a Rust trait). The read-back counterpart to the emitter — the
+//! low-level G-code **lexer** ([`lex`]) — lives here too (plan §8) so read and write share one word model;
+//! `eitri-import` consumes it to walk existing G-code back into a toolpath preview.
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +23,7 @@ pub mod arc;
 pub mod conformance;
 pub mod emit;
 pub mod format;
+pub mod lex;
 pub mod post;
 mod post_generic;
 mod post_grbl;
@@ -31,6 +33,7 @@ pub use arc::{ArcDir, ArcOffset, bulge_to_arc};
 pub use conformance::{Reason, Violation, check_grbl_conformance, is_grbl_conformant};
 pub use emit::{CutRing, DrillJob, IsolationJob, Segment, depth_steps, emit_drilling, emit_isolation};
 pub use format::{CommentStyle, LineEnding, OutputFormat};
+pub use lex::{Line, Word, lex, lex_line};
 pub use post::{ArcMove, Axes, JobContext, Postprocessor, Registry, Spindle, ToolChange};
 pub use post_generic::Generic;
 pub use post_grbl::GrblHal;

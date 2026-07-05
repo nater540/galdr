@@ -35,7 +35,7 @@ use eitri_core::Result;
 pub use arc::{ArcPolyline, ArcVertex, offset_arc};
 pub use buffer::{CapStyle, buffer_path};
 pub use default_backend::DefaultBackend;
-pub use flatten::{arc_segment_count, circle_polygon};
+pub use flatten::{arc_segment_count, circle_polygon, flatten_arc, flatten_bulge, flatten_cubic, flatten_quad};
 pub use interior::ring_interior_point;
 pub use region::{bounds, clip_lines, contains_point};
 pub use transform::{apply_affine, apply_affine_polygon};

@@ -7,9 +7,11 @@ fixtures/
   synthetic/        hand-authored, license-clean spec-corner cases (committed now)
     gerber/
     excellon/
+    svg/            Phase-6 import corners (SVG transform/viewBox/curves)
+    dxf/            Phase-6 import corners (LINE/LWPOLYLINE/ARC/CIRCLE)
   gerber/           REAL sample sets, one subdir per producing tool: gerber/<tool>/  (dropped in as they arrive)
   excellon/         REAL sample sets, one subdir per producing tool: excellon/<tool>/
-  gcode/            (later) golden NC output for the postprocessors (§8, §12)
+  golden/           golden NC output for the postprocessors (§8, §12); also the G-code-import round-trip source
 ```
 
 - **`synthetic/`** — small files written by hand for Eitri, each targeting one spec corner so a parser regression
@@ -60,3 +62,15 @@ path (`eitri-gcode/tests/fill_and_cutout_emit.rs`). No new fixture files were ne
 | `undeclared_decimal.drl` | **No** unit/format declaration; explicit-decimal coordinates parsed via inference fallback. |
 | `combined_tool_hit.drl` | **Finding #7** — a combined `T1X..Y..` line selects the tool AND drills the hit (the old code dropped it). |
 | `large_drill.drl` | **Finding #10** — a 6 mm drill facets adaptively via the shared circle builder (more than the old fixed 48 segments). |
+
+## `synthetic/svg/` and `synthetic/dxf/` (see §6 — `eitri-import`)
+
+| File | Exercises |
+|------|-----------|
+| `svg/shapes.svg` | The §6 SVG porting risk: a `viewBox="0 0 50"` into a `100`-px viewport (2x resolved scale) under a `translate(5,5)` group, so import must compose the group transform *then* the viewBox scale. Carries a `LINE`, a cubic Bézier, an elliptical-arc path command (usvg lowers arcs to beziers), and a closed `RECT` — proving curve flattening and closed→polygon / open→polyline classification. |
+| `dxf/entities.dxf` | The four supported DXF entity families in one drawing: a `LINE`, a `CIRCLE`, a 90° `ARC`, and a closed `LWPOLYLINE` — proving arc/bulge flattening and closed→polygon classification. |
+
+G-code import needs no new fixture: it round-trips against the existing `golden/*.nc` (emit↔import) plus the
+emitter's own output in `eitri-import/tests/roundtrip.rs`. The SVG/DXF *coordinate-correctness* assertions live as
+inline unit tests in `eitri-import/src/{svg,dxf}.rs`; the fixture files above are exercised end to end in
+`eitri-import/tests/fixtures.rs`.
