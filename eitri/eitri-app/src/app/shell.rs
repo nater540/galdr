@@ -900,6 +900,11 @@ mod tests {
   fn tool_db_add_edit_and_seed_round_trip_through_intents() {
     let (mut app, _) = app_with_gerber();
     let ctx = egui::Context::default();
+    // Start from a known-empty library so the test is deterministic regardless of the seeded starter set or a
+    // `tools.json` already present on this host (`EitriApp::new` loads/seeds one).
+    app.tool_db = eitri_project::ToolDatabase::new();
+    app.ui.tool_db_selected = None;
+    app.refresh_tool_list();
     assert!(app.tool_db.is_empty() && app.ui.tool_list.is_empty());
 
     // Add: a new tool lands in the library, is selected for editing, marks the library dirty, and refreshes the
