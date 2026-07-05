@@ -17,14 +17,17 @@
 //!   can be regenerated from its parent object.
 
 use crate::serde_ext;
-use eitri_cam::{DrillParams, IsolationParams, MillingDirection};
+use eitri_cam::{
+  Boundary, Concentric, CutoutOutline, CutoutParams, DrillParams, IsolationParams, MillingDirection, MirrorLine,
+  PanelSpec, PaintParams, PaintStrategy, Point, Raster, Seed, Spacing, TabPlacement,
+};
 use eitri_core::{Affine, Unit};
 use eitri_geo::JoinType;
 use eitri_gcode::Program;
 use eitri_gerber::GerberImage;
 use eitri_excellon::ExcellonImage;
 use eitri_import::ImportedGeometry;
-use geo_types::{LineString, Polygon};
+use geo_types::{Coord, LineString, MultiPolygon, Polygon};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -240,7 +243,13 @@ impl CncJobObject {
 /// A CAM operation plus the operator-facing parameters that produced an object. These are the curated *intent*
 /// knobs the UI edits and scripting sets — not the full internal `eitri-cam` params (corner joins, miter limits and
 /// the like are filled from defaults when the operation is re-run). The enum is `#[non_exhaustive]` so later phases
-/// can add paint / cutout / panelize operations without a breaking change.
+/// can add further operations without a breaking change.
+///
+/// The input *region* an operation clears or profiles (a copper layer, a source geometry) is not duplicated here — it
+/// is reached through [`CncJobObject::source`] by [`ObjectId`], mirroring the Gerber/Excellon "persist source and
+/// re-derive" contract. Only geometry the operation's *parameters* genuinely own — an explicit non-copper frame
+/// ([`BoundarySpec::Region`]), a hand-drawn cutout outline ([`CutoutOutlineSpec::Geometry`]), or explicit alignment
+/// holes — is serialized inline via `geo-types`' `serde`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum CamOperation {
@@ -248,6 +257,16 @@ pub enum CamOperation {
   Isolation(IsolationSpec),
   /// Drilling.
   Drilling(DrillSpec),
+  /// Area clearing (paint) of a source region with a chosen fill strategy.
+  Paint(PaintSpec),
+  /// Non-copper clearing: paint everything within a boundary that is *not* copper.
+  NonCopper(NonCopperSpec),
+  /// Board cutout / profile routing with holding tabs.
+  Cutout(CutoutSpec),
+  /// Panelization: array a source object into a grid.
+  Panelize(PanelizeSpec),
+  /// Two-sided alignment: a mirror line plus registration holes.
+  TwoSided(TwoSidedSpec),
 }
 
 /// Operator-facing isolation parameters. Maps to [`IsolationParams`] via [`IsolationSpec::to_params`], which fills
@@ -323,6 +342,287 @@ impl From<DirectionSpec> for MillingDirection {
     match spec {
       DirectionSpec::Climb => MillingDirection::Climb,
       DirectionSpec::Conventional => MillingDirection::Conventional,
+    }
+  }
+}
+
+/// Operator-facing area-clearing (paint) parameters. Maps to [`PaintParams`] via [`PaintSpec::to_params`] (filling
+/// the round-join defaults) and to a boxed [`PaintStrategy`] via [`PaintSpec::strategy`]. The region to clear is the
+/// job's source object, not a field here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PaintSpec {
+  /// Clearing tool diameter (millimetres).
+  pub tool_diameter: f64,
+  /// Fraction each pass overlaps the previous, in `[0, 1)`.
+  pub overlap: f64,
+  /// Inset from the region boundary before filling (millimetres, `>= 0`).
+  pub margin: f64,
+  /// Climb vs conventional milling (sets the closed-ring winding).
+  pub direction: DirectionSpec,
+  /// Append a boundary-following finishing pass after the fill.
+  pub finish_pass: bool,
+  /// Which fill pattern to use.
+  pub strategy: PaintStrategySpec,
+}
+
+impl PaintSpec {
+  /// Expand to full [`PaintParams`], filling the corner-join style with the paint default (round joins).
+  pub fn to_params(&self) -> PaintParams {
+    PaintParams {
+      tool_diameter: self.tool_diameter,
+      overlap: self.overlap,
+      margin: self.margin,
+      direction: self.direction.into(),
+      finish_pass: self.finish_pass,
+      join: JoinType::Round,
+      miter_limit: 2.0,
+    }
+  }
+
+  /// The fill strategy as a boxed [`PaintStrategy`] trait object, ready to hand to [`eitri_cam::paint`].
+  pub fn strategy(&self) -> Box<dyn PaintStrategy> {
+    self.strategy.to_strategy()
+  }
+}
+
+/// The fill pattern for an area-clearing operation, mirroring `eitri-cam`'s [`PaintStrategy`] implementors.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PaintStrategySpec {
+  /// Inward-offset rings, emitted outer → inner.
+  Concentric,
+  /// The same rings emitted inner → outer, growing from a seed.
+  Seed,
+  /// Parallel scan-line (raster) fill at `angle_deg` from the X axis.
+  Raster {
+    /// Scan-line angle in degrees.
+    angle_deg: f64,
+  },
+}
+
+impl PaintStrategySpec {
+  /// Build the concrete boxed [`PaintStrategy`] this spec names.
+  pub fn to_strategy(&self) -> Box<dyn PaintStrategy> {
+    match self {
+      PaintStrategySpec::Concentric => Box::new(Concentric),
+      PaintStrategySpec::Seed => Box::new(Seed),
+      PaintStrategySpec::Raster { angle_deg } => Box::new(Raster::at_angle(*angle_deg)),
+    }
+  }
+}
+
+/// Operator-facing non-copper-clearing parameters: the boundary to clear within plus the paint pass that clears it.
+/// The copper being cleared is the job's source object; only an explicit boundary [`BoundarySpec::Region`] is owned
+/// geometry and serialized inline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NonCopperSpec {
+  /// How the outer frame that bounds the clearing is defined.
+  pub boundary: BoundarySpec,
+  /// The paint pass (strategy + tool) that clears the non-copper region.
+  pub paint: PaintSpec,
+}
+
+impl NonCopperSpec {
+  /// The clearing [`Boundary`] for `eitri-cam`.
+  pub fn to_boundary(&self) -> Boundary {
+    self.boundary.to_boundary()
+  }
+
+  /// The paint [`PaintParams`] for the clearing pass.
+  pub fn to_params(&self) -> PaintParams {
+    self.paint.to_params()
+  }
+
+  /// The paint [`PaintStrategy`] for the clearing pass.
+  pub fn strategy(&self) -> Box<dyn PaintStrategy> {
+    self.paint.strategy()
+  }
+}
+
+/// How a non-copper clearing's outer frame is defined, mirroring `eitri-cam`'s [`Boundary`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum BoundarySpec {
+  /// The copper bounding box expanded outward by `margin` millimetres on every side.
+  BoundingBox {
+    /// Outward expansion of the copper bounding box (millimetres, `>= 0`).
+    margin: f64,
+  },
+  /// An explicit boundary region the operator owns (a traced outline, a hull) — serialized inline.
+  Region(MultiPolygon<f64>),
+}
+
+impl BoundarySpec {
+  /// Map to `eitri-cam`'s [`Boundary`].
+  pub fn to_boundary(&self) -> Boundary {
+    match self {
+      BoundarySpec::BoundingBox { margin } => Boundary::BoundingBox { margin: *margin },
+      BoundarySpec::Region(region) => Boundary::Region(region.clone()),
+    }
+  }
+}
+
+/// Operator-facing cutout (board-profile) parameters. Maps to [`CutoutParams`] via [`CutoutSpec::to_params`] and to a
+/// [`CutoutOutline`] via [`CutoutSpec::to_outline`]. The outline is genuinely owned by the operation (an explicit
+/// rectangle, or a hand-drawn geometry) and is serialized inline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CutoutSpec {
+  /// Routing tool diameter (millimetres).
+  pub tool_diameter: f64,
+  /// Width of the uncut gap left at each tab (millimetres, `>= 0`).
+  pub tab_width: f64,
+  /// Tab placement around each cut ring.
+  pub tabs: TabPlacementSpec,
+  /// Extra outward offset beyond the tool radius (millimetres, `>= 0`).
+  pub margin: f64,
+  /// Climb vs conventional milling (sets the cut-ring winding).
+  pub direction: DirectionSpec,
+  /// The board outline to cut around.
+  pub outline: CutoutOutlineSpec,
+}
+
+impl CutoutSpec {
+  /// Expand to full [`CutoutParams`], filling the corner-join style with the cutout default (round joins).
+  pub fn to_params(&self) -> CutoutParams {
+    CutoutParams {
+      tool_diameter: self.tool_diameter,
+      tab_width: self.tab_width,
+      tabs: self.tabs.to_placement(),
+      margin: self.margin,
+      direction: self.direction.into(),
+      join: JoinType::Round,
+      miter_limit: 2.0,
+    }
+  }
+
+  /// The board [`CutoutOutline`] for `eitri-cam`.
+  pub fn to_outline(&self) -> CutoutOutline {
+    self.outline.to_outline()
+  }
+}
+
+/// Where holding tabs are placed around each cut ring, mirroring `eitri-cam`'s [`TabPlacement`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TabPlacementSpec {
+  /// `n` evenly-spaced tabs, the first centred at the ring start.
+  Count(usize),
+  /// Tabs centred at these fractions of the ring perimeter (each in `[0, 1)`).
+  AtFractions(Vec<f64>),
+}
+
+impl TabPlacementSpec {
+  /// Map to `eitri-cam`'s [`TabPlacement`].
+  pub fn to_placement(&self) -> TabPlacement {
+    match self {
+      TabPlacementSpec::Count(n) => TabPlacement::Count(*n),
+      TabPlacementSpec::AtFractions(fracs) => TabPlacement::AtFractions(fracs.clone()),
+    }
+  }
+}
+
+/// The board outline to cut around, mirroring `eitri-cam`'s [`CutoutOutline`]. The [`CutoutOutlineSpec::Geometry`]
+/// variant owns its silhouette and is serialized inline; rectangle corners are stored as `geo-types` [`Coord`]s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CutoutOutlineSpec {
+  /// A simple axis-aligned rectangle from `min` to `max` (millimetres).
+  Rectangle {
+    /// Lower-left corner.
+    min: Coord<f64>,
+    /// Upper-right corner.
+    max: Coord<f64>,
+  },
+  /// A geometry-derived outline; its merged silhouette exteriors are each cut.
+  Geometry(MultiPolygon<f64>),
+}
+
+impl CutoutOutlineSpec {
+  /// Map to `eitri-cam`'s [`CutoutOutline`], turning stored corners into cam [`Point`]s.
+  pub fn to_outline(&self) -> CutoutOutline {
+    match self {
+      CutoutOutlineSpec::Rectangle { min, max } => {
+        CutoutOutline::Rectangle { min: Point::new(min.x, min.y), max: Point::new(max.x, max.y) }
+      }
+      CutoutOutlineSpec::Geometry(geometry) => CutoutOutline::Geometry(geometry.clone()),
+    }
+  }
+}
+
+/// Operator-facing panelization parameters. Maps to [`PanelSpec`] via [`PanelizeSpec::to_params`]. The source object
+/// being arrayed is the job's source, not a field here.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PanelizeSpec {
+  /// Number of rows (Y direction); at least one.
+  pub rows: usize,
+  /// Number of columns (X direction); at least one.
+  pub cols: usize,
+  /// Horizontal spacing between columns.
+  pub x: SpacingSpec,
+  /// Vertical spacing between rows.
+  pub y: SpacingSpec,
+}
+
+impl PanelizeSpec {
+  /// Map to `eitri-cam`'s [`PanelSpec`].
+  pub fn to_params(&self) -> PanelSpec {
+    PanelSpec { rows: self.rows, cols: self.cols, x: self.x.into(), y: self.y.into() }
+  }
+}
+
+/// Grid spacing along one axis, mirroring `eitri-cam`'s [`Spacing`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SpacingSpec {
+  /// A clear band of this width (millimetres) between copies; the step is `source_extent + gap`.
+  Gap(f64),
+  /// The centre-to-centre step (millimetres) between copies, independent of the source extent.
+  Pitch(f64),
+}
+
+impl From<SpacingSpec> for Spacing {
+  fn from(spec: SpacingSpec) -> Spacing {
+    match spec {
+      SpacingSpec::Gap(g) => Spacing::Gap(g),
+      SpacingSpec::Pitch(p) => Spacing::Pitch(p),
+    }
+  }
+}
+
+/// Operator-facing two-sided-alignment parameters: the mirror line for the bottom layer plus the registration holes
+/// to drill on both faces. The base hole centres are owned by the operation and stored as `geo-types` [`Coord`]s.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TwoSidedSpec {
+  /// The axis the flip mirrors about.
+  pub mirror: MirrorLineSpec,
+  /// The registration-hole centres the operator placed (millimetres).
+  pub alignment_holes: Vec<Coord<f64>>,
+  /// Registration-drill diameter (millimetres).
+  pub hole_diameter: f64,
+}
+
+impl TwoSidedSpec {
+  /// The mirror line as `eitri-cam`'s [`MirrorLine`].
+  pub fn to_mirror_line(&self) -> MirrorLine {
+    self.mirror.to_mirror_line()
+  }
+
+  /// The alignment-hole centres as cam [`Point`]s, ready for [`eitri_cam::alignment_holes`].
+  pub fn alignment_hole_points(&self) -> Vec<Point> {
+    self.alignment_holes.iter().map(|c| Point::new(c.x, c.y)).collect()
+  }
+}
+
+/// The axis a two-sided flip mirrors about, mirroring `eitri-cam`'s [`MirrorLine`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MirrorLineSpec {
+  /// Reflect about the vertical line `x = value` (a left-right flip).
+  Vertical(f64),
+  /// Reflect about the horizontal line `y = value` (a top-bottom flip).
+  Horizontal(f64),
+}
+
+impl MirrorLineSpec {
+  /// Map to `eitri-cam`'s [`MirrorLine`].
+  pub fn to_mirror_line(&self) -> MirrorLine {
+    match self {
+      MirrorLineSpec::Vertical(x) => MirrorLine::Vertical(*x),
+      MirrorLineSpec::Horizontal(y) => MirrorLine::Horizontal(*y),
     }
   }
 }

@@ -2,15 +2,21 @@
 //!
 //! These exercise only the public API (black-box), which doubles as a check that the crate is ergonomic to drive.
 
+use eitri_cam::{
+  Boundary, CutoutOutline, CutoutParams, MillingDirection, MirrorLine, PanelSpec, PaintParams, Point, Spacing,
+  TabPlacement,
+};
 use eitri_core::{CancelToken, ProgressReporter, Unit};
 use eitri_gcode::{OutputFormat, Program};
+use eitri_geo::DefaultBackend;
 use eitri_project::{
-  CamOperation, CncJobObject, DirectionSpec, DrillDefaults, DrillSpec, ExcellonObject, GeometryObject,
-  GeometryOrigin, GerberObject, History, ImportFormat, IsolationDefaults, IsolationSpec, ObjectKind, ObjectMeta,
-  ObjectPayload, Project, ProjectError, ToolDatabase, ToolEntry, load_project, load_tool_db, save_project,
-  save_tool_db,
+  BoundarySpec, CamOperation, CncJobObject, CutoutOutlineSpec, CutoutSpec, DirectionSpec, DrillDefaults, DrillSpec,
+  ExcellonObject, GeometryObject, GeometryOrigin, GerberObject, History, ImportFormat, IsolationDefaults,
+  IsolationSpec, MirrorLineSpec, NonCopperSpec, ObjectKind, ObjectMeta, ObjectPayload, PaintSpec, PaintStrategySpec,
+  PanelizeSpec, Project, ProjectError, SpacingSpec, TabPlacementSpec, ToolDatabase, ToolEntry, TwoSidedSpec,
+  load_project, load_tool_db, save_project, save_tool_db,
 };
-use geo_types::{LineString, Polygon};
+use geo_types::{Coord, LineString, MultiPolygon, Polygon};
 
 // A tiny real Gerber and Excellon, embedded from the live fixture corpus so hydration re-parses the same bytes the
 // dedicated parser tests use.
@@ -346,4 +352,209 @@ fn drill_spec_maps_peck_and_dwell() {
 
 fn empty_geo() -> GeometryObject {
   GeometryObject { polygons: Vec::new(), polylines: Vec::new(), origin: GeometryOrigin::Generated }
+}
+
+// --- Phase-7 CAM-operation coverage (paint / non-copper / cutout / panelize / two-sided) -----------------------------
+
+/// A rectangular `MultiPolygon` used where a spec genuinely owns a region (non-copper frame, geometry outline).
+fn rect_region(x0: f64, y0: f64, x1: f64, y1: f64) -> MultiPolygon<f64> {
+  let ring = LineString::from(vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]);
+  MultiPolygon::new(vec![Polygon::new(ring, vec![])])
+}
+
+fn paint_spec() -> PaintSpec {
+  PaintSpec {
+    tool_diameter: 1.0,
+    overlap: 0.25,
+    margin: 0.5,
+    direction: DirectionSpec::Climb,
+    finish_pass: true,
+    strategy: PaintStrategySpec::Raster { angle_deg: 30.0 },
+  }
+}
+
+fn paint_op() -> CamOperation {
+  CamOperation::Paint(paint_spec())
+}
+
+fn noncopper_op() -> CamOperation {
+  CamOperation::NonCopper(NonCopperSpec {
+    boundary: BoundarySpec::Region(rect_region(-1.0, -1.0, 11.0, 11.0)),
+    paint: PaintSpec {
+      tool_diameter: 0.8,
+      overlap: 0.3,
+      margin: 0.0,
+      direction: DirectionSpec::Conventional,
+      finish_pass: false,
+      strategy: PaintStrategySpec::Concentric,
+    },
+  })
+}
+
+fn cutout_op() -> CamOperation {
+  CamOperation::Cutout(CutoutSpec {
+    tool_diameter: 2.0,
+    tab_width: 3.0,
+    tabs: TabPlacementSpec::AtFractions(vec![0.0, 0.25, 0.5, 0.75]),
+    margin: 0.5,
+    direction: DirectionSpec::Conventional,
+    outline: CutoutOutlineSpec::Geometry(rect_region(0.0, 0.0, 30.0, 20.0)),
+  })
+}
+
+fn panelize_op() -> CamOperation {
+  CamOperation::Panelize(PanelizeSpec {
+    rows: 2,
+    cols: 3,
+    x: SpacingSpec::Gap(4.0),
+    y: SpacingSpec::Pitch(25.0),
+  })
+}
+
+fn twosided_op() -> CamOperation {
+  CamOperation::TwoSided(TwoSidedSpec {
+    mirror: MirrorLineSpec::Vertical(15.0),
+    alignment_holes: vec![Coord { x: 2.0, y: 3.0 }, Coord { x: 28.0, y: 3.0 }],
+    hole_diameter: 3.2,
+  })
+}
+
+/// Build a project whose collection holds one CNC job per new CAM-operation kind, so a lossless round trip proves all
+/// five variants (and the geometry they own) survive persistence.
+fn every_op_project() -> Project {
+  let mut project = Project::new("ops");
+  for (name, op) in [
+    ("paint", paint_op()),
+    ("noncopper", noncopper_op()),
+    ("cutout", cutout_op()),
+    ("panelize", panelize_op()),
+    ("twosided", twosided_op()),
+  ] {
+    project
+      .collection
+      .add(
+        ObjectMeta::new(name, Unit::Millimeters),
+        ObjectPayload::CncJob(CncJobObject {
+          gcode: std::sync::Arc::from(vec!["G21".to_string(), "M2".to_string()]),
+          dialect: "grblHAL".to_string(),
+          source: None,
+          operation: op,
+        }),
+      )
+      .expect("add cncjob");
+  }
+  project
+}
+
+fn loaded_operation(project: &Project, name: &str) -> CamOperation {
+  match &project.collection.by_name(name).unwrap().payload {
+    ObjectPayload::CncJob(job) => job.operation.clone(),
+    _ => panic!("expected a cncjob for {name}"),
+  }
+}
+
+#[test]
+fn every_new_cam_operation_round_trips_losslessly() {
+  let project = every_op_project();
+  let json = save_project(&project).unwrap();
+  let loaded = load_project(&json).unwrap();
+
+  assert_eq!(loaded.collection.len(), 5, "one job per new operation kind");
+  assert_eq!(loaded_operation(&loaded, "paint"), paint_op());
+  assert_eq!(loaded_operation(&loaded, "noncopper"), noncopper_op());
+  assert_eq!(loaded_operation(&loaded, "cutout"), cutout_op());
+  assert_eq!(loaded_operation(&loaded, "panelize"), panelize_op());
+  assert_eq!(loaded_operation(&loaded, "twosided"), twosided_op());
+}
+
+#[test]
+fn paint_spec_maps_to_paint_params_and_strategy() {
+  let spec = paint_spec();
+  assert_eq!(
+    spec.to_params(),
+    PaintParams {
+      tool_diameter: 1.0,
+      overlap: 0.25,
+      margin: 0.5,
+      direction: MillingDirection::Climb,
+      finish_pass: true,
+      join: eitri_geo::JoinType::Round,
+      miter_limit: 2.0,
+    }
+  );
+  // The Raster strategy fills a solid square with at least one open row; Concentric yields only closed rings.
+  let region = rect_region(0.0, 0.0, 10.0, 10.0);
+  let (progress, cancel) = (ProgressReporter::silent(), CancelToken::new());
+  let raster = spec.strategy();
+  let filled = eitri_cam::paint(&region, &spec.to_params(), raster.as_ref(), &DefaultBackend::new(), &progress, &cancel)
+    .expect("raster paint");
+  assert!(filled.paths.iter().any(|p| !p.is_closed()), "raster strategy produces open rows");
+
+  let concentric = PaintStrategySpec::Concentric.to_strategy();
+  let rings = eitri_cam::paint(
+    &region,
+    &PaintParams { finish_pass: false, ..spec.to_params() },
+    concentric.as_ref(),
+    &DefaultBackend::new(),
+    &progress,
+    &cancel,
+  )
+  .expect("concentric paint");
+  assert!(rings.paths.iter().all(|p| p.is_closed()), "concentric strategy produces only closed rings");
+}
+
+#[test]
+fn noncopper_spec_maps_to_boundary_and_paint_params() {
+  let CamOperation::NonCopper(spec) = noncopper_op() else { panic!("expected non-copper") };
+  assert_eq!(spec.to_boundary(), Boundary::Region(rect_region(-1.0, -1.0, 11.0, 11.0)));
+  assert_eq!(spec.to_params().tool_diameter, 0.8);
+  assert_eq!(spec.to_params().direction, MillingDirection::Conventional);
+
+  // The bounding-box boundary variant maps across too.
+  let bbox = BoundarySpec::BoundingBox { margin: 4.0 };
+  assert_eq!(bbox.to_boundary(), Boundary::BoundingBox { margin: 4.0 });
+}
+
+#[test]
+fn cutout_spec_maps_to_params_and_outline() {
+  let CamOperation::Cutout(spec) = cutout_op() else { panic!("expected cutout") };
+  assert_eq!(
+    spec.to_params(),
+    CutoutParams {
+      tool_diameter: 2.0,
+      tab_width: 3.0,
+      tabs: TabPlacement::AtFractions(vec![0.0, 0.25, 0.5, 0.75]),
+      margin: 0.5,
+      direction: MillingDirection::Conventional,
+      join: eitri_geo::JoinType::Round,
+      miter_limit: 2.0,
+    }
+  );
+  assert_eq!(spec.to_outline(), CutoutOutline::Geometry(rect_region(0.0, 0.0, 30.0, 20.0)));
+
+  // The rectangle outline variant maps its owned corners into cam Points.
+  let rect = CutoutOutlineSpec::Rectangle { min: Coord { x: 1.0, y: 2.0 }, max: Coord { x: 9.0, y: 8.0 } };
+  assert_eq!(
+    rect.to_outline(),
+    CutoutOutline::Rectangle { min: Point::new(1.0, 2.0), max: Point::new(9.0, 8.0) }
+  );
+}
+
+#[test]
+fn panelize_spec_maps_gap_and_pitch() {
+  let CamOperation::Panelize(spec) = panelize_op() else { panic!("expected panelize") };
+  assert_eq!(
+    spec.to_params(),
+    PanelSpec { rows: 2, cols: 3, x: Spacing::Gap(4.0), y: Spacing::Pitch(25.0) }
+  );
+}
+
+#[test]
+fn twosided_spec_maps_mirror_line_and_alignment_holes() {
+  let CamOperation::TwoSided(spec) = twosided_op() else { panic!("expected two-sided") };
+  assert_eq!(spec.to_mirror_line(), MirrorLine::Vertical(15.0));
+  assert_eq!(spec.alignment_hole_points(), vec![Point::new(2.0, 3.0), Point::new(28.0, 3.0)]);
+
+  let horizontal = MirrorLineSpec::Horizontal(7.5);
+  assert_eq!(horizontal.to_mirror_line(), MirrorLine::Horizontal(7.5));
 }

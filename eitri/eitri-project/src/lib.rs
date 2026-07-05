@@ -36,8 +36,10 @@ pub use error::{ProjectError, Result};
 pub use history::{DEFAULT_HISTORY_LIMIT, History};
 pub use id::{ObjectId, ToolId};
 pub use object::{
-  CamOperation, CncJobObject, DirectionSpec, DrillSpec, ExcellonObject, GeometryObject, GeometryOrigin,
-  GerberObject, ImportFormat, IsolationSpec, Object, ObjectKind, ObjectMeta, ObjectPayload,
+  BoundarySpec, CamOperation, CncJobObject, CutoutOutlineSpec, CutoutSpec, DirectionSpec, DrillSpec, ExcellonObject,
+  GeometryObject, GeometryOrigin, GerberObject, ImportFormat, IsolationSpec, MirrorLineSpec, NonCopperSpec, Object,
+  ObjectKind, ObjectMeta, ObjectPayload, PaintSpec, PaintStrategySpec, PanelizeSpec, SpacingSpec, TabPlacementSpec,
+  TwoSidedSpec,
 };
 pub use project::Project;
 pub use tooldb::{
