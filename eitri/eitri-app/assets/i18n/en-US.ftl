@@ -211,3 +211,20 @@ theme-group-text = Text
 theme-group-status = Status
 theme-group-canvas = Canvas
 theme-group-other = Other
+
+# ── Tool database ───────────────────────────────────────────────────────────────────────────────────────
+btn-tools = Tools
+tip-tools = Manage the tool library
+tool-db-title = Tool Database
+tool-db-empty = No tools yet. Add one to build your library.
+tool-db-add = Add tool
+tool-db-remove = Remove tool
+tool-db-save-hint = Write the tool library to disk
+tool-db-select = Select a tool to edit it.
+tool-db-name = Name
+tool-db-diameter = Diameter (mm)
+tool-db-iso-defaults = Isolation defaults
+tool-db-drill-defaults = Drill defaults
+tool-db-new-name = new tool
+btn-seed-tool = Seed from tool
+seed-tool-hint = pick a tool…

@@ -16,7 +16,7 @@ use super::view_state::{LogKind, OpView, ViewState};
 use crate::config::CanvasStyle;
 use crate::tr;
 use eitri_gcode::{DrillJob, IsolationJob};
-use eitri_project::{DirectionSpec, DrillSpec, IsolationSpec, ObjectId, ObjectKind};
+use eitri_project::{DirectionSpec, DrillSpec, IsolationSpec, ObjectId, ObjectKind, ToolId};
 
 /// The resolved presentation style threaded into every view: the active palette plus the canvas render knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -256,6 +256,13 @@ pub struct UiState {
   pub app_settings_open: bool,
   /// The new-theme name field in the settings dialog.
   pub theme_name_draft: String,
+  /// Whether the tool-database dialog is open.
+  pub tool_db_open: bool,
+  /// The tool selected for editing in the tool-database dialog, if any.
+  pub tool_db_selected: Option<ToolId>,
+  /// A snapshot of the tool library as `(id, name)` pairs, rebuilt by the shell whenever the library changes —
+  /// what the parameter panels' seed-from-tool combos read (the dialog itself reads the live database).
+  pub tool_list: Vec<(ToolId, String)>,
   /// The world position under the canvas pointer, for the status-bar readout.
   pub cursor_world: Option<[f64; 2]>,
   /// The in-progress inline tree rename: the object being renamed and the name draft.
@@ -367,11 +374,14 @@ pub fn toolbar(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &
       sink.push(Intent::ZoomFit);
     }
 
-    // The right cluster: the settings gear.
+    // The right cluster: the tool library and the settings gear.
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
       ui.add_space(Metrics::TOOLBAR_PAD_X - Metrics::TOOLBAR_GAP);
       if ui.button(RichText::new("⚙").size(15.0)).on_hover_text(tr!("tip-settings")).clicked() {
         sink.push(Intent::OpenAppSettings);
+      }
+      if ui.button(tr!("btn-tools")).on_hover_text(tr!("tip-tools")).clicked() {
+        sink.push(Intent::OpenToolDb);
       }
     });
   });
@@ -708,6 +718,7 @@ fn isolation_section(ui: &mut egui::Ui, palette: Palette, state: &mut UiState, b
     param_row(ui, palette, &tr!("params-travel-z"), &mut state.iso.travel_z, 0.1, 0.1..=50.0);
     param_row(ui, palette, &tr!("params-spindle-rpm"), &mut state.iso.spindle_rpm, 100.0, 0.0..=60000.0);
   });
+  seed_from_tool(ui, palette, state, "iso-seed", Intent::SeedIsolationFromTool, sink);
   ui.add_space(8.0);
   run_button(ui, palette, busy, &tr!("btn-run-isolation"), &tr!("tip-run-isolation"), || Intent::RunIsolate(id), sink);
 }
@@ -987,6 +998,7 @@ fn drill_section(ui: &mut egui::Ui, palette: Palette, state: &mut UiState, busy:
     param_row(ui, palette, &tr!("params-travel-z"), &mut state.drill.travel_z, 0.1, 0.1..=50.0);
     param_row(ui, palette, &tr!("params-spindle-rpm"), &mut state.drill.spindle_rpm, 100.0, 0.0..=60000.0);
   });
+  seed_from_tool(ui, palette, state, "drill-seed", Intent::SeedDrillFromTool, sink);
   ui.add_space(8.0);
   run_button(ui, palette, busy, &tr!("btn-run-drill"), &tr!("tip-run-drill"), || Intent::RunDrill(id), sink);
 }
@@ -1013,6 +1025,26 @@ fn section_title(palette: Palette, title: &str) -> RichText {
     .strong()
     .color(palette.text_dim)
     .extra_letter_spacing(Metrics::HEADER_TEXT * Metrics::HEADER_TRACKING_EM)
+}
+
+/// The seed-from-tool combo appended to the isolation/drill blocks: picking a tool pushes a seed intent the
+/// shell applies to the drafts. Hidden when the library is empty (nothing to seed from).
+fn seed_from_tool(ui: &mut egui::Ui, palette: Palette, state: &UiState, salt: &str, make: fn(ToolId) -> Intent,
+  sink: &mut IntentSink) {
+  if state.tool_list.is_empty() {
+    return;
+  }
+  ui.add_space(6.0);
+  ui.horizontal(|ui| {
+    ui.label(RichText::new(tr!("btn-seed-tool")).size(11.5).color(palette.text_dim));
+    egui::ComboBox::from_id_salt(salt).width(150.0).selected_text(tr!("seed-tool-hint")).show_ui(ui, |ui| {
+      for (id, name) in &state.tool_list {
+        if ui.selectable_label(false, name).clicked() {
+          sink.push(make(*id));
+        }
+      }
+    });
+  });
 }
 
 /// The accent-filled Run button, disabled while an op is in flight.

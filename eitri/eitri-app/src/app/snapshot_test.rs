@@ -208,6 +208,51 @@ fn snapshot_app_settings_user_theme_2x() {
   snapshot_settings("app_settings_user_theme_2x", config, crate::i18n::EN_US);
 }
 
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p eitri-app -- --ignored snapshot`"]
+fn snapshot_tool_db_2x() {
+  // The tool-database dialog with a small library and one tool selected: the action row, the selectable list,
+  // and the identity + isolation + drill editor grids. 2× density for glyph/spacing review.
+  use eitri_core::Length;
+  use eitri_project::{DrillDefaults, IsolationDefaults, ToolDatabase, ToolEntry, ToolId};
+
+  let mut db = ToolDatabase::new();
+  db.add(ToolEntry {
+    id: ToolId(0),
+    name: "0.2mm V-bit".to_string(),
+    diameter: Length::from_mm(0.2),
+    isolation: IsolationDefaults::default(),
+    drilling: DrillDefaults::default(),
+  });
+  let edit_id = db.add(ToolEntry {
+    id: ToolId(0),
+    name: "0.8mm drill".to_string(),
+    diameter: Length::from_mm(0.8),
+    isolation: IsolationDefaults::default(),
+    drilling: DrillDefaults::default(),
+  });
+
+  let _locale = render_in(crate::i18n::EN_US);
+  let ui_state = UiState { tool_db_selected: Some(edit_id), ..UiState::default() };
+  let palette = ui_state.style.palette;
+  let state = HarnessState::new(ViewState::default(), ui_state);
+  let mut harness = egui_kittest::Harness::builder()
+    .with_size(egui::vec2(440.0, 640.0))
+    .with_pixels_per_point(2.0)
+    .build_ui_state(
+      move |ui, state: &mut HarnessState| {
+        let mut sink = super::intent::IntentSink::new();
+        super::tool_db::body(ui, &mut state.ui, &db, true, &mut sink);
+        state.intents.extend(sink.drain());
+      },
+      state,
+    );
+  super::fonts::install(&harness.ctx);
+  super::shell::apply_theme(&harness.ctx, &palette, 1.0);
+  harness.run_steps(2);
+  harness.snapshot("tool_db_2x");
+}
+
 /// Render the settings dialog BODY at 2× density against a given config (the floating window chrome is
 /// egui-standard; the body carries our layout).
 fn snapshot_settings(name: &str, config: crate::config::Config, locale: &str) {

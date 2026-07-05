@@ -25,6 +25,7 @@ pub mod ops;
 pub mod scene;
 pub mod shell;
 pub mod theme;
+pub mod tool_db;
 pub mod view_state;
 pub mod views;
 

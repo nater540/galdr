@@ -3,7 +3,7 @@
 //! skirnir's intent layer: egui-free, so the vocabulary and the sink are host-testable, and no view ever
 //! mutates the session or the config directly.
 
-use eitri_project::ObjectId;
+use eitri_project::{ObjectId, ToolEntry, ToolId};
 
 use crate::config::ThemeOverride;
 
@@ -84,6 +84,22 @@ pub enum Intent {
   },
   /// Write the in-memory config to disk (the explicit Save boundary).
   SaveConfig,
+
+  // ── Tool database ──────────────────────────────────────────────────────────────────────────────────────
+  /// Open the tool-database dialog.
+  OpenToolDb,
+  /// Add a new default tool to the library (the shell selects it for editing).
+  AddTool,
+  /// Replace a tool's entry in the library with the dialog's edited copy.
+  UpdateTool(ToolId, ToolEntry),
+  /// Remove a tool from the library.
+  RemoveTool(ToolId),
+  /// Persist the tool library to disk (the explicit Save boundary).
+  SaveToolDb,
+  /// Seed the isolation parameter drafts from a tool's isolation defaults.
+  SeedIsolationFromTool(ToolId),
+  /// Seed the drilling parameter drafts from a tool's drill defaults.
+  SeedDrillFromTool(ToolId),
 }
 
 /// The per-frame collector views push into. Drained by the shell after the frame is built.

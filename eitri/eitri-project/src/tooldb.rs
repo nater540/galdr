@@ -91,7 +91,7 @@ impl ToolDatabase {
 }
 
 /// A single tool: a diameter plus per-operation default bundles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolEntry {
   /// Stable id assigned by the owning [`ToolDatabase`].
   pub id: ToolId,

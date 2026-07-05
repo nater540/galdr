@@ -210,3 +210,20 @@ theme-group-text = Text
 theme-group-status = Status
 theme-group-canvas = Arbetsyta
 theme-group-other = Övrigt
+
+# ── Verktygsdatabas ─────────────────────────────────────────────────────────────────────────────────────
+btn-tools = Verktyg
+tip-tools = Hantera verktygsbiblioteket
+tool-db-title = Verktygsdatabas
+tool-db-empty = Inga verktyg ännu. Lägg till ett för att bygga biblioteket.
+tool-db-add = Lägg till verktyg
+tool-db-remove = Ta bort verktyg
+tool-db-save-hint = Skriv verktygsbiblioteket till disk
+tool-db-select = Välj ett verktyg för att redigera det.
+tool-db-name = Namn
+tool-db-diameter = Diameter (mm)
+tool-db-iso-defaults = Isolationsstandard
+tool-db-drill-defaults = Borrstandard
+tool-db-new-name = nytt verktyg
+btn-seed-tool = Hämta från verktyg
+seed-tool-hint = välj ett verktyg…

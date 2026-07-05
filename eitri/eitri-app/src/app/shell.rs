@@ -21,7 +21,7 @@ use super::views::{self, RuntimeStyle, SelectedInfo, UiState};
 use crate::config::Config;
 use crate::tr;
 use eitri_core::ProgressEvent;
-use eitri_project::{ObjectId, ObjectPayload};
+use eitri_project::{DirectionSpec, ObjectId, ObjectPayload, ToolDatabase};
 use eitri_script::Session;
 
 /// The most G-code lines the dock preview keeps (a full job can run to hundreds of thousands; the preview is
@@ -47,11 +47,16 @@ pub struct EitriApp {
   config: Config,
   /// Whether the in-memory config differs from disk (drives the settings dialog's Save row).
   config_dirty: bool,
+  /// The user-global tool library (persisted separately from any project).
+  tool_db: ToolDatabase,
+  /// Whether the in-memory tool library differs from disk (drives the tool-DB dialog's Save row).
+  tool_db_dirty: bool,
 }
 
 impl EitriApp {
   /// Build the app around a fresh session, applying the config's appearance and logging any load notices.
   pub fn new(config: Config, notices: Vec<String>) -> Self {
+    let (tool_db, tool_notice) = crate::tool_store::load();
     let mut app = EitriApp {
       slot: SessionSlot::Home(Session::new(UNTITLED)),
       view: ViewState::default(),
@@ -60,13 +65,24 @@ impl EitriApp {
       split: CentralSplit::new(config.ui.dock_fraction),
       config,
       config_dirty: false,
+      tool_db,
+      tool_db_dirty: false,
     };
     apply_appearance(&mut app.ui, &app.config);
     for notice in notices {
       app.view.log_line(LogKind::Warn, notice);
     }
+    if let Some(notice) = tool_notice {
+      app.view.log_line(LogKind::Warn, notice);
+    }
+    app.refresh_tool_list();
     app.refresh_from_session();
     app
+  }
+
+  /// Rebuild the seed-from-tool snapshot the parameter panels read, after any change to the library.
+  fn refresh_tool_list(&mut self) {
+    self.ui.tool_list = self.tool_db.iter().map(|tool| (tool.id, tool.name.clone())).collect();
   }
 
   /// Rebuild everything derived from the session — the tree snapshot, the scene, the selection extras. Called
@@ -325,6 +341,52 @@ impl EitriApp {
         }
         Err(reason) => self.view.log_line(LogKind::Error, reason),
       },
+
+      Intent::OpenToolDb => self.ui.tool_db_open = true,
+      Intent::AddTool => {
+        let id = self.tool_db.add(super::tool_db::default_entry(tr!("tool-db-new-name")));
+        self.ui.tool_db_selected = Some(id);
+        self.tool_db_dirty = true;
+        self.refresh_tool_list();
+      }
+      Intent::UpdateTool(id, entry) => {
+        self.tool_db.update(id, entry);
+        self.tool_db_dirty = true;
+        self.refresh_tool_list();
+      }
+      Intent::RemoveTool(id) => {
+        self.tool_db.remove(id);
+        if self.ui.tool_db_selected == Some(id) {
+          self.ui.tool_db_selected = None;
+        }
+        self.tool_db_dirty = true;
+        self.refresh_tool_list();
+      }
+      Intent::SaveToolDb => match crate::tool_store::save(&self.tool_db) {
+        Ok(()) => {
+          self.tool_db_dirty = false;
+          if let Some(path) = crate::tool_store::path() {
+            self.view.log_line(LogKind::Ok, tr!("export-done", { path: path.display().to_string() }));
+          }
+        }
+        Err(reason) => self.view.log_line(LogKind::Error, reason),
+      },
+      Intent::SeedIsolationFromTool(id) => {
+        if let Some(spec) = self.tool_db.get(id).map(|tool| tool.isolation_spec()) {
+          self.ui.iso.tool_diameter = spec.tool_diameter;
+          self.ui.iso.passes = spec.passes;
+          self.ui.iso.overlap = spec.overlap;
+          self.ui.iso.combine = spec.combine;
+          self.ui.iso.climb = spec.direction == DirectionSpec::Climb;
+        }
+      }
+      Intent::SeedDrillFromTool(id) => {
+        if let Some(spec) = self.tool_db.get(id).map(|tool| tool.drill_spec()) {
+          self.ui.drill.depth = spec.depth;
+          self.ui.drill.feed = spec.feed;
+          self.ui.drill.retract = spec.retract;
+        }
+      }
     }
   }
 
@@ -521,6 +583,9 @@ impl eframe::App for EitriApp {
     shell_panels(ui, &self.scene, &self.view, &mut self.ui, &mut self.split, &mut sink);
     if self.ui.app_settings_open {
       super::app_settings::window(ui.ctx(), &mut self.ui, &self.config, self.config_dirty, &mut sink);
+    }
+    if self.ui.tool_db_open {
+      super::tool_db::window(ui.ctx(), &mut self.ui, &self.tool_db, self.tool_db_dirty, &mut sink);
     }
 
     // 3. Act on the intents after layout, so a view never mutates app state mid-render.
@@ -829,5 +894,41 @@ mod tests {
     let ctx = egui::Context::default();
     app.handle_intent(&ctx, Intent::ZoomFit);
     assert!(app.ui.pending_fit, "fit is consumed by the canvas when the real rect is known");
+  }
+
+  #[test]
+  fn tool_db_add_edit_and_seed_round_trip_through_intents() {
+    let (mut app, _) = app_with_gerber();
+    let ctx = egui::Context::default();
+    assert!(app.tool_db.is_empty() && app.ui.tool_list.is_empty());
+
+    // Add: a new tool lands in the library, is selected for editing, marks the library dirty, and refreshes the
+    // seed snapshot the panels read.
+    app.handle_intent(&ctx, Intent::AddTool);
+    assert_eq!(app.tool_db.len(), 1, "the tool is added");
+    assert!(app.tool_db_dirty, "the library is now unsaved");
+    assert_eq!(app.ui.tool_list.len(), 1, "the seed snapshot tracks the library");
+    let tool_id = app.ui.tool_db_selected.expect("the new tool is selected for editing");
+
+    // Edit: a whole-entry update replaces the tool in place.
+    let mut entry = app.tool_db.get(tool_id).cloned().expect("the tool exists");
+    entry.diameter = eitri_core::Length::from_mm(0.5);
+    entry.isolation.passes = 3;
+    entry.drilling.depth = -2.4;
+    app.handle_intent(&ctx, Intent::UpdateTool(tool_id, entry));
+    assert!((app.tool_db.get(tool_id).unwrap().diameter.as_mm() - 0.5).abs() < 1e-9, "the edit lands");
+
+    // Seed: the isolation and drill drafts pick up the tool's defaults.
+    app.handle_intent(&ctx, Intent::SeedIsolationFromTool(tool_id));
+    assert!((app.ui.iso.tool_diameter - 0.5).abs() < 1e-9, "the diameter seeds the isolation draft");
+    assert_eq!(app.ui.iso.passes, 3, "the passes seed too");
+    app.handle_intent(&ctx, Intent::SeedDrillFromTool(tool_id));
+    assert!((app.ui.drill.depth - (-2.4)).abs() < 1e-9, "the drill depth seeds from the tool");
+
+    // Remove: the tool leaves the library and its selection clears.
+    app.handle_intent(&ctx, Intent::RemoveTool(tool_id));
+    assert!(app.tool_db.is_empty(), "the tool is removed");
+    assert_eq!(app.ui.tool_db_selected, None, "the vanished selection clears");
+    assert!(app.ui.tool_list.is_empty(), "the seed snapshot empties with it");
   }
 }
