@@ -16,12 +16,27 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cutout;
 pub mod drill;
+pub mod edit;
+pub mod film;
 pub mod isolation;
+pub mod noncopper;
 pub mod optimize;
+pub mod paint;
+pub mod panelize;
+pub mod twosided;
 
 pub use drill::{DrillConfig, DrillMove, DrillParams, DrillPlan, ToolDrillPlan, plan_drilling};
 pub use isolation::{
   IsolationParams, IsolationRing, IsolationToolpaths, MillingDirection, RingPath, isolate, isolate_arc,
 };
 pub use optimize::{NearestNeighbor, Point, Routed, Stop, TravelOptimizer, TwoOpt, order_stops, tour_travel};
+pub use cutout::{CutoutOutline, CutoutParams, CutoutResult, TabPlacement, cutout};
+pub use film::{FilmKind, FilmParams, film_svg};
+pub use noncopper::{Boundary, clear_noncopper, clear_region};
+pub use paint::{
+  Concentric, PaintParams, PaintResult, PaintStrategy, Raster, Seed, order_paths, paint,
+};
+pub use panelize::{PanelSpec, Spacing, panel_offsets, panelize_multipolygon, panelize_points};
+pub use twosided::{MirrorLine, alignment_holes, mirror_multipolygon, mirror_points};

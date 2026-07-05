@@ -21,6 +21,8 @@ pub mod arc;
 pub mod buffer;
 pub mod flatten;
 pub mod interior;
+pub mod region;
+pub mod transform;
 pub mod winding;
 
 #[cfg(feature = "geos")]
@@ -35,6 +37,8 @@ pub use buffer::{CapStyle, buffer_path};
 pub use default_backend::DefaultBackend;
 pub use flatten::{arc_segment_count, circle_polygon};
 pub use interior::ring_interior_point;
+pub use region::{bounds, clip_lines, contains_point};
+pub use transform::{apply_affine, apply_affine_polygon};
 
 #[cfg(feature = "geos")]
 pub use geos_backend::GeosBackend;

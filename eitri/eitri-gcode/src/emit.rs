@@ -95,24 +95,38 @@ pub enum Segment {
   },
 }
 
-/// A closed cut ring reduced to a start point and an ordered list of segments that return to the start. Implemented
-/// for both ring flavours so [`emit_isolation`] is generic over linear and arc-preserving toolpaths.
+/// A cut path reduced to a start point and an ordered list of segments. For a **closed** ring the segments return
+/// to the start (isolation rings, concentric/seed paint rings); for an **open** path they end elsewhere (raster
+/// paint passes, cutout arcs between tabs). [`is_closed`](CutRing::is_closed) tells the emitter which, so multi-depth
+/// passes plunge in place on a closed ring but lift and return to the start on an open one. Implemented for both
+/// ring flavours so [`emit_isolation`] is generic over linear and arc-preserving toolpaths.
 pub trait CutRing {
-  /// The ring's start point `(x, y)` — where the tool plunges before cutting.
+  /// The path's start point `(x, y)` — where the tool plunges before cutting.
   fn start(&self) -> (f64, f64);
 
-  /// The ordered segments cutting once around the ring and back to the start.
+  /// The ordered segments cutting along the path; for a closed ring they return to the start.
   fn segments(&self) -> Vec<Segment>;
+
+  /// Whether the path is closed (its last cut point coincides with [`start`](CutRing::start)). Closed paths let a
+  /// multi-depth cut plunge straight down between passes; open paths must lift and rapid back to the start first.
+  fn is_closed(&self) -> bool;
 }
 
 impl CutRing for RingPath {
   fn start(&self) -> (f64, f64) {
-    self.points.first().map(|p| (p.x, p.y)).unwrap_or((0.0, 0.0))
+    let p = RingPath::start(self);
+    (p.x, p.y)
   }
 
   fn segments(&self) -> Vec<Segment> {
-    // The ring is closed (first == last), so cutting to each subsequent point returns to the start.
+    // Cut to each subsequent point in turn; on a closed ring (first == last) this returns to the start, on an open
+    // path it ends at the final vertex.
     self.points.iter().skip(1).map(|p| Segment::Line { x: p.x, y: p.y }).collect()
+  }
+
+  fn is_closed(&self) -> bool {
+    // Delegate to the inherent closed-ness test the CAM crate owns, so the convention has one definition.
+    RingPath::is_closed(self)
   }
 }
 
@@ -133,6 +147,11 @@ impl CutRing for ArcPolyline {
       }
     }
     segs
+  }
+
+  fn is_closed(&self) -> bool {
+    // Arc polylines model closed offset rings — `segments` wraps the last vertex back to the first.
+    true
   }
 }
 
@@ -172,10 +191,17 @@ pub fn emit_isolation<G: CutRing>(
     for ring in &toolpaths.rings {
       let (sx, sy) = ring.geometry.start();
       let segments = ring.geometry.segments();
+      let closed = ring.geometry.is_closed();
       post.rapid(&mut prog, Axes::xy(sx, sy));
-      for &z in &depths {
-        // Plunge straight down at the ring start, then cut once around; a closed ring returns here for the next
-        // deeper pass.
+      for (pass, &z) in depths.iter().enumerate() {
+        // A closed ring ends each pass back at its start, so the next deeper pass just plunges in place. An open
+        // path (a raster fill row, a cutout arc between tabs) ends elsewhere, so lift and rapid back to the start
+        // before plunging again — never drag the tool through material back to the start. The first pass always
+        // plunges in place: the rapid to the start already put the tool there.
+        if pass > 0 && !closed {
+          post.rapid(&mut prog, Axes::z(job.travel_z));
+          post.rapid(&mut prog, Axes::xy(sx, sy));
+        }
         post.linear(&mut prog, Axes::z(z), job.plunge_feed);
         emit_ring_segments(&mut prog, post, &segments, job.cut_feed);
       }
@@ -353,6 +379,41 @@ mod tests {
         assert!(!line.contains('F'), "rapid must not carry F: {line}");
       }
     }
+  }
+
+  #[test]
+  fn closed_ring_is_detected_open_path_is_not() {
+    assert!(square_ring().is_closed(), "a ring whose first == last is closed");
+    let open = RingPath { points: vec![Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, 10.0)] };
+    assert!(!open.is_closed(), "a path whose endpoints differ is open");
+  }
+
+  #[test]
+  fn open_path_multi_depth_lifts_and_returns_to_start_between_passes() {
+    // An open three-point path cut in three depth passes. Each pass must plunge at the same start, so there is one
+    // rapid to the start XY per pass (initial + a return before passes 2 and 3), and a plunge per pass.
+    let open = RingPath { points: vec![Point::new(0.0, 0.0), Point::new(10.0, 0.0), Point::new(10.0, 10.0)] };
+    let paths = IsolationToolpaths {
+      rings: vec![IsolationRing { pass: 0, offset: 0.0, winding: WindingDirection::Ccw, geometry: open }],
+    };
+    let job = IsolationJob { cut_depth: 0.3, pass_depth: 0.1, ..Default::default() };
+    let prog = emit_isolation(&paths, &job, &grbl());
+    let lines = prog.lines();
+    let starts = lines.iter().filter(|l| l.as_str() == "G0 X0.0000 Y0.0000").count();
+    assert_eq!(starts, 3, "open path returns to start once per depth pass:\n{lines:?}");
+    let plunges = lines.iter().filter(|l| l.starts_with("G1 Z-")).count();
+    assert_eq!(plunges, 3, "three depth passes => three plunges");
+  }
+
+  #[test]
+  fn closed_ring_multi_depth_plunges_in_place_without_extra_returns() {
+    // The regression guard for the open-path generalization: a closed ring must still rapid to its start exactly
+    // once (no per-pass return), so existing isolation output is byte-for-byte unchanged.
+    let paths = linear_toolpaths(square_ring());
+    let job = IsolationJob { cut_depth: 0.3, pass_depth: 0.1, ..Default::default() };
+    let prog = emit_isolation(&paths, &job, &grbl());
+    let starts = prog.lines().iter().filter(|l| l.as_str() == "G0 X0.0000 Y0.0000").count();
+    assert_eq!(starts, 1, "a closed ring rapids to its start only once");
   }
 
   #[test]

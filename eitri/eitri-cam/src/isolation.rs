@@ -104,11 +104,48 @@ impl IsolationParams {
   }
 }
 
-/// A closed ring toolpath as a polyline of points (millimetres). The first and last point coincide.
+/// A cut path as a polyline of points (millimetres). A **closed** ring repeats its first point as its last (an
+/// isolation ring, a concentric/seed paint ring); an **open** path does not (a raster paint row, a cutout arc
+/// between tabs). [`RingPath::is_closed`] distinguishes them, which the emitter uses to decide multi-depth motion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RingPath {
-  /// Ring vertices in order; closed (first == last).
+  /// Path vertices in order; for a closed ring the first and last coincide.
   pub points: Vec<Point>,
+}
+
+/// Distance (millimetres) within which a path's endpoints are treated as coincident for closed-ness.
+const RING_CLOSE_EPS: f64 = 1.0e-9;
+
+impl RingPath {
+  /// A closed ring from `points`; the caller is responsible for the first == last convention (rings built from
+  /// `geo` `LineString`s already satisfy it).
+  pub fn closed(points: Vec<Point>) -> RingPath {
+    RingPath { points }
+  }
+
+  /// An open path from `points` (a raster row or a cutout arc) — no closing vertex is appended.
+  pub fn open(points: Vec<Point>) -> RingPath {
+    RingPath { points }
+  }
+
+  /// The first point, where the tool plunges before cutting (origin if the path is empty).
+  pub fn start(&self) -> Point {
+    self.points.first().copied().unwrap_or_default()
+  }
+
+  /// The last point, where the cut ends (origin if the path is empty).
+  pub fn end(&self) -> Point {
+    self.points.last().copied().unwrap_or_default()
+  }
+
+  /// Whether the path is closed: its first and last point coincide. A two-point path with distinct endpoints is an
+  /// open segment (a raster span); only an empty or single-point path is degenerate and counts as closed.
+  pub fn is_closed(&self) -> bool {
+    if self.points.len() < 2 {
+      return true;
+    }
+    self.start().distance_to(self.end()) <= RING_CLOSE_EPS
+  }
 }
 
 /// One isolation cut ring, tagged with the pass and offset that produced it and the winding it was normalized to.
@@ -141,6 +178,22 @@ impl<G> IsolationToolpaths<G> {
   /// Whether no rings were produced (e.g. every feature was smaller than the tool).
   pub fn is_empty(&self) -> bool {
     self.rings.is_empty()
+  }
+}
+
+impl IsolationToolpaths<RingPath> {
+  /// Wrap already-generated cut `paths` (from paint, non-copper, or cutout) as toolpaths the Phase-4
+  /// [`emit_isolation`](../../eitri_gcode/emit/fn.emit_isolation.html) emitter can consume directly — the shared
+  /// reuse point that keeps fill/profile output off any parallel G-code path. Each path becomes a ring tagged with
+  /// its index as the `pass` and a zero `offset` (those fields are isolation-specific bookkeeping the emitter does
+  /// not read); `winding` records the milling direction the paths were generated for.
+  pub fn from_paths(paths: impl IntoIterator<Item = RingPath>, winding: WindingDirection) -> IsolationToolpaths<RingPath> {
+    let rings = paths
+      .into_iter()
+      .enumerate()
+      .map(|(pass, geometry)| IsolationRing { pass, offset: 0.0, winding, geometry })
+      .collect();
+    IsolationToolpaths { rings }
   }
 }
 

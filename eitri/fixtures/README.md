@@ -22,6 +22,16 @@ fixtures/
 `kicad-cli` is not available on this host and the repo's `hardware/` board has no layout to plot, so real files are
 supplied externally rather than generated here.
 
+## CAM operation tests (see `docs/eitri-porting-plan.md` §7)
+
+The Phase-5 area/profile operations — paint (concentric/seed/raster), non-copper clearing, cutout with tabs,
+panelize, two-sided mirror, edit transforms, and film — are tested against **inline synthetic geometry** built
+directly in the test modules (squares, annular rings, L/U shapes), not fixture files: the cases are small, exact,
+and self-describing, so a committed `.gbr`/`.drl` would only obscure what a regression points at. The Phase-3
+Gerber/Excellon → isolation/drill fixtures above still exercise the parse → CAM → G-code path end to end; the
+`eitri-gcode` suite additionally proves paint and cutout toolpaths emit through the shared Phase-4 `emit_isolation`
+path (`eitri-gcode/tests/fill_and_cutout_emit.rs`). No new fixture files were needed for Phase 5.
+
 ## `synthetic/gerber/` (see `docs/eitri-porting-plan.md` §4)
 
 | File | Exercises |
