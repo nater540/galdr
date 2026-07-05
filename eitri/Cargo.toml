@@ -29,6 +29,7 @@ eitri-core = { path = "eitri-core" }
 eitri-geo = { path = "eitri-geo" }
 eitri-gerber = { path = "eitri-gerber" }
 eitri-excellon = { path = "eitri-excellon" }
+eitri-cam = { path = "eitri-cam" }
 
 # Shared third-party. Versions are pinned centrally so every crate agrees on one resolution.
 # Boolean ops (union/difference/intersection/unary_union) run through `geo`, which delegates to `i_overlay`

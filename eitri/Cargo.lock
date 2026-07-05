@@ -148,6 +148,14 @@ dependencies = [
 [[package]]
 name = "eitri-gcode"
 version = "0.1.0"
+dependencies = [
+ "eitri-cam",
+ "eitri-core",
+ "eitri-excellon",
+ "eitri-geo",
+ "eitri-gerber",
+ "thiserror",
+]
 
 [[package]]
 name = "eitri-geo"
