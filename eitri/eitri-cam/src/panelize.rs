@@ -7,6 +7,9 @@
 //! object-kind agnostic — [`panel_offsets`] yields the per-cell translation, and thin wrappers apply it to a copper
 //! `MultiPolygon` ([`panelize_multipolygon`]) or to drill points ([`panelize_points`]).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use geo_types::MultiPolygon;
 use rayon::prelude::*;
 
@@ -94,14 +97,19 @@ where
   let offsets = panel_offsets(spec, x1 - x0, y1 - y0);
   let total = offsets.len() as u64;
 
-  // Translate each copy in parallel, then union every copy's polygons into the combined panel.
+  // Translate each copy in parallel, advancing progress as each cell actually completes (not in a separate loop
+  // afterwards, which left a bound UI motionless then snapped it to 100%). Cancellation is polled per cell too.
+  let counter = Arc::new(AtomicU64::new(0));
   let copies: Vec<MultiPolygon<f64>> = offsets
     .par_iter()
-    .map(|&(dx, dy)| apply_affine(source, Affine::translate(dx, dy)))
-    .collect();
-  for (done, _) in copies.iter().enumerate() {
-    progress.advance((done + 1) as u64, total);
-  }
+    .map(|&(dx, dy)| -> Result<MultiPolygon<f64>> {
+      cancel.check()?;
+      let copy = apply_affine(source, Affine::translate(dx, dy));
+      let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+      progress.advance(done, total);
+      Ok(copy)
+    })
+    .collect::<Result<Vec<_>>>()?;
   let all: Vec<_> = copies.into_iter().flat_map(|mp| mp.0).collect();
   let merged = backend.union_all(&all)?;
 
@@ -186,6 +194,30 @@ mod tests {
   fn zero_grid_is_rejected() {
     let spec = PanelSpec { rows: 0, cols: 2, x: Spacing::Gap(1.0), y: Spacing::Gap(1.0) };
     assert!(panelize_points(&[Point::new(0.0, 0.0)], &spec, 1.0, 1.0).is_err());
+  }
+
+  #[test]
+  fn progress_advances_once_per_cell_reaching_the_full_count() {
+    // Finding #7: progress used to be advanced in a separate loop AFTER the whole parallel translate finished, so a
+    // bound UI saw no movement then a single snap to 100%. Advancing inside the map yields one incremental event per
+    // completed cell, covering 1..=total exactly once and reaching the full count.
+    let source = MultiPolygon::new(vec![square(0.0, 0.0, 2.0)]);
+    let spec = PanelSpec { rows: 2, cols: 3, x: Spacing::Gap(1.0), y: Spacing::Gap(1.0) };
+    let (reporter, rx) = ProgressReporter::channel();
+    panelize_multipolygon(&source, &spec, &DefaultBackend::new(), &reporter, &CancelToken::new()).expect("panelize");
+    drop(reporter); // close the channel so the drain terminates
+    let mut dones: Vec<u64> = rx
+      .iter()
+      .filter_map(|e| match e {
+        ProgressEvent::Advanced { done, total } => {
+          assert_eq!(total, 6, "every advance reports the full cell count as total");
+          Some(done)
+        }
+        _ => None,
+      })
+      .collect();
+    dones.sort_unstable();
+    assert_eq!(dones, (1..=6).collect::<Vec<_>>(), "one advance per cell, covering 1..=total exactly once");
   }
 
   #[test]

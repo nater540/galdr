@@ -9,7 +9,8 @@
 use geo::algorithm::bool_ops::BooleanOps;
 use geo::algorithm::bounding_rect::BoundingRect;
 use geo::algorithm::contains::Contains;
-use geo_types::{Coord, MultiLineString, MultiPolygon};
+use geo::algorithm::line_intersection::line_intersection;
+use geo_types::{Coord, Line, MultiLineString, MultiPolygon};
 
 /// The axis-aligned bounds `(min_x, min_y, max_x, max_y)` of `mp`, or `None` if it is empty.
 pub fn bounds(mp: &MultiPolygon<f64>) -> Option<(f64, f64, f64, f64)> {
@@ -20,6 +21,29 @@ pub fn bounds(mp: &MultiPolygon<f64>) -> Option<(f64, f64, f64, f64)> {
 /// raster-fill connector test: a link between two fill spans is kept only when it stays inside the region.
 pub fn contains_point(region: &MultiPolygon<f64>, x: f64, y: f64) -> bool {
   region.contains(&Coord { x, y })
+}
+
+/// Whether the straight connector from `a` to `b` stays within `region` and is safe to cut. Robust to holes and
+/// concavities of *any* size: the segment is rejected if it *properly* crosses any ring edge — exterior or hole — of
+/// the region, so even a hole narrower than the segment (which a fixed-sample point test would step over) is caught,
+/// and additionally its midpoint must lie inside the region so a link skimming the mouth of a concavity without a
+/// proper crossing is still rejected. Endpoints touching a ring (the span ends of a raster fill sit on the boundary)
+/// are not proper crossings, so a legitimate in-material link is kept. Backs the raster boustrophedon linker: a link
+/// that is not provably inside must lift and rapid rather than cut through empty space.
+pub fn segment_within(region: &MultiPolygon<f64>, a: (f64, f64), b: (f64, f64)) -> bool {
+  let connector = Line::new(Coord { x: a.0, y: a.1 }, Coord { x: b.0, y: b.1 });
+  for poly in &region.0 {
+    for ring in std::iter::once(poly.exterior()).chain(poly.interiors()) {
+      for edge in ring.lines() {
+        if let Some(hit) = line_intersection(connector, edge) {
+          if hit.is_proper() {
+            return false;
+          }
+        }
+      }
+    }
+  }
+  contains_point(region, (a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
 }
 
 /// The portions of `lines` that lie inside `region`, with holes excluded. A line crossing a hole (or leaving the
@@ -92,6 +116,24 @@ mod tests {
     let xs: Vec<f64> = clipped.0[0].coords().map(|c| c.x).collect();
     let (min, max) = xs.iter().fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
     assert!((min + 5.0).abs() < 1e-6 && (max - 5.0).abs() < 1e-6, "span [{min}, {max}]");
+  }
+
+  #[test]
+  fn segment_within_rejects_a_link_crossing_a_small_hole() {
+    // A 10x10 square with a tiny hole; a connector passing through the hole must be rejected even though its length
+    // dwarfs the hole (the failure mode a fixed-sample point test steps over), while a clear connector is kept.
+    let outer = LineString(vec![
+      Coord { x: 0.0, y: 0.0 }, Coord { x: 10.0, y: 0.0 },
+      Coord { x: 10.0, y: 10.0 }, Coord { x: 0.0, y: 10.0 }, Coord { x: 0.0, y: 0.0 },
+    ]);
+    let hole = LineString(vec![
+      Coord { x: 4.7, y: 1.6 }, Coord { x: 5.3, y: 1.6 },
+      Coord { x: 5.3, y: 1.9 }, Coord { x: 4.7, y: 1.9 }, Coord { x: 4.7, y: 1.6 },
+    ]);
+    let region = MultiPolygon::new(vec![Polygon::new(outer, vec![hole])]);
+    assert!(!segment_within(&region, (5.0, 1.0), (5.0, 3.0)), "a link through the hole must be rejected");
+    assert!(segment_within(&region, (5.0, 5.0), (5.0, 8.0)), "a clear in-material link is kept");
+    assert!(!segment_within(&region, (-1.0, 5.0), (11.0, 5.0)), "a link leaving the region is rejected");
   }
 
   #[test]

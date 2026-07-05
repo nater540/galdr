@@ -120,6 +120,14 @@ pub fn parse_excellon(
             message: format!("invalid tool diameter in '{line}'"),
           })?;
           tools.insert(number, Tool { diameter: diameter * format.unit.mm_per_unit() });
+          // A define line may also carry a coordinate (T1C0.8X5Y5): select this tool and drill, otherwise the hit
+          // would be silently dropped. Only select when a coordinate follows, so pure header defines never disturb
+          // the modal tool selection.
+          let after_dia = &tail[cpos + 1 + dia_str.len()..];
+          if after_dia.contains('X') || after_dia.contains('Y') {
+            current_tool = Some(number);
+            process_hit(after_dia, line_no, &format, &tools, current_tool, &mut x, &mut y, &mut hits)?;
+          }
           continue;
         }
         // Bare selection, or a combined select-and-drill line: select, then process the hit if coordinates follow.
@@ -222,6 +230,13 @@ fn infer_format(source: &str) -> NumberFormat {
     } else if upper.starts_with("INCH") {
       unit = Some(Unit::Inches);
       scan_directives(line, &mut suppression, &mut digits);
+    } else if upper == "M71" {
+      // Legacy metric unit code (Altium and older tools) — equivalent to a METRIC directive.
+      unit = Some(Unit::Millimeters);
+    } else if upper == "M72" {
+      // Legacy inch unit code — equivalent to an INCH directive. Ignoring it left units at the mm default, so every
+      // coordinate and tool diameter came out 25.4x wrong.
+      unit = Some(Unit::Inches);
     } else if let Some(rest) = upper.strip_prefix(";FILE_FORMAT=") {
       digits = parse_digit_spec(rest).or(digits);
     } else if upper == "LZ" || upper == "TZ" {
@@ -393,6 +408,43 @@ mod tests {
     let src = "M48\nMETRIC,LZ,3.3\n%\nX1000Y1000\nM30\n";
     let err = parse_excellon(src, None, &ProgressReporter::silent(), &CancelToken::new());
     assert!(err.is_err());
+  }
+
+  #[test]
+  fn legacy_m72_unit_code_selects_inches() {
+    // Finding #1: the legacy M72 (inch) / M71 (metric) unit codes were ignored by inference, so units fell through to
+    // the mm default and every coordinate and tool diameter came out 25.4x wrong. M72 must infer inch units.
+    let src = "M48\nM72\nT1C0.04\n%\nT1\nX1.0Y0.5\nM30\n";
+    let img = parse(src, None);
+    assert_eq!(img.format.unit, Unit::Inches, "M72 must infer inch units");
+    // 0.04 inch tool -> 1.016 mm, not the 0.04 mm the ignored-unit mm-default produced.
+    assert!((img.tools[&1].diameter - 0.04 * 25.4).abs() < 1e-6, "diameter {}", img.tools[&1].diameter);
+  }
+
+  #[test]
+  fn legacy_m71_unit_code_selects_millimetres() {
+    // Finding #1: M71 is the metric counterpart of M72; it must infer millimetres.
+    let src = "M48\nM71\nT1C0.8\n%\nT1\nX2.5Y3.0\nM30\n";
+    let img = parse(src, None);
+    assert_eq!(img.format.unit, Unit::Millimeters, "M71 must infer metric units");
+    assert!((img.tools[&1].diameter - 0.8).abs() < 1e-9, "diameter {}", img.tools[&1].diameter);
+  }
+
+  #[test]
+  fn combined_tool_define_and_coordinate_line_drills() {
+    // Finding #3: a line that both DEFINES a tool and carries a coordinate (T1C0.8X..Y..) must set the tool diameter
+    // AND drill — the old code inserted the tool then unconditionally `continue`d, silently dropping the hit.
+    let src = "M48\nMETRIC,LZ,3.3\nT1C0.8X010000Y005000\nM30\n";
+    let img = parse(src, None);
+    assert!((img.tools[&1].diameter - 0.8).abs() < 1e-9, "the tool must still be defined at 0.8 mm");
+    assert_eq!(img.hits.len(), 1, "the combined define+coordinate line must emit a hit");
+    match img.hits[0] {
+      DrillHit::Drill { tool, x, y } => {
+        assert_eq!(tool, 1);
+        assert!((x - 10.0).abs() < 1e-6 && (y - 5.0).abs() < 1e-6, "hit at ({x}, {y})");
+      }
+      other => panic!("expected a drill, got {other:?}"),
+    }
   }
 
   #[test]

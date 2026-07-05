@@ -17,7 +17,7 @@ use geo_types::{Coord, LineString, MultiPolygon, Polygon};
 
 use crate::aperture::{Aperture, parse_ad};
 use crate::error::{GerberError, Result};
-use crate::format::CoordinateFormat;
+use crate::format::{CoordinateFormat, Notation};
 use crate::geometry::arc_segment_count;
 use crate::lexer::{Statement, tokenize};
 use crate::macros::MacroDef;
@@ -158,7 +158,18 @@ impl<'a> Interpreter<'a> {
     let code = &first[..first.len().min(2)];
     match code {
       "FS" => {
-        self.format = Some(CoordinateFormat::parse_fs(&first[2..], line)?);
+        let format = CoordinateFormat::parse_fs(&first[2..], line)?;
+        // Incremental notation makes every coordinate word a delta from the current point. The interpreter (like
+        // FlatCAM's modern path) only implements absolute coordinates; rather than silently treat incremental words
+        // as absolute — misplacing every primitive — refuse it loudly, matching the MI/OF/SF/AS deprecated-mode
+        // handling below. Incremental Gerber is deprecated and effectively never emitted by current tools.
+        if format.notation == Notation::Incremental {
+          return Err(GerberError::Unsupported {
+            line,
+            message: "incremental coordinate notation (FS ...I...) is not supported".to_string(),
+          });
+        }
+        self.format = Some(format);
       }
       "MO" => {
         self.unit = Some(match &first[2..] {
@@ -672,6 +683,17 @@ mod tests {
     assert!(matches!(neg, Err(GerberError::Unsupported { .. })), "IPNEG must be refused, got {neg:?}");
     let pos = try_parse("%FSLAX36Y36*%\n%MOMM*%\n%IPPOS*%\n%ADD10C,1*%\nD10*\nX0Y0D03*\nM02*\n");
     assert!(pos.is_ok(), "IPPOS is the default and must parse, got {pos:?}");
+  }
+
+  #[test]
+  fn incremental_notation_is_refused_loudly() {
+    // Finding: FS incremental notation was parsed into the format but never honoured — coordinates were silently
+    // treated as absolute. Per correct-or-loud, we refuse it (like MI/OF/SF/AS) rather than mis-place every point.
+    let err = try_parse("%FSLIX36Y36*%\n%MOMM*%\n%ADD10C,1*%\nD10*\nX0Y0D03*\nM02*\n");
+    assert!(matches!(err, Err(GerberError::Unsupported { .. })), "incremental FS must be refused, got {err:?}");
+    // Absolute notation stays the supported default.
+    let ok = try_parse("%FSLAX36Y36*%\n%MOMM*%\n%ADD10C,1*%\nD10*\nX0Y0D03*\nM02*\n");
+    assert!(ok.is_ok(), "absolute FS still parses, got {ok:?}");
   }
 
   #[test]

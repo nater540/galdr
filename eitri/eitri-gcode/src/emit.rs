@@ -274,8 +274,11 @@ fn drill_hole(prog: &mut Program, post: &dyn Postprocessor, params: &DrillParams
       loop {
         let target = (prev + peck).min(params.depth);
         if prev > 0.0 {
-          // Rapid back down to just above the last cut depth, then feed the fresh increment.
-          post.rapid(prog, Axes::z(-(prev - PECK_RAPID_CLEARANCE)));
+          // Rapid back down to just above the last cut depth, then feed the fresh increment. For a peck smaller than
+          // the clearance, `-(prev - clearance)` would rise ABOVE the work surface (Z0), sending the tool up into the
+          // air and then plunging back through material — clamp it to the surface so it never rises above Z0.
+          let resume_z = (-(prev - PECK_RAPID_CLEARANCE)).min(0.0);
+          post.rapid(prog, Axes::z(resume_z));
         }
         post.linear(prog, Axes::z(-target), params.feed);
         let last = target >= params.depth - 1.0e-9;
@@ -478,5 +481,29 @@ mod tests {
     let plunges = prog.lines().iter().filter(|l| l.starts_with("G1 Z-")).count();
     assert_eq!(plunges, 3, "peck should produce three plunge increments:\n{:?}", prog.lines());
     assert!(prog.lines().iter().any(|l| l == "G4 P0.200"), "final dwell missing:\n{:?}", prog.lines());
+  }
+
+  #[test]
+  fn small_peck_never_rapids_above_the_work_surface() {
+    // Finding #5: for a peck increment below PECK_RAPID_CLEARANCE, `-(prev - clearance)` becomes positive, so the
+    // rapid-return rose above the stock (into the air) before plunging back through material. The resume rapid must
+    // never carry a positive Z; the only legitimately-positive Z rapids are the full retract and the travel height.
+    let retract = 1.5;
+    let plan = DrillPlan {
+      tools: vec![ToolDrillPlan {
+        tool: 1,
+        diameter: 0.5,
+        params: DrillParams { depth: 0.2, feed: 60.0, retract, peck: Some(0.05), dwell: None },
+        moves: vec![DrillMove::Drill { at: Point::new(0.0, 0.0) }],
+      }],
+    };
+    let prog = emit_drilling(&plan, &DrillJob::default(), &grbl());
+    for line in prog.lines() {
+      if let Some(rest) = line.strip_prefix("G0 Z") {
+        let z: f64 = rest.trim().parse().expect("parse rapid Z");
+        // Resume rapids sit at or below the surface (<= 0); the only positive rapids are >= the retract height.
+        assert!(z <= 1e-9 || z >= retract - 1e-6, "peck rapid rose above the work surface: `{line}`");
+      }
+    }
   }
 }

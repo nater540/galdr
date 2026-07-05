@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 use eitri_core::{Affine, CancelToken, Error, ProgressEvent, ProgressReporter, Result};
 use eitri_geo::{
-  GeoBackend, JoinType, WindingDirection, apply_affine_polygon, bounds, clip_lines, contains_point,
+  GeoBackend, JoinType, WindingDirection, apply_affine_polygon, bounds, clip_lines, segment_within,
 };
 
 use crate::isolation::{MillingDirection, RingPath};
@@ -315,15 +315,12 @@ fn boustrophedon(rows: &[Vec<Span>], inset: &MultiPolygon<f64>) -> Vec<RingPath>
   paths
 }
 
-/// Whether the link from `a` to `b` stays inside `region`, sampled at three interior points. A conservative test:
-/// it may occasionally break a path that a truer inside-test would keep, but it never keeps a link that dips into a
-/// hole or concavity at a sampled point — so the tool does not cut where there is no material.
+/// Whether the link from `a` to `b` stays inside `region` and is safe to cut. Delegates to the robust
+/// [`segment_within`] geometry test (no proper crossing of any ring edge, plus midpoint containment), which catches a
+/// hole or slot of any size the link would pass through — unlike the former fixed 0.25/0.5/0.75 point sampling, which
+/// stepped over holes narrower than the sample spacing and cut across the void.
 fn link_inside(region: &MultiPolygon<f64>, a: Point, b: Point) -> bool {
-  [0.25, 0.5, 0.75].iter().all(|&t| {
-    let x = a.x + (b.x - a.x) * t;
-    let y = a.y + (b.y - a.y) * t;
-    contains_point(region, x, y)
-  })
+  segment_within(region, (a.x, a.y), (b.x, b.y))
 }
 
 /// Apply an affine transform to every point of a path, preserving its open/closed character.
@@ -381,12 +378,17 @@ fn concentric_rings(
   Ok(rings)
 }
 
-/// The boundary-following finishing rings of `region` — its exterior and holes as closed [`RingPath`]s wound to
-/// `direction`. Cleans the region outline after the interior fill.
-fn boundary_rings(region: &Polygon<f64>, direction: WindingDirection, backend: &(dyn GeoBackend + Sync)) -> Vec<RingPath> {
+/// The boundary-following finishing rings of `region` — the region **inset by the tool radius**, its exterior and
+/// holes as closed [`RingPath`]s wound to the milling direction. Insetting by the radius matches the concentric
+/// fill's offset convention so the cutter edge stays inside the region; tracing the raw boundary (offset 0) would
+/// put the cutter centre on the boundary and overcut a full tool radius outside the intended region.
+fn boundary_rings(region: &Polygon<f64>, params: &PaintParams, backend: &(dyn GeoBackend + Sync)) -> Result<Vec<RingPath>> {
+  let direction = params.direction.winding();
   let mut rings = Vec::new();
-  push_closed_rings(backend, region, direction, &mut rings);
-  rings
+  for poly in &backend.offset(region, -params.radius(), params.join, params.miter_limit)?.0 {
+    push_closed_rings(backend, poly, direction, &mut rings);
+  }
+  Ok(rings)
 }
 
 /// Normalize `poly` to `direction` (exterior = direction, holes = reversed) and push its exterior and hole rings as
@@ -444,7 +446,7 @@ where
       cancel.check()?;
       let mut paths = strategy.fill(poly, params, dyn_backend, cancel)?;
       if params.finish_pass {
-        paths.extend(boundary_rings(poly, params.direction.winding(), dyn_backend));
+        paths.extend(boundary_rings(poly, params, dyn_backend)?);
       }
       let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
       progress.advance(done, total);
@@ -485,7 +487,7 @@ pub fn order_paths<O: TravelOptimizer>(
 mod tests {
   use super::*;
   use crate::optimize::{NearestNeighbor, TwoOpt};
-  use eitri_geo::DefaultBackend;
+  use eitri_geo::{DefaultBackend, contains_point};
 
   fn square(cx: f64, cy: f64, half: f64) -> Polygon<f64> {
     Polygon::new(
@@ -646,6 +648,52 @@ mod tests {
     let with = paint(&region, &finished, &Raster::default(), &backend(), &p, &c).expect("with");
     assert_eq!(with.len(), without.len() + 1, "the finishing pass adds exactly one boundary ring");
     assert!(with.paths.last().expect("finish ring").is_closed(), "the finishing ring is closed");
+  }
+
+  #[test]
+  fn finishing_pass_is_inset_by_the_tool_radius() {
+    // Finding #4: the finishing pass built its ring from the region boundary (offset 0), so the cutter centre rode the
+    // boundary and the cutter edge overcut a full tool radius outside the region. It must be inset by the tool radius,
+    // matching the concentric fill's offset convention.
+    let region = MultiPolygon::new(vec![square(0.0, 0.0, 10.0)]); // extent +/-10
+    let params = PaintParams { tool_diameter: 2.0, finish_pass: true, ..Default::default() }; // radius 1
+    let (p, c) = silent();
+    let result = paint(&region, &params, &Raster::default(), &backend(), &p, &c).expect("paint");
+    let finish = result.paths.last().expect("finishing ring");
+    assert!(finish.is_closed(), "the finishing ring is closed");
+    let max_extent = finish.points.iter().fold(0.0_f64, |m, pt| m.max(pt.x.abs()).max(pt.y.abs()));
+    // Inset by the 1 mm radius, the ring rides at ~9, a full radius inside the +/-10 boundary — never on it (10).
+    assert!((max_extent - 9.0).abs() < 0.2, "finishing ring should be inset by the tool radius to ~9, got {max_extent}");
+    assert!(max_extent < 9.5, "finishing ring must not ride the region boundary");
+  }
+
+  #[test]
+  fn link_across_a_small_hole_is_rejected_even_when_it_misses_the_samples() {
+    // Finding #6: the old link test sampled the connector at fixed 0.25/0.5/0.75 fractions, so a hole sitting between
+    // the samples was stepped over and the connector cut across the void. The robust segment-vs-edge test catches any
+    // hole the link passes through, regardless of its size or where it sits along the link.
+    let region = MultiPolygon::new(vec![Polygon::new(
+      LineString(vec![
+        Coord { x: 0.0, y: 0.0 }, Coord { x: 10.0, y: 0.0 },
+        Coord { x: 10.0, y: 10.0 }, Coord { x: 0.0, y: 10.0 }, Coord { x: 0.0, y: 0.0 },
+      ]),
+      vec![LineString(vec![
+        // A small hole straddling x=5, spanning only y in [1.6, 1.9] — off every sample fraction of the link below.
+        Coord { x: 4.5, y: 1.6 }, Coord { x: 5.5, y: 1.6 },
+        Coord { x: 5.5, y: 1.9 }, Coord { x: 4.5, y: 1.9 }, Coord { x: 4.5, y: 1.6 },
+      ])],
+    )]);
+    // A vertical connector at x=5 from y=1 to y=3: its 0.25/0.5/0.75 samples land at y=1.5, 2.0, 2.5 — all clear of
+    // the [1.6, 1.9] hole, which is exactly the case the fixed-sample test got wrong.
+    let a = Point::new(5.0, 1.0);
+    let b = Point::new(5.0, 3.0);
+    for &t in &[0.25_f64, 0.5, 0.75] {
+      let y = a.y + (b.y - a.y) * t;
+      assert!(!(1.6..=1.9).contains(&y), "sample t={t} at y={y} must miss the hole for this regression to bite");
+    }
+    assert!(!link_inside(&region, a, b), "a connector passing through the hole must be rejected");
+    // A clear connector well away from the hole is still kept, so the fix does not reject valid links.
+    assert!(link_inside(&region, Point::new(5.0, 5.0), Point::new(5.0, 8.0)), "a clear in-material connector is kept");
   }
 
   #[test]
