@@ -88,9 +88,9 @@ mod tests {
     let mut view = ViewState::default();
     view.set_tree(
       vec![
-        TreeRow { id: ObjectId(1), name: "fixture-top".to_string(), kind: ObjectKind::Gerber },
-        TreeRow { id: ObjectId(2), name: "fixture-drills".to_string(), kind: ObjectKind::Excellon },
-        TreeRow { id: ObjectId(3), name: "fixture-top-isolation".to_string(), kind: ObjectKind::CncJob },
+        TreeRow { id: ObjectId(1), name: "fixture-top".to_string(), kind: ObjectKind::Gerber, visible: true },
+        TreeRow { id: ObjectId(2), name: "fixture-drills".to_string(), kind: ObjectKind::Excellon, visible: true },
+        TreeRow { id: ObjectId(3), name: "fixture-top-isolation".to_string(), kind: ObjectKind::CncJob, visible: true },
       ],
       true,
       false,
@@ -104,7 +104,8 @@ mod tests {
     let state = HarnessState::new(fixture_view(), UiState::default());
     let mut harness = build_shell_harness(state, DEFAULT_SIZE);
     harness.run_steps(2);
-    harness.get_by_label_contains("fixture-drills").click();
+    // Exact label: the row is "fixture-drills"; its eye toggle is "Hide fixture-drills" (a separate control).
+    harness.get_by_label("fixture-drills").click();
     harness.run();
     assert!(
       harness.state().intents.contains(&Intent::Select(Some(ObjectId(2)))),
@@ -242,6 +243,104 @@ mod tests {
     harness.get_by_label("Undo").click();
     harness.run();
     assert!(harness.state().intents.contains(&Intent::Undo), "an undoable history enables Undo");
+  }
+
+  #[test]
+  fn clicking_a_rows_eye_toggles_visibility_without_selecting() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.tree[2].visible = false; // the job starts hidden, so both directions are on screen.
+    let state = HarnessState::new(view, UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+
+    harness.get_by_label("Hide fixture-drills").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::SetVisible(ObjectId(2), false)),
+      "the eye on a visible row must emit a hide: {:?}",
+      harness.state().intents,
+    );
+    assert!(
+      !harness.state().intents.iter().any(|i| matches!(i, Intent::Select(Some(ObjectId(2))))),
+      "the eye click must not ALSO select the row: {:?}",
+      harness.state().intents,
+    );
+
+    harness.get_by_label("Show fixture-top-isolation").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::SetVisible(ObjectId(3), true)),
+      "the eye on a hidden row must emit a show: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn the_eye_is_inert_while_an_operation_runs() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.op = OpView::Running { label: "Isolation routing".to_string(), done: 1, total: 4 };
+    let state = HarnessState::new(view, UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Hide fixture-drills").click();
+    harness.run_steps(2);
+    assert!(
+      !harness.state().intents.iter().any(|i| matches!(i, Intent::SetVisible(..))),
+      "the session is away — a visibility edit must not be queued: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn clicking_the_canvas_selects_the_object_under_the_pointer() {
+    use super::super::scene::{ObjectScene, RenderScene};
+    let _locale = render_in(crate::i18n::EN_US);
+    // A synthetic filled square centred on the default view centre (world [40, 30]), so a click in the middle
+    // of the canvas node lands inside it.
+    let square = ObjectScene {
+      id: ObjectId(1),
+      kind: ObjectKind::Gerber,
+      visible: true,
+      fill: eitri_geo::TriangleMesh {
+        vertices: vec![[35.0, 25.0], [45.0, 25.0], [45.0, 35.0], [35.0, 35.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
+      },
+      outlines: vec![vec![[35.0, 25.0], [45.0, 25.0], [45.0, 35.0], [35.0, 35.0], [35.0, 25.0]]],
+      polylines: Vec::new(),
+      cuts: Vec::new(),
+      rapids: Vec::new(),
+      bounds: Some((35.0, 25.0, 45.0, 35.0)),
+    };
+    let mut state = HarnessState::new(fixture_view(), UiState::default());
+    state.scene = RenderScene { objects: vec![square], bounds: Some((35.0, 25.0, 45.0, 35.0)) };
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Canvas").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::Select(Some(ObjectId(1)))),
+      "a canvas click inside the square must select it: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn clicking_empty_canvas_clears_an_existing_selection() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.selected = Some(ObjectId(1));
+    let state = HarnessState::new(view, UiState::default()); // the scene is empty: every click misses.
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Canvas").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::Select(None)),
+      "an empty-canvas click must clear the selection: {:?}",
+      harness.state().intents,
+    );
   }
 
   #[test]

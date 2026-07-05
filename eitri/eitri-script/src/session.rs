@@ -28,7 +28,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use eitri_cam::{DrillConfig, Point, TwoOpt};
+use eitri_cam::{DrillConfig, FilmParams, Point, TwoOpt};
 use eitri_core::{Affine, CancelToken, ProgressReporter, Unit};
 use eitri_gcode::{DrillJob, IsolationJob, Postprocessor, Program, Registry, emit_drilling, emit_isolation};
 use eitri_geo::DefaultBackend;
@@ -177,6 +177,21 @@ impl Session {
   pub fn rename(&mut self, id: ObjectId, new_name: impl Into<String>) -> Result<()> {
     let new_name = new_name.into();
     self.history.edit(|c| c.rename(id, new_name)).map_err(Into::into)
+  }
+
+  /// Set an object's visibility flag (one undoable edit; setting the current value is a no-op that pushes no undo
+  /// snapshot). Errors on an unknown id. Visibility is display metadata the UI's tree/canvas honour; it persists
+  /// with the project like the rest of [`ObjectMeta`].
+  pub fn set_visible(&mut self, id: ObjectId, visible: bool) -> Result<()> {
+    if self.object(id)?.meta.visible == visible {
+      return Ok(());
+    }
+    self.history.edit(|c| {
+      if let Some(object) = c.get_mut(id) {
+        object.meta.visible = visible;
+      }
+    });
+    Ok(())
   }
 
   /// Delete an object (one undoable edit). Errors if no object has that id.
@@ -436,6 +451,14 @@ impl Session {
     self.transform(source, Affine::rotate(degrees.to_radians()))
   }
 
+  /// Render a copper/geometry `source` as a positive or negative photo-film SVG (see [`eitri_cam::film_svg`]).
+  /// Film is vector *output*, not a toolpath, so nothing is committed to the collection — the caller writes the
+  /// returned document wherever it wants.
+  pub fn film_svg(&self, source: ObjectId, params: &FilmParams) -> Result<String> {
+    let region = self.region_of(source)?;
+    eitri_cam::film_svg(&region, params, &self.backend).map_err(Into::into)
+  }
+
   // --- G-code output -----------------------------------------------------------------------------------------------
 
   /// The rendered G-code of a CNC-job object, as one newline-terminated string. Errors if the id is not a CNC job.
@@ -678,6 +701,7 @@ fn read_named(path: impl AsRef<Path>) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use eitri_cam::FilmKind;
   use eitri_gcode::check_grbl_conformance;
   use eitri_project::{
     CutoutOutlineSpec, DirectionSpec, DrillDefaults, IsolationDefaults, PaintStrategySpec, SpacingSpec,
@@ -883,6 +907,54 @@ mod tests {
   fn deleting_an_unknown_id_errors() {
     let mut s = Session::new("empty");
     assert!(matches!(s.delete(ObjectId(7)), Err(ScriptError::UnknownObject(7))));
+  }
+
+  #[test]
+  fn set_visible_flips_the_flag_undoably_and_rejects_unknown_ids() {
+    let (mut s, g) = session_with_gerber();
+    assert!(s.object(g).unwrap().meta.visible, "objects start visible");
+
+    s.set_visible(g, false).unwrap();
+    assert!(!s.object(g).unwrap().meta.visible, "the flag lands on the object");
+    assert!(s.undo(), "hiding is one undoable edit");
+    assert!(s.object(g).unwrap().meta.visible, "undo restores visibility");
+    assert!(s.redo());
+    assert!(!s.object(g).unwrap().meta.visible);
+
+    assert!(matches!(s.set_visible(ObjectId(999), true), Err(ScriptError::UnknownObject(999))));
+  }
+
+  #[test]
+  fn set_visible_to_the_current_value_is_a_no_op_that_pushes_no_undo_snapshot() {
+    let (mut s, g) = session_with_gerber();
+    // Drain the open's own undo entry so the history state is unambiguous.
+    while s.undo() {}
+    assert!(s.redo());
+    let before = s.can_undo();
+    s.set_visible(g, true).unwrap();
+    assert_eq!(s.can_undo(), before, "a no-op toggle must not pollute the undo history");
+  }
+
+  #[test]
+  fn film_svg_renders_a_positive_film_from_a_gerber_and_rejects_wrong_kinds() {
+    let (mut s, g) = session_with_gerber();
+    let svg = s.film_svg(g, &FilmParams::default()).expect("a positive film renders");
+    assert!(svg.starts_with("<svg") && svg.contains("<path"), "the copper is drawn: {svg}");
+
+    let d = s.open_excellon_str("drills", EXCELLON).unwrap();
+    assert!(matches!(s.film_svg(d, &FilmParams::default()), Err(ScriptError::WrongKind { .. })));
+
+    let bad = FilmParams { scale: 0.0, ..FilmParams::default() };
+    assert!(s.film_svg(g, &bad).is_err(), "invalid film params surface as an error");
+  }
+
+  #[test]
+  fn film_svg_negative_uses_the_backend_difference() {
+    let (s, g) = session_with_gerber();
+    let params = FilmParams { kind: FilmKind::Negative, ..FilmParams::default() };
+    let svg = s.film_svg(g, &params).expect("a negative film renders");
+    // The negative draws the frame minus the copper, so its path reaches the viewBox corner.
+    assert!(svg.contains("M 0.0000 0.0000"), "the negative's frame reaches the film corner: {svg}");
   }
 
   #[test]

@@ -34,6 +34,7 @@ pub use eitri_project::{
 };
 pub use eitri_project::{DrillDefaults, IsolationDefaults, ToolDatabase};
 pub use eitri_gcode::{DrillJob, IsolationJob};
+pub use eitri_cam::{FilmKind, FilmParams};
 pub use eitri_core::{Affine, CancelToken, ProgressEvent, ProgressReporter};
 
 #[cfg(feature = "scripting")]

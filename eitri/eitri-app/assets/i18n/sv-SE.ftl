@@ -28,6 +28,8 @@ kind-excellon = Excellon
 kind-geometry = Geometri
 kind-cncjob = CNC-jobb
 btn-delete-object = Ta bort objekt
+vis-hide = Dölj { $name }
+vis-show = Visa { $name }
 
 # ── Parameterpaneler ────────────────────────────────────────────────────────────────────────────────────
 params-title = Parametrar
@@ -68,6 +70,79 @@ geometry-shapes = { $polygons } polygoner · { $polylines } polylinjer
 excellon-hits = { $hits } borrhål · { $tools } verktyg
 gerber-info = Kopparytor tolkade och cachade
 
+# ── Operationsväljare + panelerna för fler operationer ──────────────────────────────────────────────────
+params-operation = Operation
+op-choice-isolate = Isolera
+op-choice-paint = Målning
+op-choice-noncopper = Röj ej-koppar
+op-choice-cutout = Utfräsning
+op-choice-panelize = Panelisering
+op-choice-mirror = Spegling
+op-choice-film = Filmexport
+params-paint = Ytröjning
+params-margin = Marginal (mm)
+params-strategy = Strategi
+strategy-concentric = Koncentrisk
+strategy-seed = Frö
+strategy-raster = Raster
+params-raster-angle = Rastervinkel (°)
+params-finish-pass = Slutpass
+btn-run-paint = Måla
+tip-run-paint = Röj kopparytan och skapa ett CNC-jobb
+params-noncopper = Ej-kopparröjning
+params-boundary = Gräns
+boundary-bbox = Begränsningsruta
+boundary-object = Objektsiluett
+boundary-object-none = välj ett objekt…
+params-boundary-margin = Marginal för ruta (mm)
+params-boundary-source = Gränsobjekt
+btn-run-noncopper = Röj ej-koppar
+tip-run-noncopper = Röj allt utom kopparn innanför gränsen och skapa ett CNC-jobb
+error-boundary-object = Välj ett gränsobjekt med geometri innan du kör ej-kopparröjningen.
+params-cutout = Utfräsning av kort
+params-outline = Kontur
+outline-rectangle = Rektangel
+outline-silhouette = Objektsiluett
+params-rect-min-x = Rekt. min X (mm)
+params-rect-min-y = Rekt. min Y (mm)
+params-rect-max-x = Rekt. max X (mm)
+params-rect-max-y = Rekt. max Y (mm)
+params-tab-width = Flikbredd (mm)
+params-tab-count = Flikar
+btn-seed-bounds = Använd objektets mått
+tip-seed-bounds = Fyll rektangeln från det valda objektets utbredning
+btn-run-cutout = Fräs ut
+tip-run-cutout = Fräs kortets kontur med hållflikar och skapa ett CNC-jobb
+error-outline-object = Det valda objektet har ingen siluettgeometri att fräsa runt.
+params-panelize = Panelisering
+params-rows = Rader
+params-cols = Kolumner
+params-spacing-mode = Avstånd
+spacing-gap = Mellanrum
+spacing-pitch = Delning
+params-spacing-x = Avstånd X (mm)
+params-spacing-y = Avstånd Y (mm)
+btn-run-panelize = Panelisera
+tip-run-panelize = Ordna objektet i ett rutnät som ett nytt geometriobjekt
+params-mirror = Spegling (dubbelsidig)
+params-mirror-axis = Axel
+axis-vertical = Vertikal (vänd X)
+axis-horizontal = Horisontell (vänd Y)
+params-mirror-value = Linje vid (mm)
+btn-seed-center = Objektets centrum
+tip-seed-center = Placera spegellinjen vid det valda objektets centrum
+btn-run-mirror = Spegla
+tip-run-mirror = Spegla objektet kring linjen som ett nytt geometriobjekt
+params-film = Fotofilm
+params-film-kind = Typ
+film-positive = Positiv
+film-negative = Negativ
+params-film-scale = Skala
+params-film-mirror = Spegla
+params-film-border = Ram (mm)
+btn-export-film = Exportera film-SVG…
+tip-export-film = Skriv en positiv/negativ film av kopparn som en SVG-fil
+
 # ── Operationer / förlopp ───────────────────────────────────────────────────────────────────────────────
 op-running = Kör: { $label }
 btn-cancel = Avbryt
@@ -91,6 +166,7 @@ gcode-empty = Välj ett CNC-jobb för att förhandsvisa dess G-kod.
 log-ready = Redo.
 
 # ── Arbetsyta ───────────────────────────────────────────────────────────────────────────────────────────
+canvas-label = Arbetsyta
 canvas-empty-title = Inget att visa ännu
 canvas-empty-hint = Öppna en Gerber-, Excellon-, SVG- eller DXF-fil så visas den här.
 

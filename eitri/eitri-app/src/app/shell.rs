@@ -78,7 +78,7 @@ impl EitriApp {
       .into_iter()
       .filter_map(|id| {
         let object = session.object(id).ok()?;
-        Some(TreeRow { id, name: object.meta.name.clone(), kind: object.kind() })
+        Some(TreeRow { id, name: object.meta.name.clone(), kind: object.kind(), visible: object.meta.visible })
       })
       .collect();
     self.view.set_tree(rows, session.can_undo(), session.can_redo());
@@ -92,7 +92,7 @@ impl EitriApp {
     self.ui.gcode_preview.clear();
     let (Some(session), Some(id)) = (self.slot.session(), self.view.selected) else { return };
     let Ok(object) = session.object(id) else { return };
-    let mut info = SelectedInfo::default();
+    let mut info = SelectedInfo { bounds: self.scene.object(id).and_then(|entry| entry.bounds), ..SelectedInfo::default() };
     match &object.payload {
       ObjectPayload::Gerber(_) => {}
       ObjectPayload::Excellon(excellon) => {
@@ -190,6 +190,22 @@ impl EitriApp {
         self.view.selected = id;
         self.refresh_selection_extras();
       }
+      Intent::SetVisible(id, visible) => {
+        if let Some(session) = self.slot.session_mut() {
+          if let Err(err) = session.set_visible(id, visible) {
+            self.view.log_line(LogKind::Error, err.to_string());
+          }
+          self.refresh_from_session();
+        }
+      }
+      Intent::Rename(id, name) => {
+        if let Some(session) = self.slot.session_mut() {
+          if let Err(err) = session.rename(id, name) {
+            self.view.log_line(LogKind::Error, err.to_string());
+          }
+          self.refresh_from_session();
+        }
+      }
       Intent::DeleteObject(id) => {
         if let Some(session) = self.slot.session_mut() {
           if let Err(err) = session.delete(id) {
@@ -223,6 +239,54 @@ impl EitriApp {
           OpRequest::Drill { source: id, spec: self.ui.drill.to_spec(), job: self.ui.drill.to_job(name) };
         self.launch(request);
       }
+      Intent::RunPaint(id) => {
+        let name = self.view.selected_row().map(|row| row.name.clone());
+        let request =
+          OpRequest::Paint { source: id, spec: self.ui.paint.to_spec(), job: self.ui.paint.job.to_job(name) };
+        self.launch(request);
+      }
+      Intent::RunNonCopper(id) => {
+        // Resolve the drafted boundary HERE, while the session is home: the bbox case is pure numbers; the
+        // object case clones the picked object's region (its geometry, not a computation).
+        let boundary = match self.ui.noncopper.boundary {
+          super::op_drafts::BoundaryChoice::BoundingBox => Some(self.ui.noncopper.bbox_boundary()),
+          super::op_drafts::BoundaryChoice::Object => self.boundary_region_of(self.ui.noncopper.boundary_object),
+        };
+        let Some(boundary) = boundary else {
+          self.view.log_line(LogKind::Error, tr!("error-boundary-object"));
+          return;
+        };
+        let name = self.view.selected_row().map(|row| row.name.clone());
+        let request = OpRequest::NonCopper {
+          source: id,
+          spec: self.ui.noncopper.to_spec(boundary),
+          job: self.ui.noncopper.paint.job.to_job(name),
+        };
+        self.launch(request);
+      }
+      Intent::RunCutout(id) => {
+        let outline = match self.ui.cutout.outline {
+          super::op_drafts::OutlineChoice::Rectangle => Some(self.ui.cutout.rectangle_outline()),
+          super::op_drafts::OutlineChoice::Silhouette => {
+            self.payload_region(id).map(eitri_project::CutoutOutlineSpec::Geometry)
+          }
+        };
+        let Some(outline) = outline else {
+          self.view.log_line(LogKind::Error, tr!("error-outline-object"));
+          return;
+        };
+        let name = self.view.selected_row().map(|row| row.name.clone());
+        let request =
+          OpRequest::Cutout { spec: self.ui.cutout.to_spec(outline), job: self.ui.cutout.job.to_job(name) };
+        self.launch(request);
+      }
+      Intent::RunPanelize(id) => {
+        self.launch(OpRequest::Panelize { source: id, spec: self.ui.panelize.to_spec() });
+      }
+      Intent::RunMirror(id) => {
+        self.launch(OpRequest::Mirror { source: id, line: self.ui.mirror.to_line() });
+      }
+      Intent::ExportFilm(id) => self.export_film_via_dialog(id),
       Intent::CancelOp => {
         if let Some(op) = self.slot.running() {
           op.cancel();
@@ -318,6 +382,51 @@ impl EitriApp {
     let Some(path) = dialog.save_file() else { return };
     match std::fs::write(&path, json) {
       Ok(()) => self.view.log_line(LogKind::Ok, tr!("project-saved", { path: path.display().to_string() })),
+      Err(err) => self.view.log_line(
+        LogKind::Error,
+        tr!("error-save-file", { path: path.display().to_string(), reason: err.to_string() }),
+      ),
+    }
+  }
+
+  /// The copper/geometry region an object's payload already carries, cloned for a spec that owns its outline.
+  /// Data access only — Gerber copper and geometry polygons are engine outputs; nothing is computed here.
+  fn payload_region(&self, id: ObjectId) -> Option<geo_types::MultiPolygon<f64>> {
+    let session = self.slot.session()?;
+    match &session.object(id).ok()?.payload {
+      ObjectPayload::Gerber(gerber) => gerber.image.as_ref().map(|image| image.copper.clone()),
+      ObjectPayload::Geometry(geometry) => Some(geo_types::MultiPolygon::new(geometry.polygons.clone())),
+      _ => None,
+    }
+  }
+
+  /// The region of the picked non-copper boundary object, as an owned [`eitri_project::BoundarySpec`].
+  fn boundary_region_of(&self, picked: Option<ObjectId>) -> Option<eitri_project::BoundarySpec> {
+    let region = self.payload_region(picked?)?;
+    if region.0.is_empty() {
+      return None;
+    }
+    Some(eitri_project::BoundarySpec::Region(region))
+  }
+
+  /// Render the selected copper/geometry as a film SVG (quick, on the UI thread like the other exports) and
+  /// pick a destination for it.
+  fn export_film_via_dialog(&mut self, id: ObjectId) {
+    let Some(session) = self.slot.session() else { return };
+    let svg = match session.film_svg(id, &self.ui.film.to_params()) {
+      Ok(svg) => svg,
+      Err(err) => {
+        self.view.log_line(LogKind::Error, err.to_string());
+        return;
+      }
+    };
+    let name = session.object_name(id).unwrap_or_else(|_| "film".to_string());
+    let dialog = rfd::FileDialog::new()
+      .add_filter(tr!("file-filter-svg"), &["svg"])
+      .set_file_name(format!("{name}-film.svg"));
+    let Some(path) = dialog.save_file() else { return };
+    match std::fs::write(&path, svg) {
+      Ok(()) => self.view.log_line(LogKind::Ok, tr!("export-done", { path: path.display().to_string() })),
       Err(err) => self.view.log_line(
         LogKind::Error,
         tr!("error-save-file", { path: path.display().to_string(), reason: err.to_string() }),
@@ -632,6 +741,33 @@ mod tests {
     assert!(
       app.view.log.iter().any(|l| l.kind == LogKind::Ok),
       "a finished op logs its completion: {:?}",
+      app.view.log
+    );
+  }
+
+  #[test]
+  fn set_visible_and_rename_intents_round_trip_through_the_session() {
+    let (mut app, id) = app_with_gerber();
+    let ctx = egui::Context::default();
+
+    app.handle_intent(&ctx, Intent::SetVisible(id, false));
+    assert!(!app.view.tree[0].visible, "the tree snapshot reflects the hide");
+    assert_eq!(app.scene.object(id).map(|o| o.visible), Some(false), "the scene entry reflects it too");
+    assert_eq!(app.scene.bounds, None, "the only object is hidden, so there is nothing to fit");
+
+    app.handle_intent(&ctx, Intent::Rename(id, "fixture-renamed".to_string()));
+    assert_eq!(app.view.tree[0].name, "fixture-renamed", "the rename lands in the snapshot");
+
+    // A rename that collides with an existing name is refused by the engine and LOGGED, never silent.
+    let second = {
+      let session = app.slot.session_mut().expect("home");
+      session.open_gerber_str("fixture-other", GERBER).expect("second fixture opens")
+    };
+    app.refresh_from_session();
+    app.handle_intent(&ctx, Intent::Rename(second, "fixture-renamed".to_string()));
+    assert!(
+      app.view.log.iter().any(|l| l.kind == LogKind::Error),
+      "a name collision must surface in the log: {:?}",
       app.view.log
     );
   }

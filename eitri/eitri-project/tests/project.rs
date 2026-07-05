@@ -331,6 +331,53 @@ fn tool_db_round_trips_and_seeds_cam_defaults() {
 }
 
 #[test]
+fn tool_db_update_replaces_an_entry_in_place_keeping_its_id_and_position() {
+  let mut db = ToolDatabase::new();
+  let first = db.add(ToolEntry {
+    id: eitri_project::ToolId(0),
+    name: "0.2mm end mill".to_string(),
+    diameter: eitri_core::Length::from_mm(0.2),
+    isolation: IsolationDefaults::default(),
+    drilling: DrillDefaults::default(),
+  });
+  let second = db.add(ToolEntry {
+    id: eitri_project::ToolId(0),
+    name: "1.0mm drill".to_string(),
+    diameter: eitri_core::Length::from_mm(1.0),
+    isolation: IsolationDefaults::default(),
+    drilling: DrillDefaults::default(),
+  });
+
+  // Update the FIRST entry: the id is preserved (even if the caller passed a placeholder), the list order is
+  // unchanged, and the new fields land.
+  let edited = ToolEntry {
+    id: eitri_project::ToolId(0),
+    name: "0.25mm end mill".to_string(),
+    diameter: eitri_core::Length::from_mm(0.25),
+    isolation: IsolationDefaults { passes: 2, ..IsolationDefaults::default() },
+    drilling: DrillDefaults::default(),
+  };
+  assert!(db.update(first, edited), "updating an existing id succeeds");
+  assert_eq!(db.len(), 2, "update replaces, never adds");
+  let tool = db.get(first).expect("the id survives the update");
+  assert_eq!(tool.name, "0.25mm end mill");
+  assert_eq!(tool.isolation.passes, 2);
+  assert_eq!(db.iter().next().map(|t| t.id), Some(first), "the entry keeps its list position");
+  assert_eq!(db.get(second).map(|t| t.name.as_str()), Some("1.0mm drill"), "the neighbour is untouched");
+
+  // An unknown id is refused without mutating anything.
+  let stray = ToolEntry {
+    id: eitri_project::ToolId(0),
+    name: "ghost".to_string(),
+    diameter: eitri_core::Length::from_mm(3.0),
+    isolation: IsolationDefaults::default(),
+    drilling: DrillDefaults::default(),
+  };
+  assert!(!db.update(eitri_project::ToolId(999), stray), "an unknown id must be refused");
+  assert_eq!(db.len(), 2);
+}
+
+#[test]
 fn tool_db_rejects_unsupported_version() {
   let db = ToolDatabase::new();
   let mut value: serde_json::Value = serde_json::from_str(&save_tool_db(&db).unwrap()).unwrap();

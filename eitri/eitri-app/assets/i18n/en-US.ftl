@@ -29,6 +29,8 @@ kind-excellon = Excellon
 kind-geometry = Geometry
 kind-cncjob = CNC job
 btn-delete-object = Delete object
+vis-hide = Hide { $name }
+vis-show = Show { $name }
 
 # ── Parameter panels ────────────────────────────────────────────────────────────────────────────────────
 params-title = Parameters
@@ -69,6 +71,79 @@ geometry-shapes = { $polygons } polygons · { $polylines } polylines
 excellon-hits = { $hits } drill hits · { $tools } tools
 gerber-info = Copper regions parsed and cached
 
+# ── Operation picker + the breadth op panels ────────────────────────────────────────────────────────────
+params-operation = Operation
+op-choice-isolate = Isolate
+op-choice-paint = Paint
+op-choice-noncopper = Non-copper clear
+op-choice-cutout = Cutout
+op-choice-panelize = Panelize
+op-choice-mirror = Mirror
+op-choice-film = Film export
+params-paint = Area clearing
+params-margin = Margin (mm)
+params-strategy = Strategy
+strategy-concentric = Concentric
+strategy-seed = Seed
+strategy-raster = Raster
+params-raster-angle = Raster angle (°)
+params-finish-pass = Finish pass
+btn-run-paint = Paint
+tip-run-paint = Clear the copper area and emit a CNC job
+params-noncopper = Non-copper clearing
+params-boundary = Boundary
+boundary-bbox = Bounding box
+boundary-object = Object silhouette
+boundary-object-none = pick an object…
+params-boundary-margin = Bbox margin (mm)
+params-boundary-source = Boundary object
+btn-run-noncopper = Clear non-copper
+tip-run-noncopper = Clear everything but the copper inside the boundary and emit a CNC job
+error-boundary-object = Pick a boundary object with geometry before running the non-copper clear.
+params-cutout = Board cutout
+params-outline = Outline
+outline-rectangle = Rectangle
+outline-silhouette = Object silhouette
+params-rect-min-x = Rect min X (mm)
+params-rect-min-y = Rect min Y (mm)
+params-rect-max-x = Rect max X (mm)
+params-rect-max-y = Rect max Y (mm)
+params-tab-width = Tab width (mm)
+params-tab-count = Tabs
+btn-seed-bounds = Use object bounds
+tip-seed-bounds = Fill the rectangle from the selected object's extent
+btn-run-cutout = Cut out
+tip-run-cutout = Route the board outline with holding tabs and emit a CNC job
+error-outline-object = The selected object has no silhouette geometry to cut around.
+params-panelize = Panelize
+params-rows = Rows
+params-cols = Columns
+params-spacing-mode = Spacing
+spacing-gap = Gap
+spacing-pitch = Pitch
+params-spacing-x = Spacing X (mm)
+params-spacing-y = Spacing Y (mm)
+btn-run-panelize = Panelize
+tip-run-panelize = Array the object into a grid as a new geometry object
+params-mirror = Mirror (two-sided)
+params-mirror-axis = Axis
+axis-vertical = Vertical (flip X)
+axis-horizontal = Horizontal (flip Y)
+params-mirror-value = Line at (mm)
+btn-seed-center = Object centre
+tip-seed-center = Place the mirror line at the selected object's centre
+btn-run-mirror = Mirror
+tip-run-mirror = Reflect the object about the line as a new geometry object
+params-film = Photo film
+params-film-kind = Kind
+film-positive = Positive
+film-negative = Negative
+params-film-scale = Scale
+params-film-mirror = Mirror
+params-film-border = Border (mm)
+btn-export-film = Export film SVG…
+tip-export-film = Write a positive/negative film of the copper as an SVG file
+
 # ── Operations / progress ───────────────────────────────────────────────────────────────────────────────
 op-running = Running: { $label }
 btn-cancel = Cancel
@@ -92,6 +167,7 @@ gcode-empty = Select a CNC job to preview its G-code.
 log-ready = Ready.
 
 # ── Canvas ──────────────────────────────────────────────────────────────────────────────────────────────
+canvas-label = Canvas
 canvas-empty-title = Nothing to show yet
 canvas-empty-hint = Open a Gerber, Excellon, SVG, or DXF file to see it here.
 

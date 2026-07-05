@@ -47,7 +47,7 @@ fn loaded_board() -> (HarnessState, eitri_project::ObjectId) {
     .into_iter()
     .map(|id| {
       let object = session.object(id).expect("listed ids resolve");
-      TreeRow { id, name: object.meta.name.clone(), kind: object.kind() }
+      TreeRow { id, name: object.meta.name.clone(), kind: object.kind(), visible: object.meta.visible }
     })
     .collect();
   view.set_tree(rows, session.can_undo(), session.can_redo());

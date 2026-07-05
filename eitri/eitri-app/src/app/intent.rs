@@ -31,6 +31,10 @@ pub enum Intent {
   // ── Collection ─────────────────────────────────────────────────────────────────────────────────────────
   /// Select an object in the tree (or clear the selection with `None`).
   Select(Option<ObjectId>),
+  /// Show or hide an object on the canvas (undoable in the engine's history).
+  SetVisible(ObjectId, bool),
+  /// Rename an object to the given (already-trimmed) name.
+  Rename(ObjectId, String),
   /// Delete an object (undoable in the engine's history).
   DeleteObject(ObjectId),
   /// Undo the last collection edit.
@@ -43,6 +47,18 @@ pub enum Intent {
   RunIsolate(ObjectId),
   /// Run drill planning on an Excellon source with the current drill drafts.
   RunDrill(ObjectId),
+  /// Run area clearing (paint) on a copper/geometry source with the current paint drafts.
+  RunPaint(ObjectId),
+  /// Run non-copper clearing on a copper/geometry source (the shell resolves the drafted boundary).
+  RunNonCopper(ObjectId),
+  /// Run a board cutout for the selected source (the shell resolves the drafted outline).
+  RunCutout(ObjectId),
+  /// Panelize a copper/geometry source into a grid (commits a geometry object).
+  RunPanelize(ObjectId),
+  /// Mirror a copper/geometry source about the drafted line (commits a geometry object).
+  RunMirror(ObjectId),
+  /// Export a copper/geometry source as a photo-film SVG via a save dialog (vector output, not an op run).
+  ExportFilm(ObjectId),
   /// Request cancellation of the in-flight operation.
   CancelOp,
 

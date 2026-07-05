@@ -55,6 +55,19 @@ impl ToolDatabase {
     self.tools.iter().find(|t| t.name == name)
   }
 
+  /// Replace the entry with `id` in place, keeping its id and list position (the supplied entry's placeholder id is
+  /// overwritten). Returns whether an entry with that id existed; an unknown id mutates nothing.
+  pub fn update(&mut self, id: ToolId, mut entry: ToolEntry) -> bool {
+    match self.tools.iter_mut().find(|t| t.id == id) {
+      Some(slot) => {
+        entry.id = id;
+        *slot = entry;
+        true
+      }
+      None => false,
+    }
+  }
+
   /// Remove a tool by id, returning it if present.
   pub fn remove(&mut self, id: ToolId) -> Option<ToolEntry> {
     let index = self.tools.iter().position(|t| t.id == id)?;

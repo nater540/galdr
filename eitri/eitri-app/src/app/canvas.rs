@@ -8,6 +8,7 @@
 
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, vec2};
 
+use super::intent::{Intent, IntentSink};
 use super::scene::{Bounds, RenderScene};
 use super::theme::Palette;
 use super::views::UiState;
@@ -86,10 +87,12 @@ impl CanvasView {
   }
 }
 
-/// Paint the canvas into `rect` and handle its pan/zoom input. Returns the world position under the pointer
-/// (for the status bar readout) when the pointer is over the canvas.
-pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiState, selected: Option<ObjectId>)
--> Option<[f64; 2]> {
+/// Paint the canvas into `rect` and handle its pan/zoom/click input. A click picks the topmost visible object
+/// under the pointer (via [`hit_object`]) and emits a [`Intent::Select`]; a click on empty canvas clears the
+/// selection. Returns the world position under the pointer (for the status bar readout) when the pointer is
+/// over the canvas.
+pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiState, selected: Option<ObjectId>,
+  sink: &mut IntentSink) -> Option<[f64; 2]> {
   let palette = state.style.palette;
   let style = state.style.canvas;
   // A queued fit request (the toolbar's Fit, or the auto-fit after a first open) is consumed here, where the
@@ -105,10 +108,24 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
 
   // Input first, so this frame already paints with the updated transform (no one-frame pan lag).
   let response = ui.interact(rect, ui.id().with("canvas"), egui::Sense::click_and_drag());
+  response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, ui.is_enabled(), tr!("canvas-label")));
   if response.dragged() {
     state.canvas.pan(response.drag_delta());
   }
   let hover_world = response.hover_pos().map(|pos| state.canvas.to_world(pos, rect));
+  // Click-select: a real click (egui already excludes drags) picks the topmost object under the pointer, or
+  // clears the selection on empty canvas. The tolerance is fixed in SCREEN px so picking a hairline trail
+  // feels the same at every zoom.
+  if response.clicked()
+    && let Some(pos) = response.interact_pointer_pos()
+  {
+    let world = state.canvas.to_world(pos, rect);
+    let tol_mm = (PICK_TOLERANCE_PX / state.canvas.px_per_mm.max(f32::EPSILON)) as f64;
+    let hit = hit_object(scene, world, tol_mm);
+    if hit != selected {
+      sink.push(Intent::Select(hit));
+    }
+  }
   if let Some(pos) = response.hover_pos() {
     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
     if scroll.abs() > 0.1 {
@@ -121,6 +138,10 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
   origin_cross(&painter, rect, &state.canvas, palette);
 
   for object in &scene.objects {
+    // A hidden object contributes nothing to the paint pass (nor to picking, below).
+    if !object.visible {
+      continue;
+    }
     // Fill pass: copper/drills/geometry as meshes, colour by kind. The opacity keeps trails readable over it.
     if object.fill.triangle_count() > 0 {
       let color = match object.kind {
@@ -178,6 +199,68 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
     empty_state(&painter, rect, palette);
   }
   hover_world
+}
+
+/// The screen-space picking tolerance for click-select (points): how far a click may land from a stroked
+/// polyline (an outline ring, an imported stroke, a cut trail) and still pick its object.
+pub const PICK_TOLERANCE_PX: f32 = 6.0;
+
+/// Pick the topmost visible object at `world` (mm): objects are tested in REVERSE display order (painted
+/// back-to-front, so the last is on top). A hit is a point inside a fill triangle, or within `tol_mm` of an
+/// outline ring, an open polyline, or a cut trail. Rapids are travel context, never pickable. Pure — unit
+/// tested without a window; the paint pass calls it with [`PICK_TOLERANCE_PX`] converted through the zoom.
+pub fn hit_object(scene: &RenderScene, world: [f64; 2], tol_mm: f64) -> Option<ObjectId> {
+  let tol_sq = tol_mm * tol_mm;
+  for object in scene.objects.iter().rev() {
+    if !object.visible {
+      continue;
+    }
+    // Cheap reject: outside the object's tolerance-expanded bounds nothing below can hit.
+    let Some((x0, y0, x1, y1)) = object.bounds else { continue };
+    if world[0] < x0 - tol_mm || world[0] > x1 + tol_mm || world[1] < y0 - tol_mm || world[1] > y1 + tol_mm {
+      continue;
+    }
+    let mesh = &object.fill;
+    let inside_fill = mesh.indices.chunks_exact(3).any(|tri| {
+      let (a, b, c) = (mesh.vertices[tri[0] as usize], mesh.vertices[tri[1] as usize], mesh.vertices[tri[2] as usize]);
+      point_in_triangle(world, a, b, c)
+    });
+    if inside_fill {
+      return Some(object.id);
+    }
+    let near_stroke = object
+      .outlines
+      .iter()
+      .chain(&object.polylines)
+      .chain(&object.cuts)
+      .any(|line| line.windows(2).any(|seg| dist_sq_point_segment(world, seg[0], seg[1]) <= tol_sq));
+    if near_stroke {
+      return Some(object.id);
+    }
+  }
+  None
+}
+
+/// Whether `p` lies inside (or on the edge of) triangle `abc`, via consistent cross-product signs.
+fn point_in_triangle(p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
+  let cross = |o: [f64; 2], u: [f64; 2], v: [f64; 2]| (u[0] - o[0]) * (v[1] - o[1]) - (u[1] - o[1]) * (v[0] - o[0]);
+  let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
+  let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+  let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+  !(has_neg && has_pos)
+}
+
+/// Squared distance from `p` to segment `ab`.
+fn dist_sq_point_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+  let (abx, aby) = (b[0] - a[0], b[1] - a[1]);
+  let len_sq = abx * abx + aby * aby;
+  let t = if len_sq <= f64::EPSILON {
+    0.0
+  } else {
+    (((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / len_sq).clamp(0.0, 1.0)
+  };
+  let (dx, dy) = (p[0] - (a[0] + t * abx), p[1] - (a[1] + t * aby));
+  dx * dx + dy * dy
 }
 
 /// Stroke one polyline through the transform.
@@ -347,5 +430,98 @@ mod tests {
     view.fit((5.0, 5.0, 5.0, 5.0), r); // a single point
     assert_eq!(view.center, [5.0, 5.0]);
     assert!(view.px_per_mm.is_finite() && view.px_per_mm > 0.0, "a point fit must not divide by zero");
+  }
+
+  // ── Click picking ────────────────────────────────────────────────────────────────────────────────────────
+
+  use super::super::scene::{ObjectScene, RenderScene};
+  use eitri_geo::TriangleMesh;
+
+  /// A synthetic filled square `[0,10]²` as one object — two triangles, a square outline ring.
+  fn filled_square(id: u64) -> ObjectScene {
+    ObjectScene {
+      id: ObjectId(id),
+      kind: ObjectKind::Gerber,
+      visible: true,
+      fill: TriangleMesh {
+        vertices: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
+      },
+      outlines: vec![vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]]],
+      polylines: Vec::new(),
+      cuts: Vec::new(),
+      rapids: Vec::new(),
+      bounds: Some((0.0, 0.0, 10.0, 10.0)),
+    }
+  }
+
+  /// A synthetic toolpath object: one diagonal cut trail across the square, no fill.
+  fn trail(id: u64) -> ObjectScene {
+    ObjectScene {
+      id: ObjectId(id),
+      kind: ObjectKind::CncJob,
+      visible: true,
+      fill: TriangleMesh::default(),
+      outlines: Vec::new(),
+      polylines: Vec::new(),
+      cuts: vec![vec![[0.0, 0.0], [10.0, 10.0]]],
+      rapids: vec![([0.0, 10.0], [10.0, 0.0])],
+      bounds: Some((0.0, 0.0, 10.0, 10.0)),
+    }
+  }
+
+  fn scene_of(objects: Vec<ObjectScene>) -> RenderScene {
+    let mut bounds: Option<super::super::scene::Bounds> = None;
+    for o in &objects {
+      if let (Some((x0, y0, x1, y1)), true) = (o.bounds, o.visible) {
+        bounds = Some(match bounds {
+          None => (x0, y0, x1, y1),
+          Some((a, b, c, d)) => (x0.min(a), y0.min(b), x1.max(c), y1.max(d)),
+        });
+      }
+    }
+    RenderScene { objects, bounds }
+  }
+
+  #[test]
+  fn a_point_inside_a_fill_hits_the_object_and_a_far_point_hits_nothing() {
+    let scene = scene_of(vec![filled_square(1)]);
+    assert_eq!(hit_object(&scene, [5.0, 5.0], 0.5), Some(ObjectId(1)), "inside the filled square");
+    assert_eq!(hit_object(&scene, [50.0, 50.0], 0.5), None, "far away misses");
+    assert_eq!(hit_object(&scene, [12.0, 5.0], 0.5), None, "just outside (beyond tolerance) misses");
+  }
+
+  #[test]
+  fn a_point_near_a_cut_trail_hits_the_topmost_object_over_the_fill_below() {
+    // The job is drawn AFTER the copper (later in display order = on top), so a click on its trail picks the
+    // job even though the point is also inside the copper fill.
+    let scene = scene_of(vec![filled_square(1), trail(2)]);
+    assert_eq!(hit_object(&scene, [5.0, 5.2], 0.5), Some(ObjectId(2)), "the trail is topmost where they overlap");
+    // Inside the copper but far from the diagonal: the copper wins.
+    assert_eq!(hit_object(&scene, [8.0, 1.0], 0.5), Some(ObjectId(1)), "off the trail the fill is picked");
+  }
+
+  #[test]
+  fn rapids_are_not_pickable_and_an_invisible_object_is_skipped() {
+    // A point on the anti-diagonal rapid (but off the cut) must NOT pick the job — rapids are travel context,
+    // not selectable geometry.
+    let scene = scene_of(vec![filled_square(1), trail(2)]);
+    assert_eq!(hit_object(&scene, [2.0, 8.0], 0.3), Some(ObjectId(1)), "a rapid never picks its job");
+
+    let mut hidden = filled_square(1);
+    hidden.visible = false;
+    let scene = scene_of(vec![hidden]);
+    assert_eq!(hit_object(&scene, [5.0, 5.0], 0.5), None, "a hidden object cannot be clicked");
+  }
+
+  #[test]
+  fn open_polylines_pick_within_tolerance_only() {
+    let mut geometry = filled_square(3);
+    geometry.fill = TriangleMesh::default();
+    geometry.outlines = Vec::new();
+    geometry.polylines = vec![vec![[0.0, 0.0], [10.0, 0.0]]];
+    let scene = scene_of(vec![geometry]);
+    assert_eq!(hit_object(&scene, [5.0, 0.3], 0.5), Some(ObjectId(3)), "within tolerance of the stroke");
+    assert_eq!(hit_object(&scene, [5.0, 1.2], 0.5), None, "beyond tolerance misses");
   }
 }

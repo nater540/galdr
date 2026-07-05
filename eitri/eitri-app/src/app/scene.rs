@@ -25,6 +25,9 @@ pub struct ObjectScene {
   pub id: ObjectId,
   /// Its kind (selects the fill/stroke colours).
   pub kind: ObjectKind,
+  /// Whether the object is shown ([`eitri_project::ObjectMeta::visible`]): a hidden object is neither painted
+  /// nor click-pickable, and its extent is excluded from the fit-view bounds.
+  pub visible: bool,
   /// The filled area (copper, drill capsules, geometry polygons) as an indexed triangle mesh.
   pub fill: TriangleMesh,
   /// The region's rings (exterior + holes), for the crisp outline pass over the fill.
@@ -50,10 +53,11 @@ pub struct RenderScene {
 
 impl ObjectScene {
   /// An empty entry for an object, filled in by [`build_scene`].
-  fn new(id: ObjectId, kind: ObjectKind) -> Self {
+  fn new(id: ObjectId, kind: ObjectKind, visible: bool) -> Self {
     ObjectScene {
       id,
       kind,
+      visible,
       fill: TriangleMesh::default(),
       outlines: Vec::new(),
       polylines: Vec::new(),
@@ -77,7 +81,7 @@ pub fn build_scene(session: &Session) -> RenderScene {
   let mut scene = RenderScene::default();
   for id in session.object_ids() {
     let Ok(object) = session.object(id) else { continue };
-    let mut entry = ObjectScene::new(id, object.kind());
+    let mut entry = ObjectScene::new(id, object.kind(), object.meta.visible);
     match &object.payload {
       ObjectPayload::Gerber(gerber) => {
         if let Some(image) = &gerber.image {
@@ -124,7 +128,11 @@ pub fn build_scene(session: &Session) -> RenderScene {
         }
       }
     }
-    merge_bounds(&mut scene.bounds, entry.bounds);
+    // Only what is actually on screen participates in the fit-view union — a hidden board must not zoom the
+    // camera out to frame something invisible.
+    if entry.visible {
+      merge_bounds(&mut scene.bounds, entry.bounds);
+    }
     scene.objects.push(entry);
   }
   scene
@@ -218,6 +226,30 @@ mod tests {
     let scene = build_scene(&Session::new("empty"));
     assert!(scene.objects.is_empty());
     assert_eq!(scene.bounds, None);
+  }
+
+  #[test]
+  fn a_hidden_object_is_marked_invisible_and_excluded_from_the_fit_bounds() {
+    let mut session = Session::new("fixture");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("gerber opens");
+    let drills = session.open_excellon_str("fixture-drills", EXCELLON).expect("drills open");
+    session.set_visible(gerber, false).expect("hide the gerber");
+
+    let scene = build_scene(&session);
+    assert!(!scene.object(gerber).unwrap().visible, "the hidden object carries its flag into the scene");
+    assert!(scene.object(drills).unwrap().visible, "the neighbour stays visible");
+    // Fit-view bounds only frame what is actually on screen: the union must equal the drills' own bounds.
+    assert_eq!(scene.bounds, scene.object(drills).unwrap().bounds, "hidden objects must not stretch the fit");
+  }
+
+  #[test]
+  fn hiding_everything_leaves_no_fit_bounds() {
+    let mut session = Session::new("fixture");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("gerber opens");
+    session.set_visible(gerber, false).expect("hide it");
+    let scene = build_scene(&session);
+    assert_eq!(scene.bounds, None, "an all-hidden scene has nothing to fit to");
+    assert_eq!(scene.objects.len(), 1, "the entry itself remains (the tree still lists it)");
   }
 
   #[test]

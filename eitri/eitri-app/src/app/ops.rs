@@ -15,7 +15,9 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use eitri_core::{CancelToken, ProgressEvent, ProgressReporter};
 use eitri_gcode::{DrillJob, IsolationJob};
-use eitri_project::{DrillSpec, IsolationSpec, ObjectId};
+use eitri_project::{
+  CutoutSpec, DrillSpec, IsolationSpec, MirrorLineSpec, NonCopperSpec, ObjectId, PaintSpec, PanelizeSpec,
+};
 use eitri_script::{ScriptError, Session};
 
 /// One engine command the worker runs. File contents arrive as strings (the shell reads the file before
@@ -75,6 +77,45 @@ pub enum OpRequest {
     /// The emission parameters (travel height, spindle).
     job: DrillJob,
   },
+  /// Area-clear (paint) a copper/geometry source into a CNC job.
+  Paint {
+    /// The source object.
+    source: ObjectId,
+    /// The paint parameters from the panel drafts.
+    spec: PaintSpec,
+    /// The emission parameters.
+    job: IsolationJob,
+  },
+  /// Clear all non-copper within a boundary around a source and emit the toolpaths as a job.
+  NonCopper {
+    /// The source object.
+    source: ObjectId,
+    /// The clearing parameters, with the boundary already resolved by the shell.
+    spec: NonCopperSpec,
+    /// The emission parameters.
+    job: IsolationJob,
+  },
+  /// Route a board cutout around the spec's own outline (no source object — the outline is self-contained).
+  Cutout {
+    /// The cutout parameters, with the outline already resolved by the shell.
+    spec: CutoutSpec,
+    /// The emission parameters.
+    job: IsolationJob,
+  },
+  /// Panelize a source into a grid, committing a **geometry** object.
+  Panelize {
+    /// The source object.
+    source: ObjectId,
+    /// The grid parameters.
+    spec: PanelizeSpec,
+  },
+  /// Mirror a source about a line for two-sided work, committing a **geometry** object.
+  Mirror {
+    /// The source object.
+    source: ObjectId,
+    /// The mirror line.
+    line: MirrorLineSpec,
+  },
   /// Load a project from its JSON, REPLACING the session on success (the old one is discarded).
   LoadProject {
     /// The project file's JSON body.
@@ -94,6 +135,11 @@ impl OpRequest {
       OpRequest::ImportGcode { .. } => "op-import-gcode",
       OpRequest::Isolate { .. } => "op-isolate",
       OpRequest::Drill { .. } => "op-drill",
+      OpRequest::Paint { .. } => "op-paint",
+      OpRequest::NonCopper { .. } => "op-noncopper",
+      OpRequest::Cutout { .. } => "op-cutout",
+      OpRequest::Panelize { .. } => "op-panelize",
+      OpRequest::Mirror { .. } => "op-mirror",
       OpRequest::LoadProject { .. } => "op-load-project",
     }
   }
@@ -180,6 +226,11 @@ fn run_request(mut session: Session, request: OpRequest, outcome_tx: Sender<OpOu
     OpRequest::ImportGcode { name, source } => session.import_gcode_str(name, source).map(OpOutput::Object),
     OpRequest::Isolate { source, spec, job } => session.isolate(source, spec, job).map(OpOutput::Object),
     OpRequest::Drill { source, spec, job } => session.drill(source, spec, job).map(OpOutput::Object),
+    OpRequest::Paint { source, spec, job } => session.paint(source, spec, job).map(OpOutput::Object),
+    OpRequest::NonCopper { source, spec, job } => session.noncopper(source, spec, job).map(OpOutput::Object),
+    OpRequest::Cutout { spec, job } => session.cutout(spec, job).map(OpOutput::Object),
+    OpRequest::Panelize { source, spec } => session.panelize(source, spec).map(OpOutput::Object),
+    OpRequest::Mirror { source, line } => session.mirror(source, line).map(OpOutput::Object),
     OpRequest::LoadProject { json } => match Session::load_project_str(&json) {
       // The loaded session replaces the working one; the old session is dropped here, exactly like FlatCAM's
       // open-project semantics. Failure keeps the original untouched.
@@ -277,7 +328,7 @@ fn dummy_running() -> RunningOp {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use eitri_project::{DirectionSpec, ObjectKind};
+  use eitri_project::{DirectionSpec, ObjectKind, SpacingSpec};
   use std::time::{Duration, Instant};
 
   const GERBER: &str = include_str!("../../../fixtures/synthetic/gerber/kicad_two_pads.gbr");
@@ -406,7 +457,85 @@ mod tests {
   }
 
   #[test]
+  fn a_paint_request_runs_off_thread_and_commits_a_job() {
+    let mut session = Session::new("fixture-board");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let mut slot = SessionSlot::Home(session);
+    let spec = PaintSpec {
+      tool_diameter: 0.5,
+      overlap: 0.3,
+      margin: 0.0,
+      direction: DirectionSpec::Climb,
+      finish_pass: false,
+      strategy: eitri_project::PaintStrategySpec::Concentric,
+    };
+    assert!(slot.launch(OpRequest::Paint { source: gerber, spec, job: IsolationJob::default() }));
+    let result = wait_outcome(&mut slot);
+    let id = match result.expect("the paint op succeeds on the fixture") {
+      OpOutput::Object(id) => id,
+      other => panic!("expected a job object, got {other:?}"),
+    };
+    assert_eq!(slot.session().unwrap().kind(id).unwrap(), ObjectKind::CncJob);
+  }
+
+  #[test]
+  fn panelize_and_mirror_requests_commit_geometry_objects() {
+    let mut session = Session::new("fixture-board");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let mut slot = SessionSlot::Home(session);
+    let spec = PanelizeSpec { rows: 2, cols: 2, x: SpacingSpec::Gap(5.0), y: SpacingSpec::Gap(5.0) };
+    assert!(slot.launch(OpRequest::Panelize { source: gerber, spec }));
+    let panel = match wait_outcome(&mut slot).expect("panelize succeeds") {
+      OpOutput::Object(id) => id,
+      other => panic!("expected a geometry object, got {other:?}"),
+    };
+    assert_eq!(slot.session().unwrap().kind(panel).unwrap(), ObjectKind::Geometry, "a panel is geometry");
+
+    assert!(slot.launch(OpRequest::Mirror { source: gerber, line: MirrorLineSpec::Vertical(5.0) }));
+    let mirrored = match wait_outcome(&mut slot).expect("mirror succeeds") {
+      OpOutput::Object(id) => id,
+      other => panic!("expected a geometry object, got {other:?}"),
+    };
+    assert_eq!(slot.session().unwrap().kind(mirrored).unwrap(), ObjectKind::Geometry, "a mirror is geometry");
+  }
+
+  #[test]
   fn every_request_maps_to_a_distinct_label_key() {
+    let paint = PaintSpec {
+      tool_diameter: 0.5,
+      overlap: 0.3,
+      margin: 0.0,
+      direction: DirectionSpec::Climb,
+      finish_pass: false,
+      strategy: eitri_project::PaintStrategySpec::Concentric,
+    };
+    let cutout = CutoutSpec {
+      tool_diameter: 2.0,
+      tab_width: 3.0,
+      tabs: eitri_project::TabPlacementSpec::Count(4),
+      margin: 0.0,
+      direction: DirectionSpec::Climb,
+      outline: eitri_project::CutoutOutlineSpec::Rectangle {
+        min: geo_types::Coord { x: 0.0, y: 0.0 },
+        max: geo_types::Coord { x: 10.0, y: 10.0 },
+      },
+    };
+    let extra = [
+      OpRequest::Paint { source: ObjectId(0), spec: paint.clone(), job: IsolationJob::default() }.label_key(),
+      OpRequest::NonCopper {
+        source: ObjectId(0),
+        spec: NonCopperSpec { boundary: eitri_project::BoundarySpec::BoundingBox { margin: 1.0 }, paint },
+        job: IsolationJob::default(),
+      }
+      .label_key(),
+      OpRequest::Cutout { spec: cutout, job: IsolationJob::default() }.label_key(),
+      OpRequest::Panelize {
+        source: ObjectId(0),
+        spec: PanelizeSpec { rows: 1, cols: 1, x: SpacingSpec::Gap(1.0), y: SpacingSpec::Gap(1.0) },
+      }
+      .label_key(),
+      OpRequest::Mirror { source: ObjectId(0), line: MirrorLineSpec::Vertical(0.0) }.label_key(),
+    ];
     let keys = [
       OpRequest::OpenGerber { name: String::new(), source: String::new() }.label_key(),
       OpRequest::OpenExcellon { name: String::new(), source: String::new() }.label_key(),
@@ -422,9 +551,9 @@ mod tests {
       .label_key(),
       OpRequest::LoadProject { json: String::new() }.label_key(),
     ];
-    let mut unique: Vec<&str> = keys.to_vec();
+    let mut unique: Vec<&str> = keys.iter().chain(extra.iter()).copied().collect();
     unique.sort_unstable();
     unique.dedup();
-    assert_eq!(unique.len(), keys.len(), "labels must be distinguishable in the log");
+    assert_eq!(unique.len(), keys.len() + extra.len(), "labels must be distinguishable in the log");
   }
 }

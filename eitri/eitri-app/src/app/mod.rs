@@ -20,6 +20,7 @@ pub mod dock_tiles;
 pub mod fonts;
 pub mod intent;
 pub mod metrics;
+pub mod op_drafts;
 pub mod ops;
 pub mod scene;
 pub mod shell;

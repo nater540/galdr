@@ -46,6 +46,8 @@ pub struct TreeRow {
   pub name: String,
   /// Its kind, for the icon and the parameter panel dispatch.
   pub kind: ObjectKind,
+  /// Whether the object is shown on the canvas (the tree row's eye toggle).
+  pub visible: bool,
 }
 
 /// The in-flight-operation view: what the progress UI renders and what gates the session-touching controls.
@@ -150,7 +152,7 @@ mod tests {
   use super::*;
 
   fn row(id: u64, kind: ObjectKind) -> TreeRow {
-    TreeRow { id: ObjectId(id), name: format!("fixture-{id}"), kind }
+    TreeRow { id: ObjectId(id), name: format!("fixture-{id}"), kind, visible: true }
   }
 
   #[test]
