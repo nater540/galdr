@@ -213,6 +213,20 @@ fn snapshot_app_settings_user_theme_2x() {
 fn snapshot_tool_db_2x() {
   // The tool-database dialog with a small library and one tool selected: the action row, the selectable list,
   // and the identity + isolation + drill editor grids. 2× density for glyph/spacing review.
+  snapshot_tool_db("tool_db_2x", crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p eitri-app -- --ignored snapshot`"]
+fn snapshot_tool_db_sv_2x() {
+  // The same dialog in Swedish: the longer sv-SE labels ("Isolationsstandard", "Lägg till verktyg", "osparade
+  // ändringar") are where a fixed-width grid clips — this is the locale-clipping guard for the tool DB.
+  snapshot_tool_db("tool_db_sv_2x", crate::i18n::SV_SE);
+}
+
+/// Render the tool-database dialog BODY at 2× density in a given locale, with a two-tool fixture library and
+/// the second tool selected for editing (so every editor grid is exercised).
+fn snapshot_tool_db(name: &str, locale: &str) {
   use eitri_core::Length;
   use eitri_project::{DrillDefaults, IsolationDefaults, ToolDatabase, ToolEntry, ToolId};
 
@@ -232,7 +246,7 @@ fn snapshot_tool_db_2x() {
     drilling: DrillDefaults::default(),
   });
 
-  let _locale = render_in(crate::i18n::EN_US);
+  let _locale = render_in(locale);
   let ui_state = UiState { tool_db_selected: Some(edit_id), ..UiState::default() };
   let palette = ui_state.style.palette;
   let state = HarnessState::new(ViewState::default(), ui_state);
@@ -250,7 +264,7 @@ fn snapshot_tool_db_2x() {
   super::fonts::install(&harness.ctx);
   super::shell::apply_theme(&harness.ctx, &palette, 1.0);
   harness.run_steps(2);
-  harness.snapshot("tool_db_2x");
+  harness.snapshot(name);
 }
 
 /// Render the settings dialog BODY at 2× density against a given config (the floating window chrome is

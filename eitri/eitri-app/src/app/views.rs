@@ -1037,7 +1037,7 @@ fn seed_from_tool(ui: &mut egui::Ui, palette: Palette, state: &UiState, salt: &s
   ui.add_space(6.0);
   ui.horizontal(|ui| {
     ui.label(RichText::new(tr!("btn-seed-tool")).size(11.5).color(palette.text_dim));
-    egui::ComboBox::from_id_salt(salt).width(150.0).selected_text(tr!("seed-tool-hint")).show_ui(ui, |ui| {
+    egui::ComboBox::from_id_salt(salt).width(130.0).selected_text(tr!("seed-tool-hint")).show_ui(ui, |ui| {
       for (id, name) in &state.tool_list {
         if ui.selectable_label(false, name).clicked() {
           sink.push(make(*id));
