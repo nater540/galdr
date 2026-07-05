@@ -20,7 +20,9 @@ geos = { workspace = true, optional = true }
 
 [features]
 default = []
-geos = ["dep:geos"]
+# The `geos/geo` sub-feature pulls the geos crate's `geo-types`/`wkt` interop, which is how we convert between our
+# `geo_types` geometry and GEOS geometry. Still needs a system GEOS (libgeos_c) at build time.
+geos = ["dep:geos", "geos/geo"]
 
 [dev-dependencies]
 eitri-core = { workspace = true }

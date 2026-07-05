@@ -1391,8 +1391,10 @@ version = "11.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d13c464e56cc46077aa9bafef9a02e65610ddafb6347a26a306855e7a7d3133"
 dependencies = [
+ "geo-types",
  "geos-sys",
  "libc",
+ "wkt",
 ]
 
 [[package]]
@@ -4824,6 +4826,18 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wkt"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c2252781f8927974e8ba6a67c965a759a2b88ea2b1825f6862426bbb1c8f41"
+dependencies = [
+ "geo-types",
+ "log",
+ "num-traits 0.2.19",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "writeable"

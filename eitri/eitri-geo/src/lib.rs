@@ -6,7 +6,7 @@
 //! touching a line of CAM logic. See `docs/eitri-porting-plan.md` §2.
 //!
 //! - [`DefaultBackend`] — the shipping backend: Clipper2 offsetting, `geo`/`i_overlay` booleans, DP simplify.
-//! - [`GeosBackend`] (feature `geos`) — a compiling stub of the Shapely-parity backend; full impl is a later phase.
+//! - [`GeosBackend`] (feature `geos`) — the Shapely-parity backend on GEOS, for validating the default backend.
 //! - [`offset_arc`] — arc-preserving polyline offsetting via `cavalier_contours`, for smoother toolpaths.
 //!
 //! Winding normalization ([`GeoBackend::normalize_winding`]) is load-bearing for milling direction (climb vs
