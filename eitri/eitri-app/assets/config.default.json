@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "appearance": {
+    "active_theme": "default",
+    "font_scale": 1.0,
+    "themes": {
+      "default": {
+        "bg": "#121212",
+        "panel": "#1B1B1B",
+        "panel_alt": "#222222",
+        "inset": "#0E0E0E",
+        "widget": "#2A2A2A",
+        "widget_hover": "#333333",
+        "widget_active": "#3C3C3C",
+        "divider": "#2E2E2E",
+        "border_recess": "#080808",
+        "border_raised": "#3A3A3A",
+        "accent": "#0E86D4",
+        "accent_hover": "#2BA8F0",
+        "accent_active": "#0B6FB0",
+        "text": "#E4E4E4",
+        "text_dim": "#9A9A9A",
+        "text_disabled": "#5C5C5C",
+        "state_ok": "#3FB861",
+        "state_warn": "#E0A33E",
+        "state_error": "#E5484D",
+        "state_busy": "#2BB6C9",
+        "copper": "#B2602E",
+        "copper_edge": "#D97B42",
+        "drill": "#9BB4C8",
+        "geometry": "#3FB861",
+        "toolpath_cut": "#FFE000",
+        "toolpath_rapid": "#0E86D4",
+        "selection": "#2BA8F0",
+        "origin": "#9B7FE0",
+        "grid_major": "#1B1B1B",
+        "grid_minor": "#0D0D0D"
+      }
+    }
+  },
+  "ui": {
+    "language": "en-US",
+    "window_w": 1280.0,
+    "window_h": 800.0,
+    "dock_fraction": 0.25
+  },
+  "canvas": {
+    "cut_stroke_px": 1.6,
+    "rapid_stroke_px": 1.0,
+    "outline_stroke_px": 1.0,
+    "copper_opacity": 0.85,
+    "grid_minor_px": 16.0,
+    "grid_major_every": 5
+  }
+}

@@ -1,0 +1,7 @@
+; Finding #7: a combined tool-select + coordinate line must select AND drill
+M48
+METRIC,LZ,3.3
+T1C0.8
+%
+T1X010000Y005000
+M30

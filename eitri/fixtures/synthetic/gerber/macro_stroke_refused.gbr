@@ -1,0 +1,10 @@
+G04 Finding #4: stroking a macro aperture must be refused, not silently empty*
+%FSLAX36Y36*%
+%MOMM*%
+%AMROUND*
+1,1,$1,0,0*%
+%ADD10ROUND,3*%
+D10*
+X0Y0D02*
+X1000000Y0D01*
+M02*

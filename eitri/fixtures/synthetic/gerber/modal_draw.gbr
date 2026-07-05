@@ -1,0 +1,9 @@
+G04 Finding #6: a modal operation code repeats across coordinate lines*
+%FSLAX36Y36*%
+%MOMM*%
+%ADD10C,1*%
+D10*
+X0Y0D02*
+X1000000Y0D01*
+X2000000Y0*
+M02*

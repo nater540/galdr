@@ -1,0 +1,9 @@
+G04 Finding #5: a G02 arc with neither I nor J is invalid geometry*
+%FSLAX36Y36*%
+%MOMM*%
+%ADD10C,1*%
+D10*
+X5000000Y0D02*
+G02*
+X0Y0D01*
+M02*

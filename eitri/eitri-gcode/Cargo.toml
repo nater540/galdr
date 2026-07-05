@@ -1,0 +1,22 @@
+[package]
+name = "eitri-gcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Precision constants (GCODE_DECIMALS), units, and the typed error/result live in eitri-core.
+eitri-core = { workspace = true }
+# The toolpath / operation models this crate renders: isolation rings and drill plans.
+eitri-cam = { workspace = true }
+# ArcPolyline (native bulges) is defined in eitri-geo and consumed when emitting arc-preserving cut rings.
+eitri-geo = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Golden-file tests build a real isolation job from a Gerber and a drill plan from an Excellon file, so both
+# parsers are dev-only dependencies of the emitter test-suite.
+eitri-gerber = { workspace = true }
+eitri-excellon = { workspace = true }

@@ -1,0 +1,18 @@
+%TF.GenerationSoftware,Eitri,fixtures,1.0*%
+%TF.FileFunction,Copper,L1,Top*%
+%TF.FilePolarity,Positive*%
+%FSLAX46Y46*%
+G04 Gerber Fmt 4.6, leading zeros omitted, absolute, unit mm*
+%MOMM*%
+%LPD*%
+%TA.AperFunction,ComponentPad*%
+%ADD10C,2.000000*%
+%TD*%
+%ADD11C,0.250000*%
+D10*
+X0Y0D03*
+X10000000Y0D03*
+D11*
+X0Y0D02*
+X10000000Y0D01*
+M02*

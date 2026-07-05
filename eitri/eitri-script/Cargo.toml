@@ -1,0 +1,33 @@
+[package]
+name = "eitri-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The typed `Session` command API is always built and is fully usable without any scripting runtime. The Rhai
+# binding is an additive layer behind the (default-on) `scripting` feature, so a downstream that only wants the
+# typed API can depend on this crate with `default-features = false` and never pull Rhai into its build.
+default = ["scripting"]
+scripting = ["dep:rhai"]
+
+[dependencies]
+eitri-core = { workspace = true }
+eitri-geo = { workspace = true }
+eitri-gerber = { workspace = true }
+eitri-excellon = { workspace = true }
+eitri-cam = { workspace = true }
+eitri-gcode = { workspace = true }
+eitri-import = { workspace = true }
+# `eitri-project` is not in the workspace dependency table (it is itself the integration crate), so it is pulled by
+# path, matching how Phase 7 wired its own dependents.
+eitri-project = { path = "../eitri-project" }
+geo-types = { workspace = true }
+thiserror = { workspace = true }
+# Rhai is the chosen embeddable scripting runtime (plan §10). Default features only: the engine is driven on one
+# thread, so the thread-safe `sync` feature (which swaps `Rc`/`RefCell` for `Arc`/`RwLock`) is deliberately left off
+# to avoid its atomic overhead. Cross-thread cancellation crosses the boundary via `eitri_core::CancelToken`, which
+# is already `Send + Sync`, so the engine itself never needs to be.
+rhai = { version = "1", optional = true }

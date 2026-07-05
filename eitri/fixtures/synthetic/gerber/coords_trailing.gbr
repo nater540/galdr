@@ -1,0 +1,7 @@
+G04 Trailing-zero omission, format 2.4, mm. Same pad at (5.0, 5.0) as coords_leading via X05/Y05.*
+%FSTAX24Y24*%
+%MOMM*%
+%ADD10C,1.000000*%
+D10*
+X05Y05D03*
+M02*
