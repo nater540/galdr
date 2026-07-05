@@ -21,6 +21,7 @@ pub mod arc;
 pub mod buffer;
 pub mod flatten;
 pub mod interior;
+pub mod mesh;
 pub mod region;
 pub mod transform;
 pub mod winding;
@@ -37,6 +38,7 @@ pub use buffer::{CapStyle, buffer_path};
 pub use default_backend::DefaultBackend;
 pub use flatten::{arc_segment_count, circle_polygon, flatten_arc, flatten_bulge, flatten_cubic, flatten_quad};
 pub use interior::ring_interior_point;
+pub use mesh::{TriangleMesh, triangulate};
 pub use region::{bounds, clip_lines, contains_point, segment_within};
 pub use transform::{apply_affine, apply_affine_polygon};
 

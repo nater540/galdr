@@ -83,7 +83,11 @@ pub struct ArcMove {
 ///
 /// Implementors must provide [`Postprocessor::name`], [`Postprocessor::format`], and the two frame hooks. The
 /// motion/spindle/tool/dwell/comment hooks default to standard RS-274 rendering through [`Postprocessor::format`].
-pub trait Postprocessor {
+///
+/// `Send + Sync` is a supertrait so a [`Registry`] (and anything owning one, like `eitri_script::Session`) can move
+/// to a worker thread — the GUI runs long CAM commands off its UI thread. Dialects are stateless renderers, so the
+/// bound costs implementors nothing.
+pub trait Postprocessor: Send + Sync {
   /// The dialect's registry name (e.g. `"grbl"`).
   fn name(&self) -> &str;
 

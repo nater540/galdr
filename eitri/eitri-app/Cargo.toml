@@ -1,9 +1,70 @@
 [package]
 name = "eitri-app"
+description = "Eitri's egui front-end: visualization, parameter editing, and op execution over the engine crates."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# The GUI is a THIN consumer of the engine: it renders what the engine computes and forwards operator intent into
+# `eitri_script::Session` (the typed command API). No CAM or geometry logic lives here — filled-region tessellation
+# comes from `eitri_geo::triangulate`, toolpath previews from `eitri_import::import_gcode`, drill geometry from
+# `eitri_excellon`. The UI patterns (theme tokens, Fluent i18n, JSON config, the egui_tiles central split, the
+# kittest/snapshot harness) deliberately mirror the Galdr workspace's `skirnir` sender so the two apps feel like
+# one family; the code is replicated here rather than shared because the workspaces are intentionally decoupled.
+[lib]
+name = "eitri_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "eitri-app"
+path = "src/main.rs"
+
 [dependencies]
+# The engine, consumed through its public APIs only.
+eitri-core = { workspace = true }
+eitri-geo = { workspace = true }
+eitri-gerber = { workspace = true }
+eitri-excellon = { workspace = true }
+eitri-cam = { workspace = true }
+eitri-gcode = { workspace = true }
+eitri-import = { workspace = true }
+eitri-project = { path = "../eitri-project" }
+eitri-script = { path = "../eitri-script" }
+geo-types = { workspace = true }
+
+# The egui application framework — version-matched to skirnir (eframe 0.35 on the lightweight glow backend; a 2-D
+# CAM canvas needs nothing heavier than OpenGL). `x11` + `wayland` cover the Linux display stacks alongside the
+# native macOS/Windows backends.
+eframe = { version = "0.35", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "x11",
+  "wayland",
+] }
+# The central canvas/dock split is an egui_tiles tree (matching skirnir's dock host): panes are sized TOP-DOWN
+# from shares, so pane content can never feed back into the divider. 0.16 is the egui 0.35 match.
+egui_tiles = { version = "0.16", default-features = false }
+# Native open/save dialogs for Gerber/Excellon/SVG/DXF/G-code and project files.
+rfd = "0.17.2"
+
+# Internationalization via Project Fluent, mirroring skirnir's i18n layer (same majors: fluent 0.17 →
+# fluent-bundle 0.16 → unic-langid 0.9 / intl-memoizer 0.5).
+fluent = "0.17"
+intl-memoizer = "0.5"
+unic-langid = "0.9"
+
+# The hand-editable JSON app config under the OS config dir (`~/.config/eitri` on Linux), mirroring skirnir's
+# `config.json` store: partial overrides, layered themes, atomic writes.
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+directories = "6"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The egui UI test harness (kittest + AccessKit), version-matched to egui 0.35. `wgpu` + `snapshot` enable the
+# `#[ignore]`d image-snapshot suite (offscreen renders diffed against PNG baselines under `tests/snapshots/`);
+# plain `cargo test` never needs a GPU. Run them with `cargo test -p eitri-app -- --ignored snapshot` and
+# regenerate with `UPDATE_SNAPSHOTS=1`.
+egui_kittest = { version = "0.35", default-features = false, features = ["wgpu", "snapshot"] }

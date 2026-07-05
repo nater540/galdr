@@ -109,6 +109,13 @@ impl Session {
     self.progress = progress;
   }
 
+  /// Replace the cancellation token. Cancellation is one-way on a token, so a caller that cancelled an in-flight
+  /// command installs a fresh token here before issuing the next one — otherwise every later command would bail
+  /// immediately against the still-cancelled flag.
+  pub fn set_cancel(&mut self, cancel: CancelToken) {
+    self.cancel = cancel;
+  }
+
   /// The postprocessor registry, to register additional dialects.
   pub fn registry_mut(&mut self) -> &mut Registry {
     &mut self.registry
@@ -900,6 +907,24 @@ mod tests {
     }
   }
 
+  // --- Threading ----------------------------------------------------------------------------------------------------
+
+  #[test]
+  fn a_session_can_move_to_a_worker_thread_and_come_back_with_its_result() {
+    // The GUI's op-execution contract: long CAM commands run OFF the UI thread by moving the whole `Session` into a
+    // worker (so `&mut self` commands need no locking), then handing it back over a channel with the outcome. This
+    // both asserts `Session: Send` at compile time and exercises the actual round trip on a real op.
+    let (s, g) = session_with_gerber();
+    let worker = std::thread::spawn(move || {
+      let mut s = s;
+      let result = s.isolate(g, iso_spec(), IsolationJob::default());
+      (s, result)
+    });
+    let (s, result) = worker.join().expect("the worker must not panic");
+    let job = result.expect("isolation succeeds on the fixture gerber");
+    assert_eq!(s.kind(job).unwrap(), ObjectKind::CncJob, "the returned session carries the committed job");
+  }
+
   // --- Cancellation -------------------------------------------------------------------------------------------------
 
   #[test]
@@ -908,6 +933,18 @@ mod tests {
     s.cancel_token().cancel();
     let err = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap_err();
     assert!(matches!(err, ScriptError::Engine(eitri_core::Error::Cancelled)), "cancel surfaces as Engine(Cancelled)");
+  }
+
+  #[test]
+  fn a_fresh_cancel_token_recovers_a_session_after_a_cancel() {
+    // Cancellation is one-way on a token, so a GUI that cancels one op must be able to install a FRESH token or
+    // every later command on the same session would bail immediately — the recovery seam `set_cancel` provides.
+    let (mut s, g) = session_with_gerber();
+    s.cancel_token().cancel();
+    assert!(s.isolate(g, iso_spec(), IsolationJob::default()).is_err(), "the poisoned token still bails the op");
+    s.set_cancel(CancelToken::new());
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).expect("a fresh token un-poisons the session");
+    assert_eq!(s.kind(job).unwrap(), ObjectKind::CncJob);
   }
 
   // --- Persistence --------------------------------------------------------------------------------------------------
