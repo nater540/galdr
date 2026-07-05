@@ -30,6 +30,8 @@ eitri-geo = { path = "eitri-geo" }
 eitri-gerber = { path = "eitri-gerber" }
 eitri-excellon = { path = "eitri-excellon" }
 eitri-cam = { path = "eitri-cam" }
+eitri-gcode = { path = "eitri-gcode" }
+eitri-import = { path = "eitri-import" }
 
 # Shared third-party. Versions are pinned centrally so every crate agrees on one resolution.
 # Boolean ops (union/difference/intersection/unary_union) run through `geo`, which delegates to `i_overlay`
@@ -38,13 +40,20 @@ eitri-cam = { path = "eitri-cam" }
 # arc-preserving polyline offsets. `geos` is the optional Shapely-parity backend, gated behind eitri-geo's feature.
 thiserror = "2"
 geo = "0.33"
-geo-types = "0.7"
+# `serde` is enabled so `eitri-project` can round-trip raw `Polygon`/`MultiPolygon`/`LineString` geometry through the
+# crate's own purpose-built encoding — the feature is additive, so crates that do not serialize geometry are unaffected.
+geo-types = { version = "0.7", features = ["serde"] }
 clipper2 = "0.6"
 cavalier_contours = "0.7"
 geos = "11"
 # Data-parallel per-polygon isolation and per-tool drill ordering. Independent geometry-backend calls fan out
 # across a rayon pool; the backends do their own per-call allocation so there is no cross-thread shared state.
 rayon = "1"
+# Versioned project/tool-DB persistence lives in `eitri-project`. JSON is the v1 on-disk format (human-readable and
+# debuggable); the `rc` feature lets snapshot-based undo share large immutable blobs (`Arc<str>` source, `Arc<[String]>`
+# G-code) cheaply while still round-tripping through serde.
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
 
 [profile.release]
 # CAM boolean/offset work is compute-bound; keep release fully optimized for the bench numbers to mean something.
