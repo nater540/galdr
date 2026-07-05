@@ -33,3 +33,9 @@ impossible. `UPDATE_SNAPSHOTS=1` leaves `.old.png`/`.diff.png` artifacts next to
 before reporting/committing. The toolbar's `ToolbarFit` now carries a content fingerprint (locale, transport
 attachment, badge label) that invalidates the stored full-form measurement, so the bar recovers from icon form
 when its requirement shrinks (connect, shorter locale).
+
+Update (2026-07-02, macros tab): any change to SHARED chrome (a new dock tab, a toolbar control) legitimately diffs
+EVERY shell/dock baseline — expect mass failures, regenerate, then eyeball the tight layouts FIRST
+(`shell_idle_narrow`, `shell_sv_idle_min`): that's where the 3rd dock tab painted under the collapse toggle (fixed
+by the shrink-to-fit `tab_pad` in `views::tab_strip`). Disabled states need their own shots — see
+[[egui-disabled-styling]]. Dock close-ups take a macros fixture list via `snapshot_dock(.., macros, ..)`.

@@ -65,7 +65,7 @@ Differs from the bare-driver + breakout assumption in DOC-03:
 ## 3. Limit switches — skip the opto on the breadboard
 
 You don't need to build the PC817 + 12 V field stage (`hardware/DESIGN.md`) to bring up the limit logic. Wire a
-bare **2-wire NC switch (or just a jumper) straight from GPIO10/11/12 to GND**. The firmware enables the
+bare **2-wire NC micro switch (or just a jumper) straight from the limit GPIO to GND**. The firmware enables the
 internal pull-up on every limit pin, giving the *identical* polarity as the opto design — **no `$5` invert**:
 
 | At the pin                           | Level | Firmware reads           |
@@ -74,9 +74,58 @@ internal pull-up on every limit pin, giving the *identical* polarity as the opto
 | Switch open / floating / broken wire | HIGH  | **triggered**            |
 
 So on the bench a **trip is the *open*, not a connection to ground** — disconnecting a pin (or releasing the
-jumper) raises `ALARM:1`; grounding it returns to idle. The GND→open transition is a real rising edge, so this
-also exercises the `wait_for_rising_edge` IRQ path. PROBE (GPIO21) is the same, except its pull-up follows
-`$19`. Defer the opto stage to the milled PCB; validate it there per the homing checklist §1/§3.
+jumper) raises `ALARM:1` (once `$21` is armed, §3.2); grounding it returns to idle. The GND→open transition is a
+real rising edge, so this also exercises the `wait_for_rising_edge` IRQ path. PROBE (GPIO21) is the same, except
+its pull-up follows `$19`. Defer the opto stage to the milled PCB; validate it there per the homing checklist
+§1/§3.
+
+### 3.1 Wiring the NC micro switches
+
+| Axis | Limit GPIO | Note                                                                       |
+|------|------------|----------------------------------------------------------------------------|
+| X    | GPIO10     |                                                                            |
+| Y    | GPIO11     |                                                                            |
+| Z    | GPIO12     |                                                                            |
+| A    | GPIO39     | Placeholder only — A has no physical switch (DOC-10.6); leave it jumpered. |
+
+- **Use the COM + NC terminals.** Most lever micro switches carry three tabs (COM/NO/NC, usually marked on the
+  body). Verify with a continuity meter before wiring: the correct pair reads **closed at rest and open when the
+  lever is pressed**. On the NO tab by mistake, the polarity table above reads inverted at rest — you'd boot
+  "triggered" on that axis.
+- One lead to the limit GPIO, the other to GND — the switch is passive, so lead order doesn't matter. **No
+  external resistor**: the firmware configures the internal pull-up on every limit pin unconditionally (the NC
+  broken-wire fail-safe depends on it).
+- Signal-only wiring, so breadboard tie-points are fine here (§2 applies to motor current, not limits). Keep the
+  limit leads short and routed away from the motor leads — an NC input held low by the switch is noise-tolerant,
+  but a long open run next to a stepper coil invites phantom trips once motion is running.
+- An unwired axis MUST be jumpered to GND (that's the "switch closed" state). A floating limit pin reads
+  triggered — with `$21` armed the board sits in a permanent `ALARM:1`.
+
+### 3.2 Bench-testing the endstops (no motion, drivers unpowered)
+
+The status pipeline samples the limit pins and publishes their logical state (after `$5`) into the `Pn:` field
+of the `?` report **independently of `$21`**, so start with hard limits DISARMED and just watch pins:
+
+1. `$21=0` (hard limits off) for the first pass — a press should *report*, not alarm.
+2. Poll `?` (or connect `skirnir`, which polls for you and draws the X/Y/Z endstop indicators from `Pn:`).
+   At rest — all NC switches closed — the report carries **no** `Pn:` field at all (it's omitted when nothing
+   is asserted); the machine must NOT be in alarm.
+3. **Press and hold each switch in turn** and confirm the matching letter appears — `<Idle|...|Pn:X>` for the
+   X switch, then `Y`, then `Z`. This proves each switch lands on the right GPIO. Release and confirm the
+   letter drops again. Latency note: at idle the executor samples on a 50 ms ticker, so the indicator updates
+   within ~a tick, not instantaneously.
+4. **Broken-wire fail-safe:** unplug one switch lead entirely — the pull-up floats the pin HIGH and the letter
+   asserts, exactly like a press. This is the property that makes NC the right choice: a severed wire looks
+   like a trip, never like a silently disabled limit.
+5. **`$5` sense check:** if an axis reads asserted at rest and clear when pressed, you're on the NO tab
+   (rewire, §3.1) or the switch is miswired — fix the wiring rather than papering over it with `$5` (the
+   default `$5=0` is correct for NC-to-GND, and inverting it forfeits the broken-wire fail-safe).
+6. **Arm the alarm path:** set `$21=1` and repeat one press — the board must now raise `ALARM:1` within the
+   `$26` debounce window and enter alarm. Recover with `0x18`/`$X` and confirm it re-arms (a second press
+   alarms again).
+
+From here, hand over to `docs/homing-bench-checklist.md` §3–§9 for the full procedure — debounce (`$26`),
+per-axis alarm mapping, `$H` homing against the real switches, hard limits during motion, and repeatability.
 
 ## 4. Pin sanity on the dev board
 
