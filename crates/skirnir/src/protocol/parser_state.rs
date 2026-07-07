@@ -19,6 +19,10 @@ pub struct ParserState {
   /// word at all (an older firmware, or a malformed line), so the UI can distinguish "no tool" (`Some(0)`) from
   /// "not reported" (`None`) and avoid showing a stale or fabricated number.
   pub tool: Option<u32>,
+  /// The active work-coordinate system index from the `G54`…`G59` modal word (`G54` = 0 … `G59` = 5). `None` when
+  /// the line carried no WCS word (a malformed/partial line). The height-map WCS-mismatch warning reads this to
+  /// tell whether the mesh was probed under the same WCS the job runs in.
+  pub wcs: Option<usize>,
 }
 
 /// Parse a `[GC:...]` body (the bracket-stripped text, INCLUDING the leading `GC:` tag) into a [`ParserState`],
@@ -36,6 +40,17 @@ pub fn parse_gc_body(body: &str) -> Option<ParserState> {
     {
       state.tool = Some(tool);
     }
+    // The WCS modal word is `G54`…`G59` (index 0…5). Extended systems `G59.1`…`G59.3` are not modelled — an
+    // exact match keeps them out. This is the authoritative active WCS the mesh-mismatch warning compares against.
+    state.wcs = state.wcs.or(match word {
+      "G54" => Some(0),
+      "G55" => Some(1),
+      "G56" => Some(2),
+      "G57" => Some(3),
+      "G58" => Some(4),
+      "G59" => Some(5),
+      _ => None,
+    });
   }
   Some(state)
 }
@@ -57,6 +72,17 @@ mod tests {
     // The canonical grblHAL `$G` answer: the tool word sits among the modal words and is the authoritative tool.
     let state = parse_gc_body("GC:G0 G54 G17 G21 G90 G94 M5 M9 T3 F0 S0").expect("a GC line parses");
     assert_eq!(state.tool, Some(3));
+  }
+
+  #[test]
+  fn the_active_wcs_is_extracted_from_the_g54_to_g59_word() {
+    // The WCS modal word maps G54…G59 → 0…5; the mismatch warning compares this against the mesh's probed WCS.
+    assert_eq!(parse_gc_body("GC:G0 G54 G17 G21 G90 G94 M5 M9 T0 F0 S0").expect("parses").wcs, Some(0));
+    assert_eq!(parse_gc_body("GC:G0 G56 T0 F0 S0").expect("parses").wcs, Some(2));
+    assert_eq!(parse_gc_body("GC:G0 G59 T0 F0 S0").expect("parses").wcs, Some(5));
+    // Extended systems (G59.1…) are not modelled, and a line with no WCS word reports `None`.
+    assert_eq!(parse_gc_body("GC:G0 G59.1 T0 F0 S0").expect("parses").wcs, None);
+    assert_eq!(parse_gc_body("GC:G17 G21 F0 S0").expect("parses").wcs, None);
   }
 
   #[test]

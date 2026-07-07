@@ -16,7 +16,9 @@
 //! egui/eframe at all.
 
 pub mod angle_sweep;
+pub mod autolevel;
 pub mod badge;
+pub mod datum;
 pub mod flip_verify;
 pub mod intent;
 pub mod mdi;
@@ -33,7 +35,7 @@ pub mod settings_staging;
 pub mod view_state;
 
 pub use badge::{BadgeState, TransportGroup};
-pub use intent::{Axis, Dir, Intent, IntentSink, work_offset_line, work_zero_line};
+pub use intent::{Axis, Dir, Intent, IntentSink, machine_offset_line, work_offset_line, work_zero_line};
 pub use overrides::{OverrideAxis, clamp_override, override_commands};
 pub use progress::{TimeEstimate, estimate, format_mmss, physics_estimate};
 pub use setting_help::SettingDescriptions;

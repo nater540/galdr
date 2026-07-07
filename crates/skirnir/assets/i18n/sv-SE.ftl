@@ -34,10 +34,13 @@ transport-hold = ⏸ Pausa
 transport-stop = ■ Stopp
 transport-abort = ⏹ Nödstopp
 transport-simulate = ≈ Simulera
+transport-autolevel = ⌗ Nivå
 tip-hold = Matningspaus (!)
 tip-stop = Stoppa jobbet rent (0x86) — bromsa, töm kön, återgå till Inaktiv
 tip-abort = Nödåterställning (0x18) — avbryter till LARM och återställer styrenheten
 tip-simulate = Uppskatta jobbtid från maskininställningarna (ingen rörelse — endast värd)
+tip-autolevel = Höjdkorrigera programmet mot den avkända höjdkartan före sändning (kräver en mesh)
+tip-close-dialog = Stäng
 
 # Maskintillståndets bricka (verktygsfält + statusrad). Versaler enligt designen: etiketten är främsta signalen.
 badge-disconnected = FRÅNKOPPLAD
@@ -78,6 +81,11 @@ lbl-spindle = Spindel
 ov-rapid = Snabbmatning { $pct }%
 ov-realized-feed = Verklig F
 ov-realized-speed = Verklig S
+
+# Inställnings- & avkänningsmeny (högerkolumn): kompakta genvägar till avkännings-/inställningsdialogerna.
+hdr-setup = Inställning & avkänning
+setup-intro = Guider för nollställning och avkänning. Var och en öppnas i eget fönster.
+setup-running = pågår
 
 # Avkänningspanel (Z-nollning).
 hdr-probe = Avkänn Z · ingen platta
@@ -137,6 +145,61 @@ z-datum-top = Övre yta
 z-datum-axis-desc = Z0 vid rotationsaxeln (Z_topp − D/2).
 z-datum-top-desc = Z0 vid den avkända övre ytan (Z_topp).
 z-datum-g10 = G10 sätter Z { $z }
+
+# Datumsökare (kant / hörn / Z-yta).
+hdr-datum = Datumsökare
+datum-intro = Hitta arbetsnollan: en enskild kant, ett hörn (in-/utvändigt) eller en Z-yta.
+datum-corner-label = Hörn (X/Y)
+datum-inside = Invändigt (ficka) hörn
+btn-find-corner = Hitta hörn → WCS
+datum-edge-label = Enskild kant
+lbl-datum-axis = Axel
+lbl-datum-dir = Ansättning
+btn-find-edge = Hitta kant → WCS
+datum-step-enter = Jogga till ansättningen, avkänn sedan.
+btn-datum-probe = Avkänn
+datum-step-ready-y = Jogga till Y-sidans ansättning, avkänn sedan Y.
+btn-datum-probe-y = Avkänn Y-sida
+datum-step-review = Datum hittat. Skriv det till aktivt WCS.
+btn-datum-write = Skriv datum → WCS (G10 L2)
+datum-target-corner-in = Invändigt hörn
+datum-target-corner-out = Utvändigt hörn
+datum-target-edge = { $axis }-kant
+datum-reading-edge = Kant { $v }
+datum-reading-x = X { $v }
+datum-reading-y = Y { $v }
+
+# Datumsökarens bänkinställda parametrar (fällbar sektion).
+hdr-datum-bench = Datumbänkparametrar
+lbl-tip-dia = Spets ⌀
+lbl-xy-clearance = XY-frigång
+lbl-probe-distance = Avkänningssträcka
+lbl-latch-distance = Spärrsträcka
+lbl-datum-probe-feed = Avkänningsmatning
+lbl-latch-feed = Spärrmatning
+lbl-corner-offset = Hörnförskjutning
+
+# Höjdkarta-insamlingspanel (Del B2/B3).
+hdr-mesh = Höjdkarta
+mesh-intro = Avkänn ett rutnät för att kompensera skevt material / ojämn koppar.
+lbl-mesh-min = Min
+lbl-mesh-max = Max
+lbl-mesh-spacing = Avstånd
+mesh-grid-size = { $nx } × { $ny } punkter
+btn-mesh-auto-bounds = Auto från programgränser
+btn-mesh-start = Starta insamling
+btn-mesh-apply = Tillämpa sparad höjdkarta
+btn-mesh-clear = Rensa sparad höjdkarta
+mesh-saved = En höjdkarta är sparad.
+mesh-correct-rapids = Höjdkorrigera snabbmatningar (G0 Z)
+mesh-step-ready = Jogga fritt, avkänn sedan varje rutnätspunkt.
+btn-mesh-probe = Avkänn nästa punkt
+mesh-progress = { $done } / { $total } punkter
+mesh-done = Höjdkarta klar ({ $n } punkter).
+hdr-mesh-bench = Rutnätsavkänningsparametrar
+lbl-mesh-clearance = Frigångs-Z
+lbl-mesh-feed = Avkänningsmatning
+lbl-mesh-depth = Avkänningsdjup
 
 # Verifiera/mät-panel (DOC-11 §2): 180°-vändningsverifiering och kastrapport.
 hdr-verify = Verifiera · mät

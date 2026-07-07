@@ -89,6 +89,13 @@ pub enum Intent {
   /// host computation — it sends no engine command and needs no live link — so it works while disconnected. The
   /// shell stores the timeline so the upfront ETA shows before a stream and the live remaining drains physically.
   Simulate,
+  /// Toggle height-map autoleveling for the next stream. When on (and a mesh is probed), [`Self::StartStream`]
+  /// and [`Self::Simulate`] run the loaded program through [`crate::app::autolevel::correct_program`] first; when
+  /// off, the source file streams verbatim. Flipping it invalidates the shell's cached corrected program.
+  AutolevelToggle(bool),
+  /// Set whether autolevel Z-corrects G0 rapids (`CorrectionConfig::correct_rapids`). Changing it invalidates the
+  /// corrected-program cache so the next stream/simulate re-corrects under the new setting.
+  SetCorrectRapids(bool),
 
   /// Send a single manual G-code/`$` line entered in the console.
   SendLine(String),
@@ -168,6 +175,56 @@ pub enum Intent {
   /// re-probing. Inert if no center has ever been saved.
   ApplySavedRotaryCenter,
 
+  /// Start a datum-finder single-edge run: touch off `axis` in `dir` (the approach direction) with the operator's
+  /// bench `params`, tip-compensated (X/Y) or raw (Z surface). The shell refuses to start if the probe is already
+  /// asserted (`Pn:P`), builds the [`crate::app::datum::DatumState`], and waits for the operator to jog to the
+  /// approach and trigger the touch. Replaces any datum run already in progress.
+  DatumEdgeStart {
+    axis: Axis,
+    dir: Dir,
+    params: crate::app::datum::ProbeParams,
+  },
+  /// Start a datum-finder corner run for `corner` (one of four, inside or outside) with the operator's bench
+  /// `params`. Both faces are touched at one Z plunge; the shell refuses if `Pn:P` is asserted, then waits for the
+  /// operator to jog to each face's approach and trigger the touches. Replaces any datum run in progress.
+  DatumCornerStart {
+    corner: crate::app::datum::Corner,
+    params: crate::app::datum::ProbeParams,
+  },
+  /// Trigger the datum wizard's next touch (the operator has jogged to the approach): the shell asks the wizard
+  /// which touch is due, emits its two-stage `G38.3` latch lines, and arms the probe latch before the slow pass.
+  /// Inert if no datum run is active or one is already probing.
+  DatumProbeNext,
+  /// Write the found datum to the active WCS via the wizard's offered `G10 L2` line (one axis for an edge, X&Y
+  /// for a corner). Inert until the wizard has a computed datum (the `Review` step).
+  DatumWriteWcs,
+  /// Cancel the datum-finder run, discarding its state.
+  DatumCancel,
+
+  /// Start a height-map acquisition run over the grid `[min, max]` at `spacing` (all work-mm), using the operator's
+  /// grid-probe `params`. The shell builds the [`crate::app::autolevel::Mesh`] (spacing→counts) and the serpentine
+  /// [`crate::app::autolevel::MeshProbeState`], then waits for the operator to trigger each point. Replaces any run
+  /// in progress and cancels other probe ops.
+  MeshProbeStart {
+    params: crate::app::autolevel::GridProbeParams,
+    min: (f64, f64),
+    max: (f64, f64),
+    spacing: (f64, f64),
+  },
+  /// Trigger the acquisition's next point (the operator is ready): the shell asks the wizard for the next point's
+  /// two-stage `G38.3` Z-touch lines, emits them, and arms the probe latch. Inert if no run is active or one is
+  /// already probing.
+  MeshProbeNext,
+  /// Cancel the height-map acquisition run, discarding its (partial) mesh.
+  MeshProbeCancel,
+  /// Clear the persisted height-map from the profile (and disarm autolevel's use of it). The shell drops
+  /// `profile.mesh`, saves the profile, and invalidates the corrected-program cache.
+  MeshClear,
+  /// Apply the saved height-map to the next stream: arm autolevel (if a mesh is persisted) and invalidate the
+  /// corrected-program cache so the next stream/simulate re-corrects against it. Inert with a notice if no mesh
+  /// has been probed/saved.
+  ApplySavedMesh,
+
   /// Start a Phase 2 180°-flip center-verify (DOC-11 §2.1): probe a feature along `axis`/`dir` at `angle_deg`,
   /// then at `angle_deg + 180`, and compute the residual offset from the rotation centerline. Cancels any other
   /// in-flight probe op.
@@ -214,6 +271,22 @@ pub fn work_offset_line(values: &[(Axis, f64)]) -> String {
     line.push(axis.letter());
     // `{:.3}` matches the precision the shell uses elsewhere; an integer 0 still prints as `0.000`, which grbl
     // parses identically to `0`.
+    line.push_str(&format!("{value:.3}"));
+  }
+  line
+}
+
+/// Build a `G10 L2 P0` line that sets the active work-coordinate system's ORIGIN on the given axes directly from
+/// the supplied MACHINE coordinates (grbl's "put work-0 at this machine position"). Unlike [`work_offset_line`]'s
+/// `L20` (which makes the *current* position read the value), `L2` is position-INDEPENDENT: it sets the origin
+/// from an absolute machine coordinate the caller already computed — exactly right for a probe result, where the
+/// target machine coordinate is known but the tool has since moved off it. Mirrors [`super::probe_flow::zero_z_line`]'s
+/// single-axis form for the multi-axis datum writes. Kept pure so the wire form is unit-tested without a window.
+pub fn machine_offset_line(values: &[(Axis, f64)]) -> String {
+  let mut line = String::from("G10 L2 P0");
+  for (axis, value) in values {
+    line.push(' ');
+    line.push(axis.letter());
     line.push_str(&format!("{value:.3}"));
   }
   line
@@ -385,6 +458,17 @@ mod tests {
     // The shared builder formats each axis at 3-decimal precision; this is what the Z-probe zeroing uses.
     assert_eq!(work_offset_line(&[(Axis::Z, 1.5)]), "G10 L20 P0 Z1.500");
     assert_eq!(work_offset_line(&[(Axis::X, 2.0), (Axis::Y, -3.25)]), "G10 L20 P0 X2.000 Y-3.250");
+  }
+
+  #[test]
+  fn machine_offset_line_sets_per_axis_origins_as_l2() {
+    // The L2 (position-independent) datum write: the origin is set directly from the supplied machine coordinate,
+    // one axis or several, at 3-decimal precision. This is the multi-axis form the datum finder's WCS write uses.
+    assert_eq!(machine_offset_line(&[(Axis::Z, -3.5)]), "G10 L2 P0 Z-3.500");
+    assert_eq!(machine_offset_line(&[(Axis::X, 2.0), (Axis::Y, -3.25)]), "G10 L2 P0 X2.000 Y-3.250");
+    // It must be L2 (machine-coord origin), never L20 (current-position) — the defining distinction.
+    let line = machine_offset_line(&[(Axis::X, 1.0)]);
+    assert!(line.contains("L2 ") && !line.contains("L20"), "the datum write must be G10 L2, not L20; got {line:?}");
   }
 
   #[test]

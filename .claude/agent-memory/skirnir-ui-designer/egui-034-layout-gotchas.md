@@ -66,3 +66,10 @@ egui 0.34 behaviors verified the hard way in skirnir (each caused a visible bug 
   `button_row` for the steppers, truncating right-aligned rapid row, and the
   `the_side_columns_never_overflow_their_fixed_widths_in_any_locale` guard test (en+sv, PanelState-asserted).
   Rename memo: this file's title says 0.34; entries above predate the 0.35 bump but were all re-verified on it.
+- **egui 0.35 floating-window API facts** (verified 2026-07-07 building the setup dialogs): the viewport rect for
+  centring a `Window` default_pos is `ctx.content_rect()` — NOT `ctx.screen_rect()` (removed) nor `InputState`'s
+  `screen_rect` (private in 0.35). `Window::vscroll(true)` + `.max_width(W)` + `.default_width(W)` gives a
+  fixed-width, vertically-scrolling dialog that can't overflow the viewport height. Centre-on-open without pinning:
+  `.pivot(Align2::CENTER_CENTER).default_pos(ctx.content_rect().center())` (still draggable; egui remembers against
+  the explicit `.id()`). `egui::Button::new(..).selected(bool)` exists and gives the accent "active" fill — used
+  for the setup-menu launcher that's currently open.

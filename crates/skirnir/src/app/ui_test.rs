@@ -44,12 +44,16 @@ pub(crate) struct HarnessState {
   /// Every intent the view has emitted since the harness was built, in order. The view drains its sink each
   /// frame, so we append the drained batch here to survive across frames.
   pub intents: Vec<Intent>,
+  /// An optional running rotary center-finder fixture, threaded into [`shell_layout`]'s [`ShellPanelsData`] so a
+  /// test/snapshot can drive the FORCED-open setup dialog (a running probing wizard pins its window open). `None`
+  /// (the default) is the ordinary bare-panel-data path every existing test uses.
+  pub wizard: Option<super::rotary_center::WizardState>,
 }
 
 impl HarnessState {
-  /// A fresh harness state from a given view/ui pair and no recorded intents.
+  /// A fresh harness state from a given view/ui pair and no recorded intents (and no running wizard fixture).
   pub fn new(view: ViewState, ui: UiState) -> Self {
-    HarnessState { view, ui, intents: Vec::new() }
+    HarnessState { view, ui, intents: Vec::new(), wizard: None }
   }
 }
 
@@ -124,7 +128,20 @@ pub(crate) fn build_docked_panel_harness(
 /// the tool-change banner branch, exactly the failure mode this closes).
 pub(crate) fn shell_layout(ui: &mut egui::Ui, state: &mut HarnessState, time: super::progress::TimeEstimate) {
   let mut sink = IntentSink::new();
-  views::shell_panels(ui, &state.view, &mut state.ui, views::ShellPanelsData::bare(time), &mut sink);
+  // Borrow the disjoint fixture fields directly (not through a method) so `&mut state.ui` and the wizard's
+  // `&state.wizard` can coexist — the panel data is bare apart from the optional running-wizard fixture that
+  // drives the forced-open setup dialog.
+  let data = views::ShellPanelsData {
+    time,
+    eta_qualifier: None,
+    wizard: state.wizard.as_ref(),
+    has_saved_center: false,
+    datum: None,
+    mesh_probe: None,
+    has_saved_mesh: false,
+    sweep: None,
+  };
+  views::shell_panels(ui, &state.view, &mut state.ui, data, &mut sink);
   state.intents.extend(sink.drain());
 }
 
@@ -872,6 +889,94 @@ mod tests {
     harness.get_by_label("⚙").click();
     harness.run();
     assert!(!harness.state().ui.app_settings_open, "clicking it again must close the dialog");
+  }
+
+  #[test]
+  fn the_setup_menu_launches_a_probing_dialog_instead_of_inlining_it() {
+    // The declutter: the heavy probing panels no longer stack in the right column — the column offers a compact
+    // menu whose entries open the panel in its own window. So the probe ACTION is absent from the column until
+    // the operator opens its dialog.
+    let state = HarnessState::new(view_idle(), UiState::default());
+    let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+    harness.run();
+    assert!(harness.state().ui.setup_dialog.is_none(), "no setup dialog is open on a fresh idle shell");
+    assert!(
+      harness.query_by_label("Probe Z → set work-zero").is_none(),
+      "the probe action must NOT be inline in the right column any more — it lives behind the menu"
+    );
+    // The compact menu entry (labelled by the section name) opens the probe dialog.
+    harness.get_by_label("Probe Z · no plate").click();
+    harness.run();
+    assert_eq!(
+      harness.state().ui.setup_dialog,
+      Some(views::SetupDialog::Probe),
+      "clicking the menu entry must open the probe dialog"
+    );
+    assert!(
+      harness.query_by_label("Probe Z → set work-zero").is_some(),
+      "the probe action must now render inside the opened dialog window"
+    );
+  }
+
+  #[test]
+  fn a_running_probing_wizard_forces_its_dialog_open() {
+    // Safety: a wizard that is moving the machine must never be hidden. With a center-finder mid-run but NO setup
+    // dialog opened by the operator, the shell forces the rotary dialog visible on its own and renders the run.
+    let mut state = HarnessState::new(view_idle(), UiState::default());
+    state.wizard = Some(super::super::rotary_center::WizardState::new(6.0, 0.0));
+    assert!(state.ui.setup_dialog.is_none(), "the fixture starts with no dialog opened by the operator");
+    let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+    harness.run();
+    assert_eq!(
+      harness.state().ui.setup_dialog,
+      Some(views::SetupDialog::RotaryCenter),
+      "a running center-finder must force its dialog visible even when the operator opened none"
+    );
+    assert!(
+      harness.query_by_label("Cancel").is_some(),
+      "the running wizard's Cancel control must render in the forced-open dialog"
+    );
+  }
+
+  #[test]
+  fn an_idle_setup_dialogs_title_bar_matches_the_app_section_header_style() {
+    // The floating wizards used egui's default (mixed-case, bright) window title bar; they now carry the app's
+    // uppercase, letter-tracked section-header treatment plus a ghost `×` that dismisses an idle dialog.
+    let mut ui = UiState::default();
+    ui.setup_dialog = Some(views::SetupDialog::Probe);
+    let state = HarnessState::new(view_idle(), ui);
+    let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+    harness.run();
+    // The styled header renders the section title UPPERCASED (the launcher button keeps the mixed-case label, so
+    // this uppercase form is unambiguously the dialog's own title bar, not the menu entry).
+    assert!(
+      harness.query_by_label("PROBE Z · NO PLATE").is_some(),
+      "the dialog title bar must render the section title in the uppercase section-header style"
+    );
+    // Idle dialogs stay dismissable: the ghost × clears the open dialog.
+    harness.get_by_label("×").click();
+    harness.run();
+    assert!(
+      harness.state().ui.setup_dialog.is_none(),
+      "clicking the title-bar × must close the idle dialog"
+    );
+  }
+
+  #[test]
+  fn a_running_setup_dialogs_title_bar_is_styled_but_has_no_close_button() {
+    // Safety: the forced-open running dialog wears the same styled header but MUST NOT be dismissable — no ×.
+    let mut state = HarnessState::new(view_idle(), UiState::default());
+    state.wizard = Some(super::super::rotary_center::WizardState::new(6.0, 0.0));
+    let mut harness = build_shell_harness(state, egui::vec2(1280.0, 800.0), zero_time());
+    harness.run();
+    assert!(
+      harness.query_by_label("ROTARY CENTER-FINDER").is_some(),
+      "the running dialog's title bar must also use the uppercase section-header style"
+    );
+    assert!(
+      harness.query_by_label("×").is_none(),
+      "a running (pinned) dialog must have no title-bar close × — only the in-body Cancel ends the flow"
+    );
   }
 
   #[test]

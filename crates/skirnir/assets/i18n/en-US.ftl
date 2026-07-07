@@ -37,10 +37,13 @@ transport-hold = ⏸ Hold
 transport-stop = ■ Stop
 transport-abort = ⏹ Abort
 transport-simulate = ≈ Simulate
+transport-autolevel = ⌗ Level
 tip-hold = Feed hold (!)
 tip-stop = Stop the job cleanly (0x86) — decelerate, flush, return to Idle
 tip-abort = Emergency hard reset (0x18) — aborts to ALARM and resets the controller
 tip-simulate = Estimate job time from the machine settings (no motion — host-only)
+tip-autolevel = Height-correct the program against the probed heightmap before streaming (needs a mesh)
+tip-close-dialog = Close
 
 # Machine-state badge (toolbar + status bar). Uppercase per the design: the label is the primary signal.
 badge-disconnected = DISCONNECTED
@@ -81,6 +84,11 @@ lbl-spindle = Spindle
 ov-rapid = Rapid { $pct }%
 ov-realized-feed = Realized F
 ov-realized-speed = Realized S
+
+# Setup & probing menu (right column): compact launchers for the probing/setup dialogs.
+hdr-setup = Setup & probing
+setup-intro = Touch-off and probing wizards. Each opens in its own window.
+setup-running = running
 
 # Probe (Z touch-off) panel.
 hdr-probe = Probe Z · no plate
@@ -140,6 +148,61 @@ z-datum-top = Top surface
 z-datum-axis-desc = Z0 at the rotary axis (Z_top − D/2).
 z-datum-top-desc = Z0 at the probed top surface (Z_top).
 z-datum-g10 = G10 will set Z { $z }
+
+# Datum finder (edge / corner / Z surface).
+hdr-datum = Datum finder
+datum-intro = Find work zero: a single edge, a corner (inside/outside), or a Z surface.
+datum-corner-label = Corner (X/Y)
+datum-inside = Inside (pocket) corner
+btn-find-corner = Find corner → WCS
+datum-edge-label = Single edge
+lbl-datum-axis = Axis
+lbl-datum-dir = Approach
+btn-find-edge = Find edge → WCS
+datum-step-enter = Jog to the approach, then probe.
+btn-datum-probe = Probe
+datum-step-ready-y = Jog to the Y-face approach, then probe Y.
+btn-datum-probe-y = Probe Y face
+datum-step-review = Datum found. Write it to the active WCS.
+btn-datum-write = Write datum → WCS (G10 L2)
+datum-target-corner-in = Inside corner
+datum-target-corner-out = Outside corner
+datum-target-edge = { $axis } edge
+datum-reading-edge = Edge { $v }
+datum-reading-x = X { $v }
+datum-reading-y = Y { $v }
+
+# Datum finder bench-tuned parameters (collapsing section).
+hdr-datum-bench = Datum bench params
+lbl-tip-dia = Tip ⌀
+lbl-xy-clearance = XY clearance
+lbl-probe-distance = Probe distance
+lbl-latch-distance = Latch distance
+lbl-datum-probe-feed = Probe feed
+lbl-latch-feed = Latch feed
+lbl-corner-offset = Corner offset
+
+# Heightmap acquisition panel (Part B2/B3).
+hdr-mesh = Heightmap
+mesh-intro = Probe a grid to compensate warped stock / uneven copper.
+lbl-mesh-min = Min
+lbl-mesh-max = Max
+lbl-mesh-spacing = Spacing
+mesh-grid-size = { $nx } × { $ny } points
+btn-mesh-auto-bounds = Auto from program bounds
+btn-mesh-start = Start acquisition
+btn-mesh-apply = Apply saved heightmap
+btn-mesh-clear = Clear saved heightmap
+mesh-saved = A heightmap is saved.
+mesh-correct-rapids = Height-correct rapids (G0 Z)
+mesh-step-ready = Jog clear, then probe each grid point.
+btn-mesh-probe = Probe next point
+mesh-progress = { $done } / { $total } points
+mesh-done = Heightmap complete ({ $n } points).
+hdr-mesh-bench = Grid-probe params
+lbl-mesh-clearance = Clearance Z
+lbl-mesh-feed = Probe feed
+lbl-mesh-depth = Probe depth
 
 # Verify / measure panel (DOC-11 §2): 180°-flip verify and runout report.
 hdr-verify = Verify · measure

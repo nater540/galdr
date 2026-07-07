@@ -61,12 +61,30 @@ pub enum ProbeKind {
   /// One touch of the rotary center-finder wizard (DOC-11 §1.2). The wizard ([`super::rotary_center`]) owns the
   /// follow-up: it folds the resolved result into its state machine and advances or aborts.
   RotaryCenter,
+  /// One touch of the datum finder (edge / corner / Z surface). The datum wizard ([`super::datum::finder`]) owns
+  /// the follow-up: it folds the resolved result into its state machine and advances or aborts.
+  Datum,
+  /// One point of the height-map acquisition grid probe. The acquisition wizard ([`super::autolevel::acquire`])
+  /// owns the follow-up: it folds the resolved Z into the mesh (as a delta from the first point) and advances.
+  Mesh,
   /// One touch of the 180°-flip center-verify wizard (DOC-11 §2.1). The shared angle-sweep engine
   /// ([`super::angle_sweep`]) collects the reading; the [`super::flip_verify`] computation runs on completion.
   FlipVerify,
   /// One touch of the runout report (DOC-11 §2.2). The same angle-sweep engine collects the N radial readings;
   /// the read-only [`super::runout`] computation (TIR / eccentricity) runs on completion.
   Runout,
+}
+
+impl ProbeKind {
+  /// How many `[PRB:]` pushes ONE touch of this kind produces — the count the latch must consume before it keeps a
+  /// result. The datum and mesh touches are a TWO-STAGE `G38.3` latch (a fast search then a slow re-probe), so they
+  /// emit TWO `[PRB:]`s and the KEPT reading is the SECOND (slow) one; every other kind is a single probe.
+  fn expected_pushes(self) -> usize {
+    match self {
+      ProbeKind::Datum | ProbeKind::Mesh => 2,
+      _ => 1,
+    }
+  }
 }
 
 /// The resolved outcome of a probe operation: either a typed `[PRB:]` reading, or a failure with a reason. A
@@ -101,14 +119,21 @@ pub struct ProbeOp {
   /// `Alarm`/`Error` resolves the op as failed.
   pub awaiting: bool,
   /// The last resolved outcome, or `None` while still awaiting the first result. The UI renders this; the shell
-  /// reads it to decide the follow-up (zero on success, surface a notice on failure).
+  /// reads it to decide the follow-up (zero on success, surface a notice on failure). For a two-stage touch this
+  /// is updated on EACH `[PRB:]` (last-wins), so after both pushes it holds the SLOW (kept) reading.
   pub last: Option<ProbeOutcome>,
+  /// How many more SUCCESS pushes must land before this op resolves. Starts at [`ProbeKind::expected_pushes`] (2
+  /// for the two-stage datum/mesh touch, 1 otherwise); each successful `[PRB:]` decrements it and updates `last`,
+  /// and the op resolves (clears `awaiting`) once it reaches 0 — so the SLOW re-probe, not the fast search, is the
+  /// kept reading. A FAILURE push (a `:0` miss or an alarm) resolves immediately regardless of the remaining count.
+  remaining: usize,
 }
 
 impl ProbeOp {
-  /// Begin tracking a freshly-issued probe of `kind`: awaiting a result, no outcome yet.
+  /// Begin tracking a freshly-issued probe of `kind`: awaiting a result, no outcome yet, expecting
+  /// [`ProbeKind::expected_pushes`] successful pushes before it resolves.
   pub fn issued(kind: ProbeKind) -> Self {
-    ProbeOp { kind, awaiting: true, last: None }
+    ProbeOp { kind, awaiting: true, last: None, remaining: kind.expected_pushes() }
   }
 }
 
@@ -160,6 +185,10 @@ pub struct ViewState {
   /// number). `Some(0)` means no tool; `None` means none has been reported yet this session. Cleared on
   /// disconnect so a reconnect to a (possibly different) board never shows a stale tool.
   pub current_tool: Option<u32>,
+  /// The active work-coordinate system index (`G54`=0 … `G59`=5), sourced from the `$G`/`[GC:]` parser-state line.
+  /// `None` until a parser-state line has reported one this session. Cleared on disconnect. Read by the height-map
+  /// WCS-mismatch warning (a mesh probed under a different WCS than the running job would mis-index the surface).
+  pub active_wcs: Option<usize>,
   /// Streaming progress.
   pub progress: Progress,
   /// A latched alarm/error banner, if active.
@@ -193,6 +222,7 @@ impl Default for ViewState {
       last_wco: Vec::new(),
       last_overrides: None,
       current_tool: None,
+      active_wcs: None,
       progress: Progress::default(),
       banner: None,
       probe_op: None,
@@ -468,17 +498,21 @@ impl ViewState {
         return;
       }
       Response::Message(body) => {
-        // A `[GC:...]` parser-state line (the `$G` answer) carries the active tool (`T<n>`) — the single
-        // authoritative tool source — among the modal G/M words. Fold the tool into the DRO when present. We
-        // suppress the console echo ONLY when a tool was successfully extracted (the auto-reconcile `$G` the shell
-        // fires on connect / on entering Tool would otherwise be console noise). A `[GC:]` that yields no tool —
-        // a hand-typed `$G` we model no field of, or a malformed/garbled line — must NOT be swallowed: it falls
-        // through to the console below so it stays visible-as-text rather than vanishing silently.
-        if let Some(parser_state) = parse_gc_body(body)
-          && let Some(tool) = parser_state.tool
-        {
-          self.current_tool = Some(tool);
-          return;
+        // A `[GC:...]` parser-state line (the `$G` answer) carries the active tool (`T<n>`) and the active WCS
+        // (`G54`…`G59`). We CAPTURE the WCS unconditionally (for the height-map mismatch warning) but that capture
+        // must NOT change the console-echo behaviour: the echo is suppressed ONLY when a TOOL was extracted (the
+        // auto-reconcile `$G` the shell fires on connect / on entering Tool would otherwise be console noise). A
+        // `[GC:]` that yields no tool — a hand-typed `$G` the operator wants to SEE — must still reach the console,
+        // so folding on the WCS too would swallow it (the regression this guards against). A `[GC:]` with no tool
+        // therefore falls through to the console below, exactly as before, while the WCS is still captured.
+        if let Some(parser_state) = parse_gc_body(body) {
+          if let Some(wcs) = parser_state.wcs {
+            self.active_wcs = Some(wcs);
+          }
+          if let Some(tool) = parser_state.tool {
+            self.current_tool = Some(tool);
+            return;
+          }
         }
         // A `[SETTING:...]` enumeration row enriches the settings model with the setting's label/unit/bounds and
         // is not console noise; every other bracketed message still reaches the console below.
@@ -512,15 +546,28 @@ impl ViewState {
     self.log(LogSource::Received, text);
   }
 
-  /// Capture a resolved outcome into the in-flight probe op, clearing `awaiting`. Only resolves an op that is
-  /// still awaiting, so a stray second `[PRB:]` (e.g. a push followed by a redundant `$#` echo) cannot overwrite
-  /// a result the shell may have already acted on. No-op when no probe is outstanding.
+  /// Fold one `[PRB:]` outcome into the in-flight probe op. Only acts on an op still `awaiting`. A FAILURE (a `:0`
+  /// miss or an intervening alarm) resolves it IMMEDIATELY (a miss on either the fast or the slow pass aborts the
+  /// touch). A SUCCESS updates `last` (last-wins) and decrements the expected-push counter, resolving only once the
+  /// LAST expected push has landed — so a two-stage touch keeps the SECOND (slow) reading, not the fast search's.
+  /// A stray extra `[PRB:]` after resolution (e.g. a `$#` echo) is ignored because `awaiting` is already cleared.
   fn resolve_probe(&mut self, outcome: ProbeOutcome) {
     if let Some(op) = self.probe_op.as_mut()
       && op.awaiting
     {
-      op.awaiting = false;
-      op.last = Some(outcome);
+      match &outcome {
+        ProbeOutcome::Failure { .. } => {
+          op.awaiting = false;
+          op.last = Some(outcome);
+        }
+        ProbeOutcome::Success { .. } => {
+          op.last = Some(outcome);
+          op.remaining = op.remaining.saturating_sub(1);
+          if op.remaining == 0 {
+            op.awaiting = false;
+          }
+        }
+      }
     }
   }
 
@@ -545,6 +592,7 @@ impl ViewState {
     // The active tool is the previous board's parser state; clear it so a reconnect shows no tool until the new
     // session's `$G` answers, rather than carrying a stale `T<n>` across the disconnect.
     self.current_tool = None;
+    self.active_wcs = None;
     // The settings list is the previous board's; clear it so a reconnect re-fetches rather than showing stale.
     self.settings.clear();
     // The codebook overrides are the previous board's `$EE`/`$EA` enumeration; clear them so a reconnect
@@ -682,18 +730,29 @@ mod tests {
   }
 
   #[test]
-  fn a_gc_line_without_an_extractable_tool_is_echoed_not_swallowed() {
-    // A `[GC:]` that yields no tool — a hand-typed `$G` we model no field of, or a malformed/garbled line — must
-    // still reach the console so it is visible-as-text rather than vanishing silently. We suppress the echo ONLY
-    // when a tool was successfully extracted (the auto-reconcile `$G` the shell fires would otherwise be noise).
+  fn a_gc_line_without_an_extractable_tool_is_echoed_even_though_its_wcs_is_captured() {
+    // REGRESSION guard: capturing the active WCS must NOT change the console-echo behaviour. A `[GC:]` with no
+    // `T` word — a hand-typed `$G` the operator wants to SEE — must still ECHO to the console, even though its
+    // `G54` word is captured into `active_wcs`. Folding on the WCS too would silently swallow a hand-typed `$G`.
     let mut view = ViewState::default();
-    feed_message(&mut view, "GC:G0 G54 F0 S0");
+    feed_message(&mut view, "GC:G0 G54 F0 S0"); // a WCS but no tool.
     assert_eq!(view.console.len(), 1, "a `[GC:]` with no extractable tool must be echoed, not swallowed");
     assert!(view.console.back().expect("a console line").text.contains("GC:"), "the verbatim line reaches the console");
-    // And a `[GC:]` that DID set the tool stays suppressed (no console noise from the auto-reconcile `$G`).
+    assert_eq!(view.active_wcs, Some(0), "the WCS is captured even though the line still echoes");
+    // A `[GC:]` that DID set the tool stays suppressed (no console noise from the auto-reconcile `$G`).
     feed_message(&mut view, "GC:G0 G54 T7 F0 S0");
     assert_eq!(view.current_tool, Some(7));
-    assert_eq!(view.console.len(), 1, "a parseable `[GC:]` is folded, not echoed");
+    assert_eq!(view.console.len(), 1, "a tool-bearing `[GC:]` is folded, not echoed");
+  }
+
+  #[test]
+  fn the_active_wcs_is_folded_and_cleared_on_disconnect() {
+    let mut view = ViewState::default();
+    assert_eq!(view.active_wcs, None, "no WCS reported until a `$G` answer");
+    feed_message(&mut view, "GC:G0 G55 T0 F0 S0");
+    assert_eq!(view.active_wcs, Some(1), "G55 → WCS index 1");
+    view.apply(Event::Disconnected(None));
+    assert_eq!(view.active_wcs, None, "the active WCS must not survive a disconnect");
   }
 
   #[test]
@@ -853,6 +912,51 @@ mod tests {
     let mut view = ViewState::default();
     view.apply(Event::Response(Response::Alarm(5)));
     assert_eq!(view.banner, Some(Banner::Alarm(5)));
+  }
+
+  /// Convenience: feed a `[PRB:]` push through the reducer.
+  fn feed_prb(view: &mut ViewState, position: Vec<f64>, success: bool) {
+    view.apply(Event::Response(Response::ProbeResult { position, success }));
+  }
+
+  #[test]
+  fn a_two_stage_probe_keeps_the_slow_second_reading_not_the_fast_first() {
+    // The two-stage latch bug: a datum/mesh touch pushes TWO `[PRB:]`s (fast search, then slow re-probe). The latch
+    // must keep the SECOND (slow, accurate) reading. The FAST push must NOT resolve the op.
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::Datum);
+    feed_prb(&mut view, vec![0.0, 0.0, -1.0], true); // fast reading — must be discarded.
+    assert!(view.probe_op.as_ref().unwrap().awaiting, "still awaiting the slow re-probe after the fast push");
+    feed_prb(&mut view, vec![0.0, 0.0, -1.5], true); // slow reading — the kept one.
+    let op = view.probe_op.as_ref().unwrap();
+    assert!(!op.awaiting, "resolved after the second (slow) push");
+    assert_eq!(
+      op.last,
+      Some(ProbeOutcome::Success { position: vec![0.0, 0.0, -1.5] }),
+      "the two-stage latch must keep the SLOW reading, not the fast",
+    );
+  }
+
+  #[test]
+  fn a_miss_on_either_pass_aborts_the_two_stage_probe_immediately() {
+    // A `:0` miss (or an alarm) on EITHER pass resolves the op immediately as a failure — no waiting for a 2nd push.
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::Mesh);
+    feed_prb(&mut view, vec![0.0, 0.0, 0.0], false); // the fast pass misses.
+    let op = view.probe_op.as_ref().unwrap();
+    assert!(!op.awaiting, "a miss on the fast pass resolves immediately");
+    assert!(matches!(op.last, Some(ProbeOutcome::Failure { .. })), "the miss resolves as a failure");
+  }
+
+  #[test]
+  fn a_single_stage_probe_resolves_on_the_first_push() {
+    // A non-two-stage op (here ZeroZ) is a single probe: it must still resolve on the FIRST `[PRB:]`.
+    let mut view = ViewState::default();
+    view.begin_probe(ProbeKind::ZeroZ);
+    feed_prb(&mut view, vec![0.0, 0.0, -2.0], true);
+    let op = view.probe_op.as_ref().unwrap();
+    assert!(!op.awaiting, "a single-stage probe resolves on the first push");
+    assert_eq!(op.last, Some(ProbeOutcome::Success { position: vec![0.0, 0.0, -2.0] }));
   }
 
   #[test]

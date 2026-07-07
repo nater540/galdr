@@ -135,6 +135,15 @@ fn snapshot_shell(name: &str, size: egui::Vec2, view: ViewState, ui: UiState, ti
   harness.snapshot(name);
 }
 
+/// Render one shell state from a fully-built [`HarnessState`] (so a caller can pre-open a setup dialog or seed a
+/// running-wizard fixture) and snapshot it. `name` becomes `tests/snapshots/<name>.png`.
+fn snapshot_shell_state(name: &str, size: egui::Vec2, state: HarnessState, time: TimeEstimate, locale: &str) {
+  let _locale = render_in(locale);
+  let mut harness = build_shell_harness(state, size, time);
+  harness.run_steps(2);
+  harness.snapshot(name);
+}
+
 /// No timing fixture: the zero estimate (nothing streamed, nothing projected).
 fn no_time() -> TimeEstimate {
   TimeEstimate::default()
@@ -396,6 +405,51 @@ fn snapshot_shell_idle_rotary() {
   view.connection = ConnectionState::Idle;
   apply_status(&mut view, "Idle|MPos:12.500,20.000,-1.200,45.000|WCO:2.000,3.000,1.000,0.000|FS:0,0|Ov:100,100,100");
   snapshot_shell("shell_idle_rotary", DEFAULT_SIZE, view, fixture_ui(), no_time(), crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_probe_dialog() {
+  // The decluttered right column offers a compact "Setup & probing" menu; opening the Z touch-off entry floats
+  // its panel as a dialog over the shell. Pre-open it so the shot captures the dialog chrome + body.
+  let mut ui = fixture_ui();
+  ui.setup_dialog = Some(super::views::SetupDialog::Probe);
+  let state = HarnessState::new(idle_view(), ui);
+  snapshot_shell_state("shell_probe_dialog", DEFAULT_SIZE, state, no_time(), crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_mesh_dialog() {
+  // The Heightmap setup dialog (idle, dismissable) — the case the user screenshotted. Pins both the styled
+  // section-header title bar and the one-word "HEIGHTMAP" heading (the i18n change).
+  let mut ui = fixture_ui();
+  ui.setup_dialog = Some(super::views::SetupDialog::MeshProbe);
+  let state = HarnessState::new(idle_view(), ui);
+  snapshot_shell_state("shell_mesh_dialog", DEFAULT_SIZE, state, no_time(), crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_probe_dialog_light_slate() {
+  // The styled dialog title bar must hold contrast in a LIGHT theme too (panelAlt strip + dim tracked title +
+  // divider), not only the dark default — the design's both-themes-first-class rule for the new chrome.
+  let mut ui = fixture_ui();
+  ui.style.palette = super::theme::Palette::light_slate();
+  ui.setup_dialog = Some(super::views::SetupDialog::Probe);
+  let state = HarnessState::new(idle_view(), ui);
+  snapshot_shell_state("shell_probe_dialog_light_slate", DEFAULT_SIZE, state, no_time(), crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p skirnir -- --ignored snapshot`"]
+fn snapshot_shell_rotary_running() {
+  // Safety-critical case: a rotary center-finder is mid-run, so the shell FORCES its dialog open (no close
+  // button) even though the operator opened none. The dialog shows the run readings and the step action.
+  let view = idle_view();
+  let mut state = HarnessState::new(view, fixture_ui());
+  state.wizard = Some(super::rotary_center::WizardState::new(6.0, 0.0));
+  snapshot_shell_state("shell_rotary_running", DEFAULT_SIZE, state, no_time(), crate::i18n::EN_US);
 }
 
 #[test]

@@ -28,7 +28,7 @@ use crate::app::rotary_center::ZDatum;
 /// `version` exceeds this is refused by [`Profile::from_ron`] (we cannot know how to read a future layout), while
 /// an older-or-equal version is accepted and missing fields fill from `#[serde(default)]`. This is the single
 /// knob that makes the format forward-aware.
-pub const PROFILE_VERSION: u32 = 1;
+pub const PROFILE_VERSION: u32 = 2;
 
 /// The file name written under the per-user config directory (e.g. `~/.config/skirnir/profile.ron` on Linux).
 const PROFILE_FILE: &str = "profile.ron";
@@ -122,6 +122,16 @@ pub struct Prefs {
   /// parse on the missing field.
   #[serde(default)]
   pub rotary_bench: crate::app::rotary_probe::RotaryProbeParams,
+  /// The datum finder's bench-tuned probe parameters (clearances, latch/probe feeds, tip diameter, corner offset)
+  /// — remembered so the per-bench values an operator dials in once survive a session. `#[serde(default)]` so a
+  /// profile written before this block existed still loads, defaulting the whole struct rather than failing to
+  /// parse on the missing field (the same forward-compat pattern as `rotary_bench`).
+  #[serde(default)]
+  pub datum_bench: crate::app::datum::ProbeParams,
+  /// The height-map acquisition grid-probe parameters (clearance/feeds/depth/latch/probe-offset) — remembered so
+  /// the per-bench values survive a session, like `datum_bench`. `#[serde(default)]` for forward-compat.
+  #[serde(default)]
+  pub grid_bench: crate::app::autolevel::GridProbeParams,
   /// The console dock's share of the central region (`0..1`) — the operator's dragged split ratio, restored on
   /// the next launch. `#[serde(default = ...)]` so a profile written before the tiles split still loads.
   #[serde(default = "default_dock_fraction")]
@@ -148,6 +158,8 @@ impl Default for Prefs {
       rotary_dowel_diameter: 6.0,
       rotary_index_angle: 0.0,
       rotary_bench: crate::app::rotary_probe::RotaryProbeParams::default(),
+      datum_bench: crate::app::datum::ProbeParams::default(),
+      grid_bench: crate::app::autolevel::GridProbeParams::default(),
       dock_fraction: DEFAULT_DOCK_FRACTION,
     }
   }
@@ -163,6 +175,11 @@ pub struct Profile {
   /// The persisted rotary-A center setup, or `None` until a center-finder run has been saved.
   #[serde(default)]
   pub rotary: Option<RotarySetup>,
+  /// The persisted auto-level height-map (Part B4), or `None` until one has been probed. `#[serde(default)]` so a
+  /// v1 profile (written before the mesh existed) still loads with no mesh rather than failing to parse — the
+  /// PROFILE_VERSION 1→2 bump signals the shape grew, but the default keeps older files readable.
+  #[serde(default)]
+  pub mesh: Option<crate::app::autolevel::Mesh>,
   /// Connection + UI defaults remembered across sessions.
   #[serde(default)]
   pub prefs: Prefs,
@@ -170,7 +187,7 @@ pub struct Profile {
 
 impl Default for Profile {
   fn default() -> Self {
-    Profile { version: PROFILE_VERSION, rotary: None, prefs: Prefs::default() }
+    Profile { version: PROFILE_VERSION, rotary: None, mesh: None, prefs: Prefs::default() }
   }
 }
 
@@ -274,6 +291,10 @@ mod tests {
   /// A fully-populated profile for round-trip checks — every field set to a non-default value so a dropped or
   /// mis-wired field shows up as a mismatch rather than coincidentally matching the default.
   fn sample() -> Profile {
+    // A small, non-flat mesh so a dropped or mis-wired mesh field shows up as a round-trip mismatch.
+    let mut mesh = crate::app::autolevel::Mesh::from_spacing((0.0, 0.0), (10.0, 10.0), (5.0, 5.0));
+    mesh.set_delta(1, 1, 0.05);
+    mesh.wcs_index = 1;
     Profile {
       version: PROFILE_VERSION,
       rotary: Some(RotarySetup {
@@ -283,6 +304,7 @@ mod tests {
         a_datum_deg: 90.0,
         z_datum: ZDatum::TopSurface,
       }),
+      mesh: Some(mesh),
       prefs: Prefs {
         last_port: Some("/dev/cu.usbmodem31101".to_string()),
         baud: 250_000,
@@ -295,6 +317,27 @@ mod tests {
           feed: 40.0,
           depth_mm: 12.0,
           side_probe_z: -9.0,
+        },
+        datum_bench: crate::app::datum::ProbeParams {
+          xy_clearance: 4.0,
+          depth: 6.0,
+          probe_distance: 20.0,
+          latch_distance: 1.5,
+          probe_feed: 150.0,
+          latch_feed: 40.0,
+          rapids_feed: 800.0,
+          probe_diameter: 3.175,
+          offset: 4.0,
+        },
+        grid_bench: crate::app::autolevel::GridProbeParams {
+          clearance_z: -1.0,
+          probe_feed: 180.0,
+          probe_depth: 20.0,
+          latch_distance: 1.5,
+          latch_feed: 45.0,
+          rapids_feed: 900.0,
+          probe_offset_x: 2.0,
+          probe_offset_y: -1.0,
         },
       },
     }
@@ -353,7 +396,20 @@ mod tests {
     let profile = Profile::default();
     assert_eq!(profile.version, PROFILE_VERSION);
     assert_eq!(profile.rotary, None, "a fresh profile has no found center yet");
+    assert_eq!(profile.mesh, None, "a fresh profile has no probed mesh yet");
     assert_eq!(profile.prefs, Prefs::default());
+  }
+
+  #[test]
+  fn a_v1_profile_without_a_mesh_still_loads_with_the_mesh_defaulted() {
+    // The forward-compat case for the PROFILE_VERSION 1→2 bump: a v1 file (written before the mesh field existed)
+    // must still load — its `version:1` is ≤ 2 so it is accepted, and the absent `mesh` fills from `#[serde(default)]`
+    // as `None` rather than failing the parse.
+    let v1 = "(version:1,rotary:None,prefs:(last_port:None,baud:115200,rotary_dowel_diameter:6.0,rotary_index_angle:0.0))";
+    let parsed = Profile::from_ron(v1).expect("a v1 profile must still load under v2");
+    assert_eq!(parsed.version, 1, "the on-disk version is preserved as read");
+    assert_eq!(parsed.mesh, None, "an absent mesh must default to None, not fail the load");
+    assert_eq!(parsed.rotary, None);
   }
 
   #[test]
@@ -414,6 +470,7 @@ mod tests {
     let minimal = format!("(version:{})", PROFILE_VERSION);
     let parsed = Profile::from_ron(&minimal).expect("a version-only profile must parse via serde defaults");
     assert_eq!(parsed.rotary, None);
+    assert_eq!(parsed.mesh, None);
     assert_eq!(parsed.prefs, Prefs::default());
   }
 
@@ -433,6 +490,32 @@ mod tests {
       parsed.prefs.rotary_bench,
       crate::app::rotary_probe::RotaryProbeParams::default(),
       "the absent bench block must default, not fail the load",
+    );
+    assert_eq!(
+      parsed.prefs.datum_bench,
+      crate::app::datum::ProbeParams::default(),
+      "the absent datum-bench block must default too, not fail the load",
+    );
+  }
+
+  #[test]
+  fn a_prefs_block_without_the_datum_bench_loads_with_it_defaulted() {
+    // The forward-compat case for adding `datum_bench`: a profile written with `rotary_bench` but before the datum
+    // finder existed must still parse, filling the datum bench from defaults rather than failing the whole load.
+    let pre = format!(
+      "(version:{},rotary:None,prefs:(last_port:None,baud:115200,rotary_dowel_diameter:6.0,rotary_index_angle:0.0,rotary_bench:(clearance_mm:-2.0,settle_secs:0.5,feed:50.0,depth_mm:10.0,side_probe_z:-10.0)))",
+      PROFILE_VERSION,
+    );
+    let parsed = Profile::from_ron(&pre).expect("a pre-datum-bench prefs block must still parse");
+    assert_eq!(
+      parsed.prefs.datum_bench,
+      crate::app::datum::ProbeParams::default(),
+      "the absent datum-bench block must default, not fail the load",
+    );
+    assert_eq!(
+      parsed.prefs.grid_bench,
+      crate::app::autolevel::GridProbeParams::default(),
+      "the absent grid-bench block must default too, not fail the load",
     );
   }
 

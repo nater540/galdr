@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-  "eitri-core",
-  "eitri-geo",
-  "eitri-gerber",
-  "eitri-excellon",
-  "eitri-import",
-  "eitri-cam",
-  "eitri-gcode",
-  "eitri-project",
-  "eitri-script",
-  "eitri-app",
+  "crates/eitri-core",
+  "crates/eitri-geo",
+  "crates/eitri-gerber",
+  "crates/eitri-excellon",
+  "crates/eitri-import",
+  "crates/eitri-cam",
+  "crates/eitri-gcode",
+  "crates/eitri-project",
+  "crates/eitri-script",
+  "crates/eitri-app",
 ]
 
 # Eitri is a self-contained nested workspace inside the Galdr repo. It is deliberately NOT a member of the root
@@ -25,13 +25,13 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 # Internal crates.
-eitri-core = { path = "eitri-core" }
-eitri-geo = { path = "eitri-geo" }
-eitri-gerber = { path = "eitri-gerber" }
-eitri-excellon = { path = "eitri-excellon" }
-eitri-cam = { path = "eitri-cam" }
-eitri-gcode = { path = "eitri-gcode" }
-eitri-import = { path = "eitri-import" }
+eitri-core = { path = "crates/eitri-core" }
+eitri-geo = { path = "crates/eitri-geo" }
+eitri-gerber = { path = "crates/eitri-gerber" }
+eitri-excellon = { path = "crates/eitri-excellon" }
+eitri-cam = { path = "crates/eitri-cam" }
+eitri-gcode = { path = "crates/eitri-gcode" }
+eitri-import = { path = "crates/eitri-import" }
 
 # Shared third-party. Versions are pinned centrally so every crate agrees on one resolution.
 # Boolean ops (union/difference/intersection/unary_union) run through `geo`, which delegates to `i_overlay`

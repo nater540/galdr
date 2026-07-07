@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "name": "untitled",
+  "collection": {
+    "objects": [
+      {
+        "meta": {
+          "id": 1,
+          "name": "starter-B_Paste",
+          "units": "mm",
+          "placement": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ],
+          "visible": true,
+          "notes": ""
+        },
+        "payload": {
+          "Gerber": {
+            "source": "%TF.GenerationSoftware,KiCad,Pcbnew,10.0.3*%\n%TF.CreationDate,2026-07-07T16:42:39-06:00*%\n%TF.ProjectId,starter,73746172-7465-4722-9e6b-696361645f70,rev?*%\n%TF.SameCoordinates,Original*%\n%TF.FileFunction,Paste,Bot*%\n%TF.FilePolarity,Positive*%\n%FSLAX46Y46*%\nG04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*\nG04 Created by KiCad (PCBNEW 10.0.3) date 2026-07-07 16:42:39*\n%MOMM*%\n%LPD*%\nG01*\nG04 APERTURE LIST*\nG04 APERTURE END LIST*\nM02*\n"
+          }
+        }
+      },
+      {
+        "meta": {
+          "id": 2,
+          "name": "starter-B_Silkscreen",
+          "units": "mm",
+          "placement": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ],
+          "visible": true,
+          "notes": ""
+        },
+        "payload": {
+          "Gerber": {
+            "source": "%TF.GenerationSoftware,KiCad,Pcbnew,10.0.3*%\n%TF.CreationDate,2026-07-07T16:42:39-06:00*%\n%TF.ProjectId,starter,73746172-7465-4722-9e6b-696361645f70,rev?*%\n%TF.SameCoordinates,Original*%\n%TF.FileFunction,Legend,Bot*%\n%TF.FilePolarity,Positive*%\n%FSLAX46Y46*%\nG04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*\nG04 Created by KiCad (PCBNEW 10.0.3) date 2026-07-07 16:42:39*\n%MOMM*%\n%LPD*%\nG01*\nG04 APERTURE LIST*\nG04 APERTURE END LIST*\nM02*\n"
+          }
+        }
+      },
+      {
+        "meta": {
+          "id": 3,
+          "name": "starter-Edge_Cuts",
+          "units": "mm",
+          "placement": [
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0
+          ],
+          "visible": true,
+          "notes": ""
+        },
+        "payload": {
+          "Gerber": {
+            "source": "%TF.GenerationSoftware,KiCad,Pcbnew,10.0.3*%\n%TF.CreationDate,2026-07-07T16:42:39-06:00*%\n%TF.ProjectId,starter,73746172-7465-4722-9e6b-696361645f70,rev?*%\n%TF.SameCoordinates,Original*%\n%TF.FileFunction,Profile,NP*%\n%FSLAX46Y46*%\nG04 Gerber Fmt 4.6, Leading zero omitted, Abs format (unit mm)*\nG04 Created by KiCad (PCBNEW 10.0.3) date 2026-07-07 16:42:39*\n%MOMM*%\n%LPD*%\nG01*\nG04 APERTURE LIST*\n%TA.AperFunction,Profile*%\n%ADD10C,0.050000*%\n%TD*%\nG04 APERTURE END LIST*\nD10*\nX119597123Y-86478046D02*\nX137058329Y-86478046D01*\nX137058329Y-109956620D01*\nX119597123Y-109956620D01*\nX119597123Y-86478046D01*\nM02*\n"
+          }
+        }
+      }
+    ],
+    "groups": [],
+    "next_id": 4
+  }
+}

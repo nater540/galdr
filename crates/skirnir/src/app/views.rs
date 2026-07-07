@@ -111,6 +111,14 @@ pub struct UiState {
   /// frame, or the start of the trail) begins a fresh stroke, so the draw loop does not bridge a line across the
   /// travel between cuts. Set `false` on any non-cut frame, on run-entry, and by [`Self::set_program`].
   prev_frame_was_cut: bool,
+  /// Whether height-map autoleveling is armed for the next stream/simulate. When set (and [`crate::profile::Profile::mesh`]
+  /// holds a probed mesh), the shell height-corrects the loaded program through [`super::autolevel::correct_program`]
+  /// before streaming; when clear, the source file streams verbatim. Toggled via [`super::intent::Intent::AutolevelToggle`],
+  /// which also invalidates the shell's cached corrected program. Transient — not persisted.
+  pub autolevel_enabled: bool,
+  /// The correction knobs applied when autoleveling (currently just whether rapids are Z-corrected). Carried into
+  /// [`super::autolevel::correct_program`]; a change invalidates the shell's corrected-program cache.
+  pub autolevel_cfg: super::autolevel::CorrectionConfig,
   /// The jog step distance (mm) selected in the jog pad.
   pub jog_step: f64,
   /// Whether the jog pad is in continuous (press-and-hold) mode rather than fixed-step. In continuous mode a
@@ -152,6 +160,26 @@ pub struct UiState {
   /// entirely (a crash risk, finding #13). Every center-finder run uses a side (Y) touch, so Start is gated on
   /// this acknowledgement — it is transient (never persisted), so each session must re-confirm the bench is right.
   pub rotary_side_probe_confirmed: bool,
+  /// The datum finder's bench-tuned probe parameters (approach clearances, latch/probe feeds, tip diameter,
+  /// corner slide offset), edited in the datum panel and carried into a run via [`Intent::DatumEdgeStart`] /
+  /// [`Intent::DatumCornerStart`]. Seeded from [`crate::profile::Prefs`] and persisted with the profile.
+  pub datum_bench: super::datum::ProbeParams,
+  /// The datum panel's single-edge selection: which axis and approach direction a single-edge touch-off probes.
+  /// Transient (a live UI selection, never persisted).
+  pub datum_edge_axis: super::intent::Axis,
+  /// The datum panel's single-edge approach direction. Transient.
+  pub datum_edge_dir: super::intent::Dir,
+  /// The datum panel's corner selection (one of the four rectangular corners, inside or outside). Transient.
+  pub datum_corner: super::datum::Corner,
+  /// The height-map panel's grid bounds `(min_x, min_y)` in work-mm. Transient inputs (the probed mesh persists).
+  pub mesh_min: (f64, f64),
+  /// The height-map panel's grid bounds `(max_x, max_y)` in work-mm.
+  pub mesh_max: (f64, f64),
+  /// The height-map panel's target grid spacing (mm) — the point counts derive from it (`ceil(range/spacing)+1`).
+  pub mesh_spacing: f64,
+  /// The height-map panel's bench-tuned grid-probe params (clearance/feeds/latch/offsets). Seeded from defaults;
+  /// carried into a run via [`super::intent::Intent::MeshProbeStart`].
+  pub mesh_bench: super::autolevel::GridProbeParams,
   /// The Phase 2 verify/measure starting A angle (degrees): θ for the flip-verify pair, and the first runout angle.
   pub verify_start_angle: f64,
   /// The Phase 2 runout report's number of evenly-spaced angles (N ≥ 2).
@@ -160,6 +188,10 @@ pub struct UiState {
   pub settings_open: bool,
   /// Whether the APP settings dialog (language/theme/font scale — [`super::app_settings`]) is open.
   pub app_settings_open: bool,
+  /// Which setup/probing dialog is currently open (the right column's compact menu launches these as separate
+  /// floating windows instead of a long inline scroll). `None` when none is open. A running probing flow forces
+  /// its dialog open regardless (see [`forced_setup_dialog`]).
+  pub setup_dialog: Option<SetupDialog>,
   /// The in-progress name for a new user theme in the app settings dialog, kept across frames while typing.
   pub theme_name_draft: String,
   /// The setting currently being edited in the panel, as `(number, edit_buffer)`, or `None` when no row is in
@@ -245,6 +277,50 @@ pub enum DockTab {
   Program,
 }
 
+/// The setup/probing dialogs launched from the right column's compact "Setup &amp; probing" menu (the panel
+/// declutter — these were a long inline scroll of six stacked sections). Each is a separate floating window and
+/// only one is open at a time. A running probing flow (rotary center-finder, datum finder, height-map,
+/// verify/measure) FORCES its dialog open (see [`forced_setup_dialog`]) so an in-progress wizard — which is
+/// moving the machine — can never be hidden behind a closed window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupDialog {
+  /// The Z touch-off / probe panel ([`probe`]).
+  Probe,
+  /// The rotary center-finder wizard ([`rotary_center`]).
+  RotaryCenter,
+  /// The datum finder — edge / corner / Z surface ([`datum_finder`]).
+  Datum,
+  /// The height-map (mesh) acquisition panel ([`mesh_probe`]).
+  MeshProbe,
+  /// The Phase 2 verify / measure — flip-verify + runout ([`verify_measure`]).
+  VerifyMeasure,
+}
+
+/// The setup dialog a running probing flow FORCES visible, so an in-progress wizard can never be hidden behind a
+/// closed window (these flows move the machine — safety). At most one probing flow runs at a time in practice;
+/// the priority here is fixed and deterministic only as a tie-break. Returns `None` when nothing is running,
+/// leaving the operator's own open/closed choice untouched.
+fn forced_setup_dialog(rotary: bool, datum: bool, mesh: bool, sweep: bool) -> Option<SetupDialog> {
+  if rotary {
+    Some(SetupDialog::RotaryCenter)
+  } else if datum {
+    Some(SetupDialog::Datum)
+  } else if mesh {
+    Some(SetupDialog::MeshProbe)
+  } else if sweep {
+    Some(SetupDialog::VerifyMeasure)
+  } else {
+    None
+  }
+}
+
+/// Toggle logic for a setup-menu button: clicking the entry for the already-open dialog closes it, otherwise it
+/// switches to that dialog (only one setup dialog is open at a time). A running flow's force
+/// ([`forced_setup_dialog`]) is applied separately and overrides this.
+fn toggle_setup_dialog(current: Option<SetupDialog>, clicked: SetupDialog) -> Option<SetupDialog> {
+  if current == Some(clicked) { None } else { Some(clicked) }
+}
+
 impl Default for UiState {
   fn default() -> Self {
     UiState {
@@ -261,6 +337,8 @@ impl Default for UiState {
       job_min_z: 0.0,
       prev_run_state: None,
       prev_frame_was_cut: false,
+      autolevel_enabled: false,
+      autolevel_cfg: super::autolevel::CorrectionConfig::default(),
       jog_step: 1.0,
       jog_continuous: false,
       jog_feed: 500.0,
@@ -275,10 +353,19 @@ impl Default for UiState {
       rotary_index_angle: 0.0,
       rotary_bench: super::rotary_probe::RotaryProbeParams::default(),
       rotary_side_probe_confirmed: false,
+      datum_bench: super::datum::ProbeParams::default(),
+      datum_edge_axis: super::intent::Axis::X,
+      datum_edge_dir: super::intent::Dir::Pos,
+      datum_corner: super::datum::Corner::A,
+      mesh_min: (0.0, 0.0),
+      mesh_max: (100.0, 100.0),
+      mesh_spacing: 10.0,
+      mesh_bench: super::autolevel::GridProbeParams::default(),
       verify_start_angle: 0.0,
       verify_runout_n: 4,
       settings_open: false,
       app_settings_open: false,
+      setup_dialog: None,
       theme_name_draft: String::new(),
       editing_setting: None,
       settings_staging: super::settings_staging::SettingsStaging::new(),
@@ -314,6 +401,8 @@ impl UiState {
       rotary_dowel_diameter: prefs.rotary_dowel_diameter,
       rotary_index_angle: prefs.rotary_index_angle,
       rotary_bench: prefs.rotary_bench,
+      datum_bench: prefs.datum_bench,
+      mesh_bench: prefs.grid_bench,
       dock_fraction: prefs.dock_fraction,
       ..UiState::default()
     }
@@ -387,6 +476,14 @@ impl UiState {
     // density — so a re-flow leaves it untouched: only the dim planned geometry is rebuilt.
   }
 
+  /// The loaded program's XY extents `((min_x, min_y), (max_x, max_y))` in work-mm, or `None` when no program is
+  /// loaded (or it has no XY geometry). The height-map panel's "auto from program" button seeds the grid bounds
+  /// from this — the toolpath-bounds scan already computed at load, exposed as `f64` tuples for the mesh setup.
+  pub fn program_xy_bounds(&self) -> Option<((f64, f64), (f64, f64))> {
+    let (min, max) = self.toolpath_bounds?;
+    Some(((min.x as f64, min.y as f64), (max.x as f64, max.y as f64)))
+  }
+
   /// The number of cached toolpath segments (chords). Exposed so the reload/arc-density behaviour can be asserted
   /// without reaching into private fields; the count rises as arcs are flattened more finely.
   pub fn toolpath_segment_count(&self) -> usize {
@@ -424,6 +521,33 @@ fn header_bar(ui: &mut egui::Ui, palette: Palette, left: impl FnOnce(&mut egui::
 /// the common case above the override/probe/toolpath/jog sections.
 pub fn section_header(ui: &mut egui::Ui, palette: Palette, title: &str) {
   header_bar(ui, palette, |ui| header_title(ui, palette, title), |_ui| {});
+}
+
+/// Draw a floating setup dialog's title bar in the SAME [`section_header`] treatment the inline panels used —
+/// the uppercase, letter-tracked, dim title over the `panelAlt` strip with its bottom divider — so the launched
+/// wizards read as the app's own panels rather than egui's default (mixed-case, bright) window chrome. When
+/// `closable`, a ghost `×` sits at the strip's right edge; clicking it returns `true` so the caller clears the
+/// open dialog. A running (forced-open) wizard passes `closable = false`: its bar carries no `×` and the flow
+/// can only be ended from the in-body Cancel — the same "can't hide a moving machine" safety rule the window's
+/// missing close button enforced before.
+fn setup_dialog_header(ui: &mut egui::Ui, palette: Palette, title: &str, closable: bool) -> bool {
+  let mut close = false;
+  header_bar(
+    ui, palette,
+    |ui| header_title(ui, palette, title),
+    |ui| {
+      if closable {
+        // Icon-tight ghost button (no fill, no border) so the glyph is a compact ~22px target flush to the
+        // strip's 14px right pad — the same ghost-chrome recipe the toolbar gear uses.
+        ui.spacing_mut().button_padding = Vec2::new(4.0, 0.0);
+        let x = egui::Button::new(RichText::new("×").size(16.0).color(palette.text_dim)).fill(Color32::TRANSPARENT);
+        if ui.add(x).on_hover_text(crate::tr!("tip-close-dialog")).clicked() {
+          close = true;
+        }
+      }
+    },
+  );
+  close
 }
 
 /// Draw a dock tab strip in the design's §03 style: the same 30px `panelAlt` bar, but with mixed-case tab
@@ -655,14 +779,29 @@ pub struct ShellPanelsData<'a> {
   pub wizard: Option<&'a super::rotary_center::WizardState>,
   /// Whether a rotary center was persisted in the profile (the no-run panel offers a one-click re-apply).
   pub has_saved_center: bool,
+  /// The running datum-finder's pure state, if one is active.
+  pub datum: Option<&'a super::datum::DatumState>,
+  /// The running height-map acquisition's pure state, if one is active.
+  pub mesh_probe: Option<&'a super::autolevel::MeshProbeState>,
+  /// Whether a height-map is persisted in the profile (the panel offers a one-click clear).
+  pub has_saved_mesh: bool,
   /// The running Phase 2 sweep and which wizard owns it, if one is active.
   pub sweep: Option<(&'a super::angle_sweep::AngleSweep, super::view_state::ProbeKind)>,
 }
 
 impl ShellPanelsData<'_> {
-  /// The harness/fixture form: the given clock, no ETA qualifier, and no wizard/sweep state.
+  /// The harness/fixture form: the given clock, no ETA qualifier, and no wizard/datum/mesh/sweep state.
   pub fn bare(time: super::progress::TimeEstimate) -> Self {
-    ShellPanelsData { time, eta_qualifier: None, wizard: None, has_saved_center: false, sweep: None }
+    ShellPanelsData {
+      time,
+      eta_qualifier: None,
+      wizard: None,
+      has_saved_center: false,
+      datum: None,
+      mesh_probe: None,
+      has_saved_mesh: false,
+      sweep: None,
+    }
   }
 }
 
@@ -768,16 +907,18 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
         // Same content-width cap as the left column (see there): the ratchet bug manifested HERE first, as the
         // overrides header allocating a transiently-wide row and pushing the whole column off-window.
         ui.set_max_width(Metrics::RIGHT_COL_W);
+        // Only the live overrides stay in the always-visible column — the thing an operator watches and adjusts
+        // DURING a running job. The heavy setup wizards (probe/touch-off, rotary center, datum, height-map,
+        // verify/measure) used to stack below here as a six-section scroll; they now live in dialogs launched from
+        // the compact menu, so the column stays short and scannable.
         overrides(ui, view, state, sink);
         ui.separator();
-        probe(ui, view, state, sink);
-        ui.separator();
-        // The rotary center-finder reads the shell-owned wizard state (the firmware has no pivot concept, so
-        // the center lives in skirnir state); a borrow keeps the view a pure render of it.
-        rotary_center(ui, view, state, data.wizard, data.has_saved_center, sink);
-        ui.separator();
-        // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
-        verify_measure(ui, view, state, data.sweep, sink);
+        setup_menu(ui, state, SetupRunning {
+          rotary: data.wizard.is_some(),
+          datum: data.datum.is_some(),
+          mesh: data.mesh_probe.is_some(),
+          sweep: data.sweep.is_some(),
+        });
       });
     }));
 
@@ -801,6 +942,150 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
       state.central_split = Some(split);
     }
   });
+
+  // A running probing flow FORCES its dialog visible (safety: a wizard that is moving the machine must never be
+  // hidden behind a closed window); the operator's own open/closed choice is otherwise untouched. Then draw
+  // whichever setup dialog is open as a floating window over the panel grid. Drawn here — inside the shared
+  // `shell_panels`, from the shell's live wizard/datum/mesh/sweep borrows — so the whole-window test harness
+  // drives the SAME dialogs the app does and the two cannot drift.
+  if let Some(forced) = forced_setup_dialog(
+    data.wizard.is_some(), data.datum.is_some(), data.mesh_probe.is_some(), data.sweep.is_some())
+  {
+    state.setup_dialog = Some(forced);
+  }
+  let ctx = ui.ctx().clone();
+  setup_dialog_windows(&ctx, view, state, &data, sink);
+}
+
+/// Which setup/probing flows are currently RUNNING, threaded into the [`setup_menu`] so a button whose wizard is
+/// in progress carries a live tag. A pure boolean snapshot of the shell's `Option` borrows.
+#[derive(Clone, Copy, Default)]
+pub struct SetupRunning {
+  /// The rotary center-finder is mid-run.
+  pub rotary: bool,
+  /// The datum finder is mid-run.
+  pub datum: bool,
+  /// A height-map acquisition is mid-run.
+  pub mesh: bool,
+  /// A Phase 2 verify/measure sweep is mid-run.
+  pub sweep: bool,
+}
+
+/// Render the right column's compact "Setup &amp; probing" menu: a section header over a short stack of full-width
+/// buttons, each OPENING one of the setup/probing dialogs rather than expanding a long inline panel (the six
+/// stacked sections this replaced overran the column into a giant scroll). A button whose flow is running carries
+/// a live "· running" tag — text, not colour alone — plus the running colour, so an in-progress wizard reads at a
+/// glance even when its window sits behind another. Emits no machine intents; it only toggles
+/// [`UiState::setup_dialog`].
+fn setup_menu(ui: &mut egui::Ui, state: &mut UiState, running: SetupRunning) {
+  let palette = state.style.palette;
+  section_header(ui, palette, &crate::tr!("hdr-setup"));
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+    ui.label(RichText::new(crate::tr!("setup-intro")).size(11.0).color(palette.text_dim));
+    ui.add_space(8.0);
+    // The five entries in workflow order: touch-off first, then the setup wizards. `hdr-*` keys double as both
+    // the button label and the dialog title (see [`setup_dialog_windows`]).
+    let entries = [
+      (SetupDialog::Probe, crate::tr!("hdr-probe"), false),
+      (SetupDialog::RotaryCenter, crate::tr!("hdr-rotary-center"), running.rotary),
+      (SetupDialog::Datum, crate::tr!("hdr-datum"), running.datum),
+      (SetupDialog::MeshProbe, crate::tr!("hdr-mesh"), running.mesh),
+      (SetupDialog::VerifyMeasure, crate::tr!("hdr-verify"), running.sweep),
+    ];
+    for (index, (kind, label, is_running)) in entries.into_iter().enumerate() {
+      if index > 0 {
+        ui.add_space(4.0);
+      }
+      setup_menu_button(ui, palette, state, kind, &label, is_running);
+    }
+  });
+}
+
+/// One entry in the [`setup_menu`]: a full-width button toggling `kind`'s dialog. Shows a selected look while that
+/// dialog is open and, when the flow is running, tints to the running colour and appends a "· running" tag (state
+/// is never colour alone — accessibility). Truncates in a bounded width so a long translation can never overflow
+/// the fixed column (the class of overflow that shifts the whole central region under egui 0.35).
+fn setup_menu_button(ui: &mut egui::Ui, palette: Palette, state: &mut UiState, kind: SetupDialog, label: &str,
+  running: bool) {
+  let selected = state.setup_dialog == Some(kind);
+  let text = if running {
+    RichText::new(format!("{label}  ·  {}", crate::tr!("setup-running"))).size(11.5).color(palette.state_run)
+  } else {
+    RichText::new(label.to_string()).size(11.5)
+  };
+  let button = egui::Button::new(text).wrap_mode(egui::TextWrapMode::Truncate).selected(selected);
+  let size = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 8.0);
+  if ui.add_sized(size, button).clicked() {
+    state.setup_dialog = toggle_setup_dialog(state.setup_dialog, kind);
+  }
+}
+
+/// Draw whichever setup/probing dialog is open ([`UiState::setup_dialog`]) as a floating window over the panel
+/// grid, hosting the existing panel render fn as its body. The window's default title bar is REPLACED by
+/// [`setup_dialog_header`] so the floating wizard wears the app's own section-header treatment rather than
+/// egui's mixed-case, bright window chrome — matching how the panels looked when they were inline. A running
+/// flow's header omits the close `×` (and, being forced open every frame, cannot be dismissed mid-run) so an
+/// in-progress wizard can only end from its in-body Cancel; an idle dialog's `×` clears the state. The window
+/// is capped at the right column's width and scrolls vertically, so a tall wizard (datum with its bench params
+/// expanded) never overflows the viewport.
+fn setup_dialog_windows(ctx: &egui::Context, view: &ViewState, state: &mut UiState, data: &ShellPanelsData<'_>,
+  sink: &mut IntentSink) {
+  let Some(kind) = state.setup_dialog else {
+    return;
+  };
+  let palette = state.style.palette;
+  // A running flow pins its window open (no `×`); idle dialogs get a close button.
+  let running = match kind {
+    SetupDialog::Probe => false,
+    SetupDialog::RotaryCenter => data.wizard.is_some(),
+    SetupDialog::Datum => data.datum.is_some(),
+    SetupDialog::MeshProbe => data.mesh_probe.is_some(),
+    SetupDialog::VerifyMeasure => data.sweep.is_some(),
+  };
+  // A stable, translation-independent window id so egui remembers the operator's drag across a language switch
+  // (the same reason the firmware settings window pins its id). The title is the translated section name.
+  let (title, id) = match kind {
+    SetupDialog::Probe => (crate::tr!("hdr-probe"), "setup-dialog-probe"),
+    SetupDialog::RotaryCenter => (crate::tr!("hdr-rotary-center"), "setup-dialog-rotary"),
+    SetupDialog::Datum => (crate::tr!("hdr-datum"), "setup-dialog-datum"),
+    SetupDialog::MeshProbe => (crate::tr!("hdr-mesh"), "setup-dialog-mesh"),
+    SetupDialog::VerifyMeasure => (crate::tr!("hdr-verify"), "setup-dialog-verify"),
+  };
+  // Custom chrome: a squared `panel`-filled frame (matching the inline column) with a 1px divider border and the
+  // window shadow for float separation, and ZERO inner margin so the section-header strip and each body's own
+  // `RIGHT_PAD` reach the edges exactly as they did inline. Dropping the title bar makes egui fall back to
+  // drag-from-anywhere (see `WindowDrag`), so the dialog stays freely draggable without egui's chrome.
+  let frame = egui::Frame::new()
+    .fill(palette.panel)
+    .stroke(egui::Stroke::new(Metrics::DIVIDER, palette.divider))
+    .shadow(ctx.global_style().visuals.window_shadow)
+    .inner_margin(0);
+  let mut close_requested = false;
+  // Open centred on the viewport (clear of the toolbar it otherwise covers at the default top-left placement);
+  // still freely draggable, and egui remembers the operator's drag against the stable id thereafter.
+  egui::Window::new(&title).id(egui::Id::new(id)).title_bar(false).frame(frame).collapsible(false)
+    .resizable(false).default_width(Metrics::RIGHT_COL_W).max_width(Metrics::RIGHT_COL_W).vscroll(true)
+    .pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center())
+    .show(ctx, |ui| {
+      // The same content-width cap the fixed columns carry: the wizard rows allocate full-width controls, and a
+      // transiently-wide allocation must not ratchet the window (or overflow it) in any locale.
+      ui.set_max_width(Metrics::RIGHT_COL_W);
+      // The app-styled title bar stands in for the section header the panels dropped when they moved here; a
+      // running wizard's bar has no `×` (safety: a moving-machine flow cannot be hidden).
+      if setup_dialog_header(ui, palette, &title, !running) {
+        close_requested = true;
+      }
+      match kind {
+        SetupDialog::Probe => probe(ui, view, state, sink),
+        SetupDialog::RotaryCenter => rotary_center(ui, view, state, data.wizard, data.has_saved_center, sink),
+        SetupDialog::Datum => datum_finder(ui, view, state, data.datum, sink),
+        SetupDialog::MeshProbe => mesh_probe(ui, view, state, data.mesh_probe, data.has_saved_mesh, sink),
+        SetupDialog::VerifyMeasure => verify_measure(ui, view, state, data.sweep, sink),
+      }
+    });
+  if close_requested {
+    state.setup_dialog = None;
+  }
 }
 
 /// The toolbar's self-measured fit, persisted in egui temp memory across frames: whether the bar renders in
@@ -1147,6 +1432,24 @@ pub(crate) fn transport_group(ui: &mut egui::Ui, view: &ViewState, state: &UiSta
     .clicked()
   {
     sink.push(Intent::Simulate);
+  }
+
+  // Autolevel: arm height-map correction for the next stream/simulate. A selectable (toggle) label so its armed
+  // state reads at a glance; the mesh check + the actual `correct_program` rewrite happen at stream time (with a
+  // notice if no mesh is probed). Available whenever a program is loaded, like Simulate — it is a host-only pre-pass.
+  let level_label = if compact { "⌗".to_string() } else { crate::tr!("transport-autolevel") };
+  // A ghost button like Simulate, but drawn `.selected()` when armed so its on/off state reads at a glance. (egui
+  // has no free-standing `SelectableLabel` widget type in this version — a selected Button is the idiom here.)
+  let level_color = if has_program { palette.text_dim } else { palette.text_disabled };
+  let level = egui::Button::new(RichText::new(level_label).color(level_color))
+    .fill(Color32::TRANSPARENT)
+    .selected(state.autolevel_enabled);
+  if ui
+    .add_enabled(has_program, level)
+    .on_hover_text(compact_tip(compact, crate::tr!("transport-autolevel"), crate::tr!("tip-autolevel")))
+    .clicked()
+  {
+    sink.push(Intent::AutolevelToggle(!state.autolevel_enabled));
   }
 }
 
@@ -1782,7 +2085,6 @@ pub(crate) mod slider_rect_probe {
 /// Render the probe panel: depth/feed/plate inputs and a "Probe Z" action that the shell sequences.
 pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
-  section_header(ui, palette, &crate::tr!("hdr-probe"));
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     ui.label(RichText::new(crate::tr!("probe-intro")).size(11.0).color(palette.text_dim));
     ui.add_space(4.0);
@@ -1860,7 +2162,6 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   wizard: Option<&super::rotary_center::WizardState>, has_saved_center: bool, sink: &mut IntentSink) {
   let palette = state.style.palette;
   use super::rotary_center::WizardStep;
-  section_header(ui, palette, &crate::tr!("hdr-rotary-center"));
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     let Some(w) = wizard else {
       // No run: collect the dowel diameter + index angle and offer Start. Only meaningful while idle/connected,
@@ -1993,6 +2294,204 @@ pub fn rotary_center(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   });
 }
 
+/// Render the datum finder (edge / corner / Z surface). When no run is active it offers the two shapes — a
+/// four-corner picker with an inside/outside toggle, and a single-edge axis/direction picker — plus the bench
+/// params and a Start button each; when a run is active it guides the operator touch by touch and shows the
+/// captured readings + computed datum. The wizard state is owned by the shell and passed in as a borrow, so this
+/// stays a pure render that only emits intents.
+pub fn datum_finder(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
+  datum: Option<&super::datum::DatumState>, sink: &mut IntentSink) {
+  use super::datum::{Corner, DatumStep, DatumTarget};
+  let palette = state.style.palette;
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+    let idle = view.connection == ConnectionState::Idle;
+    let Some(w) = datum else {
+      // No run: offer the corner picker and the single-edge picker, plus the bench params, and a Start for each.
+      ui.label(RichText::new(crate::tr!("datum-intro")).size(11.0).color(palette.text_dim));
+      ui.add_space(4.0);
+
+      // ── Corner ──
+      ui.label(RichText::new(crate::tr!("datum-corner-label")).size(11.0).color(palette.text));
+      let inside = state.datum_corner.inside;
+      egui::Grid::new("datum_corner_pick").num_columns(2).show(ui, |ui| {
+        // The 2×2 grid mirrors the physical corners; each button is labelled by its OUTSIDE approach signs. The
+        // inside toggle (below) flips the actual approach without changing the picked location.
+        corner_button(ui, state, Corner::B, "−X +Y");
+        corner_button(ui, state, Corner::A, "+X +Y");
+        ui.end_row();
+        corner_button(ui, state, Corner::C, "−X −Y");
+        corner_button(ui, state, Corner::D, "+X −Y");
+        ui.end_row();
+      });
+      let mut inside_toggle = inside;
+      if ui.checkbox(&mut inside_toggle, RichText::new(crate::tr!("datum-inside")).size(11.0)).changed() {
+        state.datum_corner.inside = inside_toggle;
+      }
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-find-corner"))).clicked() {
+          sink.push(Intent::DatumCornerStart { corner: state.datum_corner, params: state.datum_bench });
+        }
+      });
+
+      ui.separator();
+
+      // ── Single edge ──
+      ui.label(RichText::new(crate::tr!("datum-edge-label")).size(11.0).color(palette.text));
+      egui::Grid::new("datum_edge_pick").num_columns(2).show(ui, |ui| {
+        ui.label(crate::tr!("lbl-datum-axis"));
+        ui.horizontal(|ui| {
+          for axis in [Axis::X, Axis::Y, Axis::Z] {
+            let selected = state.datum_edge_axis == axis;
+            if ui.selectable_label(selected, axis.letter().to_string()).clicked() {
+              state.datum_edge_axis = axis;
+            }
+          }
+        });
+        ui.end_row();
+        ui.label(crate::tr!("lbl-datum-dir"));
+        ui.horizontal(|ui| {
+          for (dir, glyph) in [(Dir::Pos, "+"), (Dir::Neg, "−")] {
+            let selected = state.datum_edge_dir == dir;
+            if ui.selectable_label(selected, glyph).clicked() {
+              state.datum_edge_dir = dir;
+            }
+          }
+        });
+        ui.end_row();
+      });
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-find-edge"))).clicked() {
+          sink.push(Intent::DatumEdgeStart {
+            axis: state.datum_edge_axis,
+            dir: state.datum_edge_dir,
+            params: state.datum_bench,
+          });
+        }
+      });
+
+      datum_bench_params(ui, state);
+      return;
+    };
+
+    // A run is active: describe the target, show the readings, and offer the step's action + Cancel.
+    let target = match w.target {
+      DatumTarget::Corner(c) if c.inside => crate::tr!("datum-target-corner-in"),
+      DatumTarget::Corner(_) => crate::tr!("datum-target-corner-out"),
+      DatumTarget::Edge { axis, .. } => crate::tr!("datum-target-edge", { axis: axis.letter().to_string() }),
+    };
+    ui.label(RichText::new(target).size(11.0).color(palette.text_dim));
+    datum_run_readings(ui, palette, w);
+    ui.add_space(6.0);
+    let probing = w.is_probing();
+    match w.step {
+      DatumStep::EnterParams => {
+        ui.label(RichText::new(crate::tr!("datum-step-enter")).size(11.0).color(palette.text_dim));
+        ui.add_enabled_ui(idle && !probing, |ui| {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-datum-probe"))).clicked() {
+            sink.push(Intent::DatumProbeNext);
+          }
+        });
+      }
+      DatumStep::ReadyFaceY => {
+        ui.label(RichText::new(crate::tr!("datum-step-ready-y")).size(11.0).color(palette.text_dim));
+        ui.add_enabled_ui(idle && !probing, |ui| {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-datum-probe-y"))).clicked() {
+            sink.push(Intent::DatumProbeNext);
+          }
+        });
+      }
+      DatumStep::Review => {
+        ui.label(RichText::new(crate::tr!("datum-step-review")).size(11.0).color(palette.state_run));
+        ui.add_enabled_ui(idle, |ui| {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-datum-write"))).clicked() {
+            sink.push(Intent::DatumWriteWcs);
+          }
+        });
+      }
+      DatumStep::Aborted => {
+        let reason = w.abort_reason.clone().unwrap_or_else(|| crate::tr!("reason-cancelled"));
+        ui.label(RichText::new(crate::tr!("msg-aborted", { reason: reason })).size(11.0).color(palette.state_alarm));
+      }
+      // The probing steps await a result; only Cancel is offered.
+      DatumStep::ProbeEdge | DatumStep::ProbeFaceX | DatumStep::ProbeFaceY => {
+        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
+      }
+    }
+    ui.add_space(4.0);
+    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
+      sink.push(Intent::DatumCancel);
+    }
+  });
+}
+
+/// Render one corner-picker button labelled by its outside approach signs, selecting `corner` (preserving the
+/// current inside/outside toggle) when clicked and highlighting the currently-picked location.
+fn corner_button(ui: &mut egui::Ui, state: &mut UiState, corner: super::datum::Corner, label: &str) {
+  // The picked location is compared on the OUTSIDE signs alone — the inside toggle is orthogonal, so it does not
+  // change which of the four buttons reads as selected.
+  let selected = state.datum_corner.af_x == corner.af_x && state.datum_corner.af_y == corner.af_y;
+  if ui.selectable_label(selected, label).clicked() {
+    state.datum_corner = super::datum::Corner { inside: state.datum_corner.inside, ..corner };
+  }
+}
+
+/// Render the datum run's captured readings + computed datum: the comped edge for a single edge, or the comped
+/// `(X, Y)` for a corner, once available. A thin render of the pure [`super::datum::DatumState`].
+fn datum_run_readings(ui: &mut egui::Ui, palette: Palette, w: &super::datum::DatumState) {
+  use super::datum::DatumTarget;
+  ui.add_space(4.0);
+  match w.target {
+    DatumTarget::Edge { .. } => {
+      if let Some(v) = w.edge_value() {
+        ui.label(RichText::new(crate::tr!("datum-reading-edge", { v: format!("{v:.3}") })).size(11.0)
+          .color(palette.text));
+      }
+    }
+    DatumTarget::Corner(_) => {
+      if let Some((x, y)) = w.corner_xy() {
+        ui.label(RichText::new(crate::tr!("datum-reading-x", { v: format!("{x:.3}") })).size(11.0).color(palette.text));
+        ui.label(RichText::new(crate::tr!("datum-reading-y", { v: format!("{y:.3}") })).size(11.0).color(palette.text));
+      }
+    }
+  }
+}
+
+/// Render the editable datum bench-tuned parameters in a collapsing section, mutating `state.datum_bench` in
+/// place. Collapsed by default so the common path is just the corner/edge picker; opened to dial in a bench. The
+/// tip diameter is the load-bearing one for accuracy (it sets the tip-radius compensation).
+fn datum_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
+  let palette = state.style.palette;
+  let p = &mut state.datum_bench;
+  egui::CollapsingHeader::new(RichText::new(crate::tr!("hdr-datum-bench")).size(11.0).color(palette.text_dim))
+    .id_salt("datum_bench_params")
+    .show(ui, |ui| {
+      egui::Grid::new("datum_bench").num_columns(2).show(ui, |ui| {
+        ui.label(crate::tr!("lbl-tip-dia"));
+        ui.add(egui::DragValue::new(&mut p.probe_diameter).speed(0.01).range(0.0..=50.0).suffix(" mm"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-xy-clearance"));
+        ui.add(egui::DragValue::new(&mut p.xy_clearance).speed(0.1).range(0.0..=100.0).suffix(" mm"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-probe-distance"));
+        ui.add(egui::DragValue::new(&mut p.probe_distance).speed(0.5).range(0.1..=200.0).suffix(" mm"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-latch-distance"));
+        ui.add(egui::DragValue::new(&mut p.latch_distance).speed(0.1).range(0.1..=50.0).suffix(" mm"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-datum-probe-feed"));
+        ui.add(egui::DragValue::new(&mut p.probe_feed).speed(5.0).range(1.0..=5000.0).suffix(" mm/min"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-latch-feed"));
+        ui.add(egui::DragValue::new(&mut p.latch_feed).speed(1.0).range(1.0..=2000.0).suffix(" mm/min"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-corner-offset"));
+        ui.add(egui::DragValue::new(&mut p.offset).speed(0.1).range(0.0..=100.0).suffix(" mm"));
+        ui.end_row();
+      });
+    });
+}
+
 /// Render the editable bench-tuned rotary-touch parameters in a collapsing "Bench params" section, mutating
 /// `state.rotary_bench` in place. Collapsed by default so the common setup is just dowel ⌀ + A angle; opened when
 /// the operator needs to dial in a bench. The crash-risk side-probe Z is NOT here — it is hoisted into the
@@ -2081,6 +2580,201 @@ fn rotary_z_datum_picker(ui: &mut egui::Ui, palette: Palette, w: &super::rotary_
   }
 }
 
+/// Render the height-map acquisition panel (Part B2/B3). When no run is active it collects the grid bounds +
+/// spacing (showing the derived point count), the grid-probe bench params, a Start button, and a Clear for a saved
+/// mesh; while running it shows the serpentine progress and a Probe-next / Cancel pair. The acquisition state is
+/// owned by the shell (the probed mesh is host state persisted to the profile), passed as a borrow, so this stays
+/// a pure render that only emits intents.
+pub fn mesh_probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
+  run: Option<&super::autolevel::MeshProbeState>, has_saved_mesh: bool, sink: &mut IntentSink) {
+  use super::autolevel::MeshProbeStep;
+  let palette = state.style.palette;
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+    let idle = view.connection == ConnectionState::Idle;
+    let Some(w) = run else {
+      // No run: collect the grid bounds + spacing and offer Start (and a Clear for a persisted mesh).
+      ui.label(RichText::new(crate::tr!("mesh-intro")).size(11.0).color(palette.text_dim));
+      ui.add_space(4.0);
+      egui::Grid::new("mesh_setup").num_columns(3).show(ui, |ui| {
+        ui.label(crate::tr!("lbl-mesh-min"));
+        ui.add(egui::DragValue::new(&mut state.mesh_min.0).speed(0.5).suffix(" X"));
+        ui.add(egui::DragValue::new(&mut state.mesh_min.1).speed(0.5).suffix(" Y"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-mesh-max"));
+        ui.add(egui::DragValue::new(&mut state.mesh_max.0).speed(0.5).suffix(" X"));
+        ui.add(egui::DragValue::new(&mut state.mesh_max.1).speed(0.5).suffix(" Y"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-mesh-spacing"));
+        ui.add(egui::DragValue::new(&mut state.mesh_spacing).speed(0.5).range(0.1..=1000.0).suffix(" mm"));
+        ui.end_row();
+      });
+      // Auto-fill the bounds from the loaded program's XY extents (the toolpath-bounds scan). Read the bounds into
+      // an owned Option first so the immutable borrow is released before the click mutates the min/max fields.
+      let program_bounds = state.program_xy_bounds();
+      ui.add_enabled_ui(program_bounds.is_some(), |ui| {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-auto-bounds"))).clicked()
+          && let Some((min, max)) = program_bounds
+        {
+          state.mesh_min = min;
+          state.mesh_max = max;
+        }
+      });
+      // The derived grid size (ceil(range/spacing)+1, min 2 per axis) so the operator sees the point count before
+      // committing — this is exactly what `Mesh::from_spacing` will build.
+      let (nx, ny) = grid_point_counts(state.mesh_min, state.mesh_max, state.mesh_spacing);
+      ui.label(RichText::new(crate::tr!("mesh-grid-size", { nx: nx.to_string(), ny: ny.to_string() }))
+        .size(11.0).color(palette.text_dim));
+      mesh_bench_params(ui, state);
+      // Correction option (affects the STREAM, not acquisition): whether autolevel Z-corrects G0 rapids. Emits an
+      // intent on change so the shell invalidates the corrected-program cache.
+      let mut correct_rapids = state.autolevel_cfg.correct_rapids;
+      if ui.checkbox(&mut correct_rapids, RichText::new(crate::tr!("mesh-correct-rapids")).size(11.0)).changed() {
+        sink.push(Intent::SetCorrectRapids(correct_rapids));
+      }
+      ui.add_space(4.0);
+      ui.add_enabled_ui(idle, |ui| {
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-start"))).clicked() {
+          sink.push(Intent::MeshProbeStart {
+            params: state.mesh_bench,
+            min: state.mesh_min,
+            max: state.mesh_max,
+            spacing: (state.mesh_spacing, state.mesh_spacing),
+          });
+        }
+      });
+      if has_saved_mesh {
+        ui.add_space(4.0);
+        ui.label(RichText::new(crate::tr!("mesh-saved")).size(11.0).color(palette.state_run));
+        // Apply the saved mesh (arm autolevel against it) or clear it.
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-apply"))).clicked() {
+          sink.push(Intent::ApplySavedMesh);
+        }
+        ui.add_space(2.0);
+        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-clear"))).clicked() {
+          sink.push(Intent::MeshClear);
+        }
+      }
+      return;
+    };
+
+    // A run is active: show progress, the live grid/Z preview, then the step's action + Cancel.
+    let (done, total) = w.progress();
+    let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+    ui.add(egui::ProgressBar::new(fraction).text(crate::tr!("mesh-progress", { done: done.to_string(), total: total.to_string() })));
+    ui.add_space(4.0);
+    mesh_preview(ui, palette, w);
+    ui.add_space(6.0);
+    let probing = w.is_probing();
+    match w.step {
+      MeshProbeStep::Ready => {
+        ui.label(RichText::new(crate::tr!("mesh-step-ready")).size(11.0).color(palette.text_dim));
+        ui.add_enabled_ui(idle && !probing, |ui| {
+          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-probe"))).clicked() {
+            sink.push(Intent::MeshProbeNext);
+          }
+        });
+      }
+      MeshProbeStep::Probing => {
+        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
+      }
+      MeshProbeStep::Done => {
+        ui.label(RichText::new(crate::tr!("mesh-done", { n: total.to_string() })).size(11.0).color(palette.state_run));
+      }
+      MeshProbeStep::Aborted => {
+        let reason = w.abort_reason.clone().unwrap_or_else(|| crate::tr!("reason-cancelled"));
+        ui.label(RichText::new(crate::tr!("msg-aborted", { reason: reason })).size(11.0).color(palette.state_alarm));
+      }
+    }
+    ui.add_space(4.0);
+    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
+      sink.push(Intent::MeshProbeCancel);
+    }
+  });
+}
+
+/// The derived `(nx, ny)` node counts for a grid `[min, max]` at `spacing`, matching
+/// [`super::autolevel::Mesh::from_spacing`] (`ceil(range/spacing)+1`, min 2; a non-positive spacing / zero range →
+/// 2). Kept in the view so the panel can show the point count before a run without building a mesh.
+fn grid_point_counts(min: (f64, f64), max: (f64, f64), spacing: f64) -> (usize, usize) {
+  let count = |lo: f64, hi: f64| -> usize {
+    let range = hi - lo;
+    if spacing <= 0.0 || range <= 0.0 { 2 } else { ((range / spacing).ceil() as usize + 1).max(2) }
+  };
+  (count(min.0, max.0), count(min.1, max.1))
+}
+
+/// Render a simple live grid/Z preview of the acquisition: an `nx×ny` dot grid (Y up), each PROBED node shaded on
+/// a cool→warm ramp by its Z delta (relative to the probed min/max), not-yet-probed nodes dim. A thin render of
+/// the pure [`super::autolevel::MeshProbeState`] — no state mutation.
+fn mesh_preview(ui: &mut egui::Ui, palette: Palette, w: &super::autolevel::MeshProbeState) {
+  let mesh = w.mesh();
+  let (nx, ny) = (mesh.nx, mesh.ny);
+  if nx == 0 || ny == 0 {
+    return;
+  }
+  let width = ui.available_width();
+  let height = 72.0;
+  let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+  let painter = ui.painter_at(rect);
+  // The probed set + the delta range over probed nodes, for the colour ramp.
+  let probed: std::collections::HashSet<(usize, usize)> = w.probed().iter().copied().collect();
+  let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+  for &(ix, iy) in w.probed() {
+    let d = mesh.z[mesh.index(ix, iy)];
+    lo = lo.min(d);
+    hi = hi.max(d);
+  }
+  let span = (hi - lo).max(1e-6);
+  let pad = 8.0;
+  let cell_w = if nx > 1 { (width - 2.0 * pad) / (nx - 1) as f32 } else { 0.0 };
+  let cell_h = if ny > 1 { (height - 2.0 * pad) / (ny - 1) as f32 } else { 0.0 };
+  // Cool (low) → warm (high) ramp for probed nodes; dim for not-yet-probed.
+  let cool = egui::Color32::from_rgb(60, 120, 220);
+  let warm = egui::Color32::from_rgb(220, 90, 70);
+  for iy in 0..ny {
+    for ix in 0..nx {
+      let cx = rect.left() + pad + ix as f32 * cell_w;
+      let cy = rect.bottom() - pad - iy as f32 * cell_h; // flip Y so +Y is up, like the bed.
+      let color = if probed.contains(&(ix, iy)) {
+        let t = ((mesh.z[mesh.index(ix, iy)] - lo) / span) as f32;
+        lerp_color(cool, warm, t)
+      } else {
+        palette.text_disabled
+      };
+      painter.circle_filled(egui::pos2(cx, cy), 3.0, color);
+    }
+  }
+}
+
+/// Linearly interpolate between two colours (per-channel), clamping `t` to `0..=1`.
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+  let t = t.clamp(0.0, 1.0);
+  let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+  egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// Render the editable grid-probe bench params in a collapsing section, mutating `state.mesh_bench` in place.
+fn mesh_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
+  let palette = state.style.palette;
+  let p = &mut state.mesh_bench;
+  egui::CollapsingHeader::new(RichText::new(crate::tr!("hdr-mesh-bench")).size(11.0).color(palette.text_dim))
+    .id_salt("mesh_bench_params")
+    .show(ui, |ui| {
+      egui::Grid::new("mesh_bench").num_columns(2).show(ui, |ui| {
+        ui.label(crate::tr!("lbl-mesh-clearance"));
+        ui.add(egui::DragValue::new(&mut p.clearance_z).speed(0.1).range(-300.0..=0.0).suffix(" mm"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-mesh-feed"));
+        ui.add(egui::DragValue::new(&mut p.probe_feed).speed(5.0).range(1.0..=5000.0).suffix(" mm/min"));
+        ui.end_row();
+        ui.label(crate::tr!("lbl-mesh-depth"));
+        ui.add(egui::DragValue::new(&mut p.probe_depth).speed(0.5).range(0.1..=200.0).suffix(" mm"));
+        ui.end_row();
+      });
+    });
+}
+
 /// Render the Phase 2 verify/measure panel (DOC-11 §2): the 180°-flip center-verify and the runout report, both
 /// driven by the shared [`super::angle_sweep::AngleSweep`] engine (passed as `(sweep, kind)` when one is running).
 /// When idle it offers both Start actions; while running it guides the per-angle touches and shows the readings;
@@ -2092,7 +2786,6 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   use super::angle_sweep::SweepStep;
   use super::intent::{Axis, Dir};
   use super::view_state::ProbeKind;
-  section_header(ui, palette, &crate::tr!("hdr-verify"));
   egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
     let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
     let idle = view.connection == ConnectionState::Idle;
@@ -3537,6 +4230,29 @@ pub fn settings_discard_confirm(ctx: &egui::Context, state: &mut UiState) -> Opt
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_running_probing_flow_forces_its_setup_dialog_open() {
+    // Nothing running: the operator's own open/closed choice is left untouched (no force).
+    assert_eq!(forced_setup_dialog(false, false, false, false), None);
+    // Each running flow forces exactly its own dialog visible so an in-progress wizard can never be hidden.
+    assert_eq!(forced_setup_dialog(true, false, false, false), Some(SetupDialog::RotaryCenter));
+    assert_eq!(forced_setup_dialog(false, true, false, false), Some(SetupDialog::Datum));
+    assert_eq!(forced_setup_dialog(false, false, true, false), Some(SetupDialog::MeshProbe));
+    assert_eq!(forced_setup_dialog(false, false, false, true), Some(SetupDialog::VerifyMeasure));
+    // If more than one somehow reads active, the priority is fixed and deterministic (rotary wins).
+    assert_eq!(forced_setup_dialog(true, true, true, true), Some(SetupDialog::RotaryCenter));
+  }
+
+  #[test]
+  fn setup_menu_button_toggles_its_dialog_open_and_closed() {
+    // From closed, a click opens that dialog.
+    assert_eq!(toggle_setup_dialog(None, SetupDialog::Probe), Some(SetupDialog::Probe));
+    // Clicking the entry for the already-open dialog closes it (a toggle).
+    assert_eq!(toggle_setup_dialog(Some(SetupDialog::Probe), SetupDialog::Probe), None);
+    // Clicking a different entry switches to it (only one setup dialog open at a time).
+    assert_eq!(toggle_setup_dialog(Some(SetupDialog::Probe), SetupDialog::Datum), Some(SetupDialog::Datum));
+  }
 
   #[test]
   fn eta_qualifier_text_joins_the_default_settings_flag_and_the_pause_count() {

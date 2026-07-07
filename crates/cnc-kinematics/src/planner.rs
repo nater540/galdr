@@ -151,14 +151,19 @@ impl PlannerConfig {
 }
 
 impl Default for PlannerConfig {
-  /// grbl-like defaults useful for tests and first boot. Linear X/Y/Z: 250 steps/mm, 500 mm/min, 10 mm/s².
-  /// Rotary A (index 3, degrees): 8.889 steps/deg (200 × 16 microsteps / 360), 3600 deg/min (10 rev/min),
-  /// 360 deg/s². `$11` = 0.01 mm, `$12` = 0.002 mm, `$376` = [`DEFAULT_ROTARY_MASK`] (A rotary).
+  /// grbl-like defaults useful for tests and first boot. Steps/mm assume 0.9° (400-step) motors at 16
+  /// microsteps = 6400 steps/rev. X/Y are Tr8x8 leadscrews (8 mm/rev): 6400 / 8 = 800 steps/mm. Z is a
+  /// Tr8x2 leadscrew (2 mm/rev): 6400 / 2 = 3200 steps/mm. Max rates hold every motor at a safe ~300 RPM:
+  /// X/Y Tr8x8 = 2400 mm/min, Z Tr8x2 = 600 mm/min (all ~32 kHz step rate). Accel 100/100/50 mm/s² lets those
+  /// rates be reached within ~8 mm (X/Y) / ~1 mm (Z) — the old 10 mm/s² needed 80 mm, so the rate was
+  /// unreachable. Rotary A (index 3, degrees) still assumes a 1.8° (200-step) 1:1 direct drive: 8.889
+  /// steps/deg (200 × 16 / 360) — revisit if the rotary uses 0.9° motors or a gearbox. 3600 deg/min
+  /// (10 rev/min), 360 deg/s². `$11` = 0.01 mm, `$12` = 0.002 mm, `$376` = [`DEFAULT_ROTARY_MASK`] (A rotary).
   fn default() -> Self {
     PlannerConfig {
-      steps_per_mm: [250.0, 250.0, 250.0, 8.889],
-      max_rate_mm_min: [500.0, 500.0, 500.0, 3600.0],
-      accel_mm_s2: [10.0, 10.0, 10.0, 360.0],
+      steps_per_mm: [800.0, 800.0, 3200.0, 8.889],
+      max_rate_mm_min: [2400.0, 2400.0, 600.0, 3600.0],
+      accel_mm_s2: [100.0, 100.0, 50.0, 360.0],
       junction_deviation_mm: 0.01,
       arc_tolerance_mm: 0.002,
       rotary_mask: DEFAULT_ROTARY_MASK,

@@ -124,6 +124,12 @@ pub struct SkirnirApp {
   /// loaded (the operator simulated while disconnected, or before fetching settings). Surfaced as a small "(default
   /// settings)" qualifier near the ETA so the figure is not mistaken for one grounded in the board's real config.
   simulated_default_settings: bool,
+  /// The height-corrected program cached from the last [`Self::resolve_stream_program`], or `None` when cold. When
+  /// autoleveling is armed, [`crate::app::autolevel::correct_program`] rewrites the loaded file once and the result
+  /// is reused by both the stream and the ETA build (which must key on the SAME, longer, corrected line total).
+  /// Invalidated ([`Self::invalidate_autolevel`]) on program load, a mesh change, and any autolevel toggle/config
+  /// change, so a stale correction can never reach the wire.
+  autolevel_cache: Option<std::sync::Arc<[String]>>,
   /// The continuous jog currently being streamed while the operator holds a jog control, or `None`. Owned by the
   /// shell (not the reducer) because pacing the increments is wall-clock work the egui frame drives.
   jog_stream: Option<JogStream>,
@@ -153,6 +159,15 @@ pub struct SkirnirApp {
   /// its probes: [`Self::pump_wizard`] folds each resolved Phase 0 latch result into the state machine. Held in
   /// app state (not persisted) — DOC-11 §1.3 flags cross-session persistence as a follow-up.
   wizard: Option<RotaryCenterRun>,
+  /// The active datum-finder run (single-edge or corner), or `None`. Holds the pure [`super::datum::DatumState`]
+  /// plus the shared bench [`super::datum::ProbeParams`]. The wizard owns its probes' follow-up:
+  /// [`Self::pump_datum`] folds each resolved Phase 0 latch result into the state machine. Not persisted — a
+  /// found datum is written straight to the WCS (only the bench params persist, via the profile).
+  datum: Option<DatumRun>,
+  /// The active height-map acquisition run, or `None`. Holds the pure [`super::autolevel::MeshProbeState`] plus its
+  /// current point's lost-push fallback. [`Self::pump_mesh`] folds each resolved Z into the mesh; on completion the
+  /// filled mesh is saved to [`crate::profile::Profile::mesh`] and the corrected-program cache is invalidated.
+  mesh_probe: Option<MeshProbeRun>,
   /// The active Phase 2 angle-sweep run (180°-flip verify OR runout report), or `None`. Both wizards share one
   /// [`super::angle_sweep::AngleSweep`] engine and one kind-dispatched pump ([`Self::pump_sweep`]) rather than
   /// each owning a bespoke pump — they are the same "probe at a list of A angles, collect readings" shape.
@@ -195,8 +210,22 @@ enum ProbeOpSlot {
   ZeroZ,
   /// The rotary center-finder (`wizard`).
   Wizard,
+  /// The datum finder (`datum`) — single-edge or corner.
+  Datum,
+  /// The height-map acquisition grid probe (`mesh_probe`).
+  Mesh,
   /// The Phase 2 angle-sweep (`sweep`) — flip-verify or runout.
   Sweep,
+}
+
+/// The shell-side bookkeeping for a height-map acquisition run: the pure [`super::autolevel::MeshProbeState`] plus
+/// the current point's lost-push fallback. Mirrors [`DatumRun`]; all decisions live in the pure state machine.
+struct MeshProbeRun {
+  /// The pure acquisition state machine (mesh being filled, serpentine order, cursor, `Z₀`, step).
+  state: super::autolevel::MeshProbeState,
+  /// The CURRENT point's lost-push fallback (the same completion-gated push-or-poll-`$#`-or-give-up machinery the
+  /// other probe flows use, shared via [`super::probe_flow::await_action`]). `None` between points.
+  touch_fallback: Option<TouchFallback>,
 }
 
 /// The shell-side bookkeeping for a Phase 2 angle-sweep run: the shared pure sweep engine, the bench probe
@@ -225,6 +254,19 @@ struct RotaryCenterRun {
   /// machinery the ZeroZ flow uses, shared via [`super::probe_flow::await_action`]). `None` between touches; set
   /// when a touch is issued and cleared when it resolves. So a dropped/suppressed `[PRB:]` push cannot leave the
   /// wizard awaiting forever — it polls `$#` once the touch has finished, then gives up cleanly.
+  touch_fallback: Option<TouchFallback>,
+}
+
+/// The shell-side bookkeeping for a datum-finder run: the pure [`super::datum::DatumState`] wizard plus the
+/// bench-tuned [`super::datum::ProbeParams`] shared across its touches, and the current touch's lost-push
+/// fallback. Mirrors [`RotaryCenterRun`]; all decisions live in the pure state machine.
+struct DatumRun {
+  /// The pure datum wizard state machine (step, target, captured contacts, computed datum).
+  state: super::datum::DatumState,
+  /// The bench-tuned clearances/feeds/tip-diameter/offset shared across the run's touches.
+  params: super::datum::ProbeParams,
+  /// The CURRENT touch's lost-push fallback (the same completion-gated push-or-poll-`$#`-or-give-up machinery the
+  /// ZeroZ and rotary flows use, shared via [`super::probe_flow::await_action`]). `None` between touches.
   touch_fallback: Option<TouchFallback>,
 }
 
@@ -299,6 +341,7 @@ impl SkirnirApp {
       stream_finished_at: None,
       simulated: None,
       simulated_default_settings: false,
+      autolevel_cache: None,
       jog_stream: None,
       last_status_at: None,
       last_badge: super::badge::BadgeState::Disconnected,
@@ -306,6 +349,8 @@ impl SkirnirApp {
       pending_probe: None,
       pending_zero_z: None,
       wizard: None,
+      datum: None,
+      mesh_probe: None,
       sweep: None,
       profile,
       profile_path_override: None,
@@ -608,6 +653,22 @@ impl SkirnirApp {
       Intent::OpenProgram(path) => self.open_program(&path),
       Intent::StartStream => self.start_stream(),
       Intent::Simulate => self.simulate(),
+      Intent::AutolevelToggle(on) => {
+        // Arm/disarm height-map correction for the next stream/simulate. The armed state changes which lines a Run
+        // sends, so any cached corrected program is now stale — drop it so the next resolve recomputes (or returns
+        // the source verbatim when disarmed). A stored simulation was built over the OTHER program shape (source vs
+        // corrected have different line counts), so it too must be dropped or the live per-line ETA would index the
+        // wrong timeline — exactly as a fresh program load clears both.
+        self.ui.autolevel_enabled = on;
+        self.invalidate_autolevel();
+        self.clear_simulation();
+      }
+      Intent::SetCorrectRapids(on) => {
+        // The correction config changed, so a cached corrected program (and any simulation over it) is stale.
+        self.ui.autolevel_cfg.correct_rapids = on;
+        self.invalidate_autolevel();
+        self.clear_simulation();
+      }
       Intent::SendLine(line) => {
         self.send_line(line);
       }
@@ -644,6 +705,16 @@ impl SkirnirApp {
       }
       Intent::RotaryCenterCancel => self.wizard = None,
       Intent::ApplySavedRotaryCenter => self.apply_saved_rotary_center(),
+      Intent::DatumEdgeStart { axis, dir, params } => self.datum_edge_start(axis, dir, params),
+      Intent::DatumCornerStart { corner, params } => self.datum_corner_start(corner, params),
+      Intent::DatumProbeNext => self.datum_probe_next(),
+      Intent::DatumWriteWcs => self.datum_write_wcs(),
+      Intent::DatumCancel => self.datum = None,
+      Intent::MeshProbeStart { params, min, max, spacing } => self.mesh_probe_start(params, min, max, spacing),
+      Intent::MeshProbeNext => self.mesh_probe_next(),
+      Intent::MeshProbeCancel => self.mesh_probe = None,
+      Intent::MeshClear => self.mesh_clear(),
+      Intent::ApplySavedMesh => self.apply_saved_mesh(),
       Intent::FlipVerifyStart { angle_deg, axis, dir } => self.flip_verify_start(angle_deg, axis, dir),
       Intent::RunoutStart { n, start_deg, axis, dir } => self.runout_start(n, start_deg, axis, dir),
       Intent::SweepProbe => self.sweep_probe(),
@@ -884,6 +955,9 @@ impl SkirnirApp {
         // A fresh program invalidates any prior simulation: the estimate belongs to the file that just closed, so
         // drop it (and its default-settings flag) until the operator re-simulates against the newly loaded lines.
         self.clear_simulation();
+        // The cached height-corrected program belonged to the closed file — drop it so the next stream/simulate
+        // re-corrects the freshly loaded lines rather than sending the previous file's corrected output.
+        self.invalidate_autolevel();
         self.notice(format!("loaded {count} lines from {}", path.display()));
       }
       Err(err) => self.notice(format!("open failed: {err}")),
@@ -897,9 +971,73 @@ impl SkirnirApp {
       self.notice("no program loaded".to_string());
       return;
     }
-    let lines = self.ui.program.clone();
-    self.notice(format!("streaming {} lines", lines.len()));
+    // Resolve the lines to actually send: the source file, or — when autoleveling is armed and a mesh exists — the
+    // height-corrected rewrite. An `Err` (no mesh, or a program the corrector refuses) surfaces a notice and streams
+    // NOTHING, so we never fall back to sending the uncorrected file behind the operator's back.
+    let lines = match self.resolve_stream_program() {
+      Ok(lines) => lines,
+      Err(reason) => {
+        self.notice(reason);
+        return;
+      }
+    };
+    if self.ui.autolevel_enabled {
+      self.warn_on_wcs_mismatch();
+      self.notice(format!("streaming {} lines (autolevel: {} source)", lines.len(), self.ui.program.len()));
+    } else {
+      self.notice(format!("streaming {} lines", lines.len()));
+    }
     self.send_command(Command::StreamProgram(lines));
+  }
+
+  /// Surface a warning (not a block) if the armed height-map was probed under a DIFFERENT WCS than the job is
+  /// about to run in — the mesh indexes work-XY, so a WCS shift moves the surface out from under the correction.
+  /// A no-op when no mesh is armed or the active WCS is unknown (no `$G` answer yet). Reads the active WCS from
+  /// the `[GC:]` parser state ([`ViewState::active_wcs`]) against the mesh's stamped `wcs_index`.
+  fn warn_on_wcs_mismatch(&mut self) {
+    let mesh_wcs = self.profile.mesh.as_ref().map(|m| m.wcs_index);
+    if let (Some(mesh_wcs), Some(active)) = (mesh_wcs, self.view.active_wcs)
+      && mesh_wcs != active
+    {
+      self.notice(format!(
+        "warning: height-map was probed under G{} but the job runs under G{} — the correction may be misaligned",
+        54 + mesh_wcs,
+        54 + active,
+      ));
+    }
+  }
+
+  /// Resolve the program to stream/estimate. With autoleveling off, that is the source lines verbatim (today's
+  /// behavior). With it on, the loaded program is height-corrected through [`crate::app::autolevel::correct_program`]
+  /// against the probed [`crate::profile::Profile::mesh`] and the result is cached ([`Self::autolevel_cache`]) so a
+  /// Run and its ETA build share ONE correction pass. Returns `Err(reason)` — surfaced as a notice by the caller —
+  /// when autoleveling is armed but cannot be applied (no mesh probed, or the corrector refuses the program), so the
+  /// caller aborts rather than silently sending an uncorrected file. Never sends a command itself.
+  fn resolve_stream_program(&mut self) -> Result<std::sync::Arc<[String]>, String> {
+    if !self.ui.autolevel_enabled {
+      return Ok(self.ui.program.clone());
+    }
+    if let Some(cached) = &self.autolevel_cache {
+      return Ok(cached.clone());
+    }
+    let Some(mesh) = self.profile.mesh.as_ref() else {
+      return Err("autolevel on but no height map probed".to_string());
+    };
+    match crate::app::autolevel::correct_program(&self.ui.program, mesh, &self.ui.autolevel_cfg) {
+      Ok(lines) => {
+        let arc: std::sync::Arc<[String]> = std::sync::Arc::from(lines);
+        self.autolevel_cache = Some(arc.clone());
+        Ok(arc)
+      }
+      Err(e) => Err(format!("autolevel refused: {e}")),
+    }
+  }
+
+  /// Drop the cached corrected program so the next stream/simulate recomputes it. Called whenever an input to the
+  /// correction changes: a freshly loaded program, a mesh change, or an autolevel toggle/config edit. Cheap (clears
+  /// one `Option`); the recompute is deferred to the next [`Self::resolve_stream_program`].
+  fn invalidate_autolevel(&mut self) {
+    self.autolevel_cache = None;
   }
 
   /// Simulate the loaded program: build a physics-based job-time estimate ([`crate::eta::EtaTimeline`]) over the
@@ -915,6 +1053,16 @@ impl SkirnirApp {
       self.notice("no program to simulate".to_string());
       return;
     }
+    // Estimate over the SAME lines a Run would send: with autoleveling armed, that is the height-corrected (longer)
+    // program, so the ETA and the live per-line remaining key on the same total the stream acks against. A refusal
+    // (no mesh / uncorrectable program) surfaces the notice and skips the estimate rather than timing the wrong file.
+    let program = match self.resolve_stream_program() {
+      Ok(program) => program,
+      Err(reason) => {
+        self.notice(reason);
+        return;
+      }
+    };
     // Whether the live settings model carries any `$$` values: with none, every config field defaults, so the
     // estimate is grounded in the firmware's default machine model rather than this board's real config. We flag
     // that so the UI qualifies the ETA rather than presenting a defaulted figure as authoritative.
@@ -924,7 +1072,7 @@ impl SkirnirApp {
     // unparseable values fall back to the firmware default inside `configs_from_settings`.
     let (planner, motion) =
       crate::eta::configs_from_settings(|n| settings.value_of(n).and_then(|s| s.trim().parse::<f64>().ok()));
-    let timeline = crate::eta::EtaTimeline::build(&self.ui.program, &planner, &motion);
+    let timeline = crate::eta::EtaTimeline::build(&program, &planner, &motion);
     let total = timeline.total_seconds;
     let pauses = timeline.pauses.len();
     self.simulated = Some(timeline);
@@ -1476,6 +1624,373 @@ impl SkirnirApp {
     }
   }
 
+  /// Start a datum-finder single-edge run: touch off `axis` in `dir` with `params`, replacing any datum run in
+  /// progress. Guarded by [`Self::verify_probe_clear`] — a probe already asserted (`Pn:P`) means a short / wrong
+  /// polarity, so starting would probe against a triggered input and read garbage; refuse with a notice instead.
+  fn datum_edge_start(&mut self, axis: Axis, dir: Dir, params: super::datum::ProbeParams) {
+    if !self.verify_probe_clear() {
+      return;
+    }
+    self.cancel_probe_ops_except(ProbeOpSlot::Datum);
+    self.datum = Some(DatumRun {
+      state: super::datum::DatumState::new_edge(axis, dir, params.probe_diameter),
+      params,
+      touch_fallback: None,
+    });
+    self.notice(format!("datum: single {} edge, approach {}", axis.letter(), dir_word(dir)));
+  }
+
+  /// Start a datum-finder corner run for `corner` with `params`, replacing any datum run in progress. Guarded by
+  /// [`Self::verify_probe_clear`] like the edge start.
+  fn datum_corner_start(&mut self, corner: super::datum::Corner, params: super::datum::ProbeParams) {
+    if !self.verify_probe_clear() {
+      return;
+    }
+    self.cancel_probe_ops_except(ProbeOpSlot::Datum);
+    self.datum = Some(DatumRun {
+      state: super::datum::DatumState::new_corner(corner, params.probe_diameter),
+      params,
+      touch_fallback: None,
+    });
+    let side = if corner.inside { "inside" } else { "outside" };
+    self.notice(format!("datum: {side} corner (approach X{:+.0} Y{:+.0})", corner.approach_x(), corner.approach_y()));
+  }
+
+  /// The VerifyProbe guard (mirroring ioSender's `VerifyProbe`): refuse to start a probe op when the probe input
+  /// is already asserted (`Pn:P`), which means it is shorted or wired the wrong polarity. Returns whether it is
+  /// safe to proceed; surfaces a notice and returns `false` when the probe is already triggered.
+  fn verify_probe_clear(&mut self) -> bool {
+    if self.view.pins.probe {
+      self.notice("probe is already asserted (Pn:P) — check wiring/polarity before probing".to_string());
+      return false;
+    }
+    true
+  }
+
+  /// Trigger the datum wizard's next touch: ask the state machine which touch is due, emit its two-stage `G38.3`
+  /// latch lines, and arm the Phase 0 latch (as a `Datum` op) before the SLOW pass so [`Self::pump_datum`] folds
+  /// the kept reading back in. Inert if no datum run is active, one is already probing, or no touch is due.
+  ///
+  /// The fast pass's `ok` is consumed by ordinary flow control; the latch is armed for the whole emitted sequence
+  /// (issued before the first line), so the slow pass's `[PRB:]` — the only probe result the sequence produces —
+  /// resolves it. That is exactly the two-stage contract: `G38.3` reports `[PRB:]` on each probe, but the fast
+  /// pass's push is a stale intermediate the wizard folds as the reading; to keep the KEPT reading the slow one we
+  /// rely on send-order and the wizard reading the LAST resolved result (each touch clears the latch before the
+  /// next). Because a single touch issues exactly one wizard step, only one `[PRB:]` is awaited per touch here.
+  fn datum_probe_next(&mut self) {
+    let Some(run) = self.datum.as_mut() else {
+      self.notice("no datum run active".to_string());
+      return;
+    };
+    if run.state.is_probing() {
+      self.notice("datum probe already in progress".to_string());
+      return;
+    }
+    let Some(touch) = run.state.begin_probe() else {
+      self.notice("no datum touch is due in this step".to_string());
+      return;
+    };
+    let params = run.params;
+    let lines = super::datum::touch_lines(touch, &params);
+    // Only this datum run may own the latch now (cross-contamination guard), and arm it BEFORE sending so the
+    // result always finds an op awaiting it; the wizard owns the follow-up.
+    self.cancel_probe_ops_except(ProbeOpSlot::Datum);
+    self.view.begin_probe(super::view_state::ProbeKind::Datum);
+    if let Some(run) = self.datum.as_mut() {
+      run.touch_fallback =
+        Some(TouchFallback { issued_at: Instant::now(), polled: false, polled_at: None, seen_cycle: false });
+    }
+    let mut all_sent = true;
+    for line in lines {
+      self.view.note_sent(line.clone());
+      if !self.send_command(Command::SendLine(line)) {
+        all_sent = false;
+        break;
+      }
+    }
+    if !all_sent {
+      // The send failed mid-sequence (no engine): fail the latch and the wizard rather than awaiting forever.
+      self.view.fail_probe("datum probe not sent (not connected)");
+      if let Some(run) = self.datum.as_mut() {
+        run.state.abort("probe not sent (not connected)");
+      }
+    }
+  }
+
+  /// Write the found datum to the active WCS via the wizard's offered `G10 L2` line (one axis for an edge, X&Y for
+  /// a corner). Inert until the wizard has a computed datum (the `Review` step). A failed send (no engine) already
+  /// notices why, so only a real write claims success.
+  fn datum_write_wcs(&mut self) {
+    let Some(run) = self.datum.as_ref() else {
+      return;
+    };
+    let Some(line) = run.state.offer_g10() else {
+      self.notice("no datum to write yet".to_string());
+      return;
+    };
+    if !self.send_line(line) {
+      return;
+    }
+    self.notice("wrote datum to the active WCS".to_string());
+  }
+
+  /// Drive a running datum touch one frame: fold a resolved latch result into the wizard, or run the SHARED
+  /// completion-gated lost-push fallback (`$#` poll, then give up) so a dropped/suppressed `[PRB:]` never leaves
+  /// the wizard awaiting forever. Mirrors [`Self::pump_wizard`] but folds into the datum state machine. Returns
+  /// whether anything changed (for a prompt repaint). No-op when no datum run is active or it is not awaiting.
+  fn pump_datum(&mut self) -> bool {
+    use super::probe_flow::{AwaitAction, await_action};
+    let (issued_at, polled_at) = match self.datum.as_ref() {
+      Some(run) if run.state.is_probing() => match &run.touch_fallback {
+        Some(f) => (f.issued_at, f.polled_at),
+        None => (Instant::now(), None),
+      },
+      _ => return false,
+    };
+    // The latch must belong to THIS flow. Gone (disconnect) or another kind ⇒ abort the wizard rather than wait
+    // forever or act on someone else's `[PRB:]`.
+    match self.view.probe_op.as_ref() {
+      Some(op) if op.kind == super::view_state::ProbeKind::Datum => {}
+      _ => {
+        if let Some(run) = self.datum.as_mut() {
+          run.state.abort("probe latch lost");
+        }
+        return true;
+      }
+    }
+    // If the latch has resolved, fold the outcome into the wizard and finish the touch.
+    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
+    if let Some(outcome) = resolved {
+      if let Some(run) = self.datum.as_mut() {
+        run.state.on_probe_result(&outcome);
+        run.touch_fallback = None;
+      }
+      // Consume the latch so the result is fed exactly once (the next touch's `begin_probe` re-arms it).
+      self.view.clear_probe_op();
+      return true;
+    }
+    // Still awaiting: run the shared lost-push fallback, gated on the touch having demonstrably finished.
+    let now = Instant::now();
+    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
+    if busy_now && let Some(run) = self.datum.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+      f.seen_cycle = true;
+    }
+    let (polled, seen_cycle) = match self.datum.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
+      Some(f) => (f.polled, f.seen_cycle),
+      None => return false,
+    };
+    let probe_finished = seen_cycle && !busy_now;
+    let since_issue = now.duration_since(issued_at);
+    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
+    match await_action(polled, probe_finished, since_issue, since_poll) {
+      AwaitAction::Wait => false,
+      AwaitAction::Poll => {
+        if let Some(run) = self.datum.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+          f.polled = true;
+          f.polled_at = Some(now);
+        }
+        self.send_line("$#".to_string());
+        true
+      }
+      AwaitAction::GiveUp(reason) => {
+        if let Some(run) = self.datum.as_mut() {
+          run.state.abort(reason.clone());
+          run.touch_fallback = None;
+        }
+        self.view.fail_probe(reason);
+        true
+      }
+    }
+  }
+
+  /// Start a height-map acquisition run over the grid `[min, max]` at `spacing` (work-mm) with `params`. Guarded by
+  /// [`Self::verify_probe_clear`] (a probe already asserted means bad wiring), then builds the serpentine
+  /// [`super::autolevel::MeshProbeState`] over a fresh [`super::autolevel::Mesh`]. Replaces any run in progress.
+  fn mesh_probe_start(
+    &mut self, params: super::autolevel::GridProbeParams, min: (f64, f64), max: (f64, f64), spacing: (f64, f64),
+  ) {
+    if !self.verify_probe_clear() {
+      return;
+    }
+    let mut mesh = super::autolevel::Mesh::from_spacing(min, max, spacing);
+    // Stamp the WCS the mesh is being probed under (the active `G54`…`G59`, default G54) so a later stream can
+    // warn if the job runs under a different WCS than the surface was measured in.
+    mesh.wcs_index = self.view.active_wcs.unwrap_or(0);
+    let (nx, ny) = (mesh.nx, mesh.ny);
+    self.cancel_probe_ops_except(ProbeOpSlot::Mesh);
+    self.mesh_probe =
+      Some(MeshProbeRun { state: super::autolevel::MeshProbeState::new(mesh, params), touch_fallback: None });
+    self.notice(format!("height-map acquisition: {nx}×{ny} grid ({} points)", nx * ny));
+  }
+
+  /// Trigger the acquisition's next point: ask the state machine for its two-stage `G38.3` Z-touch lines (the
+  /// clearance retract, the work-XY rapid, the probe, the retract), emit them, and arm the Phase 0 latch as a
+  /// `Mesh` op so [`Self::pump_mesh`] folds the result back. Inert if no run is active, one is probing, or done.
+  fn mesh_probe_next(&mut self) {
+    let lines = {
+      let Some(run) = self.mesh_probe.as_mut() else {
+        self.notice("no height-map acquisition active".to_string());
+        return;
+      };
+      if run.state.is_probing() {
+        self.notice("mesh probe already in progress".to_string());
+        return;
+      }
+      match run.state.begin_next_point() {
+        Some(lines) => lines,
+        None => {
+          self.notice("no mesh point is due".to_string());
+          return;
+        }
+      }
+    };
+    // Only this run may own the latch now; arm it BEFORE sending so the result always finds an op awaiting it.
+    self.cancel_probe_ops_except(ProbeOpSlot::Mesh);
+    self.view.begin_probe(super::view_state::ProbeKind::Mesh);
+    if let Some(run) = self.mesh_probe.as_mut() {
+      run.touch_fallback =
+        Some(TouchFallback { issued_at: Instant::now(), polled: false, polled_at: None, seen_cycle: false });
+    }
+    let mut all_sent = true;
+    for line in lines {
+      self.view.note_sent(line.clone());
+      if !self.send_command(Command::SendLine(line)) {
+        all_sent = false;
+        break;
+      }
+    }
+    if !all_sent {
+      self.view.fail_probe("mesh probe not sent (not connected)");
+      if let Some(run) = self.mesh_probe.as_mut() {
+        run.state.abort("probe not sent (not connected)");
+      }
+    }
+  }
+
+  /// Drive a running mesh acquisition one frame: fold a resolved latch result into the state machine (saving the
+  /// finished mesh on completion), or run the shared lost-push fallback. Mirrors [`Self::pump_datum`]. Returns
+  /// whether anything changed. No-op when no run is active or it is not awaiting a point.
+  fn pump_mesh(&mut self) -> bool {
+    use super::probe_flow::{AwaitAction, await_action};
+    let (issued_at, polled_at) = match self.mesh_probe.as_ref() {
+      Some(run) if run.state.is_probing() => match &run.touch_fallback {
+        Some(f) => (f.issued_at, f.polled_at),
+        None => (Instant::now(), None),
+      },
+      _ => return false,
+    };
+    // The latch must belong to THIS flow. Gone or another kind ⇒ abort rather than act on someone else's `[PRB:]`.
+    match self.view.probe_op.as_ref() {
+      Some(op) if op.kind == super::view_state::ProbeKind::Mesh => {}
+      _ => {
+        if let Some(run) = self.mesh_probe.as_mut() {
+          run.state.abort("probe latch lost");
+        }
+        return true;
+      }
+    }
+    // Resolved ⇒ fold the Z into the mesh; if that completed the grid, persist it.
+    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
+    if let Some(outcome) = resolved {
+      let mut just_done = false;
+      if let Some(run) = self.mesh_probe.as_mut() {
+        run.state.on_probe_result(&outcome);
+        run.touch_fallback = None;
+        just_done = run.state.is_done();
+      }
+      self.view.clear_probe_op();
+      if just_done {
+        self.finish_mesh_probe();
+      }
+      return true;
+    }
+    // Still awaiting ⇒ shared lost-push fallback, gated on the point having demonstrably finished.
+    let now = Instant::now();
+    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
+    if busy_now
+      && let Some(run) = self.mesh_probe.as_mut()
+      && let Some(f) = run.touch_fallback.as_mut()
+    {
+      f.seen_cycle = true;
+    }
+    let (polled, seen_cycle) = match self.mesh_probe.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
+      Some(f) => (f.polled, f.seen_cycle),
+      None => return false,
+    };
+    let probe_finished = seen_cycle && !busy_now;
+    let since_issue = now.duration_since(issued_at);
+    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
+    match await_action(polled, probe_finished, since_issue, since_poll) {
+      AwaitAction::Wait => false,
+      AwaitAction::Poll => {
+        if let Some(run) = self.mesh_probe.as_mut()
+          && let Some(f) = run.touch_fallback.as_mut()
+        {
+          f.polled = true;
+          f.polled_at = Some(now);
+        }
+        self.send_line("$#".to_string());
+        true
+      }
+      AwaitAction::GiveUp(reason) => {
+        if let Some(run) = self.mesh_probe.as_mut() {
+          run.state.abort(reason.clone());
+          run.touch_fallback = None;
+        }
+        self.view.fail_probe(reason);
+        true
+      }
+    }
+  }
+
+  /// Persist a completed height-map: snapshot the filled mesh into [`crate::profile::Profile::mesh`], invalidate
+  /// the corrected-program cache (it may have been built on an older/absent mesh), and save the profile. Called by
+  /// [`Self::pump_mesh`] the moment the last point resolves. A no-op unless the run is actually done.
+  fn finish_mesh_probe(&mut self) {
+    let mut mesh = match self.mesh_probe.as_ref() {
+      Some(run) if run.state.is_done() => run.state.mesh().clone(),
+      _ => return,
+    };
+    // Pin `max_height` to the exact grid maximum on completion: `set_delta`'s O(1) incremental update only rises,
+    // so a re-probe that lowered a node could leave it stale-high. One authoritative O(N) pass here fixes that.
+    mesh.recompute_max_height();
+    self.profile.mesh = Some(mesh);
+    // A freshly probed mesh changes the correction inputs — drop any cached corrected program AND any stored
+    // simulation (both were built against the old/absent mesh) so the next stream/simulate recomputes against the
+    // new surface. The simulation's per-line timeline indexes the corrected program, so a stale one would misdrive
+    // the live ETA once the new mesh changes the corrected line count.
+    self.invalidate_autolevel();
+    self.clear_simulation();
+    self.save_profile();
+    self.notice("height-map complete — saved to the profile".to_string());
+  }
+
+  /// Clear the persisted height-map from the profile and disarm autolevel's use of it (invalidate the cache).
+  fn mesh_clear(&mut self) {
+    if self.profile.mesh.is_none() {
+      self.notice("no saved height-map to clear".to_string());
+      return;
+    }
+    self.profile.mesh = None;
+    self.invalidate_autolevel();
+    self.clear_simulation();
+    self.save_profile();
+    self.notice("cleared the saved height-map".to_string());
+  }
+
+  /// Apply the saved height-map to the next stream: arm autolevel and invalidate the corrected cache so the next
+  /// stream/simulate re-corrects against `profile.mesh`. A no-op (with a notice) when no mesh has been saved.
+  fn apply_saved_mesh(&mut self) {
+    if self.profile.mesh.is_none() {
+      self.notice("no saved height-map to apply — probe one first".to_string());
+      return;
+    }
+    self.ui.autolevel_enabled = true;
+    self.invalidate_autolevel();
+    self.clear_simulation();
+    self.notice("armed autolevel with the saved height-map".to_string());
+  }
+
   /// Cancel every OTHER in-flight probe op so only one is ever armed at a time (the cross-contamination guard).
   /// Called when any probe flow starts. The shared latch is kind-routed, but clearing the others' pending state
   /// here means a stale follow-up can never act on a new flow's `[PRB:]`.
@@ -1485,6 +2000,12 @@ impl SkirnirApp {
     }
     if keep != ProbeOpSlot::Wizard {
       self.wizard = None;
+    }
+    if keep != ProbeOpSlot::Datum {
+      self.datum = None;
+    }
+    if keep != ProbeOpSlot::Mesh {
+      self.mesh_probe = None;
     }
     if keep != ProbeOpSlot::Sweep {
       self.sweep = None;
@@ -1754,6 +2275,8 @@ impl SkirnirApp {
       rotary_dowel_diameter: self.ui.rotary_dowel_diameter,
       rotary_index_angle: self.ui.rotary_index_angle,
       rotary_bench: self.ui.rotary_bench,
+      datum_bench: self.ui.datum_bench,
+      grid_bench: self.ui.mesh_bench,
       dock_fraction: self.ui.dock_fraction,
     };
   }
@@ -1901,6 +2424,12 @@ impl eframe::App for SkirnirApp {
       // Whether a center was persisted last session (DOC-11 §1.3): the no-run panel offers a one-click
       // re-apply so a restart restores the found center without re-probing.
       has_saved_center: self.profile.rotary.is_some(),
+      // The datum finder reads the shell-owned wizard state (a found datum is host state written straight to the
+      // WCS); a borrow keeps the view a pure render of it.
+      datum: self.datum.as_ref().map(|run| &run.state),
+      // The height-map acquisition panel reads the shell-owned acquisition state; `has_saved_mesh` offers a clear.
+      mesh_probe: self.mesh_probe.as_ref().map(|run| &run.state),
+      has_saved_mesh: self.profile.mesh.is_some(),
       // The Phase 2 verify/measure panel reads the shared sweep engine + which wizard owns it.
       sweep: self.sweep.as_ref().map(|run| (&run.sweep, run.kind)),
     };
@@ -1979,6 +2508,12 @@ impl eframe::App for SkirnirApp {
     //     wizard advances (or aborts) the instant a touch resolves.
     let saw_wizard = self.pump_wizard();
 
+    // 3d′. Service a running datum finder the same way, via its kind-routed pump.
+    let saw_datum = self.pump_datum();
+
+    // 3d″. Service a running height-map acquisition the same way, via its kind-routed pump.
+    let saw_mesh = self.pump_mesh();
+
     // 3e. Service a running Phase 2 sweep (flip-verify / runout) the same way, via the shared kind-routed pump.
     let saw_sweep = self.pump_sweep();
 
@@ -2000,11 +2535,20 @@ impl eframe::App for SkirnirApp {
         (false, false)
       }
     };
-    if saw_event || saw_probe || saw_probe_z || saw_wizard || saw_sweep || fired_reconnect || probe_pending
-      || reconnect_pending || self.engine.is_some() || self.jog_stream.is_some() || self.pending_zero_z.is_some()
+    if saw_event || saw_probe || saw_probe_z || saw_wizard || saw_datum || saw_mesh || saw_sweep || fired_reconnect
+      || probe_pending || reconnect_pending || self.engine.is_some() || self.jog_stream.is_some()
+      || self.pending_zero_z.is_some()
     {
       ctx.request_repaint_after(REPAINT_INTERVAL);
     }
+  }
+}
+
+/// A short human word for a jog/approach direction, for datum-run notices (`+` vs `−`).
+fn dir_word(dir: Dir) -> &'static str {
+  match dir {
+    Dir::Pos => "positive",
+    Dir::Neg => "negative",
   }
 }
 
@@ -3059,6 +3603,248 @@ mod tests {
     assert!(!after.contains("G10"), "an aborted wizard must never write a WCS offset; saw {after:?}");
   }
 
+  /// Drive the datum pump across a short window, draining engine events (so an injected `[PRB:]` reaches the latch
+  /// and is folded into the wizard) and the transport writes each step. Returns everything written.
+  fn pump_datum_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_events();
+      app.pump_datum();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// Issue one datum touch and feed back its two-stage `[PRB:]` results, returning the emitted probe lines. Mirrors
+  /// the real flow: the operator triggers the touch (`datum_probe_next`), the firmware runs the FAST search then
+  /// the SLOW re-probe (each pushing a `[PRB:]`), and the pump folds the KEPT (slow) reading into the wizard. The
+  /// fast reading is a DISTINCT junk value so a caller's assertion would fail if the latch wrongly kept it.
+  fn datum_touch(app: &mut SkirnirApp, controller: &mut LoopbackController, prb: &str) -> String {
+    app.datum_probe_next();
+    let issued = String::from_utf8_lossy(&pump_datum_steps(app, controller, 8)).into_owned();
+    // Fast pass: a junk reading that MUST be discarded (the two-stage keeps the slow re-probe, not this).
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line("[PRB:99.000,99.000,99.000:1]"));
+    pump_datum_steps(app, controller, 6);
+    // Slow pass: the KEPT reading (or a `:0` miss, which aborts).
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line(prb));
+    pump_datum_steps(app, controller, 12);
+    issued
+  }
+
+  /// The datum finder must drive a full outside-corner run over the loopback: each face composes the Phase 0
+  /// latch as a two-stage `G38.3` touch, the readings are tip-comped, and the WCS write is a `G10 L2 P0 X.. Y..`.
+  /// This is the headline datum integration test (the non-rotary sibling of the rotary center-finder run).
+  #[test]
+  fn the_datum_finder_runs_a_corner_and_writes_comped_xy() {
+    use crate::app::datum::{Corner, DatumStep, ProbeParams};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // Outside corner A (+X,+Y), 2 mm tip (radius 1): X contact 5 → 6, Y contact 8 → 9.
+    let params = ProbeParams { probe_diameter: 2.0, ..ProbeParams::default() };
+    app.datum_corner_start(Corner::A, params);
+    controller.drain_written();
+
+    // Face 1 — X. The emitted sequence must be the two-stage latch (fast G38.3, retract, slow G38.3), never carry
+    // an A word, and never use the alarming G38.2.
+    let face_x = datum_touch(&mut app, &mut controller, "[PRB:5.000,0.000,0.000:1]");
+    assert!(face_x.contains("G91 G38.3 X"), "the X face must probe X with a no-alarm G38.3; saw {face_x:?}");
+    assert!(!face_x.contains("G38.2"), "a datum touch must never use the alarming G38.2; saw {face_x:?}");
+    let probe_lines: Vec<&str> = face_x.lines().filter(|l| l.contains("G38")).collect();
+    assert_eq!(probe_lines.len(), 2, "a touch must emit exactly the fast + slow passes; saw {face_x:?}");
+    assert!(!face_x.contains('A'), "no datum line may carry an A word; saw {face_x:?}");
+    assert_eq!(app.datum.as_ref().unwrap().state.step, DatumStep::ReadyFaceY);
+
+    // Face 2 — Y. After it the wizard reaches Review with the comped corner.
+    datum_touch(&mut app, &mut controller, "[PRB:0.000,8.000,0.000:1]");
+    let state = &app.datum.as_ref().unwrap().state;
+    assert_eq!(state.step, DatumStep::Review);
+    assert_eq!(state.corner_xy(), Some((6.0, 9.0)));
+
+    // Write the datum: a G10 L2 carrying the comped X and Y.
+    app.datum_write_wcs();
+    let wrote = String::from_utf8_lossy(&pump_datum_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(wrote.contains("G10 L2 P0 X6.000 Y9.000"), "the datum write must be G10 L2 X/Y; saw {wrote:?}");
+    let g10 = wrote.lines().find(|l| l.contains("G10")).expect("a G10 line");
+    assert!(!g10.contains('A'), "the datum write must never carry an A word; saw {g10:?}");
+  }
+
+  /// A single-edge touch-off writes exactly one tip-comped axis. Approaching +X with a 4 mm tip and a contact at
+  /// machine-X 10 → edge at 12, written as a one-axis `G10 L2 P0 X12.000`.
+  #[test]
+  fn a_datum_single_edge_touch_off_writes_one_comped_axis() {
+    use crate::app::datum::ProbeParams;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    let params = ProbeParams { probe_diameter: 4.0, ..ProbeParams::default() };
+    app.datum_edge_start(Axis::X, Dir::Pos, params);
+    controller.drain_written();
+    datum_touch(&mut app, &mut controller, "[PRB:10.000,0.000,0.000:1]");
+
+    app.datum_write_wcs();
+    let wrote = String::from_utf8_lossy(&pump_datum_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(wrote.contains("G10 L2 P0 X12.000"), "a single edge must write one comped axis; saw {wrote:?}");
+  }
+
+  /// A datum touch that reports no contact (`G38.3`'s software miss, flag `:0`) must abort the run and never
+  /// reach the WCS write — the fail-closed contract that keeps a bad reading from writing a bogus offset.
+  #[test]
+  fn a_missed_datum_touch_aborts_without_writing() {
+    use crate::app::datum::{DatumStep, ProbeParams};
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    app.datum_edge_start(Axis::Y, Dir::Neg, ProbeParams::default());
+    controller.drain_written();
+    // The touch misses: `[PRB:…:0]` (no alarm, thanks to G38.3). The wizard must abort.
+    datum_touch(&mut app, &mut controller, "[PRB:0.000,0.000,0.000:0]");
+    assert_eq!(app.datum.as_ref().unwrap().state.step, DatumStep::Aborted);
+
+    // A write attempt on an aborted run must emit no G10.
+    controller.drain_written();
+    app.datum_write_wcs();
+    let after = String::from_utf8_lossy(&pump_datum_steps(&mut app, &mut controller, 8)).into_owned();
+    assert!(!after.contains("G10"), "an aborted datum run must never write a WCS offset; saw {after:?}");
+  }
+
+  /// The VerifyProbe guard: starting a datum run while the probe is already asserted (`Pn:P`) must be refused, so
+  /// the operator never probes against a shorted / wrong-polarity input. No run is created and a notice explains.
+  #[test]
+  fn a_datum_start_is_refused_when_the_probe_is_already_asserted() {
+    use crate::app::datum::ProbeParams;
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+
+    // The firmware reports the probe input asserted (`Pn:P`); pump it into the view so the guard sees it.
+    assert!(controller.inject_line("<Idle|MPos:0.000,0.000,0.000|Pn:P>"));
+    assert!(pump_until(&mut app, |a| a.view.pins.probe), "the Pn:P status must reach the view");
+
+    app.datum_edge_start(Axis::X, Dir::Pos, ProbeParams::default());
+    assert!(app.datum.is_none(), "a datum run must not start while the probe is asserted");
+    assert!(
+      app.view.console.iter().any(|l| l.text.contains("already asserted")),
+      "the refusal must be explained to the operator",
+    );
+  }
+
+  /// Drive the mesh pump across a short window, draining engine events + transport writes each step.
+  fn pump_mesh_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..steps {
+      app.pump_events();
+      app.pump_mesh();
+      out.extend(controller.drain_written());
+      std::thread::sleep(Duration::from_millis(5));
+    }
+    out
+  }
+
+  /// Probe one grid point and feed back its two-stage `[PRB:]` Z results, returning the emitted lines. Like
+  /// [`datum_touch`], the grid probe is a two-stage latch: a junk FAST reading (discarded) then the SLOW re-probe's
+  /// KEPT reading (`prb`, or a `:0` miss which aborts).
+  fn mesh_point(app: &mut SkirnirApp, controller: &mut LoopbackController, prb: &str) -> String {
+    app.mesh_probe_next();
+    let issued = String::from_utf8_lossy(&pump_mesh_steps(app, controller, 8)).into_owned();
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line("[PRB:99.000,99.000,99.000:1]"));
+    pump_mesh_steps(app, controller, 6);
+    assert!(controller.inject_line("ok"));
+    assert!(controller.inject_line(prb));
+    pump_mesh_steps(app, controller, 12);
+    issued
+  }
+
+  /// The headline acquisition integration: a full serpentine grid probe over the loopback stores deltas from the
+  /// first point and, on the last point, persists the completed mesh to the profile + invalidates the corrected
+  /// cache. A 2×2 grid → 4 points; Z readings 5.0/5.2/4.9/5.1 → deltas 0/+0.2/−0.1/+0.1 in COLUMN-major
+  /// serpentine order (0,0),(0,1),(1,1),(1,0).
+  #[test]
+  fn a_full_mesh_acquisition_probes_the_grid_and_persists_the_mesh() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+    // Prime a stale corrected cache AND a stale simulation so we can prove completion invalidates both.
+    app.autolevel_cache = Some(std::sync::Arc::from(vec!["stale".to_string()]));
+    app.ui.set_program(vec!["G0 X0 Y0 Z-1".to_string(), "G1 X5 Y0 F100".to_string()], None);
+    app.handle_intent(Intent::Simulate);
+    assert!(app.simulated.is_some(), "a simulation is primed");
+
+    app.mesh_probe_start(crate::app::autolevel::GridProbeParams::default(), (0.0, 0.0), (10.0, 10.0), (10.0, 10.0));
+    controller.drain_written();
+    assert_eq!(app.mesh_probe.as_ref().unwrap().state.progress(), (0, 4), "a 2×2 grid is four points");
+
+    // Point 1 must emit the two-stage no-alarm Z touch (never G38.2) and a work-coord XY rapid.
+    let first = mesh_point(&mut app, &mut controller, "[PRB:0.000,0.000,5.000:1]");
+    assert!(first.contains("G90 G0 X") && first.contains("G53 G0 Z"), "a point positions in work XY + machine Z; saw {first:?}");
+    let probes: Vec<&str> = first.lines().filter(|l| l.contains("G38")).collect();
+    assert_eq!(probes.len(), 2, "a grid touch is two-stage; saw {first:?}");
+    assert!(probes.iter().all(|p| p.contains("G38.3")), "a grid touch must be the no-alarm G38.3; saw {first:?}");
+
+    mesh_point(&mut app, &mut controller, "[PRB:0.000,0.000,5.200:1]");
+    mesh_point(&mut app, &mut controller, "[PRB:0.000,0.000,4.900:1]");
+    mesh_point(&mut app, &mut controller, "[PRB:0.000,0.000,5.100:1]");
+
+    // On the last point the run finished and the mesh was persisted to the profile with deltas-from-first-point.
+    let mesh = app.profile.mesh.as_ref().expect("the completed mesh must be saved to the profile");
+    assert!((mesh.z[mesh.index(0, 0)] - 0.0).abs() < 1e-9, "the first point is the reference (delta 0)");
+    assert!((mesh.z[mesh.index(0, 1)] - 0.2).abs() < 1e-9);
+    assert!((mesh.z[mesh.index(1, 1)] + 0.1).abs() < 1e-9);
+    assert!((mesh.z[mesh.index(1, 0)] - 0.1).abs() < 1e-9);
+    // Completion invalidated the stale corrected cache AND the stale simulation so the next stream/ETA rebuilds
+    // against the new surface (the simulation's per-line timeline indexes the corrected program).
+    assert!(app.autolevel_cache.is_none(), "a completed mesh must invalidate the corrected-program cache");
+    assert!(app.simulated.is_none(), "a completed mesh must clear a simulation built against the old surface");
+  }
+
+  /// Clearing the saved mesh (MeshClear) invalidates the corrected cache AND a stale simulation (same reasoning as
+  /// a completed acquisition — the correction inputs changed).
+  #[test]
+  fn clearing_the_mesh_invalidates_the_cache_and_the_simulation() {
+    let mut app = app_disconnected();
+    app.profile.mesh = Some(test_mesh(0.3));
+    app.autolevel_cache = Some(std::sync::Arc::from(vec!["stale".to_string()]));
+    app.ui.set_program(vec!["G1 X10 F100".to_string()], None);
+    app.handle_intent(Intent::Simulate);
+    assert!(app.simulated.is_some(), "a simulation is primed");
+
+    app.handle_intent(Intent::MeshClear);
+    assert!(app.profile.mesh.is_none(), "the mesh is cleared");
+    assert!(app.autolevel_cache.is_none(), "clearing the mesh invalidates the corrected cache");
+    assert!(app.simulated.is_none(), "clearing the mesh clears a simulation built against it");
+  }
+
+  /// A missed grid point (`G38.3` → `:0`) aborts acquisition fail-closed: no mesh is persisted, the run is Aborted.
+  #[test]
+  fn a_missed_grid_point_aborts_acquisition_without_persisting() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+    app.mesh_probe_start(crate::app::autolevel::GridProbeParams::default(), (0.0, 0.0), (10.0, 10.0), (10.0, 10.0));
+    controller.drain_written();
+
+    mesh_point(&mut app, &mut controller, "[PRB:0.000,0.000,5.000:1]"); // point 1 ok.
+    mesh_point(&mut app, &mut controller, "[PRB:0.000,0.000,0.000:0]"); // point 2 misses.
+    assert_eq!(
+      app.mesh_probe.as_ref().unwrap().state.step,
+      crate::app::autolevel::MeshProbeStep::Aborted,
+      "a missed point must abort the run",
+    );
+    assert!(app.profile.mesh.is_none(), "an aborted acquisition must not persist a partial mesh");
+  }
+
+  /// Starting acquisition while the probe is already asserted (`Pn:P`) is refused by the shared VerifyProbe guard.
+  #[test]
+  fn a_mesh_acquisition_is_refused_when_the_probe_is_asserted() {
+    let (mut app, mut controller) = app_with_engine();
+    flush_handshake(&mut app, &mut controller);
+    assert!(controller.inject_line("<Idle|MPos:0.000,0.000,0.000|Pn:P>"));
+    assert!(pump_until(&mut app, |a| a.view.pins.probe), "the Pn:P status must reach the view");
+    app.mesh_probe_start(crate::app::autolevel::GridProbeParams::default(), (0.0, 0.0), (10.0, 10.0), (10.0, 10.0));
+    assert!(app.mesh_probe.is_none(), "acquisition must not start while the probe is asserted");
+  }
+
   /// Pump ALL probe follow-ups (ZeroZ, center-finder, and Phase 2 sweep) each step, draining events + writes — so
   /// a test can prove no flow acts on another's `[PRB:]` through the shared kind-routed latch.
   fn pump_both_steps(app: &mut SkirnirApp, controller: &mut LoopbackController, steps: usize) -> Vec<u8> {
@@ -3550,6 +4336,258 @@ mod tests {
     app.open_program(&path);
     assert!(app.simulated.is_none(), "opening a new program must clear the stale simulation");
     let _ = std::fs::remove_file(&path);
+  }
+
+  /// A small flat mesh covering the test programs' XY, uniformly offset so a correction is observable. A uniform
+  /// +0.5 mesh shifts every corrected cut Z by exactly 0.5.
+  fn test_mesh(delta: f64) -> crate::app::autolevel::Mesh {
+    let mut m = crate::app::autolevel::Mesh::from_spacing((0.0, 0.0), (100.0, 100.0), (10.0, 10.0));
+    for iy in 0..m.ny {
+      for ix in 0..m.nx {
+        m.set_delta(ix, iy, delta);
+      }
+    }
+    m
+  }
+
+  /// With autoleveling OFF, the stream resolver returns the source lines verbatim (byte-identical) — the opt-out
+  /// path must never touch the program.
+  #[test]
+  fn resolve_stream_program_returns_the_source_verbatim_when_autolevel_is_off() {
+    let mut app = app_disconnected();
+    let src = vec!["G0 X0 Y0 Z-1".to_string(), "G1 X20 Y0 F100".to_string()];
+    app.ui.set_program(src.clone(), None);
+    assert!(!app.ui.autolevel_enabled, "autolevel starts off");
+    let lines = app.resolve_stream_program().expect("off never errors");
+    assert_eq!(&*lines, src.as_slice(), "with autolevel off the source must stream verbatim");
+    assert!(app.autolevel_cache.is_none(), "the off path must not populate the corrected cache");
+  }
+
+  /// Arming autoleveling with NO mesh probed must refuse (Err) rather than silently sending the uncorrected file.
+  #[test]
+  fn resolve_stream_program_refuses_when_armed_without_a_mesh() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X0 Y0 Z-1".to_string()], None);
+    app.ui.autolevel_enabled = true;
+    app.profile.mesh = None;
+    let result = app.resolve_stream_program();
+    assert!(result.is_err(), "armed without a mesh must refuse, not stream the uncorrected file");
+    assert!(result.unwrap_err().contains("no height map"), "the refusal reason must name the missing mesh");
+  }
+
+  /// Arming autoleveling with a probed mesh returns the height-CORRECTED program (canonical header + shifted Z),
+  /// and caches it so a Run and its ETA share one correction pass.
+  #[test]
+  fn resolve_stream_program_corrects_and_caches_when_armed_with_a_mesh() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X0 Y0 Z5".to_string(), "G1 Z-1 F100".to_string(), "G1 X20 Y0 F100".to_string()], None);
+    app.ui.autolevel_enabled = true;
+    app.profile.mesh = Some(test_mesh(0.5));
+
+    let lines = app.resolve_stream_program().expect("a probed mesh corrects successfully");
+    assert_eq!(lines[0], "G90 G21 G94", "the corrected output opens with the canonical header");
+    // The cut Z is shifted by the uniform +0.5 mesh (-1 → -0.5), proving the correction actually ran.
+    assert!(
+      lines.iter().any(|l| l.contains("G1") && l.contains("Z-0.500")),
+      "the corrected cut Z must carry the mesh offset; got {lines:?}",
+    );
+    // The cache is populated and reused (same allocation) on a second call.
+    let cached = app.autolevel_cache.as_ref().expect("the corrected program is cached").clone();
+    let again = app.resolve_stream_program().expect("the second resolve reuses the cache");
+    assert!(std::sync::Arc::ptr_eq(&cached, &again), "a second resolve must reuse the cached Arc, not re-correct");
+  }
+
+  /// The AutolevelToggle intent flips the armed flag AND invalidates both the corrected cache and any stale
+  /// simulation (a sim over one program shape must not drive the live ETA for the other).
+  #[test]
+  fn the_autolevel_toggle_invalidates_the_cache_and_a_stale_simulation() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X0 Y0 Z-1".to_string(), "G1 X20 Y0 F100".to_string()], None);
+    app.ui.autolevel_enabled = true;
+    app.profile.mesh = Some(test_mesh(0.5));
+    // Prime the cache and a simulation (both now over the corrected program).
+    app.resolve_stream_program().expect("corrects");
+    app.handle_intent(Intent::Simulate);
+    assert!(app.autolevel_cache.is_some() && app.simulated.is_some(), "cache + simulation are primed");
+
+    // Toggling OFF must clear both so nothing stale survives the change of program shape.
+    app.handle_intent(Intent::AutolevelToggle(false));
+    assert!(!app.ui.autolevel_enabled, "the toggle flips the armed flag");
+    assert!(app.autolevel_cache.is_none(), "the toggle must invalidate the corrected cache");
+    assert!(app.simulated.is_none(), "the toggle must drop a simulation built over the other program shape");
+  }
+
+  /// Changing the `correct_rapids` correction option flips the config and invalidates the cached corrected program
+  /// (and any simulation over it), so the next stream/simulate re-corrects under the new setting.
+  #[test]
+  fn setting_correct_rapids_invalidates_the_corrected_cache() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X0 Y0 Z-1".to_string(), "G1 X20 Y0 F100".to_string()], None);
+    app.ui.autolevel_enabled = true;
+    app.profile.mesh = Some(test_mesh(0.5));
+    app.resolve_stream_program().expect("corrects");
+    assert!(app.autolevel_cache.is_some(), "the cache is primed");
+    assert!(app.ui.autolevel_cfg.correct_rapids, "correct_rapids defaults on");
+
+    app.handle_intent(Intent::SetCorrectRapids(false));
+    assert!(!app.ui.autolevel_cfg.correct_rapids, "the config flag flips");
+    assert!(app.autolevel_cache.is_none(), "changing the config must invalidate the corrected cache");
+  }
+
+  /// Opening a new program invalidates the corrected cache (it belonged to the closed file), so the next stream
+  /// re-corrects the freshly loaded lines rather than sending the previous file's corrected output.
+  #[test]
+  fn opening_a_new_program_invalidates_the_corrected_cache() {
+    let mut app = app_disconnected();
+    app.ui.set_program(vec!["G0 X0 Y0 Z-1".to_string()], None);
+    app.ui.autolevel_enabled = true;
+    app.profile.mesh = Some(test_mesh(0.5));
+    app.resolve_stream_program().expect("corrects");
+    assert!(app.autolevel_cache.is_some(), "the cache is primed for the first file");
+
+    let dir = std::env::temp_dir().join(format!("skirnir-autolevel-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("fresh.gcode");
+    std::fs::write(&path, "G0 X0 Y0 Z-2\nG1 X10 F100\n").expect("write program");
+    app.open_program(&path);
+    assert!(app.autolevel_cache.is_none(), "opening a new program must invalidate the corrected cache");
+    let _ = std::fs::remove_file(&path);
+  }
+
+  /// With autoleveling armed, Simulate builds the ETA over the CORRECTED (longer, subdivided) program, so the
+  /// live per-line remaining keys on the same total the corrected stream acks against.
+  #[test]
+  fn simulate_estimates_over_the_corrected_program_when_armed() {
+    let mut app = app_disconnected();
+    // A single 20 mm cut: uncorrected it is one G1 line; corrected at grid 10 it subdivides into 2 sub-moves, so
+    // the corrected timeline has MORE lines than the source.
+    app.ui.set_program(vec!["G0 X0 Y0 Z-1".to_string(), "G1 X20 Y0 F100".to_string()], None);
+
+    // Baseline: autolevel off → timeline over the 2 source lines.
+    app.handle_intent(Intent::Simulate);
+    let source_lines = app.simulated.as_ref().expect("a timeline").lines.len();
+    assert_eq!(source_lines, 2, "the source program is two lines");
+
+    // Arm autolevel with a mesh and re-simulate: the corrected program subdivides the cut, so the timeline grows.
+    app.profile.mesh = Some(test_mesh(0.5));
+    app.handle_intent(Intent::AutolevelToggle(true));
+    app.handle_intent(Intent::Simulate);
+    let corrected_lines = app.simulated.as_ref().expect("a timeline over the corrected program").lines.len();
+    assert!(corrected_lines > source_lines, "the corrected timeline must span the subdivided program ({corrected_lines} > {source_lines})");
+  }
+
+  /// A CorrectionError (here G93 inverse-time on a corrected move) surfaces as an `Err` from the resolver so the
+  /// caller can notice "autolevel refused: …" and stream nothing — never fall back to the uncorrected file.
+  #[test]
+  fn resolve_stream_program_surfaces_a_correction_error() {
+    let mut app = app_disconnected();
+    // G93 inverse-time on a corrected move is a fail-closed hazard in correct_program.
+    app.ui.set_program(
+      vec!["G0 X0 Y0 Z-1".to_string(), "G93".to_string(), "G1 X10 F0.5".to_string()],
+      None,
+    );
+    app.ui.autolevel_enabled = true;
+    app.profile.mesh = Some(test_mesh(0.5));
+    let err = app.resolve_stream_program().expect_err("a G93 corrected move must be refused");
+    assert!(err.contains("autolevel refused"), "the refusal must be surfaced as an autolevel notice; got {err:?}");
+    assert!(app.autolevel_cache.is_none(), "a refused correction must not populate the cache");
+  }
+
+  /// ApplySavedMesh arms autolevel against the persisted mesh and invalidates a stale corrected cache; with no
+  /// saved mesh it refuses (a notice, no arming).
+  #[test]
+  fn apply_saved_mesh_arms_autolevel_and_invalidates_the_cache() {
+    let mut app = app_disconnected();
+    // No saved mesh: apply must refuse and NOT arm autolevel.
+    app.handle_intent(Intent::ApplySavedMesh);
+    assert!(!app.ui.autolevel_enabled, "with no saved mesh, apply must not arm autolevel");
+    assert!(
+      app.view.console.iter().any(|l| l.text.contains("no saved height-map")),
+      "the refusal must be explained to the operator",
+    );
+    // With a saved mesh: apply arms autolevel and drops the stale corrected cache so the next stream re-corrects.
+    app.profile.mesh = Some(test_mesh(0.3));
+    app.autolevel_cache = Some(std::sync::Arc::from(vec!["stale".to_string()]));
+    app.handle_intent(Intent::ApplySavedMesh);
+    assert!(app.ui.autolevel_enabled, "apply must arm autolevel when a mesh is saved");
+    assert!(app.autolevel_cache.is_none(), "apply must invalidate the stale corrected cache");
+  }
+
+  /// The WCS-mismatch warning fires when the armed mesh was probed under a different WCS than the job now runs in,
+  /// and stays silent when they match (or the active WCS is unknown).
+  #[test]
+  fn a_wcs_mismatch_between_the_mesh_and_the_active_wcs_warns() {
+    let mut app = app_disconnected();
+    app.ui.autolevel_enabled = true;
+    let mut mesh = test_mesh(0.3);
+    mesh.wcs_index = 1; // the mesh was probed under G55.
+    app.profile.mesh = Some(mesh);
+
+    // Job runs under G54 (index 0): mismatch → a warning notice.
+    app.view.active_wcs = Some(0);
+    app.warn_on_wcs_mismatch();
+    assert!(
+      app.view.console.iter().any(|l| l.text.contains("may be misaligned")),
+      "a WCS mismatch must warn the operator",
+    );
+
+    // Job now runs under the SAME WCS (G55): no new warning.
+    app.view.clear_console();
+    app.view.active_wcs = Some(1);
+    app.warn_on_wcs_mismatch();
+    assert!(
+      !app.view.console.iter().any(|l| l.text.contains("may be misaligned")),
+      "a matching WCS must not warn",
+    );
+
+    // Active WCS unknown (no `$G` answer): no warning (we cannot compare).
+    app.view.clear_console();
+    app.view.active_wcs = None;
+    app.warn_on_wcs_mismatch();
+    assert!(app.view.console.is_empty(), "an unknown active WCS must not warn");
+  }
+
+  /// The acquisition stamps the mesh with the WCS it was probed under (from the `[GC:]` active WCS).
+  #[test]
+  fn acquisition_stamps_the_probed_wcs_onto_the_mesh() {
+    let (mut app, _controller) = app_with_engine();
+    app.view.active_wcs = Some(2); // probing under G56.
+    app.mesh_probe_start(crate::app::autolevel::GridProbeParams::default(), (0.0, 0.0), (10.0, 10.0), (10.0, 10.0));
+    assert_eq!(
+      app.mesh_probe.as_ref().unwrap().state.mesh().wcs_index,
+      2,
+      "the mesh must record the WCS it was probed under",
+    );
+  }
+
+  /// End-to-end over the loopback: with autolevel armed and a mesh, a Run streams the CORRECTED program and the
+  /// engine's reported Progress.total is the corrected (longer) line count — so acks count against the right total.
+  #[test]
+  fn streaming_with_autolevel_reports_the_corrected_total() {
+    let _ = crate::i18n::init();
+    let (mut app, mut controller) = app_with_engine();
+    assert!(controller.inject_line("GrblHAL 1.1f ['$' or '$HELP' for help]"));
+    assert!(pump_until(&mut app, |a| a.view.connection == ConnectionState::Idle));
+    let _ = pump_collect(&mut app, &mut controller);
+
+    // A 30 mm cut subdivides (grid 10 → 3 sub-moves), so the corrected program is longer than the 2 source lines.
+    let source = vec!["G0 X0 Y0 Z-1".to_string(), "G1 X30 Y0 F100".to_string()];
+    app.ui.set_program(source.clone(), None);
+    app.profile.mesh = Some(test_mesh(0.5));
+    app.handle_intent(Intent::AutolevelToggle(true));
+    app.start_stream();
+    assert!(
+      pump_until(&mut app, |a| a.view.progress.total > 0),
+      "the engine never reported a stream total; got {:?}",
+      app.view.progress,
+    );
+    let corrected_total = app.autolevel_cache.as_ref().expect("a corrected program was cached").len();
+    assert!(corrected_total > source.len(), "the corrected program must be longer than the source");
+    assert_eq!(
+      app.view.progress.total, corrected_total,
+      "Progress.total must be the CORRECTED line count, not the source ({}), so acks key on the right total",
+      source.len(),
+    );
   }
 
   /// `stream_time` returns the physics-based UPFRONT total the moment a simulation exists, before any stream — the
