@@ -60,6 +60,9 @@ pub enum Intent {
   RunMirror(ObjectId),
   /// Export a copper/geometry source as a photo-film SVG via a save dialog (vector output, not an op run).
   ExportFilm(ObjectId),
+  /// Recalculate a CNC job in place from its stored operation + emission against the current source geometry (the
+  /// per-toolpath "rebuild" action). Runs off-thread like any other op.
+  RebuildJob(ObjectId),
   /// Request cancellation of the in-flight operation.
   CancelOp,
 
@@ -80,6 +83,19 @@ pub enum Intent {
   // ── Canvas ─────────────────────────────────────────────────────────────────────────────────────────────
   /// Zoom the canvas to fit the loaded geometry.
   ZoomFit,
+  /// Move the group containing `anchor` (or just `anchor` if ungrouped) by `(dx, dy)` millimetres on the stock —
+  /// emitted per frame while dragging an object on the canvas. `new_edit` is `true` on the first frame of a drag
+  /// (start a fresh undo entry) and `false` for the rest (coalesce into it), so a whole drag undoes at once.
+  TranslateGroup {
+    /// The object grabbed on the canvas; its whole group moves with it.
+    anchor: ObjectId,
+    /// Translation this frame in world millimetres (X right).
+    dx: f64,
+    /// Translation this frame in world millimetres (Y up).
+    dy: f64,
+    /// Whether to start a new undo entry (first drag frame) rather than coalesce into the current one.
+    new_edit: bool,
+  },
 
   // ── Appearance / settings ─────────────────────────────────────────────────────────────────────────────
   /// Open the application-settings dialog.

@@ -50,6 +50,9 @@ impl Postprocessor for Generic {
     if let Some(name) = &job.name {
       prog.comment(name);
     }
+    if let Some(tool) = &job.tool {
+      prog.comment(tool);
+    }
     prog.push(format!("G90 {} G17", self.format.units_word()));
   }
 

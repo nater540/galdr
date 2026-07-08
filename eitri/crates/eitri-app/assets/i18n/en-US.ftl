@@ -24,6 +24,9 @@ tip-zoom-fit = Zoom the canvas to the loaded geometry
 tree-title = Project
 tree-empty = No objects yet.
 tree-empty-hint = Open a Gerber or Excellon file to begin.
+toolpaths-title = Toolpaths
+toolpaths-empty = No toolpaths yet.
+toolpaths-empty-hint = Run an operation to generate G-code.
 kind-gerber = Gerber
 kind-excellon = Excellon
 kind-geometry = Geometry
@@ -31,6 +34,7 @@ kind-cncjob = CNC job
 btn-delete-object = Delete object
 vis-hide = Hide { $name }
 vis-show = Show { $name }
+job-rebuild = Rebuild { $name }
 
 # ── Parameter panels ────────────────────────────────────────────────────────────────────────────────────
 params-title = Parameters
@@ -64,6 +68,7 @@ job-lines = { $count ->
    *[other] { $count } lines of G-code
   }
 job-dialect = Dialect: { $dialect }
+job-tool = Tool: { $dia } mm
 btn-export-gcode = Export G-code…
 tip-export-gcode = Write this job's G-code to a file
 params-geometry = Geometry
@@ -189,6 +194,7 @@ op-noncopper = Non-copper clearing
 op-cutout = Board cutout
 op-panelize = Panelizing
 op-mirror = Mirroring
+op-rebuild = Rebuilding toolpath
 op-load-project = Open project
 
 # ── Dock ────────────────────────────────────────────────────────────────────────────────────────────────

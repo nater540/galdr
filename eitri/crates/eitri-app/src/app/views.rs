@@ -12,7 +12,7 @@ use super::canvas::CanvasView;
 use super::intent::{Intent, IntentSink};
 use super::metrics::Metrics;
 use super::theme::Palette;
-use super::view_state::{LogKind, OpView, Selection, ViewState};
+use super::view_state::{LogKind, OpView, Selection, TreeRow, ViewState};
 use crate::config::CanvasStyle;
 use crate::tr;
 use eitri_gcode::{DrillJob, IsolationJob};
@@ -270,6 +270,9 @@ pub struct SelectedInfo {
   pub gcode_lines: usize,
   /// The job's dialect (CNC jobs).
   pub dialect: String,
+  /// The job's cutting-tool diameter in millimetres (CNC jobs with a single tool: isolation/paint/non-copper/
+  /// cutout). `None` for drilling (multi-tool) or non-job selections.
+  pub tool_diameter: Option<f64>,
   /// The object's world bounds `(min_x, min_y, max_x, max_y)` from the render scene, for the panel's
   /// seed-from-object buttons (cutout rectangle, mirror centre).
   pub bounds: Option<(f64, f64, f64, f64)>,
@@ -347,6 +350,9 @@ pub struct UiState {
   pub cursor_world: Option<[f64; 2]>,
   /// The in-progress inline tree rename: the object being renamed and the name draft.
   pub renaming: Option<(ObjectId, String)>,
+  /// The in-progress canvas drag-to-move (`None` while panning or idle). Set on the frame a drag starts over an
+  /// object and cleared when the drag ends, so every frame of one gesture moves the same group into one undo entry.
+  pub canvas_drag: Option<super::canvas::CanvasDrag>,
 }
 
 // ── Shared building blocks ─────────────────────────────────────────────────────────────────────────────────
@@ -509,7 +515,12 @@ enum RowAction {
   ToggleVisibility,
   /// Start an inline rename (double-click on the name).
   BeginRename,
+  /// Recalculate a toolpath (the ⟳ rebuild zone on a CNC-job row).
+  Rebuild,
 }
+
+/// The width of the ⟳ rebuild-button zone on a CNC-job row's right edge (just left of the eye).
+const TREE_REBUILD_W: f32 = 22.0;
 
 /// The width of the eye (visibility-toggle) zone on a tree row's right edge.
 const TREE_EYE_W: f32 = 24.0;
@@ -542,25 +553,97 @@ pub fn tree_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink
       return;
     }
     let busy = view.busy();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("project-rows").auto_shrink([false, false]).show(ui, |ui| {
       ui.spacing_mut().item_spacing.y = 2.0;
+      // Grouped objects render first — each under a folder header, members indented; then any ungrouped rows. A
+      // group is a locked board (its layers move together), so the folder makes that registration visible.
+      let mut grouped: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+      for group in &view.groups {
+        group_header(ui, palette, &group.name);
+        ui.indent(("tree-group", group.name.as_str()), |ui| {
+          ui.spacing_mut().item_spacing.y = 2.0;
+          for member in &group.members {
+            grouped.insert(*member);
+            if let Some(row) = view.tree.iter().find(|r| r.id == *member) {
+              let selected = view.selected == Some(Selection::Object(row.id));
+              object_row(ui, palette, row, selected, busy, state, sink);
+            }
+          }
+        });
+      }
       for row in &view.tree {
-        if state.renaming.as_ref().is_some_and(|(id, _)| *id == row.id) {
-          rename_row(ui, state, row.id, sink);
+        if grouped.contains(&row.id) {
           continue;
         }
         let selected = view.selected == Some(Selection::Object(row.id));
-        match tree_row(ui, palette, row, selected, busy) {
-          RowAction::Select => {
-            sink.push(Intent::Select(if selected { None } else { Some(Selection::Object(row.id)) }));
-          }
-          RowAction::ToggleVisibility => sink.push(Intent::SetVisible(row.id, !row.visible)),
-          RowAction::BeginRename => state.renaming = Some((row.id, row.name.clone())),
-          RowAction::None => {}
-        }
+        object_row(ui, palette, row, selected, busy, state, sink);
       }
     });
   });
+}
+
+/// A project-tree group (folder) header: a folder glyph and the group name in the dim tone. Non-interactive — the
+/// folder is a visual grouping of its member rows, not a selectable node.
+fn group_header(ui: &mut egui::Ui, palette: Palette, name: &str) {
+  let (rect, _response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), Metrics::PANEL_CONTROL_H),
+    egui::Sense::hover());
+  if ui.is_rect_visible(rect) {
+    ui.painter().text(
+      egui::pos2(rect.left() + 8.0, rect.center().y),
+      egui::Align2::LEFT_CENTER,
+      "▤",
+      egui::FontId::proportional(11.0),
+      palette.text_dim,
+    );
+    ui.painter().text(
+      egui::pos2(rect.left() + 26.0, rect.center().y),
+      egui::Align2::LEFT_CENTER,
+      name,
+      egui::FontId::proportional(11.5),
+      palette.text_dim,
+    );
+  }
+}
+
+/// The TOOLPATHS panel: the collection's CNC jobs, listed below PROJECT in their own section. Reuses [`tree_row`]
+/// (and [`object_row`]) so selection, the visibility eye, and inline rename behave exactly as in the project tree.
+pub fn toolpaths_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  let palette = state.style.palette;
+  section_header(ui, palette, &tr!("toolpaths-title"));
+  egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
+    ui.spacing_mut().item_spacing.y = 2.0;
+    if view.toolpaths.is_empty() {
+      ui.add_space(4.0);
+      ui.label(RichText::new(tr!("toolpaths-empty")).size(11.5).color(palette.text_dim));
+      ui.label(RichText::new(tr!("toolpaths-empty-hint")).size(10.5).color(palette.text_disabled));
+      return;
+    }
+    let busy = view.busy();
+    egui::ScrollArea::vertical().id_salt("toolpath-rows").auto_shrink([false, false]).show(ui, |ui| {
+      ui.spacing_mut().item_spacing.y = 2.0;
+      for row in &view.toolpaths {
+        let selected = view.selected == Some(Selection::Object(row.id));
+        object_row(ui, palette, row, selected, busy, state, sink);
+      }
+    });
+  });
+}
+
+/// Render one object row (in either panel) and fold its interaction into selection/visibility/rename — the shared
+/// body behind the PROJECT tree and the TOOLPATHS list, so a job row behaves exactly like a source row.
+fn object_row(ui: &mut egui::Ui, palette: Palette, row: &TreeRow, selected: bool, busy: bool, state: &mut UiState,
+  sink: &mut IntentSink) {
+  if state.renaming.as_ref().is_some_and(|(id, _)| *id == row.id) {
+    rename_row(ui, state, row.id, sink);
+    return;
+  }
+  match tree_row(ui, palette, row, selected, busy) {
+    RowAction::Select => sink.push(Intent::Select(if selected { None } else { Some(Selection::Object(row.id)) })),
+    RowAction::ToggleVisibility => sink.push(Intent::SetVisible(row.id, !row.visible)),
+    RowAction::BeginRename => state.renaming = Some((row.id, row.name.clone())),
+    RowAction::Rebuild => sink.push(Intent::RebuildJob(row.id)),
+    RowAction::None => {}
+  }
 }
 
 /// The pinned Setup row: hand-painted like [`tree_row`] (same fills, accent bar, glyph + name) but with no eye
@@ -655,6 +738,21 @@ fn tree_row(ui: &mut egui::Ui, palette: Palette, row: &super::view_state::TreeRo
     if row.visible { tr!("vis-hide", { name: row.name.clone() }) } else { tr!("vis-show", { name: row.name.clone() }) };
   eye_response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, eye_label.clone()));
 
+  // The ⟳ rebuild zone: only CNC-job rows carry it, just left of the eye. Emphasized (warning tone) when the job
+  // is stale, dim otherwise (a rebuild is always allowed). Session-editing, so inert while an op runs.
+  let is_job = row.kind == ObjectKind::CncJob;
+  let rebuild_rect = egui::Rect::from_min_max(
+    egui::pos2(eye_rect.left() - TREE_REBUILD_W, rect.top()),
+    egui::pos2(eye_rect.left(), rect.bottom()),
+  );
+  let rebuild_response = is_job.then(|| {
+    let response = ui.interact(rebuild_rect, ui.id().with(("tree-rebuild", row.id.0)), egui::Sense::click());
+    response.widget_info(|| {
+      egui::WidgetInfo::labeled(egui::WidgetType::Button, !busy, tr!("job-rebuild", { name: row.name.clone() }))
+    });
+    response
+  });
+
   if ui.is_rect_visible(rect) {
     let fill = if selected {
       palette.widget_active
@@ -685,11 +783,31 @@ fn tree_row(ui: &mut egui::Ui, palette: Palette, row: &super::view_state::TreeRo
       egui::FontId::proportional(11.0),
       if row.visible { kind_color(palette, row.kind) } else { palette.text_disabled },
     );
-    // The name is clipped short of the eye zone so a long name never collides with the toggle.
-    let name_painter = ui.painter().with_clip_rect(egui::Rect::from_min_max(
-      rect.min,
-      egui::pos2(eye_rect.left() - 2.0, rect.bottom()),
-    ));
+    // The ⟳ rebuild button on a CNC-job row: warning-toned when stale (nudging a rebuild), dim otherwise, brighter
+    // on hover. The name clips short of it so a long name never collides. Non-job rows have no button.
+    let name_clip_right = if is_job { rebuild_rect.left() - 2.0 } else { eye_rect.left() - 2.0 };
+    if let Some(rebuild_response) = &rebuild_response {
+      let rebuild_color = if busy {
+        palette.text_disabled
+      } else if rebuild_response.hovered() {
+        palette.text
+      } else if row.stale {
+        palette.state_warn
+      } else {
+        palette.text_dim
+      };
+      ui.painter().text(
+        rebuild_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "⟳",
+        egui::FontId::proportional(13.0),
+        rebuild_color,
+      );
+    }
+    // The name is clipped short of the button/eye zones so a long name never collides with them.
+    let name_painter = ui
+      .painter()
+      .with_clip_rect(egui::Rect::from_min_max(rect.min, egui::pos2(name_clip_right, rect.bottom())));
     name_painter.text(
       egui::pos2(rect.left() + 28.0, rect.center().y),
       egui::Align2::LEFT_CENTER,
@@ -720,6 +838,9 @@ fn tree_row(ui: &mut egui::Ui, palette: Palette, row: &super::view_state::TreeRo
     }
   }
 
+  if rebuild_response.as_ref().is_some_and(|r| r.clicked()) {
+    return if busy { RowAction::None } else { RowAction::Rebuild };
+  }
   if eye_response.clicked() {
     return if busy { RowAction::None } else { RowAction::ToggleVisibility };
   }
@@ -1362,6 +1483,9 @@ fn job_section(ui: &mut egui::Ui, palette: Palette, state: &mut UiState, busy: b
   if let Some(info) = &state.selected_info {
     ui.label(RichText::new(tr!("job-lines", { count: info.gcode_lines as u64 })).size(11.5).color(palette.text));
     ui.label(RichText::new(tr!("job-dialect", { dialect: info.dialect.clone() })).size(10.5).color(palette.text_dim));
+    if let Some(dia) = info.tool_diameter {
+      ui.label(RichText::new(tr!("job-tool", { dia: format!("{dia:.3}") })).size(10.5).color(palette.text_dim));
+    }
   }
   ui.add_space(8.0);
   let export = egui::Button::new(RichText::new(tr!("btn-export-gcode")).color(palette.text)).fill(palette.accent);

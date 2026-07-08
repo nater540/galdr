@@ -20,6 +20,16 @@ use eitri_project::{ObjectId, ObjectKind, Stock};
 /// The zoom bounds (px per mm): far enough out for a metre of travel, close enough in for a 0.1 mm trace.
 const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.05..=5000.0;
 
+/// The latched state of an in-progress canvas drag-to-move: which object was grabbed (its whole group moves with
+/// the drag) and whether the gesture has already opened its undo entry, so later frames coalesce into it.
+#[derive(Debug, Clone, Copy)]
+pub struct CanvasDrag {
+  /// The grabbed object; its group moves with the drag.
+  pub anchor: ObjectId,
+  /// Whether the first move (which opens the single undo entry for the drag) has been emitted yet.
+  pub committed: bool,
+}
+
 /// The pan/zoom state: which world point sits at the viewport centre, and the scale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CanvasView {
@@ -110,8 +120,39 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
   // Input first, so this frame already paints with the updated transform (no one-frame pan lag).
   let response = ui.interact(rect, ui.id().with("canvas"), egui::Sense::click_and_drag());
   response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, ui.is_enabled(), tr!("canvas-label")));
+  // A drag decides its mode ONCE, when it starts: grabbing an object drags that object's group across the stock;
+  // grabbing empty canvas pans. The choice is latched in `state.canvas_drag` so the whole gesture keeps one mode.
+  if response.drag_started() {
+    let anchor = response.interact_pointer_pos().and_then(|pos| {
+      let world = state.canvas.to_world(pos, rect);
+      let tol_mm = (PICK_TOLERANCE_PX / state.canvas.px_per_mm.max(f32::EPSILON)) as f64;
+      hit_object(scene, world, tol_mm)
+    });
+    state.canvas_drag = anchor.map(|anchor| CanvasDrag { anchor, committed: false });
+    // Grabbing an object also selects it, so the parameter panel follows the move.
+    if let Some(anchor) = anchor
+      && selected != Some(anchor)
+    {
+      sink.push(Intent::Select(Some(Selection::Object(anchor))));
+    }
+  }
   if response.dragged() {
-    state.canvas.pan(response.drag_delta());
+    let scale = state.canvas.px_per_mm.max(f32::EPSILON) as f64;
+    let delta = response.drag_delta();
+    match &mut state.canvas_drag {
+      Some(drag) => {
+        // Screen delta → world millimetres: X right, Y up (screen Y is down, hence the negation).
+        let (dx, dy) = (delta.x as f64 / scale, -(delta.y as f64) / scale);
+        if dx != 0.0 || dy != 0.0 {
+          sink.push(Intent::TranslateGroup { anchor: drag.anchor, dx, dy, new_edit: !drag.committed });
+          drag.committed = true;
+        }
+      }
+      None => state.canvas.pan(delta),
+    }
+  }
+  if response.drag_stopped() {
+    state.canvas_drag = None;
   }
   let hover_world = response.hover_pos().map(|pos| state.canvas.to_world(pos, rect));
   // Click-select: a real click (egui already excludes drags) picks the topmost object under the pointer, or

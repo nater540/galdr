@@ -47,6 +47,14 @@ impl History {
     mutate(&mut self.present)
   }
 
+  /// Mutate the present state WITHOUT taking a new undo snapshot. Used to coalesce a continuous gesture (dragging an
+  /// object across the stock) into the single snapshot its first step already pushed, so the whole drag undoes at
+  /// once rather than one pixel at a time. The redo future is left untouched (the gesture's first [`Self::edit`]
+  /// already cleared it).
+  pub fn amend<R>(&mut self, mutate: impl FnOnce(&mut ObjectCollection) -> R) -> R {
+    mutate(&mut self.present)
+  }
+
   /// Whether there is a prior state to undo to.
   pub fn can_undo(&self) -> bool {
     !self.past.is_empty()

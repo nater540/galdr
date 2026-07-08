@@ -88,10 +88,22 @@ mod tests {
     let mut view = ViewState::default();
     view.set_tree(
       vec![
-        TreeRow { id: ObjectId(1), name: "fixture-top".to_string(), kind: ObjectKind::Gerber, visible: true },
-        TreeRow { id: ObjectId(2), name: "fixture-drills".to_string(), kind: ObjectKind::Excellon, visible: true },
-        TreeRow { id: ObjectId(3), name: "fixture-top-isolation".to_string(), kind: ObjectKind::CncJob, visible: true },
+        TreeRow { id: ObjectId(1), name: "fixture-top".into(), kind: ObjectKind::Gerber, visible: true, stale: false },
+        TreeRow {
+          id: ObjectId(2),
+          name: "fixture-drills".into(),
+          kind: ObjectKind::Excellon,
+          visible: true,
+          stale: false,
+        },
       ],
+      vec![TreeRow {
+        id: ObjectId(3),
+        name: "fixture-top-isolation".to_string(),
+        kind: ObjectKind::CncJob,
+        visible: true,
+        stale: false,
+      }],
       true,
       false,
     );
@@ -249,7 +261,7 @@ mod tests {
   fn clicking_a_rows_eye_toggles_visibility_without_selecting() {
     let _locale = render_in(crate::i18n::EN_US);
     let mut view = fixture_view();
-    view.tree[2].visible = false; // the job starts hidden, so both directions are on screen.
+    view.toolpaths[0].visible = false; // the job starts hidden, so both eye directions are on screen.
     let state = HarnessState::new(view, UiState::default());
     let mut harness = build_shell_harness(state, DEFAULT_SIZE);
     harness.run_steps(2);
@@ -272,6 +284,22 @@ mod tests {
     assert!(
       harness.state().intents.contains(&Intent::SetVisible(ObjectId(3), true)),
       "the eye on a hidden row must emit a show: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn clicking_a_toolpaths_rebuild_button_emits_a_rebuild_intent() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let state = HarnessState::new(fixture_view(), UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    // The job row (id 3) in the TOOLPATHS panel carries a ⟳ rebuild button; only jobs do.
+    harness.get_by_label("Rebuild fixture-top-isolation").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::RebuildJob(ObjectId(3))),
+      "the rebuild button must emit a rebuild for its job: {:?}",
       harness.state().intents,
     );
   }

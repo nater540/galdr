@@ -37,18 +37,28 @@ fn shots_dir() -> PathBuf {
   dir
 }
 
-/// Mirror of the shell's `refresh_from_session`: the tree rows and history flags a live window would show.
+/// Mirror of the shell's `refresh_from_session`: the PROJECT/TOOLPATHS rows and history flags a live window would
+/// show, partitioned by kind exactly as the shell does.
 fn synced_view(session: &Session) -> ViewState {
   let mut view = ViewState::default();
-  let rows: Vec<TreeRow> = session
-    .object_ids()
+  let (mut tree, mut toolpaths): (Vec<TreeRow>, Vec<TreeRow>) = (Vec::new(), Vec::new());
+  for id in session.object_ids() {
+    let Ok(object) = session.object(id) else { continue };
+    let kind = object.kind();
+    let stale = matches!(&object.payload, eitri_project::ObjectPayload::CncJob(job) if job.stale);
+    let row = TreeRow { id, name: object.meta.name.clone(), kind, visible: object.meta.visible, stale };
+    if kind == eitri_project::ObjectKind::CncJob {
+      toolpaths.push(row);
+    } else {
+      tree.push(row);
+    }
+  }
+  view.set_tree(tree, toolpaths, session.can_undo(), session.can_redo());
+  view.groups = session
+    .groups()
     .into_iter()
-    .filter_map(|id| {
-      let object = session.object(id).ok()?;
-      Some(TreeRow { id, name: object.meta.name.clone(), kind: object.kind(), visible: object.meta.visible })
-    })
+    .map(|(name, members)| super::view_state::GroupView { name, members })
     .collect();
-  view.set_tree(rows, session.can_undo(), session.can_redo());
   view
 }
 

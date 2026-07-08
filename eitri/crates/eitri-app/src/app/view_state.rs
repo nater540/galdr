@@ -58,6 +58,19 @@ pub struct TreeRow {
   pub kind: ObjectKind,
   /// Whether the object is shown on the canvas (the tree row's eye toggle).
   pub visible: bool,
+  /// Whether a CNC job is out of date with its source (its source was moved/changed since it was posted) — drives
+  /// the ⟳ "stale" badge on toolpath rows. Always `false` for non-job rows.
+  pub stale: bool,
+}
+
+/// A named group of objects, as the PROJECT tree renders it (a folder with its member ids). Snapshotted from the
+/// session alongside the tree rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupView {
+  /// The group's display name.
+  pub name: String,
+  /// Member object ids, in add order.
+  pub members: Vec<ObjectId>,
 }
 
 /// The in-flight-operation view: what the progress UI renders and what gates the session-touching controls.
@@ -81,8 +94,15 @@ pub enum OpView {
 /// The pure view state the shell owns and the views read.
 #[derive(Debug, Clone, Default)]
 pub struct ViewState {
-  /// The tree snapshot, in display order.
+  /// The PROJECT snapshot — imported sources and derived geometry (everything that is not a CNC job), in display
+  /// order. Computed toolpaths live in [`ViewState::toolpaths`] instead, so the two panels stay separate.
   pub tree: Vec<TreeRow>,
+  /// The TOOLPATHS snapshot — the collection's CNC jobs, in display order. Rendered in the dedicated panel below
+  /// PROJECT; a selection here resolves through [`ViewState::selected_row`] just like a project row.
+  pub toolpaths: Vec<TreeRow>,
+  /// The collection's groups (import boards, manual groups), for rendering the PROJECT tree as folders. Members are
+  /// object ids resolved against [`ViewState::tree`].
+  pub groups: Vec<GroupView>,
   /// The selection, if any: the pinned Setup node or an object (an object selection clears automatically when
   /// the object disappears; the Setup node always resolves).
   pub selected: Option<Selection>,
@@ -138,16 +158,17 @@ impl ViewState {
     }
   }
 
-  /// Replace the tree snapshot and drop an OBJECT selection that no longer resolves — the reducer the shell
-  /// calls after every collection change (op done, undo/redo, delete). A Setup selection always survives: the
-  /// node is synthetic and never leaves the tree.
-  pub fn set_tree(&mut self, rows: Vec<TreeRow>, can_undo: bool, can_redo: bool) {
+  /// Replace both the PROJECT (`tree`) and TOOLPATHS (`toolpaths`) snapshots and drop an OBJECT selection that no
+  /// longer resolves in EITHER list — the reducer the shell calls after every collection change (op done,
+  /// undo/redo, delete). A Setup selection always survives: the node is synthetic and never leaves the tree.
+  pub fn set_tree(&mut self, tree: Vec<TreeRow>, toolpaths: Vec<TreeRow>, can_undo: bool, can_redo: bool) {
     if let Some(Selection::Object(selected)) = self.selected
-      && !rows.iter().any(|row| row.id == selected)
+      && !tree.iter().chain(toolpaths.iter()).any(|row| row.id == selected)
     {
       self.selected = None;
     }
-    self.tree = rows;
+    self.tree = tree;
+    self.toolpaths = toolpaths;
     self.can_undo = can_undo;
     self.can_redo = can_redo;
   }
@@ -160,10 +181,11 @@ impl ViewState {
     }
   }
 
-  /// The selected object's row, if the selection is an object that still resolves.
+  /// The selected object's row, if the selection is an object that still resolves — searched across BOTH the
+  /// PROJECT tree and the TOOLPATHS list, so the parameter panel dispatches correctly whichever panel holds it.
   pub fn selected_row(&self) -> Option<&TreeRow> {
     let id = self.selected_object()?;
-    self.tree.iter().find(|row| row.id == id)
+    self.tree.iter().chain(self.toolpaths.iter()).find(|row| row.id == id)
   }
 }
 
@@ -172,7 +194,7 @@ mod tests {
   use super::*;
 
   fn row(id: u64, kind: ObjectKind) -> TreeRow {
-    TreeRow { id: ObjectId(id), name: format!("fixture-{id}"), kind, visible: true }
+    TreeRow { id: ObjectId(id), name: format!("fixture-{id}"), kind, visible: true, stale: false }
   }
 
   #[test]
@@ -221,21 +243,22 @@ mod tests {
   #[test]
   fn set_tree_drops_a_selection_that_no_longer_resolves_and_keeps_one_that_does() {
     let mut view = ViewState::default();
-    view.set_tree(vec![row(1, ObjectKind::Gerber), row(2, ObjectKind::CncJob)], true, false);
+    // A CNC job lives in the TOOLPATHS list, a source in the PROJECT tree; a selection resolves against either.
+    view.set_tree(vec![row(1, ObjectKind::Gerber)], vec![row(2, ObjectKind::CncJob)], true, false);
     view.selected = Some(Selection::Object(ObjectId(2)));
-    assert_eq!(view.selected_row().map(|r| r.id), Some(ObjectId(2)));
+    assert_eq!(view.selected_row().map(|r| r.id), Some(ObjectId(2)), "a toolpath selection resolves");
     assert_eq!(view.selected_object(), Some(ObjectId(2)));
     assert!(view.can_undo && !view.can_redo);
 
-    // The job is deleted (undoable): the refreshed tree no longer carries id 2 → the selection clears rather
+    // The job is deleted (undoable): the refreshed lists no longer carry id 2 → the selection clears rather
     // than pointing at a ghost the parameter panel would then fail to resolve.
-    view.set_tree(vec![row(1, ObjectKind::Gerber)], true, true);
+    view.set_tree(vec![row(1, ObjectKind::Gerber)], Vec::new(), true, true);
     assert_eq!(view.selected, None, "a vanished selection must clear");
     assert_eq!(view.selected_row(), None);
 
     // A selection that still resolves survives a refresh.
     view.selected = Some(Selection::Object(ObjectId(1)));
-    view.set_tree(vec![row(1, ObjectKind::Gerber), row(3, ObjectKind::Geometry)], false, false);
+    view.set_tree(vec![row(1, ObjectKind::Gerber), row(3, ObjectKind::Geometry)], Vec::new(), false, false);
     assert_eq!(view.selected, Some(Selection::Object(ObjectId(1))), "a still-present selection survives");
   }
 
@@ -244,9 +267,9 @@ mod tests {
     // The Setup node is synthetic — it is never in the row snapshot, so the vanished-selection sweep must not
     // clear it, and the object-selection helpers must not pretend it resolves to a row.
     let mut view = ViewState { selected: Some(Selection::Setup), ..ViewState::default() };
-    view.set_tree(vec![row(1, ObjectKind::Gerber)], true, false);
+    view.set_tree(vec![row(1, ObjectKind::Gerber)], Vec::new(), true, false);
     assert_eq!(view.selected, Some(Selection::Setup), "Setup survives a refresh with objects");
-    view.set_tree(Vec::new(), false, false);
+    view.set_tree(Vec::new(), Vec::new(), false, false);
     assert_eq!(view.selected, Some(Selection::Setup), "Setup survives even an emptied collection");
     assert_eq!(view.selected_object(), None, "Setup is not an object selection");
     assert_eq!(view.selected_row(), None, "Setup has no tree row snapshot");

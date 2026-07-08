@@ -116,6 +116,11 @@ pub enum OpRequest {
     /// The mirror line.
     line: MirrorLineSpec,
   },
+  /// Recalculate an existing CNC job in place from its stored operation + emission (the "rebuild" action).
+  Rebuild {
+    /// The CNC job to recompute.
+    job: ObjectId,
+  },
   /// Load a project from its JSON, REPLACING the session on success (the old one is discarded).
   LoadProject {
     /// The project file's JSON body.
@@ -140,6 +145,7 @@ impl OpRequest {
       OpRequest::Cutout { .. } => "op-cutout",
       OpRequest::Panelize { .. } => "op-panelize",
       OpRequest::Mirror { .. } => "op-mirror",
+      OpRequest::Rebuild { .. } => "op-rebuild",
       OpRequest::LoadProject { .. } => "op-load-project",
     }
   }
@@ -231,6 +237,8 @@ fn run_request(mut session: Session, request: OpRequest, outcome_tx: Sender<OpOu
     OpRequest::Cutout { spec, job } => session.cutout(spec, job).map(OpOutput::Object),
     OpRequest::Panelize { source, spec } => session.panelize(source, spec).map(OpOutput::Object),
     OpRequest::Mirror { source, line } => session.mirror(source, line).map(OpOutput::Object),
+    // Rebuild recomputes the job in place; its id is unchanged, so the shell re-selects it via `Object(job)`.
+    OpRequest::Rebuild { job } => session.rebuild_job(job).map(|()| OpOutput::Object(job)),
     OpRequest::LoadProject { json } => match Session::load_project_str(&json) {
       // The loaded session replaces the working one; the old session is dropped here, exactly like FlatCAM's
       // open-project semantics. Failure keeps the original untouched.

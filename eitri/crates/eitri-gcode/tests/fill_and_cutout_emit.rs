@@ -40,7 +40,7 @@ fn paint_fill_emits_conformant_gcode_through_the_isolation_emitter() {
   // The reuse point: paint output becomes IsolationToolpaths and flows through the SAME emitter as isolation.
   let toolpaths = result.toolpaths();
   let job = IsolationJob { cut_depth: 0.1, pass_depth: 0.1, ..Default::default() };
-  let prog = emit_isolation(&toolpaths, &job, Origin::NATIVE, &GrblHal::new());
+  let prog = emit_isolation(&toolpaths, &job, Origin::NATIVE, &GrblHal::new(), None);
   let text = prog.render();
 
   let violations = check_grbl_conformance(&text);
@@ -60,7 +60,7 @@ fn cutout_profile_emits_conformant_gcode_with_open_path_multi_depth() {
   // Multi-depth cut of the open arcs through the shared emitter (0.4mm total at 0.1mm/pass => 4 passes).
   let toolpaths = result.toolpaths();
   let job = IsolationJob { cut_depth: 0.4, pass_depth: 0.1, cut_feed: 200.0, plunge_feed: 60.0, ..Default::default() };
-  let prog = emit_isolation(&toolpaths, &job, Origin::NATIVE, &GrblHal::new());
+  let prog = emit_isolation(&toolpaths, &job, Origin::NATIVE, &GrblHal::new(), None);
   let text = prog.render();
 
   let violations = check_grbl_conformance(&text);
