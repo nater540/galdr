@@ -133,6 +133,32 @@ btn-seed-center = Objektets centrum
 tip-seed-center = Placera spegellinjen vid det valda objektets centrum
 btn-run-mirror = Spegla
 tip-run-mirror = Spegla objektet kring linjen som ett nytt geometriobjekt
+
+# ── Uppställningsnoden (ämne & arbetsnolla) ─────────────────────────────────────────────────────────────
+tree-setup = Uppställning
+setup-kind = Jobbuppställning — ämne & arbetsnolla
+setup-hint = Materialblocket som bearbetas och var arbets-X0 Y0 Z0 sitter på det. Objekten flyttas aldrig — bara koordinaterna som matas ut i G-koden förskjuts.
+params-stock = Ämne
+params-stock-x = Storlek X (mm)
+params-stock-y = Storlek Y (mm)
+params-stock-thickness = Tjocklek (mm)
+btn-fit-stock = Anpassa till kort
+tip-fit-stock = Storleksätt ämnet efter det valda objektets utbredning
+params-datum = Nollpunkt (X0 Y0)
+datum-corner-bl = Nedre vänster
+datum-corner-br = Nedre höger
+datum-corner-tl = Övre vänster
+datum-corner-tr = Övre höger
+datum-corner-center = Mitten
+params-z-zero = Z-nolla
+z-zero-top = Ämnets ovansida
+z-zero-bottom = Ämnets undersida
+work-zero-label = Arbetsnolla (mm)
+work-zero-native = Ursprungsram — ingen förskjutning
+btn-stock-native = Ursprungsram (inget ämne)
+tip-stock-native = Mata ut G-kod i källfilens eget koordinatsystem
+stock-set = Ämne satt — arbetsnolla vid X { $x } Y { $y } Z { $z }
+stock-cleared = Ämne rensat — utmatning i ursprungliga koordinater
 params-film = Fotofilm
 params-film-kind = Typ
 film-positive = Positiv
@@ -157,6 +183,11 @@ op-import-dxf = Importera DXF
 op-import-gcode = Importera G-kod
 op-isolate = Isolationsfräsning
 op-drill = Borrplanering
+op-paint = Målning
+op-noncopper = Röjning av ej-koppar
+op-cutout = Utfräsning
+op-panelize = Panelisering
+op-mirror = Spegling
 op-load-project = Öppna projekt
 
 # ── Docka ───────────────────────────────────────────────────────────────────────────────────────────────

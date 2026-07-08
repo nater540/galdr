@@ -111,18 +111,33 @@ pub fn build_scene(session: &Session) -> RenderScene {
       }
       ObjectPayload::CncJob(job) => {
         // The preview importer walks the job's own rendered G-code — the engine's classification of cut vs
-        // rapid, not ours. A job that somehow fails to re-import previews as empty rather than wrong.
+        // rapid, not ours. A job that somehow fails to re-import previews as empty rather than wrong. The G-code
+        // was posted with the job's datum subtracted, so add it back here to draw the toolpath over the
+        // native-frame source geometry (a native job's origin is (0, 0), so this is a no-op for those).
+        let (ox, oy) = job.origin;
         if let Ok(preview) = eitri_import::import_gcode(&job.render()) {
           for line in preview.cut_polylines() {
-            let pts: Vec<[f64; 2]> = line.0.iter().map(|c| [c.x, c.y]).collect();
+            let pts: Vec<[f64; 2]> = line.0.iter().map(|c| [c.x + ox, c.y + oy]).collect();
             extend_bounds(&mut entry.bounds, pts.iter().copied());
             entry.cuts.push(pts);
           }
+          let mut seen_cut = false;
           for mv in &preview.moves {
-            if mv.kind == MotionKind::Rapid {
-              let (from, to) = ([mv.from.x, mv.from.y], [mv.to.x, mv.to.y]);
-              extend_bounds(&mut entry.bounds, [from, to].into_iter());
-              entry.rapids.push((from, to));
+            match mv.kind {
+              // Before the first cut, every rapid is setup off the importer's assumed (0, 0) start — the leading
+              // `G0 Z<safe>` and the synthetic hop to the first cut, both from the phantom origin. Drop those (they
+              // are not part of the job and would stretch the fit out to frame empty space). Once cutting has begun,
+              // every rapid is real between-ring travel and stays — including one that starts at (0, 0) because a
+              // ring begins on the datum corner.
+              MotionKind::Rapid => {
+                if !seen_cut && mv.from.x == 0.0 && mv.from.y == 0.0 {
+                  continue;
+                }
+                let (from, to) = ([mv.from.x + ox, mv.from.y + oy], [mv.to.x + ox, mv.to.y + oy]);
+                extend_bounds(&mut entry.bounds, [from, to].into_iter());
+                entry.rapids.push((from, to));
+              }
+              MotionKind::Cut => seen_cut = true,
             }
           }
         }
@@ -219,6 +234,37 @@ mod tests {
     let trails = entry.bounds.unwrap();
     assert!(trails.0 <= copper.2 && trails.2 >= copper.0, "the toolpath must span the copper in X");
     assert!(trails.1 <= copper.3 && trails.3 >= copper.1, "and in Y");
+  }
+
+  #[test]
+  fn the_importers_synthetic_start_rapid_is_stripped_from_job_previews() {
+    // The G-code preview importer assumes the machine starts at (0, 0), so every job preview begins with a
+    // synthetic rapid from the origin to the first real move — a long diagonal to nowhere on a KiCad-frame
+    // board. The scene must drop it (and keep it out of the bounds), while keeping the real between-ring hops.
+    let mut session = Session::new("fixture");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let spec = IsolationSpec {
+      tool_diameter: 0.2,
+      passes: 1,
+      overlap: 0.0,
+      combine: false,
+      direction: DirectionSpec::Climb,
+    };
+    let job = session.isolate(gerber, spec, IsolationJob::default()).expect("isolation succeeds");
+    let scene = build_scene(&session);
+    let entry = scene.object(job).expect("the job is in the scene");
+    assert!(!entry.rapids.is_empty(), "the real between-ring rapids survive the strip");
+    let (ox, oy) = (0.0, 0.0); // a native-frame job posts un-shifted, so gcode (0,0) is world (0,0).
+    assert!(
+      entry.rapids.iter().all(|(from, _)| *from != [ox, oy]),
+      "no preview rapid may start at the importer's synthetic origin: {:?}",
+      entry.rapids.first(),
+    );
+    // The job's bounds hug the copper it isolates — the origin must no longer stretch them to (0, 0). The
+    // two-pad fixture's copper starts near x=1, so a bounds min at 0 would be the synthetic rapid leaking in.
+    let copper = scene.objects.iter().find(|o| o.kind == ObjectKind::Gerber).unwrap().bounds.unwrap();
+    let trails = entry.bounds.unwrap();
+    assert!(trails.0 >= copper.0 - 1.0, "the preview bounds must hug the copper, not the machine origin");
   }
 
   #[test]

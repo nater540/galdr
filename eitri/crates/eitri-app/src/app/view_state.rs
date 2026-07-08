@@ -36,6 +36,16 @@ pub struct LogLine {
   pub text: String,
 }
 
+/// What the tree has selected and the parameter panel edits: the pinned, synthetic Setup node (the project's
+/// stock/work-zero setup — always present, never in the object collection) or one collection object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+  /// The Setup (stock & work zero) node pinned at the top of the tree.
+  Setup,
+  /// A collection object, by id.
+  Object(ObjectId),
+}
+
 /// One row of the project tree — a snapshot of an object's display facts, rebuilt from the session whenever
 /// the collection changes. The tree renders from this even while the session is away on a worker thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,8 +83,9 @@ pub enum OpView {
 pub struct ViewState {
   /// The tree snapshot, in display order.
   pub tree: Vec<TreeRow>,
-  /// The selected object, if any (cleared automatically when the object disappears).
-  pub selected: Option<ObjectId>,
+  /// The selection, if any: the pinned Setup node or an object (an object selection clears automatically when
+  /// the object disappears; the Setup node always resolves).
+  pub selected: Option<Selection>,
   /// The log tail, capped at [`LOG_CAPACITY`].
   pub log: Vec<LogLine>,
   /// The op lifecycle.
@@ -127,10 +138,11 @@ impl ViewState {
     }
   }
 
-  /// Replace the tree snapshot and drop a selection that no longer resolves — the reducer the shell calls
-  /// after every collection change (op done, undo/redo, delete).
+  /// Replace the tree snapshot and drop an OBJECT selection that no longer resolves — the reducer the shell
+  /// calls after every collection change (op done, undo/redo, delete). A Setup selection always survives: the
+  /// node is synthetic and never leaves the tree.
   pub fn set_tree(&mut self, rows: Vec<TreeRow>, can_undo: bool, can_redo: bool) {
-    if let Some(selected) = self.selected
+    if let Some(Selection::Object(selected)) = self.selected
       && !rows.iter().any(|row| row.id == selected)
     {
       self.selected = None;
@@ -140,9 +152,17 @@ impl ViewState {
     self.can_redo = can_redo;
   }
 
-  /// The selected row, if the selection still resolves.
+  /// The selected OBJECT's id, if the selection is an object (the Setup node yields `None`).
+  pub fn selected_object(&self) -> Option<ObjectId> {
+    match self.selected {
+      Some(Selection::Object(id)) => Some(id),
+      _ => None,
+    }
+  }
+
+  /// The selected object's row, if the selection is an object that still resolves.
   pub fn selected_row(&self) -> Option<&TreeRow> {
-    let id = self.selected?;
+    let id = self.selected_object()?;
     self.tree.iter().find(|row| row.id == id)
   }
 }
@@ -202,8 +222,9 @@ mod tests {
   fn set_tree_drops_a_selection_that_no_longer_resolves_and_keeps_one_that_does() {
     let mut view = ViewState::default();
     view.set_tree(vec![row(1, ObjectKind::Gerber), row(2, ObjectKind::CncJob)], true, false);
-    view.selected = Some(ObjectId(2));
+    view.selected = Some(Selection::Object(ObjectId(2)));
     assert_eq!(view.selected_row().map(|r| r.id), Some(ObjectId(2)));
+    assert_eq!(view.selected_object(), Some(ObjectId(2)));
     assert!(view.can_undo && !view.can_redo);
 
     // The job is deleted (undoable): the refreshed tree no longer carries id 2 → the selection clears rather
@@ -213,8 +234,21 @@ mod tests {
     assert_eq!(view.selected_row(), None);
 
     // A selection that still resolves survives a refresh.
-    view.selected = Some(ObjectId(1));
+    view.selected = Some(Selection::Object(ObjectId(1)));
     view.set_tree(vec![row(1, ObjectKind::Gerber), row(3, ObjectKind::Geometry)], false, false);
-    assert_eq!(view.selected, Some(ObjectId(1)), "a still-present selection survives the refresh");
+    assert_eq!(view.selected, Some(Selection::Object(ObjectId(1))), "a still-present selection survives");
+  }
+
+  #[test]
+  fn the_setup_selection_survives_every_tree_refresh_and_is_not_an_object() {
+    // The Setup node is synthetic — it is never in the row snapshot, so the vanished-selection sweep must not
+    // clear it, and the object-selection helpers must not pretend it resolves to a row.
+    let mut view = ViewState { selected: Some(Selection::Setup), ..ViewState::default() };
+    view.set_tree(vec![row(1, ObjectKind::Gerber)], true, false);
+    assert_eq!(view.selected, Some(Selection::Setup), "Setup survives a refresh with objects");
+    view.set_tree(Vec::new(), false, false);
+    assert_eq!(view.selected, Some(Selection::Setup), "Setup survives even an emptied collection");
+    assert_eq!(view.selected_object(), None, "Setup is not an object selection");
+    assert_eq!(view.selected_row(), None, "Setup has no tree row snapshot");
   }
 }

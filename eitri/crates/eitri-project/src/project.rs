@@ -19,12 +19,19 @@ pub struct Project {
   pub name: String,
   /// The objects and groups.
   pub collection: ObjectCollection,
+  /// The work-zero (datum) offset `(x, y, z)`, in the board's native frame, that CAM output is posted relative to:
+  /// the emitter subtracts it from every coordinate. `(0.0, 0.0, 0.0)` is the native frame (no shift). Normally
+  /// derived from [`Project::stock`]; see [`crate::datum`].
+  pub origin: (f64, f64, f64),
+  /// The job's stock (material block) and the work-zero setup it defines, or `None` for the native frame. See
+  /// [`crate::Stock`].
+  pub stock: Option<crate::Stock>,
 }
 
 impl Project {
-  /// A new, empty project.
+  /// A new, empty project with a native (unshifted) datum and no stock.
   pub fn new(name: impl Into<String>) -> Project {
-    Project { name: name.into(), collection: ObjectCollection::new() }
+    Project { name: name.into(), collection: ObjectCollection::new(), origin: (0.0, 0.0, 0.0), stock: None }
   }
 
   /// Re-derive the parsed geometry for every Gerber/Excellon object from its embedded source, filling the parse

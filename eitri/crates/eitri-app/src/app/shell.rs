@@ -16,8 +16,8 @@ use super::metrics::Metrics;
 use super::ops::{OpOutput, OpRequest, SessionSlot};
 use super::scene::{self, RenderScene};
 use super::theme::Palette;
-use super::view_state::{LogKind, TreeRow, ViewState};
-use super::views::{self, RuntimeStyle, SelectedInfo, UiState};
+use super::view_state::{LogKind, Selection, TreeRow, ViewState};
+use super::views::{self, RuntimeStyle, SelectedInfo, StockDraft, UiState};
 use crate::config::Config;
 use crate::tr;
 use eitri_core::ProgressEvent;
@@ -99,14 +99,28 @@ impl EitriApp {
       .collect();
     self.view.set_tree(rows, session.can_undo(), session.can_redo());
     self.scene = scene::build_scene(session);
+    self.sync_setup_from_session();
     self.refresh_selection_extras();
+  }
+
+  /// Snapshot the session's stock + resolved work-zero for the Setup panel, the canvas block, and the
+  /// crosshair (a project load restores them; the setup intents keep them fresh in between). A committed stock
+  /// also refreshes the panel's drafts, so the numbers on screen are the numbers in force.
+  fn sync_setup_from_session(&mut self) {
+    let Some(session) = self.slot.session() else { return };
+    let (x, y, z) = session.work_origin();
+    self.ui.work_origin = [x, y, z];
+    self.ui.stock = session.stock();
+    if let Some(stock) = self.ui.stock {
+      self.ui.stock_draft = StockDraft::from_stock(stock);
+    }
   }
 
   /// Rebuild the parameter panel's facts and the G-code preview for the current selection.
   fn refresh_selection_extras(&mut self) {
     self.ui.selected_info = None;
     self.ui.gcode_preview.clear();
-    let (Some(session), Some(id)) = (self.slot.session(), self.view.selected) else { return };
+    let (Some(session), Some(id)) = (self.slot.session(), self.view.selected_object()) else { return };
     let Ok(object) = session.object(id) else { return };
     let mut info = SelectedInfo { bounds: self.scene.object(id).and_then(|entry| entry.bounds), ..SelectedInfo::default() };
     match &object.payload {
@@ -162,7 +176,8 @@ impl EitriApp {
     match result {
       Ok(OpOutput::Object(id)) => {
         self.view.log_line(LogKind::Ok, tr!("op-done", { label: label }));
-        self.view.selected = Some(id);
+        self.view.selected = Some(Selection::Object(id));
+        self.auto_fit_stock(id);
         self.refresh_from_session();
         // The first thing loaded into an empty canvas gets framed automatically — the operator should see
         // their board, not a distant speck at the default zoom.
@@ -187,6 +202,36 @@ impl EitriApp {
         self.refresh_from_session();
       }
     }
+  }
+
+  /// Auto-fill the Setup node from the FIRST geometry-bearing object that lands in the project: when no stock
+  /// is set and nothing else on the tree could have bounded one, fit the stock to the new object at the
+  /// drafted thickness (the Vectric-style "the job setup knows your material" first-load seed). Quietly a
+  /// no-op for boundless kinds (an Excellon opened first, a CNC job) and once the operator owns the setup —
+  /// an explicit stock, or a board already present when this one arrived, is never overridden.
+  fn auto_fit_stock(&mut self, id: ObjectId) {
+    let thickness = self.ui.stock_draft.thickness.max(0.01);
+    let Some(session) = self.slot.session_mut() else { return };
+    if session.stock().is_some() {
+      return;
+    }
+    // Presence, not extent: whether another object COULD have bounded a stock is a kind question, so match the
+    // payload cheaply instead of materializing (and cloning) every layer's geometry just to bound-and-discard it.
+    let others_have_geometry = session.object_ids().into_iter().any(|other| {
+      other != id
+        && session
+          .object(other)
+          .map(|o| matches!(o.payload, ObjectPayload::Gerber(_) | ObjectPayload::Geometry(_)))
+          .unwrap_or(false)
+    });
+    if others_have_geometry || session.fit_stock_to(id, thickness).is_err() {
+      return;
+    }
+    let (x, y, z) = session.work_origin();
+    self.view.log_line(
+      LogKind::Info,
+      tr!("stock-set", { x: format!("{x:.3}"), y: format!("{y:.3}"), z: format!("{z:.3}") }),
+    );
   }
 
   /// Perform one intent. Session-touching intents check the slot (their buttons are disabled while busy, so a
@@ -303,6 +348,37 @@ impl EitriApp {
         self.launch(OpRequest::Mirror { source: id, line: self.ui.mirror.to_line() });
       }
       Intent::ExportFilm(id) => self.export_film_via_dialog(id),
+      Intent::SetStock(stock) => {
+        if let Some(session) = self.slot.session_mut() {
+          session.set_stock(Some(stock));
+          self.sync_setup_from_session();
+          // Deliberately NOT logged: a DragValue re-commits on every frame of a drag, and a log line per frame
+          // would flood the dock. The readout, the canvas block, and the crosshair are the live confirmation;
+          // the discrete setup events (fit, clear, auto-fit) do log.
+        }
+      }
+      Intent::ClearStock => {
+        if let Some(session) = self.slot.session_mut() {
+          session.set_stock(None);
+          self.sync_setup_from_session();
+          self.view.log_line(LogKind::Ok, tr!("stock-cleared"));
+        }
+      }
+      Intent::FitStock { reference, thickness } => {
+        if let Some(session) = self.slot.session_mut() {
+          match session.fit_stock_to(reference, thickness) {
+            Ok(()) => {
+              self.sync_setup_from_session();
+              let [x, y, z] = self.ui.work_origin;
+              self.view.log_line(
+                LogKind::Ok,
+                tr!("stock-set", { x: format!("{x:.3}"), y: format!("{y:.3}"), z: format!("{z:.3}") }),
+              );
+            }
+            Err(err) => self.view.log_line(LogKind::Error, err.to_string()),
+          }
+        }
+      }
       Intent::CancelOp => {
         if let Some(op) = self.slot.running() {
           op.cancel();
@@ -791,7 +867,7 @@ mod tests {
     let (mut app, id) = app_with_gerber();
     // Simulate the empty→loaded auto-fit already consumed; the op path sets it again only from empty.
     app.ui.pending_fit = false;
-    app.view.selected = Some(id);
+    app.view.selected = Some(Selection::Object(id));
     let ctx = egui::Context::default();
     app.handle_intent(&ctx, Intent::RunIsolate(id));
     assert!(app.view.busy(), "the isolate runs off-thread");
@@ -799,7 +875,7 @@ mod tests {
 
     pump_until_idle(&mut app);
     assert_eq!(app.view.tree.len(), 2, "the job landed in the collection");
-    let job = app.view.selected.expect("the new job is selected");
+    let job = app.view.selected_object().expect("the new job is selected");
     assert_eq!(app.view.tree.iter().find(|r| r.id == job).map(|r| r.kind), Some(eitri_project::ObjectKind::CncJob));
     assert!(app.ui.selected_info.as_ref().is_some_and(|i| i.gcode_lines > 0), "the job facts are snapshotted");
     assert!(!app.ui.gcode_preview.is_empty(), "the dock preview is populated");
@@ -841,7 +917,7 @@ mod tests {
   fn delete_and_undo_round_trip_through_intents() {
     let (mut app, id) = app_with_gerber();
     let ctx = egui::Context::default();
-    app.handle_intent(&ctx, Intent::Select(Some(id)));
+    app.handle_intent(&ctx, Intent::Select(Some(Selection::Object(id))));
     app.handle_intent(&ctx, Intent::DeleteObject(id));
     assert!(app.view.tree.is_empty(), "the delete refreshes the tree");
     assert_eq!(app.view.selected, None, "the vanished selection clears");
@@ -866,7 +942,7 @@ mod tests {
     };
     app.refresh_from_session();
     let ctx = egui::Context::default();
-    app.handle_intent(&ctx, Intent::Select(Some(job)));
+    app.handle_intent(&ctx, Intent::Select(Some(Selection::Object(job))));
     assert!(!app.ui.gcode_preview.is_empty(), "a selected job previews its G-code");
     app.handle_intent(&ctx, Intent::Select(None));
     assert!(app.ui.gcode_preview.is_empty(), "deselecting clears the preview");
@@ -885,6 +961,97 @@ mod tests {
       (app.config.appearance.font_scale - *crate::config::FONT_SCALE_RANGE.end()).abs() < 1e-6,
       "an out-of-range scale clamps"
     );
+  }
+
+  #[test]
+  fn set_stock_intents_commit_sync_the_snapshots_and_clear_through_the_session() {
+    let (mut app, _) = app_with_gerber();
+    let ctx = egui::Context::default();
+    assert_eq!(app.ui.work_origin, [0.0, 0.0, 0.0], "a fresh session is in the native frame");
+    assert_eq!(app.ui.stock, None);
+
+    // Committing a stock derives the work zero from its datum corner and Z face, and mirrors it into the
+    // draft so the panel shows the numbers in force.
+    let stock = eitri_project::Stock {
+      min_x: 2.0,
+      min_y: 3.0,
+      size_x: 20.0,
+      size_y: 10.0,
+      thickness: 1.6,
+      z_ref: eitri_project::ZReference::Bottom,
+      datum: eitri_project::DatumCorner::BottomRight,
+    };
+    app.handle_intent(&ctx, Intent::SetStock(stock));
+    assert_eq!(app.ui.stock, Some(stock), "the committed stock is snapshotted for the views");
+    assert_eq!(app.ui.work_origin, [22.0, 3.0, -1.6], "bottom-right/bottom resolves the 3-D work zero");
+    assert_eq!(app.ui.stock_draft.datum, eitri_project::DatumCorner::BottomRight, "the draft mirrors it");
+    // A routine commit is deliberately SILENT (a DragValue re-commits every frame of a drag — logging each
+    // would flood the dock); only errors and the discrete fit/clear events write log lines.
+    assert!(!app.view.log.iter().any(|l| l.kind == LogKind::Error), "a valid commit must not error");
+
+    // Clearing reverts to the native frame but keeps the draft numbers for a cheap re-commit.
+    app.handle_intent(&ctx, Intent::ClearStock);
+    assert_eq!(app.ui.stock, None);
+    assert_eq!(app.ui.work_origin, [0.0, 0.0, 0.0]);
+    assert!((app.ui.stock_draft.size_x - 20.0).abs() < 1e-9, "a clear keeps what the operator typed");
+  }
+
+  #[test]
+  fn fit_stock_sizes_the_footprint_to_the_reference_and_an_invalid_reference_logs() {
+    let (mut app, id) = app_with_gerber();
+    let ctx = egui::Context::default();
+    let bounds = app.scene.object(id).and_then(|o| o.bounds).expect("the fixture copper has bounds");
+
+    app.handle_intent(&ctx, Intent::FitStock { reference: id, thickness: 1.6 });
+    let stock = app.ui.stock.expect("the fit committed a stock");
+    assert_eq!(stock.footprint(), bounds, "the footprint is the copper's bounding box");
+    assert_eq!(app.ui.work_origin[0], bounds.0, "a fresh fit is bottom-left, so work X0 is the min corner");
+    assert!((app.ui.stock_draft.size_x - stock.size_x).abs() < 1e-9, "the draft mirrors the fit");
+
+    // A CNC job has no geometry to bound — the engine refuses and the shell surfaces that in the log rather
+    // than silently keeping a stale success state.
+    let job = {
+      let session = app.slot.session_mut().expect("home");
+      let spec = eitri_project::IsolationSpec {
+        tool_diameter: 0.2,
+        passes: 1,
+        overlap: 0.0,
+        combine: false,
+        direction: eitri_project::DirectionSpec::Climb,
+      };
+      session.isolate(id, spec, eitri_gcode::IsolationJob::default()).expect("isolates")
+    };
+    app.refresh_from_session();
+    app.handle_intent(&ctx, Intent::FitStock { reference: job, thickness: 1.6 });
+    assert!(
+      app.view.log.iter().any(|l| l.kind == LogKind::Error),
+      "an invalid reference must be reported: {:?}",
+      app.view.log
+    );
+    assert_eq!(app.ui.stock, Some(stock), "a refused fit leaves the committed stock unchanged");
+  }
+
+  #[test]
+  fn the_first_loaded_board_auto_fits_the_stock_and_later_boards_do_not() {
+    // The Vectric-style seed: opening the FIRST board into an empty project fills the Setup node (footprint =
+    // board bbox, drafted thickness, bottom-left/top) without the operator visiting it.
+    let mut app = EitriApp::new(Config::default(), Vec::new());
+    let ctx = egui::Context::default();
+    let _ = ctx; // the open goes through the worker, not an intent.
+    app.launch(OpRequest::OpenGerber { name: "fixture-top".to_string(), source: GERBER.to_string() });
+    pump_until_idle(&mut app);
+    let first = app.view.selected_object().expect("the opened board is selected");
+    let bounds = app.scene.object(first).and_then(|o| o.bounds).expect("the copper has bounds");
+    let stock = app.ui.stock.expect("the first board auto-fits the stock");
+    assert_eq!(stock.footprint(), bounds, "the auto-fit footprint is the board's bounding box");
+    assert!((stock.thickness - 1.6).abs() < 1e-9, "the drafted default thickness is kept");
+
+    // The operator now owns the setup: clearing it and opening ANOTHER board must not re-seed a stock over an
+    // explicit native choice while geometry is already present.
+    app.handle_intent(&egui::Context::default(), Intent::ClearStock);
+    app.launch(OpRequest::OpenGerber { name: "fixture-other".to_string(), source: GERBER.to_string() });
+    pump_until_idle(&mut app);
+    assert_eq!(app.ui.stock, None, "a later board never overrides the operator's setup");
   }
 
   #[test]
@@ -919,7 +1086,7 @@ mod tests {
     let mut entry = app.tool_db.get(tool_id).cloned().expect("the tool exists");
     entry.diameter = eitri_core::Length::from_mm(0.5);
     entry.isolation.passes = 3;
-    entry.drilling.depth = -2.4;
+    entry.drilling.depth = 2.4;
     app.handle_intent(&ctx, Intent::UpdateTool(tool_id, entry));
     assert!((app.tool_db.get(tool_id).unwrap().diameter.as_mm() - 0.5).abs() < 1e-9, "the edit lands");
 
@@ -928,7 +1095,7 @@ mod tests {
     assert!((app.ui.iso.tool_diameter - 0.5).abs() < 1e-9, "the diameter seeds the isolation draft");
     assert_eq!(app.ui.iso.passes, 3, "the passes seed too");
     app.handle_intent(&ctx, Intent::SeedDrillFromTool(tool_id));
-    assert!((app.ui.drill.depth - (-2.4)).abs() < 1e-9, "the drill depth seeds from the tool");
+    assert!((app.ui.drill.depth - 2.4).abs() < 1e-9, "the drill depth seeds from the tool");
 
     // Remove: the tool leaves the library and its selection clears.
     app.handle_intent(&ctx, Intent::RemoveTool(tool_id));

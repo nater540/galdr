@@ -211,21 +211,29 @@ pub struct CncJobObject {
   pub source: Option<ObjectId>,
   /// The operation and parameters that produced the job.
   pub operation: CamOperation,
+  /// The datum (work-zero) offset, in the board's native frame, this job was posted with: the emitter already
+  /// subtracted it from the stored `gcode`, so a preview that re-imports the G-code adds it back to place the
+  /// toolpath over the native-frame source. `(0.0, 0.0)` for a job posted in the native frame. `#[serde(default)]`
+  /// so jobs written before the datum existed load as native.
+  #[serde(default)]
+  pub origin: (f64, f64),
 }
 
 impl CncJobObject {
-  /// Capture an emitted [`Program`]'s rendered lines as a persisted CNC job.
+  /// Capture an emitted [`Program`]'s rendered lines as a persisted CNC job posted with datum `origin`.
   pub fn from_program(
     program: &Program,
     dialect: impl Into<String>,
     source: Option<ObjectId>,
     operation: CamOperation,
+    origin: (f64, f64),
   ) -> CncJobObject {
     CncJobObject {
       gcode: Arc::from(program.lines().to_vec()),
       dialect: dialect.into(),
       source,
       operation,
+      origin,
     }
   }
 
@@ -303,7 +311,8 @@ impl IsolationSpec {
 /// Operator-facing drilling parameters. Maps to [`DrillParams`] via [`DrillSpec::to_params`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DrillSpec {
-  /// Total drill depth (millimetres, negative into the stock as the emitter expects).
+  /// Total drill depth as a positive magnitude below the surface (millimetres); the emitter negates it to a negative
+  /// Z, so a positive value drills down (matching the isolation `cut_depth` and `eitri-cam`'s `DrillParams::depth`).
   pub depth: f64,
   /// Plunge feed rate (mm/min).
   pub feed: f64,
@@ -316,10 +325,12 @@ pub struct DrillSpec {
 }
 
 impl DrillSpec {
-  /// Expand to full [`DrillParams`].
+  /// Expand to full [`DrillParams`]. Depth is normalized to a positive magnitude here — the single choke point every
+  /// drill emission passes through — so a stray negative (a legacy persisted spec, a hand-built Rhai/script spec)
+  /// can never reach the negating emitter and air-drill above the stock.
   pub fn to_params(&self) -> DrillParams {
     DrillParams {
-      depth: self.depth,
+      depth: self.depth.abs(),
       feed: self.feed,
       retract: self.retract,
       peck: self.peck,

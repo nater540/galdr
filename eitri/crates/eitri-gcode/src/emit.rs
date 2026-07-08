@@ -72,6 +72,37 @@ impl Default for DrillJob {
   }
 }
 
+/// The work-zero (datum) the emitter posts relative to: it subtracts this point — in the toolpaths' own coordinate
+/// frame — from every emitted coordinate, so the exported program is referenced to the operator's chosen origin (the
+/// Vectric-style datum + Z-zero). Absolute XY shifts by `(x, y)`; every Z shifts by `z` (which is `0` when work-Z0 is
+/// the stock top, or `-thickness` when it is the stock bottom). Arc I/J offsets are relative, so they are never
+/// shifted. [`Origin::NATIVE`] is the default: no shift, i.e. keep the source (EDA plot) frame with Z0 at the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Origin {
+  /// The X coordinate, in the native frame, that maps to work X0.
+  pub x: f64,
+  /// The Y coordinate, in the native frame, that maps to work Y0.
+  pub y: f64,
+  /// The Z coordinate, in the native (surface = 0) frame, that maps to work Z0. `0.0` keeps Z0 at the surface;
+  /// `-thickness` moves it to the stock bottom.
+  pub z: f64,
+}
+
+impl Origin {
+  /// The identity datum: coordinates are emitted unchanged, in their native (source) frame.
+  pub const NATIVE: Origin = Origin { x: 0.0, y: 0.0, z: 0.0 };
+
+  /// A datum at native-frame point `(x, y)` with Z0 at the surface.
+  pub fn new(x: f64, y: f64) -> Origin {
+    Origin { x, y, z: 0.0 }
+  }
+
+  /// A datum at native-frame point `(x, y, z)`.
+  pub fn with_z(x: f64, y: f64, z: f64) -> Origin {
+    Origin { x, y, z }
+  }
+}
+
 /// One segment of a cut ring: a straight line to a point, or an arc to a point with an I/J centre offset.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Segment {
@@ -176,6 +207,7 @@ pub fn depth_steps(total: f64, step: f64) -> Vec<f64> {
 pub fn emit_isolation<G: CutRing>(
   toolpaths: &IsolationToolpaths<G>,
   job: &IsolationJob,
+  origin: Origin,
   post: &dyn Postprocessor,
 ) -> Program {
   let mut prog = Program::new(post.format());
@@ -185,11 +217,12 @@ pub fn emit_isolation<G: CutRing>(
   if !toolpaths.rings.is_empty() {
     post.spindle_on(&mut prog, Spindle { rpm: job.spindle_rpm });
     // Establish the safe-height invariant once; every ring restores it on exit.
-    post.rapid(&mut prog, Axes::z(job.travel_z));
+    post.rapid(&mut prog, Axes::z(job.travel_z - origin.z));
 
     let depths = depth_steps(job.cut_depth, job.pass_depth);
     for ring in &toolpaths.rings {
       let (sx, sy) = ring.geometry.start();
+      let (sx, sy) = (sx - origin.x, sy - origin.y);
       let segments = ring.geometry.segments();
       let closed = ring.geometry.is_closed();
       post.rapid(&mut prog, Axes::xy(sx, sy));
@@ -199,13 +232,13 @@ pub fn emit_isolation<G: CutRing>(
         // before plunging again — never drag the tool through material back to the start. The first pass always
         // plunges in place: the rapid to the start already put the tool there.
         if pass > 0 && !closed {
-          post.rapid(&mut prog, Axes::z(job.travel_z));
+          post.rapid(&mut prog, Axes::z(job.travel_z - origin.z));
           post.rapid(&mut prog, Axes::xy(sx, sy));
         }
-        post.linear(&mut prog, Axes::z(z), job.plunge_feed);
-        emit_ring_segments(&mut prog, post, &segments, job.cut_feed);
+        post.linear(&mut prog, Axes::z(z - origin.z), job.plunge_feed);
+        emit_ring_segments(&mut prog, post, &segments, job.cut_feed, origin);
       }
-      post.rapid(&mut prog, Axes::z(job.travel_z));
+      post.rapid(&mut prog, Axes::z(job.travel_z - origin.z));
     }
   }
 
@@ -214,12 +247,15 @@ pub fn emit_isolation<G: CutRing>(
   prog
 }
 
-/// Cut each segment of a ring at `feed`, dispatching linear vs arc to the postprocessor.
-fn emit_ring_segments(prog: &mut Program, post: &dyn Postprocessor, segments: &[Segment], feed: f64) {
+/// Cut each segment of a ring at `feed`, dispatching linear vs arc to the postprocessor. Absolute XY is shifted to the
+/// datum; the arc I/J `offset` is relative, so it is emitted unchanged.
+fn emit_ring_segments(prog: &mut Program, post: &dyn Postprocessor, segments: &[Segment], feed: f64, origin: Origin) {
   for seg in segments {
     match *seg {
-      Segment::Line { x, y } => post.linear(prog, Axes::xy(x, y), feed),
-      Segment::Arc { x, y, offset, dir } => post.arc(prog, ArcMove { x, y, offset, dir }, feed),
+      Segment::Line { x, y } => post.linear(prog, Axes::xy(x - origin.x, y - origin.y), feed),
+      Segment::Arc { x, y, offset, dir } => {
+        post.arc(prog, ArcMove { x: x - origin.x, y: y - origin.y, offset, dir }, feed)
+      }
     }
   }
 }
@@ -227,33 +263,33 @@ fn emit_ring_segments(prog: &mut Program, post: &dyn Postprocessor, segments: &[
 /// Emit a complete drilling program from `plan` using `post`. Each tool group gets a tool change and spindle start,
 /// then every hit is drilled (with a manual peck cycle when configured — grbl has no canned `G81`/`G83`) or every
 /// slot is plunged and routed.
-pub fn emit_drilling(plan: &DrillPlan, job: &DrillJob, post: &dyn Postprocessor) -> Program {
+pub fn emit_drilling(plan: &DrillPlan, job: &DrillJob, origin: Origin, post: &dyn Postprocessor) -> Program {
   let mut prog = Program::new(post.format());
   let ctx = JobContext { name: job.name.clone() };
   post.start_code(&mut prog, &ctx);
 
   if !plan.tools.is_empty() {
-    post.rapid(&mut prog, Axes::z(job.travel_z));
+    post.rapid(&mut prog, Axes::z(job.travel_z - origin.z));
     for tool in &plan.tools {
       post.tool_change(&mut prog, ToolChange { number: tool.tool, diameter: tool.diameter });
       post.spindle_on(&mut prog, Spindle { rpm: job.spindle_rpm });
       // Lift to the cross-tool safe height after the change before repositioning.
-      post.rapid(&mut prog, Axes::z(job.travel_z));
+      post.rapid(&mut prog, Axes::z(job.travel_z - origin.z));
 
       for mv in &tool.moves {
         match *mv {
           DrillMove::Drill { at } => {
-            post.rapid(&mut prog, Axes::xy(at.x, at.y));
-            drill_hole(&mut prog, post, &tool.params);
+            post.rapid(&mut prog, Axes::xy(at.x - origin.x, at.y - origin.y));
+            drill_hole(&mut prog, post, &tool.params, origin.z);
           }
           DrillMove::Slot { from, to } => {
-            post.rapid(&mut prog, Axes::xy(from.x, from.y));
-            route_slot(&mut prog, post, to.x, to.y, &tool.params);
+            post.rapid(&mut prog, Axes::xy(from.x - origin.x, from.y - origin.y));
+            route_slot(&mut prog, post, to.x - origin.x, to.y - origin.y, &tool.params, origin.z);
           }
         }
       }
       // Restore the safe height for the next tool change / program end.
-      post.rapid(&mut prog, Axes::z(job.travel_z));
+      post.rapid(&mut prog, Axes::z(job.travel_z - origin.z));
     }
   }
 
@@ -267,7 +303,7 @@ const PECK_RAPID_CLEARANCE: f64 = 0.1;
 
 /// Drill one hole at the current XY: a single plunge, or a manual peck cycle expanded into explicit plunge/retract
 /// moves because grbl supports no `G83`. A final dwell (if configured) happens at the bottom before the last retract.
-fn drill_hole(prog: &mut Program, post: &dyn Postprocessor, params: &DrillParams) {
+fn drill_hole(prog: &mut Program, post: &dyn Postprocessor, params: &DrillParams, z_off: f64) {
   match params.peck {
     Some(peck) if peck > 0.0 && peck < params.depth => {
       let mut prev = 0.0;
@@ -278,16 +314,16 @@ fn drill_hole(prog: &mut Program, post: &dyn Postprocessor, params: &DrillParams
           // the clearance, `-(prev - clearance)` would rise ABOVE the work surface (Z0), sending the tool up into the
           // air and then plunging back through material — clamp it to the surface so it never rises above Z0.
           let resume_z = (-(prev - PECK_RAPID_CLEARANCE)).min(0.0);
-          post.rapid(prog, Axes::z(resume_z));
+          post.rapid(prog, Axes::z(resume_z - z_off));
         }
-        post.linear(prog, Axes::z(-target), params.feed);
+        post.linear(prog, Axes::z(-target - z_off), params.feed);
         let last = target >= params.depth - 1.0e-9;
         if last {
           if let Some(dwell) = params.dwell {
             post.dwell(prog, dwell);
           }
         }
-        post.rapid(prog, Axes::z(params.retract));
+        post.rapid(prog, Axes::z(params.retract - z_off));
         prev = target;
         if last {
           break;
@@ -295,24 +331,24 @@ fn drill_hole(prog: &mut Program, post: &dyn Postprocessor, params: &DrillParams
       }
     }
     _ => {
-      post.linear(prog, Axes::z(-params.depth), params.feed);
+      post.linear(prog, Axes::z(-params.depth - z_off), params.feed);
       if let Some(dwell) = params.dwell {
         post.dwell(prog, dwell);
       }
-      post.rapid(prog, Axes::z(params.retract));
+      post.rapid(prog, Axes::z(params.retract - z_off));
     }
   }
 }
 
 /// Route a slot: plunge to full depth at the current start, feed across to `(x, y)`, optionally dwell, then retract.
-/// Slots plunge in a single pass (peck is a point-drill concern).
-fn route_slot(prog: &mut Program, post: &dyn Postprocessor, x: f64, y: f64, params: &DrillParams) {
-  post.linear(prog, Axes::z(-params.depth), params.feed);
+/// Slots plunge in a single pass (peck is a point-drill concern). `z_off` shifts every Z to the work-Z0 datum.
+fn route_slot(prog: &mut Program, post: &dyn Postprocessor, x: f64, y: f64, params: &DrillParams, z_off: f64) {
+  post.linear(prog, Axes::z(-params.depth - z_off), params.feed);
   post.linear(prog, Axes::xy(x, y), params.feed);
   if let Some(dwell) = params.dwell {
     post.dwell(prog, dwell);
   }
-  post.rapid(prog, Axes::z(params.retract));
+  post.rapid(prog, Axes::z(params.retract - z_off));
 }
 
 #[cfg(test)]
@@ -363,7 +399,7 @@ mod tests {
   fn isolation_emits_preamble_spindle_plunge_cut_and_end() {
     let paths = linear_toolpaths(square_ring());
     let job = IsolationJob { cut_depth: 0.1, pass_depth: 0.1, ..Default::default() };
-    let prog = emit_isolation(&paths, &job, &grbl());
+    let prog = emit_isolation(&paths, &job, Origin::NATIVE, &grbl());
     let text = prog.render();
     assert!(text.contains("G90 G21 G54 G17 G94"), "preamble missing:\n{text}");
     assert!(text.contains("M3 S10000"), "spindle on missing:\n{text}");
@@ -376,7 +412,7 @@ mod tests {
   #[test]
   fn isolation_rapid_moves_never_carry_a_feed_word() {
     let paths = linear_toolpaths(square_ring());
-    let prog = emit_isolation(&paths, &IsolationJob::default(), &grbl());
+    let prog = emit_isolation(&paths, &IsolationJob::default(), Origin::NATIVE, &grbl());
     for line in prog.lines() {
       if line.starts_with("G0") {
         assert!(!line.contains('F'), "rapid must not carry F: {line}");
@@ -400,7 +436,7 @@ mod tests {
       rings: vec![IsolationRing { pass: 0, offset: 0.0, winding: WindingDirection::Ccw, geometry: open }],
     };
     let job = IsolationJob { cut_depth: 0.3, pass_depth: 0.1, ..Default::default() };
-    let prog = emit_isolation(&paths, &job, &grbl());
+    let prog = emit_isolation(&paths, &job, Origin::NATIVE, &grbl());
     let lines = prog.lines();
     let starts = lines.iter().filter(|l| l.as_str() == "G0 X0.0000 Y0.0000").count();
     assert_eq!(starts, 3, "open path returns to start once per depth pass:\n{lines:?}");
@@ -414,7 +450,7 @@ mod tests {
     // once (no per-pass return), so existing isolation output is byte-for-byte unchanged.
     let paths = linear_toolpaths(square_ring());
     let job = IsolationJob { cut_depth: 0.3, pass_depth: 0.1, ..Default::default() };
-    let prog = emit_isolation(&paths, &job, &grbl());
+    let prog = emit_isolation(&paths, &job, Origin::NATIVE, &grbl());
     let starts = prog.lines().iter().filter(|l| l.as_str() == "G0 X0.0000 Y0.0000").count();
     assert_eq!(starts, 1, "a closed ring rapids to its start only once");
   }
@@ -423,7 +459,7 @@ mod tests {
   fn multi_depth_produces_a_plunge_per_level() {
     let paths = linear_toolpaths(square_ring());
     let job = IsolationJob { cut_depth: 0.3, pass_depth: 0.1, ..Default::default() };
-    let prog = emit_isolation(&paths, &job, &grbl());
+    let prog = emit_isolation(&paths, &job, Origin::NATIVE, &grbl());
     let plunges = prog.lines().iter().filter(|l| l.starts_with("G1 Z-")).count();
     assert_eq!(plunges, 3, "0.3mm at 0.1mm/pass => three plunges");
   }
@@ -440,9 +476,62 @@ mod tests {
     let paths = IsolationToolpaths {
       rings: vec![IsolationRing { pass: 0, offset: 0.5, winding: WindingDirection::Ccw, geometry: ring }],
     };
-    let prog = emit_isolation(&paths, &IsolationJob::default(), &grbl());
+    let prog = emit_isolation(&paths, &IsolationJob::default(), Origin::NATIVE, &grbl());
     let text = prog.render();
     assert!(text.contains("G3 X0.0000 Y1.0000 I-1.0000 J0.0000 F"), "arc move missing:\n{text}");
+  }
+
+  #[test]
+  fn datum_shifts_absolute_xy_but_not_arc_ij_or_z() {
+    // The same CCW quarter-circle arc, posted against a datum at (1, 0): every absolute XY drops by the datum, while
+    // the relative I/J arc offset and the Z depth are untouched.
+    let ring = ArcPolyline {
+      vertices: vec![
+        ArcVertex { x: 1.0, y: 0.0, bulge: (std::f64::consts::FRAC_PI_8).tan() },
+        ArcVertex { x: 0.0, y: 1.0, bulge: 0.0 },
+      ],
+    };
+    let paths = IsolationToolpaths {
+      rings: vec![IsolationRing { pass: 0, offset: 0.5, winding: WindingDirection::Ccw, geometry: ring }],
+    };
+    let job = IsolationJob { cut_depth: 0.1, pass_depth: 0.1, ..Default::default() };
+    let native = emit_isolation(&paths, &job, Origin::NATIVE, &grbl()).render();
+    let shifted = emit_isolation(&paths, &job, Origin::new(1.0, 0.0), &grbl()).render();
+    assert!(native.contains("G0 X1.0000 Y0.0000"), "native start:\n{native}");
+    assert!(shifted.contains("G0 X0.0000 Y0.0000"), "datum drops the start to the origin:\n{shifted}");
+    // The arc endpoint shifts in X, but the relative I/J offset is byte-for-byte identical, as is the Z plunge.
+    assert!(native.contains("G3 X0.0000 Y1.0000 I-1.0000 J0.0000"), "native arc:\n{native}");
+    assert!(shifted.contains("G3 X-1.0000 Y1.0000 I-1.0000 J0.0000"), "arc XY shifts, I/J unchanged:\n{shifted}");
+    assert!(shifted.contains("G1 Z-0.1000"), "the Z depth is unaffected by an XY datum:\n{shifted}");
+  }
+
+  #[test]
+  fn z_datum_shifts_every_z_by_the_offset() {
+    // Work-Z0 at the stock bottom of a 1.6 mm board: origin.z = -1.6, so every emitted Z rises by 1.6 — the plunge
+    // to −0.1 becomes +1.5, the 2 mm travel becomes 3.6. XY is unaffected (origin x/y = 0 here).
+    let paths = linear_toolpaths(square_ring());
+    let job = IsolationJob { cut_depth: 0.1, pass_depth: 0.1, travel_z: 2.0, ..Default::default() };
+    let text = emit_isolation(&paths, &job, Origin::with_z(0.0, 0.0, -1.6), &grbl()).render();
+    assert!(text.contains("G1 Z1.5000"), "plunge to −0.1 with Z0 at the bottom is +1.5:\n{text}");
+    assert!(text.contains("G0 Z3.6000"), "the 2 mm travel height rises by the 1.6 mm thickness:\n{text}");
+    // A top-zero (origin.z = 0) job is byte-for-byte the old output.
+    let top = emit_isolation(&paths, &job, Origin::new(0.0, 0.0), &grbl()).render();
+    assert!(top.contains("G1 Z-0.1000") && top.contains("G0 Z2.0000"), "top-zero is unchanged:\n{top}");
+  }
+
+  #[test]
+  fn datum_shifts_drill_hits_but_not_depth() {
+    let plan = DrillPlan {
+      tools: vec![ToolDrillPlan {
+        tool: 1,
+        diameter: 0.8,
+        params: DrillParams { depth: 1.6, feed: 100.0, retract: 2.0, peck: None, dwell: None },
+        moves: vec![DrillMove::Drill { at: Point::new(1.0, 2.0) }],
+      }],
+    };
+    let text = emit_drilling(&plan, &DrillJob::default(), Origin::new(1.0, 2.0), &grbl()).render();
+    assert!(text.contains("G0 X0.0000 Y0.0000"), "the hole at (1,2) posts at the datum origin:\n{text}");
+    assert!(text.contains("G1 Z-1.6000"), "drill depth is unaffected by the XY datum:\n{text}");
   }
 
   #[test]
@@ -458,7 +547,7 @@ mod tests {
         ],
       }],
     };
-    let prog = emit_drilling(&plan, &DrillJob::default(), &grbl());
+    let prog = emit_drilling(&plan, &DrillJob::default(), Origin::NATIVE, &grbl());
     let text = prog.render();
     assert!(text.contains("M6 T1"), "tool change missing:\n{text}");
     assert!(text.contains("G0 X1.0000 Y2.0000"), "rapid to first hole missing:\n{text}");
@@ -476,7 +565,7 @@ mod tests {
         moves: vec![DrillMove::Drill { at: Point::new(0.0, 0.0) }],
       }],
     };
-    let prog = emit_drilling(&plan, &DrillJob::default(), &grbl());
+    let prog = emit_drilling(&plan, &DrillJob::default(), Origin::NATIVE, &grbl());
     // 1.0mm at 0.4mm pecks => plunges to -0.4, -0.8, -1.0 (three feed-downs) with a dwell before the final retract.
     let plunges = prog.lines().iter().filter(|l| l.starts_with("G1 Z-")).count();
     assert_eq!(plunges, 3, "peck should produce three plunge increments:\n{:?}", prog.lines());
@@ -497,7 +586,7 @@ mod tests {
         moves: vec![DrillMove::Drill { at: Point::new(0.0, 0.0) }],
       }],
     };
-    let prog = emit_drilling(&plan, &DrillJob::default(), &grbl());
+    let prog = emit_drilling(&plan, &DrillJob::default(), Origin::NATIVE, &grbl());
     for line in prog.lines() {
       if let Some(rest) = line.strip_prefix("G0 Z") {
         let z: f64 = rest.trim().parse().expect("parse rapid Z");

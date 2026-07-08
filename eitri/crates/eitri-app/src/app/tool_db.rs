@@ -149,7 +149,7 @@ pub fn body(ui: &mut egui::Ui, state: &mut UiState, database: &ToolDatabase, dir
   ui.add_space(2.0);
   egui::Grid::new("tool-db-drill").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
     ui.label(RichText::new(tr!("params-drill-depth")).size(11.5).color(palette.text_dim));
-    if ui.add(egui::DragValue::new(&mut edited.drilling.depth).speed(0.05).range(-20.0..=-0.01).max_decimals(3)).changed()
+    if ui.add(egui::DragValue::new(&mut edited.drilling.depth).speed(0.05).range(0.01..=20.0).max_decimals(3)).changed()
     {
       changed = true;
     }

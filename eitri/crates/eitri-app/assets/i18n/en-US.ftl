@@ -134,6 +134,32 @@ btn-seed-center = Object centre
 tip-seed-center = Place the mirror line at the selected object's centre
 btn-run-mirror = Mirror
 tip-run-mirror = Reflect the object about the line as a new geometry object
+
+# ── Setup node (stock & work zero) ──────────────────────────────────────────────────────────────────────
+tree-setup = Setup
+setup-kind = Job setup — stock & work zero
+setup-hint = The material block being machined and where work X0 Y0 Z0 sits on it. Objects never move — only the coordinates posted into G-code shift.
+params-stock = Stock
+params-stock-x = Size X (mm)
+params-stock-y = Size Y (mm)
+params-stock-thickness = Thickness (mm)
+btn-fit-stock = Fit to board
+tip-fit-stock = Size the stock to the chosen object's bounding box
+params-datum = Datum (X0 Y0)
+datum-corner-bl = Bottom left
+datum-corner-br = Bottom right
+datum-corner-tl = Top left
+datum-corner-tr = Top right
+datum-corner-center = Center
+params-z-zero = Z zero
+z-zero-top = Top of stock
+z-zero-bottom = Bottom of stock
+work-zero-label = Work zero (mm)
+work-zero-native = Native frame — no offset applied
+btn-stock-native = Native (no stock)
+tip-stock-native = Post G-code in the source file's own coordinate frame
+stock-set = Stock set — work zero at X { $x } Y { $y } Z { $z }
+stock-cleared = Stock cleared — posting in native coordinates
 params-film = Photo film
 params-film-kind = Kind
 film-positive = Positive
@@ -158,6 +184,11 @@ op-import-dxf = Import DXF
 op-import-gcode = Import G-code
 op-isolate = Isolation routing
 op-drill = Drill planning
+op-paint = Area clearing
+op-noncopper = Non-copper clearing
+op-cutout = Board cutout
+op-panelize = Panelizing
+op-mirror = Mirroring
 op-load-project = Open project
 
 # ── Dock ────────────────────────────────────────────────────────────────────────────────────────────────

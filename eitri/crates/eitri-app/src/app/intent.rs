@@ -3,8 +3,9 @@
 //! skirnir's intent layer: egui-free, so the vocabulary and the sink are host-testable, and no view ever
 //! mutates the session or the config directly.
 
-use eitri_project::{ObjectId, ToolEntry, ToolId};
+use eitri_project::{ObjectId, Stock, ToolEntry, ToolId};
 
+use super::view_state::Selection;
 use crate::config::ThemeOverride;
 
 /// Everything a view can ask the shell to do. One frame may emit several; the shell handles them in order.
@@ -29,8 +30,8 @@ pub enum Intent {
   ExportGcode(ObjectId),
 
   // ── Collection ─────────────────────────────────────────────────────────────────────────────────────────
-  /// Select an object in the tree (or clear the selection with `None`).
-  Select(Option<ObjectId>),
+  /// Select the Setup node or an object in the tree (or clear the selection with `None`).
+  Select(Option<Selection>),
   /// Show or hide an object on the canvas (undoable in the engine's history).
   SetVisible(ObjectId, bool),
   /// Rename an object to the given (already-trimmed) name.
@@ -61,6 +62,20 @@ pub enum Intent {
   ExportFilm(ObjectId),
   /// Request cancellation of the in-flight operation.
   CancelOp,
+
+  // ── Setup / stock / work zero (cheap and synchronous — the shell applies these inline, not on the worker) ─
+  /// Commit the Setup panel's stock (footprint, thickness, datum corner, Z reference) as the job's material
+  /// block; the work zero every posted job references derives from it.
+  SetStock(Stock),
+  /// Clear the stock and revert posting to the native (source) coordinate frame.
+  ClearStock,
+  /// Auto-fit the stock footprint to a reference object's bounding box at the given material thickness (mm).
+  FitStock {
+    /// The board/geometry object whose bounds size the stock.
+    reference: ObjectId,
+    /// The material thickness to keep (mm).
+    thickness: f64,
+  },
 
   // ── Canvas ─────────────────────────────────────────────────────────────────────────────────────────────
   /// Zoom the canvas to fit the loaded geometry.

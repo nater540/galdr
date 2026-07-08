@@ -14,7 +14,7 @@ use super::dock_tiles::CentralSplit;
 use super::intent::Intent;
 use super::scene::RenderScene;
 use super::shell;
-use super::view_state::{OpView, TreeRow, ViewState};
+use super::view_state::{OpView, Selection, TreeRow, ViewState};
 use super::views::UiState;
 use eitri_project::{ObjectId, ObjectKind};
 
@@ -108,7 +108,7 @@ mod tests {
     harness.get_by_label("fixture-drills").click();
     harness.run();
     assert!(
-      harness.state().intents.contains(&Intent::Select(Some(ObjectId(2)))),
+      harness.state().intents.contains(&Intent::Select(Some(Selection::Object(ObjectId(2))))),
       "clicking a row must select it: {:?}",
       harness.state().intents,
     );
@@ -118,7 +118,7 @@ mod tests {
   fn clicking_the_selected_row_emits_a_deselect() {
     let _locale = render_in(crate::i18n::EN_US);
     let mut view = fixture_view();
-    view.selected = Some(ObjectId(2));
+    view.selected = Some(Selection::Object(ObjectId(2)));
     let state = HarnessState::new(view, UiState::default());
     let mut harness = build_shell_harness(state, DEFAULT_SIZE);
     harness.run_steps(2);
@@ -159,7 +159,7 @@ mod tests {
     let _locale = render_in(crate::i18n::EN_US);
     // Idle, Gerber selected: the Run button emits the isolate intent.
     let mut view = fixture_view();
-    view.selected = Some(ObjectId(1));
+    view.selected = Some(Selection::Object(ObjectId(1)));
     let state = HarnessState::new(view.clone(), UiState::default());
     let mut harness = build_shell_harness(state, DEFAULT_SIZE);
     harness.run_steps(2);
@@ -262,7 +262,7 @@ mod tests {
       harness.state().intents,
     );
     assert!(
-      !harness.state().intents.iter().any(|i| matches!(i, Intent::Select(Some(ObjectId(2))))),
+      !harness.state().intents.iter().any(|i| matches!(i, Intent::Select(Some(Selection::Object(ObjectId(2)))))),
       "the eye click must not ALSO select the row: {:?}",
       harness.state().intents,
     );
@@ -320,7 +320,7 @@ mod tests {
     harness.get_by_label("Canvas").click();
     harness.run();
     assert!(
-      harness.state().intents.contains(&Intent::Select(Some(ObjectId(1)))),
+      harness.state().intents.contains(&Intent::Select(Some(Selection::Object(ObjectId(1))))),
       "a canvas click inside the square must select it: {:?}",
       harness.state().intents,
     );
@@ -330,7 +330,7 @@ mod tests {
   fn clicking_empty_canvas_clears_an_existing_selection() {
     let _locale = render_in(crate::i18n::EN_US);
     let mut view = fixture_view();
-    view.selected = Some(ObjectId(1));
+    view.selected = Some(Selection::Object(ObjectId(1)));
     let state = HarnessState::new(view, UiState::default()); // the scene is empty: every click misses.
     let mut harness = build_shell_harness(state, DEFAULT_SIZE);
     harness.run_steps(2);
@@ -339,6 +339,130 @@ mod tests {
     assert!(
       harness.state().intents.contains(&Intent::Select(None)),
       "an empty-canvas click must clear the selection: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn clicking_the_pinned_setup_row_selects_the_setup_node() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let state = HarnessState::new(fixture_view(), UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Setup").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::Select(Some(Selection::Setup))),
+      "the pinned row must select the Setup node: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn the_setup_row_is_present_and_clickable_even_on_an_empty_project() {
+    // The whole point of the node: it exists BEFORE anything is loaded, so the operator can set up stock first.
+    let _locale = render_in(crate::i18n::EN_US);
+    let state = HarnessState::new(ViewState::default(), UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Setup").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::Select(Some(Selection::Setup))),
+      "an empty tree still pins the Setup row: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn the_setup_panels_datum_grid_commits_a_stock_with_the_clicked_corner() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.selected = Some(Selection::Setup);
+    let state = HarnessState::new(view, UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Bottom right").click();
+    harness.run();
+    let committed = harness.state().intents.iter().find_map(|i| match i {
+      Intent::SetStock(stock) => Some(*stock),
+      _ => None,
+    });
+    let stock = committed.expect("clicking a corner dot must commit the drafted stock");
+    assert_eq!(stock.datum, eitri_project::DatumCorner::BottomRight, "the pick lands in the committed stock");
+    assert!(stock.size_x > 0.0 && stock.thickness > 0.0, "the drafted block is a real material size");
+  }
+
+  #[test]
+  fn the_fit_button_emits_fit_stock_against_the_reference_object() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.selected = Some(Selection::Setup);
+    let state = HarnessState::new(view, UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Fit to board").click();
+    harness.run();
+    // The default reference is the first geometry-bearing row (the fixture Gerber, id 1) at the drafted 1.6 mm.
+    assert!(
+      harness
+        .state()
+        .intents
+        .iter()
+        .any(|i| matches!(i, Intent::FitStock { reference: ObjectId(1), thickness } if (thickness - 1.6).abs() < 1e-9)),
+      "Fit must target the first board at the drafted thickness: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn the_native_button_clears_the_stock() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.selected = Some(Selection::Setup);
+    // A committed stock makes the Native button meaningful (it is disabled in the native frame).
+    let ui = UiState {
+      stock: Some(super::super::views::StockDraft::default().to_stock()),
+      ..UiState::default()
+    };
+    let state = HarnessState::new(view, ui);
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Native (no stock)").click();
+    harness.run();
+    assert!(
+      harness.state().intents.contains(&Intent::ClearStock),
+      "the Native button must revert to the source frame: {:?}",
+      harness.state().intents,
+    );
+  }
+
+  #[test]
+  fn the_setup_controls_are_inert_while_an_operation_runs() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let mut view = fixture_view();
+    view.selected = Some(Selection::Setup);
+    view.op = OpView::Running { label: "Isolation routing".to_string(), done: 1, total: 4 };
+    let ui = UiState {
+      stock: Some(super::super::views::StockDraft::default().to_stock()),
+      ..UiState::default()
+    };
+    let state = HarnessState::new(view, ui);
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    harness.get_by_label("Bottom left").click();
+    harness.run_steps(2);
+    harness.get_by_label("Native (no stock)").click();
+    harness.run_steps(2);
+    harness.get_by_label("Fit to board").click();
+    harness.run_steps(2);
+    assert!(
+      !harness
+        .state()
+        .intents
+        .iter()
+        .any(|i| matches!(i, Intent::SetStock(..) | Intent::ClearStock | Intent::FitStock { .. })),
+      "the session is away — setup edits must not be queued: {:?}",
       harness.state().intents,
     );
   }

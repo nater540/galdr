@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use eitri_cam::{DrillConfig, IsolationParams, MillingDirection, NearestNeighbor, isolate, plan_drilling};
 use eitri_core::{CancelToken, ProgressReporter};
-use eitri_gcode::{DrillJob, GrblHal, IsolationJob, check_grbl_conformance, emit_drilling, emit_isolation};
+use eitri_gcode::{DrillJob, GrblHal, IsolationJob, Origin, check_grbl_conformance, emit_drilling, emit_isolation};
 use eitri_geo::{DefaultBackend, JoinType};
 
 /// Absolute path to a fixture under `eitri/fixtures/`.
@@ -60,7 +60,7 @@ fn isolation_program() -> String {
     spindle_rpm: 10000.0,
     name: Some("isolation kicad_two_pads".to_string()),
   };
-  emit_isolation(&paths, &job, &GrblHal::new()).render()
+  emit_isolation(&paths, &job, Origin::NATIVE, &GrblHal::new()).render()
 }
 
 /// Build the drilling program for the metric Excellon fixture.
@@ -72,7 +72,7 @@ fn drilling_program() -> String {
   let plan = plan_drilling(&img, &config, &NearestNeighbor, &ProgressReporter::silent(), &CancelToken::new())
     .expect("plan drilling");
   let job = DrillJob { travel_z: 3.0, spindle_rpm: 10000.0, name: Some("drill metric_leading".to_string()) };
-  emit_drilling(&plan, &job, &GrblHal::new()).render()
+  emit_drilling(&plan, &job, Origin::NATIVE, &GrblHal::new()).render()
 }
 
 #[test]

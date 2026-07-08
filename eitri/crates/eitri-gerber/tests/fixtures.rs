@@ -19,6 +19,27 @@ fn parse(name: &str) -> GerberImage {
   parse_gerber(&fixture(name), &ProgressReporter::silent(), &CancelToken::new()).expect("parse")
 }
 
+/// Read a real (non-synthetic) fixture from `fixtures/gerber/` — a full board plotted by KiCad.
+fn real_fixture(name: &str) -> String {
+  let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/gerber").join(name);
+  std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+#[test]
+fn kicad_ground_pour_survives_the_shared_union() {
+  // Regression: a KiCad copper pour is one self-touching G36 region — the boundary carves each isolated-pad
+  // clearance with a zero-width bridge (out to the clearance and back along the same line). Pushed raw into the
+  // same-polarity `union_all` alongside the pads, that non-simple boundary was mis-resolved and the whole pour
+  // dropped, collapsing the parsed copper to just the pads/trace (~18 mm²). It must retain the full pour.
+  let img = parse_gerber(&real_fixture("starter-F_Cu.gbr"), &ProgressReporter::silent(), &CancelToken::new())
+    .expect("parse starter-F_Cu");
+  assert!(img.copper.unsigned_area() > 150.0, "ground pour missing — copper area only {}", img.copper.unsigned_area());
+  // The discriminating signal that the region (not just the pad flashes) assembled: the pour is a filled area with
+  // clearance holes around the isolated features.
+  let holes: usize = img.copper.0.iter().map(|p| p.interiors().len()).sum();
+  assert!(holes > 0, "expected clearance holes in the pour, found none");
+}
+
 fn try_parse(name: &str) -> Result<GerberImage, GerberError> {
   parse_gerber(&fixture(name), &ProgressReporter::silent(), &CancelToken::new())
 }

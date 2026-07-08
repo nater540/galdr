@@ -94,7 +94,7 @@ impl egui_tiles::Behavior<CentralPane> for CentralBehavior<'_> {
       CentralPane::Canvas => {
         let rect = ui.available_rect_before_wrap();
         self.state.cursor_world =
-          super::canvas::show(ui, rect, self.scene, self.state, self.view.selected, self.sink);
+          super::canvas::show(ui, rect, self.scene, self.state, self.view.selected_object(), self.sink);
       }
       CentralPane::Dock => {
         egui::Frame::new().fill(self.state.style.palette.panel).show(ui, |ui| {

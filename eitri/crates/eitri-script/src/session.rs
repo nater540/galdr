@@ -30,13 +30,13 @@ use std::path::Path;
 
 use eitri_cam::{DrillConfig, FilmParams, Point, TwoOpt};
 use eitri_core::{Affine, CancelToken, ProgressReporter, Unit};
-use eitri_gcode::{DrillJob, IsolationJob, Postprocessor, Program, Registry, emit_drilling, emit_isolation};
+use eitri_gcode::{DrillJob, IsolationJob, Origin, Postprocessor, Program, Registry, emit_drilling, emit_isolation};
 use eitri_geo::DefaultBackend;
 use eitri_project::{
   CamOperation, CncJobObject, DrillSpec, ExcellonObject, GeometryObject, GeometryOrigin, GerberObject, History,
-  ImportFormat, IsolationSpec, MirrorLineSpec, NonCopperSpec, Object, ObjectCollection, ObjectId, ObjectKind,
-  ObjectMeta, ObjectPayload, PaintSpec, PanelizeSpec, Project, ToolDatabase, ToolEntry, ToolId, load_project,
-  save_project,
+  ImportFormat, IsolationSpec, JobOrigin, MirrorLineSpec, NonCopperSpec, Object, ObjectCollection, ObjectId,
+  ObjectKind, ObjectMeta, ObjectPayload, PaintSpec, PanelizeSpec, Project, Stock, ToolDatabase, ToolEntry, ToolId,
+  load_project, save_project,
 };
 use eitri_project::{CutoutSpec, load_tool_db, save_tool_db};
 use eitri_excellon::{ExcellonImage, parse_excellon};
@@ -68,6 +68,13 @@ pub struct Session {
   progress: ProgressReporter,
   /// The cooperative cancellation flag long ops poll.
   cancel: CancelToken,
+  /// The work-zero (datum) offset `(x, y, z)`, in the board's native frame, every CAM op posts its G-code relative
+  /// to. The emitter subtracts it from all coordinates; `(0.0, 0.0, 0.0)` is the native (unshifted) frame. Normally
+  /// derived from [`Session::stock`]; persisted with the project.
+  origin: (f64, f64, f64),
+  /// The job's stock (material block) + work-zero setup, or `None` for the native frame. When set, it drives
+  /// [`Session::origin`].
+  stock: Option<Stock>,
 }
 
 impl Session {
@@ -83,6 +90,8 @@ impl Session {
       dialect: DEFAULT_DIALECT.to_string(),
       progress: ProgressReporter::silent(),
       cancel: CancelToken::new(),
+      origin: (0.0, 0.0, 0.0),
+      stock: None,
     }
   }
 
@@ -133,6 +142,69 @@ impl Session {
       return Err(ScriptError::UnknownDialect(name));
     }
     self.dialect = name;
+    Ok(())
+  }
+
+  // --- Stock / datum / work-zero -----------------------------------------------------------------------------------
+
+  /// The current work-zero (datum) offset `(x, y, z)`, in the board's native frame; `(0.0, 0.0, 0.0)` is the native
+  /// (unshifted) frame. Every CAM op posts its G-code relative to this point.
+  pub fn work_origin(&self) -> (f64, f64, f64) {
+    self.origin
+  }
+
+  /// The XY datum offset — a convenience over [`Session::work_origin`] for callers that only need the plane.
+  pub fn datum(&self) -> (f64, f64) {
+    (self.origin.0, self.origin.1)
+  }
+
+  /// The current stock (material block) + work-zero setup, or `None` for the native frame.
+  pub fn stock(&self) -> Option<Stock> {
+    self.stock
+  }
+
+  /// Set (or clear) the job's stock, deriving the work-zero from it. `None` reverts to the native frame. This is the
+  /// primary datum control: the UI edits a [`Stock`] and commits it here, and every subsequent CAM op posts relative
+  /// to the stock's datum corner and Z reference.
+  pub fn set_stock(&mut self, stock: Option<Stock>) {
+    self.origin = stock.map(|s| s.origin()).unwrap_or((0.0, 0.0, 0.0));
+    self.stock = stock;
+  }
+
+  /// The axis-aligned XY bounds `(min_x, min_y, max_x, max_y)` of an object's geometry — what the UI auto-fits a
+  /// stock to. Errors if the object has no geometry, or is a kind without bounds (an Excellon / CNC job).
+  pub fn object_bounds(&self, id: ObjectId) -> Result<(f64, f64, f64, f64)> {
+    let region = self.region_of(id)?;
+    eitri_geo::bounds(&region)
+      .ok_or_else(|| ScriptError::InvalidArgument("object has no geometry to bound".to_string()))
+  }
+
+  /// Auto-fit the stock to `reference`'s bounds (footprint = the board's bounding box) with the given material
+  /// `thickness`, a bottom-left datum, and a top Z reference — the one-call setup a freshly-loaded board seeds.
+  pub fn fit_stock_to(&mut self, reference: ObjectId, thickness: f64) -> Result<()> {
+    let bounds = self.object_bounds(reference)?;
+    self.set_stock(Some(Stock::fit(bounds, thickness)));
+    Ok(())
+  }
+
+  /// Post CAM output relative to an explicit native-frame point (Z0 at the surface), clearing any stock — the
+  /// "set origin here" primitive.
+  pub fn set_datum_point(&mut self, x: f64, y: f64) {
+    self.stock = None;
+    self.origin = (x, y, 0.0);
+  }
+
+  /// Revert to the native (source / EDA plot) coordinate frame, clearing any stock.
+  pub fn clear_datum(&mut self) {
+    self.set_stock(None);
+  }
+
+  /// Resolve `origin` against the bounds of `reference` and set an XY datum from it (no stock). Kept for scripting;
+  /// the UI uses [`Session::set_stock`]. Errors if the reference has no geometry.
+  pub fn set_datum(&mut self, origin: JobOrigin, reference: ObjectId) -> Result<()> {
+    let bounds = self.object_bounds(reference)?;
+    let (x, y) = origin.resolve(bounds);
+    self.set_datum_point(x, y);
     Ok(())
   }
 
@@ -332,7 +404,7 @@ impl Session {
     let toolpaths = eitri_cam::isolate(&self.backend, &region, &spec.to_params(), &self.progress, &self.cancel)?;
     let program = {
       let post = self.post()?;
-      emit_isolation(&toolpaths, &job, post)
+      emit_isolation(&toolpaths, &job, self.emit_origin(), post)
     };
     let base = self.job_name(source, "isolation")?;
     self.store_program(program, Some(source), CamOperation::Isolation(spec), &base)
@@ -346,7 +418,7 @@ impl Session {
     let plan = eitri_cam::plan_drilling(&image, &config, &TwoOpt::new(), &self.progress, &self.cancel)?;
     let program = {
       let post = self.post()?;
-      emit_drilling(&plan, &job, post)
+      emit_drilling(&plan, &job, self.emit_origin(), post)
     };
     let base = self.job_name(source, "drilling")?;
     self.store_program(program, Some(source), CamOperation::Drilling(spec), &base)
@@ -367,7 +439,7 @@ impl Session {
     let toolpaths = result.toolpaths();
     let program = {
       let post = self.post()?;
-      emit_isolation(&toolpaths, &job, post)
+      emit_isolation(&toolpaths, &job, self.emit_origin(), post)
     };
     let base = self.job_name(source, "paint")?;
     self.store_program(program, Some(source), CamOperation::Paint(spec), &base)
@@ -390,7 +462,7 @@ impl Session {
     let toolpaths = result.toolpaths();
     let program = {
       let post = self.post()?;
-      emit_isolation(&toolpaths, &job, post)
+      emit_isolation(&toolpaths, &job, self.emit_origin(), post)
     };
     let base = self.job_name(source, "noncopper")?;
     self.store_program(program, Some(source), CamOperation::NonCopper(spec), &base)
@@ -404,7 +476,7 @@ impl Session {
     let toolpaths = result.toolpaths();
     let program = {
       let post = self.post()?;
-      emit_isolation(&toolpaths, &job, post)
+      emit_isolation(&toolpaths, &job, self.emit_origin(), post)
     };
     self.store_program(program, None, CamOperation::Cutout(spec), "cutout")
   }
@@ -480,7 +552,12 @@ impl Session {
 
   /// Serialize the current project to versioned JSON.
   pub fn save_project(&self) -> Result<String> {
-    let project = Project { name: self.name.clone(), collection: self.collection().clone() };
+    let project = Project {
+      name: self.name.clone(),
+      collection: self.collection().clone(),
+      origin: self.origin,
+      stock: self.stock,
+    };
     save_project(&project).map_err(Into::into)
   }
 
@@ -508,6 +585,8 @@ impl Session {
       dialect: DEFAULT_DIALECT.to_string(),
       progress,
       cancel,
+      origin: project.origin,
+      stock: project.stock,
     })
   }
 
@@ -568,6 +647,11 @@ impl Session {
     self.registry.get(&self.dialect).ok_or_else(|| ScriptError::UnknownDialect(self.dialect.clone()))
   }
 
+  /// The datum as the emitter's [`Origin`] type, subtracted from every emitted coordinate.
+  fn emit_origin(&self) -> Origin {
+    Origin::with_z(self.origin.0, self.origin.1, self.origin.2)
+  }
+
   /// Borrow a tool by id.
   fn tool(&self, id: ToolId) -> Result<&ToolEntry> {
     self.tools.get(id).ok_or_else(|| ScriptError::InvalidArgument(format!("no tool with id {id}")))
@@ -614,7 +698,7 @@ impl Session {
     base_name: &str,
   ) -> Result<ObjectId> {
     let dialect = self.dialect.clone();
-    let cnc = CncJobObject::from_program(&program, dialect, source, operation);
+    let cnc = CncJobObject::from_program(&program, dialect, source, operation, (self.origin.0, self.origin.1));
     let name = self.unique_name(base_name);
     self.add(name, ObjectPayload::CncJob(cnc))
   }
@@ -704,8 +788,8 @@ mod tests {
   use eitri_cam::FilmKind;
   use eitri_gcode::check_grbl_conformance;
   use eitri_project::{
-    CutoutOutlineSpec, DirectionSpec, DrillDefaults, IsolationDefaults, PaintStrategySpec, SpacingSpec,
-    TabPlacementSpec,
+    CutoutOutlineSpec, DatumCorner, DirectionSpec, DrillDefaults, IsolationDefaults, JobOrigin, PaintStrategySpec,
+    SpacingSpec, TabPlacementSpec,
   };
 
   const GERBER: &str = include_str!("../../../fixtures/synthetic/gerber/kicad_two_pads.gbr");
@@ -718,7 +802,7 @@ mod tests {
   }
 
   fn drill_spec() -> DrillSpec {
-    DrillSpec { depth: -1.6, feed: 100.0, retract: 2.0, peck: None, dwell: None }
+    DrillSpec { depth: 1.6, feed: 100.0, retract: 2.0, peck: None, dwell: None }
   }
 
   /// A session with the two-pad Gerber already opened as `"top"`.
@@ -1036,6 +1120,134 @@ mod tests {
     // The persisted job renders the same g-code it was saved with.
     let job2 = reloaded.id_of(&reloaded.object_name(job).unwrap()).unwrap();
     assert_eq!(reloaded.write_gcode(job2).unwrap(), saved_gcode);
+  }
+
+  // --- Datum / work-zero --------------------------------------------------------------------------------------------
+
+  /// The first `G0 X.. Y..` rapid (a ring start) of a program, as `(x, y)`; the safe-height `G0 Z..` rapids are
+  /// skipped since they carry no X.
+  fn first_xy(gcode: &str) -> (f64, f64) {
+    for line in gcode.lines() {
+      if let Some(rest) = line.strip_prefix("G0 X") {
+        let mut parts = rest.split(" Y");
+        let x = parts.next().and_then(|s| s.parse::<f64>().ok());
+        let y = parts.next().and_then(|s| s.parse::<f64>().ok());
+        if let (Some(x), Some(y)) = (x, y) {
+          return (x, y);
+        }
+      }
+    }
+    panic!("no `G0 X.. Y..` rapid in program:\n{gcode}");
+  }
+
+  #[test]
+  fn set_datum_shifts_every_coordinate_by_the_resolved_offset() {
+    let (mut s, g) = session_with_gerber();
+    let native_job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    let (nx, ny) = first_xy(&s.write_gcode(native_job).unwrap());
+
+    // A bottom-left datum resolves to the copper's (min_x, min_y); the emitter subtracts it from every coordinate.
+    s.set_datum(JobOrigin::Bounds(DatumCorner::BottomLeft), g).unwrap();
+    let (ox, oy) = s.datum();
+    assert_eq!((ox, oy), eitri_geo::bounds(&s.region_of(g).unwrap()).map(|b| (b.0, b.1)).unwrap());
+
+    let shifted_job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    let shifted = s.write_gcode(shifted_job).unwrap();
+    let (sx, sy) = first_xy(&shifted);
+    assert!(
+      (sx - (nx - ox)).abs() < 1e-3 && (sy - (ny - oy)).abs() < 1e-3,
+      "datum must shift the ring start by exactly the offset: native ({nx},{ny}) − ({ox},{oy}) got ({sx},{sy})"
+    );
+    assert!(check_grbl_conformance(&shifted).is_empty(), "datum-shifted output stays grbl-conformant");
+  }
+
+  #[test]
+  fn a_job_records_the_datum_it_was_posted_with() {
+    // The job stores the emit origin so a preview (which re-imports the datum-shifted G-code) can add it back and
+    // draw the toolpath over the native-frame source geometry.
+    let (mut s, g) = session_with_gerber();
+    s.set_datum(JobOrigin::Bounds(DatumCorner::BottomLeft), g).unwrap();
+    let datum = s.datum();
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    match &s.object(job).unwrap().payload {
+      ObjectPayload::CncJob(c) => assert_eq!(c.origin, datum, "the job records its emit origin"),
+      _ => unreachable!(),
+    }
+  }
+
+  #[test]
+  fn fit_stock_seeds_a_datum_and_posts_relative_to_the_board_corner() {
+    use eitri_project::{DatumCorner, ZReference};
+    let (mut s, g) = session_with_gerber();
+    let native_job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    let native = first_xy(&s.write_gcode(native_job).unwrap());
+
+    s.fit_stock_to(g, 1.6).unwrap();
+    let stock = s.stock().expect("stock is set");
+    assert_eq!(stock.thickness, 1.6);
+    assert_eq!(stock.datum, DatumCorner::BottomLeft);
+    assert_eq!(stock.z_ref, ZReference::Top);
+    // The work origin is the board's bottom-left corner, Z0 at the surface.
+    let (ox, oy, oz) = s.work_origin();
+    assert_eq!((ox, oy), eitri_geo::bounds(&s.region_of(g).unwrap()).map(|b| (b.0, b.1)).unwrap());
+    assert_eq!(oz, 0.0);
+
+    let shifted_job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    let shifted = first_xy(&s.write_gcode(shifted_job).unwrap());
+    assert!((shifted.0 - (native.0 - ox)).abs() < 1e-3, "stock datum shifts the ring start by the board corner");
+  }
+
+  #[test]
+  fn a_bottom_z_reference_lifts_the_emitted_z_by_the_thickness() {
+    use eitri_project::ZReference;
+    let (mut s, g) = session_with_gerber();
+    s.fit_stock_to(g, 1.6).unwrap();
+    let mut stock = s.stock().unwrap();
+    stock.z_ref = ZReference::Bottom;
+    s.set_stock(Some(stock));
+    assert_eq!(s.work_origin().2, -1.6, "work Z0 sits one thickness below the surface");
+    let job = s.isolate(g, iso_spec(), IsolationJob { cut_depth: 0.1, pass_depth: 0.1, ..IsolationJob::default() }).unwrap();
+    let gcode = s.write_gcode(job).unwrap();
+    assert!(gcode.contains("G1 Z1.5000"), "a 0.1 mm cut with Z0 at the stock bottom is at +1.5:\n{gcode}");
+  }
+
+  #[test]
+  fn stock_persists_through_save_and_load() {
+    use eitri_project::DatumCorner;
+    let (mut s, g) = session_with_gerber();
+    s.fit_stock_to(g, 1.6).unwrap();
+    let json = s.save_project().unwrap();
+    let reloaded = Session::load_project_str(&json).unwrap();
+    let stock = reloaded.stock().expect("stock round-trips");
+    assert_eq!(stock.thickness, 1.6);
+    assert_eq!(stock.datum, DatumCorner::BottomLeft);
+    assert_eq!(reloaded.work_origin(), s.work_origin(), "the resolved work origin round-trips too");
+  }
+
+  #[test]
+  fn datum_point_round_trips_and_clears() {
+    let (mut s, _) = session_with_gerber();
+    assert_eq!(s.datum(), (0.0, 0.0), "a fresh session is in the native frame");
+    s.set_datum_point(3.0, -4.0);
+    assert_eq!(s.datum(), (3.0, -4.0));
+    s.clear_datum();
+    assert_eq!(s.datum(), (0.0, 0.0));
+  }
+
+  #[test]
+  fn datum_persists_through_save_and_load() {
+    let (mut s, _) = session_with_gerber();
+    s.set_datum_point(12.5, -7.25);
+    let json = s.save_project().unwrap();
+    let reloaded = Session::load_project_str(&json).unwrap();
+    assert_eq!(reloaded.datum(), (12.5, -7.25), "the datum round-trips with the project");
+  }
+
+  #[test]
+  fn set_datum_against_a_drill_reference_is_a_wrong_kind_error() {
+    let mut s = Session::new("board");
+    let d = s.open_excellon_str("drills", EXCELLON).unwrap();
+    assert!(s.set_datum(JobOrigin::Bounds(DatumCorner::Center), d).is_err(), "drills have no region to bound");
   }
 
   // --- Tool database ------------------------------------------------------------------------------------------------

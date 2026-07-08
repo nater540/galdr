@@ -68,3 +68,7 @@ thiserror = { workspace = true }
 # plain `cargo test` never needs a GPU. Run them with `cargo test -p eitri-app -- --ignored snapshot` and
 # regenerate with `UPDATE_SNAPSHOTS=1`.
 egui_kittest = { version = "0.35", default-features = false, features = ["wgpu", "snapshot"] }
+# PNG encoding for the `#[ignore]`d tutorial-screenshot generator (`app/tutorial_shots.rs`), which renders the
+# shell offscreen through the same kittest/wgpu harness but writes docs images, not test baselines. Version-
+# matched to the `image` egui_kittest already pulls in.
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -894,6 +894,7 @@ dependencies = [
  "eitri-script",
  "fluent",
  "geo-types",
+ "image",
  "intl-memoizer",
  "rfd",
  "serde",

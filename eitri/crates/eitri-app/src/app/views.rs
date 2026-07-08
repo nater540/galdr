@@ -12,11 +12,11 @@ use super::canvas::CanvasView;
 use super::intent::{Intent, IntentSink};
 use super::metrics::Metrics;
 use super::theme::Palette;
-use super::view_state::{LogKind, OpView, ViewState};
+use super::view_state::{LogKind, OpView, Selection, ViewState};
 use crate::config::CanvasStyle;
 use crate::tr;
 use eitri_gcode::{DrillJob, IsolationJob};
-use eitri_project::{DirectionSpec, DrillSpec, IsolationSpec, ObjectId, ObjectKind, ToolId};
+use eitri_project::{DatumCorner, DirectionSpec, DrillSpec, IsolationSpec, ObjectId, ObjectKind, Stock, ToolId, ZReference};
 
 /// The resolved presentation style threaded into every view: the active palette plus the canvas render knobs.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -104,7 +104,7 @@ impl IsolationDraft {
 /// The drilling parameter drafts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrillDraft {
-  /// Drill depth — NEGATIVE mm (below the surface), matching the engine's convention.
+  /// Drill depth as a positive magnitude below the surface (mm), matching the engine's convention.
   pub depth: f64,
   /// Plunge feed (mm/min).
   pub feed: f64,
@@ -119,15 +119,16 @@ pub struct DrillDraft {
 impl Default for DrillDraft {
   fn default() -> Self {
     let job = DrillJob::default();
-    DrillDraft { depth: -1.7, feed: 120.0, retract: 2.0, travel_z: job.travel_z, spindle_rpm: job.spindle_rpm }
+    DrillDraft { depth: 1.7, feed: 120.0, retract: 2.0, travel_z: job.travel_z, spindle_rpm: job.spindle_rpm }
   }
 }
 
 impl DrillDraft {
-  /// The engine spec: the depth is forced below the surface (a hand-typed positive depth would air-drill).
+  /// The engine spec: the depth is a positive magnitude (the emitter negates it to a negative Z), so a mistakenly
+  /// negative entry is folded positive rather than air-drilling upward.
   pub fn to_spec(&self) -> DrillSpec {
     DrillSpec {
-      depth: -self.depth.abs().max(0.01),
+      depth: self.depth.abs().max(0.01),
       feed: self.feed.max(1.0),
       retract: self.retract.max(0.1),
       peck: None,
@@ -183,6 +184,72 @@ impl OpChoice {
       OpChoice::Panelize => "op-choice-panelize",
       OpChoice::Mirror => "op-choice-mirror",
       OpChoice::Film => "op-choice-film",
+    }
+  }
+}
+
+/// The Setup panel's editable stock drafts — the operator's numbers, committed to the session as a
+/// [`Stock`] on every change (a cheap inline setter, like the rest of the setup controls). Kept separate from
+/// the committed snapshot so a cleared (native) setup still remembers what the operator last typed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StockDraft {
+  /// Footprint minimum X (native frame, mm) — set by Fit, kept through size edits.
+  pub min_x: f64,
+  /// Footprint minimum Y (native frame, mm).
+  pub min_y: f64,
+  /// Stock size along X (mm).
+  pub size_x: f64,
+  /// Stock size along Y (mm).
+  pub size_y: f64,
+  /// Material thickness (mm).
+  pub thickness: f64,
+  /// Which stock face is work-Z0.
+  pub z_ref: ZReference,
+  /// Which footprint corner (or the centre) is work X0 Y0.
+  pub datum: DatumCorner,
+}
+
+impl Default for StockDraft {
+  fn default() -> Self {
+    // A blank project's placeholder block: a 100×100×1.6 mm sheet at the native origin, bottom-left/top —
+    // the PCB-shaped defaults; the first loaded board auto-fits over them.
+    StockDraft {
+      min_x: 0.0,
+      min_y: 0.0,
+      size_x: 100.0,
+      size_y: 100.0,
+      thickness: 1.6,
+      z_ref: ZReference::Top,
+      datum: DatumCorner::BottomLeft,
+    }
+  }
+}
+
+impl StockDraft {
+  /// The draft as the engine's [`Stock`], with degenerate hand-typed sizes floored to keep a zero-extent block
+  /// from ever reaching the session.
+  pub fn to_stock(&self) -> Stock {
+    Stock {
+      min_x: self.min_x,
+      min_y: self.min_y,
+      size_x: self.size_x.max(0.1),
+      size_y: self.size_y.max(0.1),
+      thickness: self.thickness.max(0.01),
+      z_ref: self.z_ref,
+      datum: self.datum,
+    }
+  }
+
+  /// A draft mirroring a committed [`Stock`] (after a fit, a project load, or an intent round trip).
+  pub fn from_stock(stock: Stock) -> Self {
+    StockDraft {
+      min_x: stock.min_x,
+      min_y: stock.min_y,
+      size_x: stock.size_x,
+      size_y: stock.size_y,
+      thickness: stock.thickness,
+      z_ref: stock.z_ref,
+      datum: stock.datum,
     }
   }
 }
@@ -263,6 +330,19 @@ pub struct UiState {
   /// A snapshot of the tool library as `(id, name)` pairs, rebuilt by the shell whenever the library changes —
   /// what the parameter panels' seed-from-tool combos read (the dialog itself reads the live database).
   pub tool_list: Vec<(ToolId, String)>,
+  /// The resolved work-zero `[x, y, z]` in native millimetres, snapshotted from the session by the shell —
+  /// all zeros is the native frame. The canvas draws the origin crosshair at its XY and the Setup panel shows
+  /// the full readout.
+  pub work_origin: [f64; 3],
+  /// The committed stock, snapshotted from the session by the shell — `None` is the native frame. The canvas
+  /// draws the material block from its footprint; the Setup panel's grid highlight and readout key off it.
+  pub stock: Option<Stock>,
+  /// The Setup panel's editable stock numbers (see [`StockDraft`]); every edit re-commits via
+  /// [`Intent::SetStock`].
+  pub stock_draft: StockDraft,
+  /// The Setup panel's fit-to-board reference pick, when the operator chose one (`None` = the first
+  /// geometry-bearing row).
+  pub fit_reference: Option<ObjectId>,
   /// The world position under the canvas pointer, for the status-bar readout.
   pub cursor_world: Option<[f64; 2]>,
   /// The in-progress inline tree rename: the object being renamed and the name draft.
@@ -441,8 +521,22 @@ pub fn tree_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink
   let palette = state.style.palette;
   section_header(ui, palette, &tr!("tree-title"));
   egui::Frame::new().inner_margin(egui::Margin { left: 8, right: 8, top: 6, bottom: 6 }).show(ui, |ui| {
+    ui.spacing_mut().item_spacing.y = 2.0;
+    // The pinned Setup node: always first, always present — the project-wide stock/work-zero setup. Selection
+    // is a read-only view concern, so it stays clickable even while an op runs (the panel gates its edits).
+    let setup_selected = view.selected == Some(Selection::Setup);
+    if setup_row(ui, palette, setup_selected) {
+      sink.push(Intent::Select(if setup_selected { None } else { Some(Selection::Setup) }));
+    }
+    ui.add_space(2.0);
+    ui.painter().hline(
+      ui.available_rect_before_wrap().x_range(),
+      ui.cursor().top(),
+      Stroke::new(1.0, palette.divider),
+    );
+    ui.add_space(3.0);
     if view.tree.is_empty() {
-      ui.add_space(6.0);
+      ui.add_space(4.0);
       ui.label(RichText::new(tr!("tree-empty")).size(11.5).color(palette.text_dim));
       ui.label(RichText::new(tr!("tree-empty-hint")).size(10.5).color(palette.text_disabled));
       return;
@@ -455,9 +549,11 @@ pub fn tree_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink
           rename_row(ui, state, row.id, sink);
           continue;
         }
-        let selected = view.selected == Some(row.id);
+        let selected = view.selected == Some(Selection::Object(row.id));
         match tree_row(ui, palette, row, selected, busy) {
-          RowAction::Select => sink.push(Intent::Select(if selected { None } else { Some(row.id) })),
+          RowAction::Select => {
+            sink.push(Intent::Select(if selected { None } else { Some(Selection::Object(row.id)) }));
+          }
           RowAction::ToggleVisibility => sink.push(Intent::SetVisible(row.id, !row.visible)),
           RowAction::BeginRename => state.renaming = Some((row.id, row.name.clone())),
           RowAction::None => {}
@@ -465,6 +561,50 @@ pub fn tree_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink
       }
     });
   });
+}
+
+/// The pinned Setup row: hand-painted like [`tree_row`] (same fills, accent bar, glyph + name) but with no eye
+/// zone — the node is synthetic and cannot be hidden or renamed. Returns whether it was clicked this frame.
+fn setup_row(ui: &mut egui::Ui, palette: Palette, selected: bool) -> bool {
+  let (rect, response) = ui.allocate_exact_size(
+    egui::vec2(ui.available_width(), Metrics::PANEL_CONTROL_H),
+    egui::Sense::click(),
+  );
+  let label = tr!("tree-setup");
+  response.widget_info(|| {
+    egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), selected, label.clone())
+  });
+  if ui.is_rect_visible(rect) {
+    let fill = if selected {
+      palette.widget_active
+    } else if response.hovered() {
+      palette.widget_hover
+    } else {
+      Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, Metrics::CONTROL_RADIUS as f32, fill);
+    if selected {
+      let bar = egui::Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 2.0, rect.max.y));
+      ui.painter().rect_filled(bar, 0.0, palette.accent);
+    }
+    // The glyph shares the work-zero violet: the Setup node, the canvas crosshair, and the stock block are one
+    // semantic family.
+    ui.painter().text(
+      egui::pos2(rect.left() + 10.0, rect.center().y),
+      egui::Align2::LEFT_CENTER,
+      "▦",
+      egui::FontId::proportional(11.0),
+      palette.origin,
+    );
+    ui.painter().text(
+      egui::pos2(rect.left() + 28.0, rect.center().y),
+      egui::Align2::LEFT_CENTER,
+      label,
+      egui::FontId::proportional(12.5),
+      if selected { palette.text } else { palette.text_dim },
+    );
+  }
+  response.clicked()
 }
 
 /// The inline-rename editor rendered in place of a tree row: Enter commits (the shell validates against the
@@ -609,6 +749,10 @@ pub fn params_panel(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, si
     // Dense panel rows: trim egui's default 14×6 button padding or the direction toggle and the accent action
     // buttons overflow the fixed 286px column (the recorded skirnir lesson about dense rows in exact panels).
     ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
+    if view.selected == Some(Selection::Setup) {
+      setup_section(ui, palette, view, state, sink);
+      return;
+    }
     let Some(row) = view.selected_row().cloned() else {
       ui.add_space(4.0);
       ui.label(RichText::new(tr!("params-empty")).size(11.5).color(palette.text_dim));
@@ -987,12 +1131,220 @@ fn film_section(ui: &mut egui::Ui, palette: Palette, state: &mut UiState, busy: 
   }
 }
 
+/// The height of the datum corner-grid glyph strip.
+const DATUM_GRID_H: f32 = 104.0;
+/// The board-glyph width inside the strip (the height follows from the strip minus the dot headroom).
+const DATUM_BOARD_W: f32 = 150.0;
+/// Radius of a corner dot's painted ring.
+const DATUM_DOT_R: f32 = 5.5;
+/// Side of a corner dot's square hit zone (comfortably larger than the ring).
+const DATUM_HIT: f32 = 22.0;
+
+/// Every pickable datum position with its i18n label key, in reading order.
+const DATUM_POSITIONS: [(DatumCorner, &str); 5] = [
+  (DatumCorner::TopLeft, "datum-corner-tl"),
+  (DatumCorner::TopRight, "datum-corner-tr"),
+  (DatumCorner::Center, "datum-corner-center"),
+  (DatumCorner::BottomLeft, "datum-corner-bl"),
+  (DatumCorner::BottomRight, "datum-corner-br"),
+];
+
+/// Where a corner's dot sits on the board glyph, as `(x, y)` fractions of the glyph rect in SCREEN space
+/// (Y down). Corners are named in WORLD space (Y up), so "bottom" anchors at fraction 1 — the glyph's lower
+/// edge — matching the canvas orientation the operator sees.
+fn datum_anchor_fraction(corner: DatumCorner) -> (f32, f32) {
+  match corner {
+    DatumCorner::BottomLeft => (0.0, 1.0),
+    DatumCorner::BottomRight => (1.0, 1.0),
+    DatumCorner::TopLeft => (0.0, 0.0),
+    DatumCorner::TopRight => (1.0, 0.0),
+    DatumCorner::Center => (0.5, 0.5),
+  }
+}
+
+/// The Vectric-style datum picker: a board glyph with five clickable dots (four corners + centre). Returns the
+/// corner clicked this frame, if any. Each dot is a separately-labelled AccessKit control; while `busy` the
+/// dots render disabled and clicks are swallowed (the session is away on a worker).
+fn datum_grid(ui: &mut egui::Ui, palette: Palette, active: Option<DatumCorner>, busy: bool) -> Option<DatumCorner> {
+  let (strip, _) =
+    ui.allocate_exact_size(egui::vec2(ui.available_width(), DATUM_GRID_H), egui::Sense::hover());
+  let board = egui::Rect::from_center_size(
+    strip.center(),
+    egui::vec2(DATUM_BOARD_W.min(strip.width() - DATUM_HIT), DATUM_GRID_H - DATUM_HIT),
+  );
+  // The board glyph: a quiet inset slab standing in for the reference object's bounds.
+  ui.painter().rect_filled(board, 2.0, palette.inset);
+  ui.painter().rect_stroke(board, 2.0, Stroke::new(1.0, palette.border_raised), egui::StrokeKind::Inside);
+
+  let mut picked = None;
+  for (corner, key) in DATUM_POSITIONS {
+    let (fx, fy) = datum_anchor_fraction(corner);
+    let center = egui::pos2(board.left() + fx * board.width(), board.top() + fy * board.height());
+    let hit = egui::Rect::from_center_size(center, egui::Vec2::splat(DATUM_HIT));
+    let response = ui.interact(hit, ui.id().with(("datum-corner", key)), egui::Sense::click());
+    let label = tr!(key);
+    let selected = active == Some(corner);
+    response.widget_info(|| {
+      egui::WidgetInfo::selected(egui::WidgetType::Button, !busy, selected, label.clone())
+    });
+    let ring = if busy {
+      palette.text_disabled
+    } else if selected {
+      palette.accent
+    } else if response.hovered() {
+      palette.text
+    } else {
+      palette.text_dim
+    };
+    ui.painter().circle_stroke(center, DATUM_DOT_R, Stroke::new(1.4, ring));
+    if selected {
+      // The applied pick is a filled accent dot — shape + fill, so the state is not colour-alone on hover.
+      ui.painter().circle_filled(center, DATUM_DOT_R - 2.0, palette.accent);
+    }
+    if response.clicked() && !busy {
+      picked = Some(corner);
+    }
+    response.on_hover_text(label);
+  }
+  picked
+}
+
+/// The Setup panel — the Vectric-style "Job Setup" for the whole project: the stock (material block) size and
+/// thickness, the fit-to-board affordance, the datum corner grid, the Z-zero face, the resolved work-zero
+/// readout, and the native reset. Every edit re-commits the drafted [`Stock`] immediately (cheap session
+/// setters — no Run button); the readout, the canvas block, and the crosshair confirm the result.
+fn setup_section(ui: &mut egui::Ui, palette: Palette, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
+  // The identity block, mirroring an object selection's: glyph + name in the setup family's violet.
+  ui.horizontal(|ui| {
+    ui.label(RichText::new("▦").size(12.0).color(palette.origin));
+    ui.label(RichText::new(tr!("tree-setup")).size(13.0).strong().color(palette.text));
+  });
+  ui.label(RichText::new(tr!("setup-kind")).size(10.5).color(palette.text_disabled));
+  ui.add_space(6.0);
+
+  let busy = view.busy();
+  if busy {
+    ui.label(RichText::new(tr!("params-busy")).size(11.0).color(palette.state_warn));
+    ui.add_space(4.0);
+  }
+
+  egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    ui.label(RichText::new(tr!("setup-hint")).size(10.5).color(palette.text_dim));
+    ui.add_space(8.0);
+
+    // ── Stock size ─────────────────────────────────────────────────────────────────────────────────────
+    ui.label(section_title(palette, &tr!("params-stock")));
+    ui.add_space(4.0);
+    let mut edited = false;
+    ui.add_enabled_ui(!busy, |ui| {
+      egui::Grid::new("stock-params").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        for (label, value) in [
+          (tr!("params-stock-x"), &mut state.stock_draft.size_x),
+          (tr!("params-stock-y"), &mut state.stock_draft.size_y),
+          (tr!("params-stock-thickness"), &mut state.stock_draft.thickness),
+        ] {
+          ui.label(RichText::new(label).size(11.5).color(palette.text_dim));
+          edited |= ui.add(egui::DragValue::new(value).speed(0.1).range(0.01..=10000.0).max_decimals(3)).changed();
+          ui.end_row();
+        }
+      });
+    });
+
+    // Fit-to-board: size the footprint to a geometry-bearing object's bounds (Gerber copper, geometry). Hidden
+    // when nothing on the tree could bound a stock.
+    let candidates: Vec<&super::view_state::TreeRow> = view
+      .tree
+      .iter()
+      .filter(|row| matches!(row.kind, ObjectKind::Gerber | ObjectKind::Geometry))
+      .collect();
+    if !candidates.is_empty() {
+      let reference = state
+        .fit_reference
+        .filter(|picked| candidates.iter().any(|row| row.id == *picked))
+        .unwrap_or(candidates[0].id);
+      ui.add_space(4.0);
+      ui.horizontal(|ui| {
+        if ui.add_enabled(!busy, egui::Button::new(tr!("btn-fit-stock"))).on_hover_text(tr!("tip-fit-stock")).clicked()
+        {
+          sink.push(Intent::FitStock { reference, thickness: state.stock_draft.thickness.max(0.01) });
+        }
+        let current = candidates.iter().find(|row| row.id == reference).map(|row| row.name.clone());
+        egui::ComboBox::from_id_salt("fit-reference")
+          .width(130.0)
+          .selected_text(current.unwrap_or_default())
+          .show_ui(ui, |ui| {
+            for row in &candidates {
+              ui.selectable_value(&mut state.fit_reference, Some(row.id), row.name.clone());
+            }
+          });
+      });
+    }
+
+    // ── Datum (which stock corner is work X0 Y0) ───────────────────────────────────────────────────────
+    ui.add_space(10.0);
+    ui.label(section_title(palette, &tr!("params-datum")));
+    ui.add_space(2.0);
+    // The grid highlight shows the COMMITTED stock's corner; in the native frame nothing is lit, and the first
+    // pick both sets the corner and commits the drafted stock.
+    if let Some(corner) = datum_grid(ui, palette, state.stock.map(|stock| stock.datum), busy) {
+      state.stock_draft.datum = corner;
+      edited = true;
+    }
+
+    // ── Z zero (which stock face is work Z0) ───────────────────────────────────────────────────────────
+    ui.add_enabled_ui(!busy, |ui| {
+      egui::Grid::new("z-zero").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+        let z_label = match state.stock_draft.z_ref {
+          ZReference::Top => tr!("z-zero-top"),
+          ZReference::Bottom => tr!("z-zero-bottom"),
+        };
+        ui.label(RichText::new(tr!("params-z-zero")).size(11.5).color(palette.text_dim));
+        egui::ComboBox::from_id_salt("z-zero-face").width(130.0).selected_text(z_label).show_ui(ui, |ui| {
+          edited |= ui.selectable_value(&mut state.stock_draft.z_ref, ZReference::Top, tr!("z-zero-top")).changed();
+          edited |=
+            ui.selectable_value(&mut state.stock_draft.z_ref, ZReference::Bottom, tr!("z-zero-bottom")).changed();
+        });
+        ui.end_row();
+      });
+    });
+    if edited && !busy {
+      sink.push(Intent::SetStock(state.stock_draft.to_stock()));
+    }
+
+    // ── The resolved work zero: the truth about the frame every job posts in. Caption + value on separate
+    // lines — a KiCad-frame board's coordinates run long, and one combined line would clip in the column. ─
+    ui.add_space(8.0);
+    // "Native" is decided by the resolved work origin, not by stock presence: a bare point datum (set via the
+    // scripting API, or restored from such a project) has no stock yet a non-zero origin, and the panel must report
+    // that real offset and let the operator clear it — not claim the frame is unshifted.
+    let native = state.work_origin == [0.0, 0.0, 0.0];
+    if native {
+      ui.label(RichText::new(tr!("work-zero-native")).monospace().size(10.5).color(palette.text_disabled));
+    } else {
+      ui.label(RichText::new(tr!("work-zero-label")).size(10.5).color(palette.text_dim));
+      let [x, y, z] = state.work_origin;
+      ui.label(RichText::new(format!("X {x:.3}  Y {y:.3}  Z {z:.3}")).monospace().size(10.5).color(palette.text));
+    }
+    ui.add_space(6.0);
+    // Enabled whenever there is anything to revert — a committed stock OR a bare non-zero datum — so a stock whose
+    // datum happens to land on the origin is still clearable, and a point datum can be dropped.
+    let has_setup = state.stock.is_some() || !native;
+    if ui
+      .add_enabled(!busy && has_setup, egui::Button::new(tr!("btn-stock-native")))
+      .on_hover_text(tr!("tip-stock-native"))
+      .clicked()
+    {
+      sink.push(Intent::ClearStock);
+    }
+  });
+}
+
 /// The drilling parameter block + Run.
 fn drill_section(ui: &mut egui::Ui, palette: Palette, state: &mut UiState, busy: bool, id: ObjectId, sink: &mut IntentSink) {
   ui.label(section_title(palette, &tr!("params-drill")));
   ui.add_space(4.0);
   egui::Grid::new("drill-params").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-    param_row(ui, palette, &tr!("params-drill-depth"), &mut state.drill.depth, 0.05, -20.0..=-0.01);
+    param_row(ui, palette, &tr!("params-drill-depth"), &mut state.drill.depth, 0.05, 0.01..=20.0);
     param_row(ui, palette, &tr!("params-drill-feed"), &mut state.drill.feed, 1.0, 1.0..=2000.0);
     param_row(ui, palette, &tr!("params-drill-retract"), &mut state.drill.retract, 0.1, 0.1..=20.0);
     param_row(ui, palette, &tr!("params-travel-z"), &mut state.drill.travel_z, 0.1, 0.1..=50.0);
@@ -1264,13 +1616,13 @@ mod tests {
   }
 
   #[test]
-  fn drill_drafts_force_the_depth_below_the_surface() {
+  fn drill_drafts_keep_the_depth_a_positive_magnitude() {
+    // A positive magnitude passes straight through; the emitter negates it to a negative Z to drill down.
     let draft = DrillDraft { depth: 1.6, ..DrillDraft::default() };
-    let spec = draft.to_spec();
-    assert!(spec.depth < 0.0, "a hand-typed positive depth must not air-drill: {}", spec.depth);
-    assert!((spec.depth - (-1.6)).abs() < 1e-9, "the magnitude is preserved");
-    let already_negative = DrillDraft { depth: -2.0, ..DrillDraft::default() };
-    assert!((already_negative.to_spec().depth - (-2.0)).abs() < 1e-9);
+    assert!((draft.to_spec().depth - 1.6).abs() < 1e-9, "a positive depth is preserved");
+    // A mistakenly negative entry is folded positive so it never air-drills upward.
+    let folded = DrillDraft { depth: -2.0, ..DrillDraft::default() }.to_spec().depth;
+    assert!((folded - 2.0).abs() < 1e-9, "a negative entry is folded positive: {folded}");
   }
 
   #[test]
@@ -1279,5 +1631,50 @@ mod tests {
     assert_eq!(state.dock_tab, DockTab::Log);
     assert!(!state.app_settings_open && !state.pending_fit);
     assert!(state.gcode_preview.is_empty() && state.selected_info.is_none());
+    assert_eq!(state.work_origin, [0.0, 0.0, 0.0], "a fresh app is in the native frame");
+    assert_eq!(state.stock, None, "no stock is committed until the operator (or the auto-fit) sets one");
+    assert_eq!(state.fit_reference, None);
+  }
+
+  #[test]
+  fn stock_drafts_default_to_a_pcb_shaped_block_and_round_trip_through_stock() {
+    let draft = StockDraft::default();
+    assert_eq!((draft.size_x, draft.size_y), (100.0, 100.0));
+    assert!((draft.thickness - 1.6).abs() < 1e-9, "the default thickness is the standard 1.6 mm PCB");
+    assert_eq!(draft.z_ref, ZReference::Top);
+    assert_eq!(draft.datum, DatumCorner::BottomLeft);
+    // A committed stock mirrors back into an identical draft (the shell syncs after fits and project loads).
+    let stock = Stock {
+      min_x: 120.0,
+      min_y: -110.0,
+      size_x: 17.0,
+      size_y: 24.0,
+      thickness: 1.6,
+      z_ref: ZReference::Bottom,
+      datum: DatumCorner::Center,
+    };
+    let round = StockDraft::from_stock(stock).to_stock();
+    assert_eq!(round, stock, "a committed stock round-trips through the draft unchanged");
+  }
+
+  #[test]
+  fn degenerate_stock_drafts_are_floored_before_reaching_the_session() {
+    // A hand-typed zero (or a mid-edit negative) must never commit a zero-extent block or a paper-thin stock.
+    let draft = StockDraft { size_x: 0.0, size_y: -5.0, thickness: 0.0, ..StockDraft::default() };
+    let stock = draft.to_stock();
+    assert!(stock.size_x > 0.0 && stock.size_y > 0.0, "sizes are floored positive");
+    assert!(stock.thickness > 0.0, "thickness is floored positive");
+  }
+
+  #[test]
+  fn datum_grid_anchors_map_corners_to_the_right_screen_fractions() {
+    use eitri_project::DatumCorner;
+    // The glyph is painted in SCREEN space (Y down), but the corners are named in WORLD space (Y up): the
+    // world bottom-left must anchor at the glyph's left-BOTTOM, i.e. fraction (0, 1).
+    assert_eq!(datum_anchor_fraction(DatumCorner::BottomLeft), (0.0, 1.0));
+    assert_eq!(datum_anchor_fraction(DatumCorner::BottomRight), (1.0, 1.0));
+    assert_eq!(datum_anchor_fraction(DatumCorner::TopLeft), (0.0, 0.0));
+    assert_eq!(datum_anchor_fraction(DatumCorner::TopRight), (1.0, 0.0));
+    assert_eq!(datum_anchor_fraction(DatumCorner::Center), (0.5, 0.5));
   }
 }

@@ -152,7 +152,7 @@ impl Default for IsolationDefaults {
 /// Per-tool drilling defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DrillDefaults {
-  /// Default total drill depth (millimetres, negative into the stock).
+  /// Default total drill depth as a positive magnitude below the surface (millimetres); the emitter negates it to Z.
   pub depth: f64,
   /// Default plunge feed (mm/min).
   pub feed: f64,
@@ -166,7 +166,7 @@ pub struct DrillDefaults {
 
 impl Default for DrillDefaults {
   fn default() -> DrillDefaults {
-    DrillDefaults { depth: -1.6, feed: 100.0, retract: 2.0, peck: None, dwell: None }
+    DrillDefaults { depth: 1.6, feed: 100.0, retract: 2.0, peck: None, dwell: None }
   }
 }
 
@@ -195,7 +195,13 @@ pub fn load_tool_db(json: &str) -> Result<ToolDatabase> {
   if version != TOOL_DB_SCHEMA_VERSION {
     return Err(ProjectError::UnsupportedVersion { found: version, supported: TOOL_DB_SCHEMA_VERSION });
   }
-  let file: ToolDbFile =
+  let mut file: ToolDbFile =
     serde_json::from_value(value).map_err(|e| ProjectError::Deserialize(e.to_string()))?;
+  // Migrate databases saved under the old signed-Z convention: drill depth is now a positive magnitude, so fold any
+  // legacy negative into its magnitude. Without this an old `-1.8` would be clamped to `0.01` by the editor's
+  // positive-only range (silently destroying the depth) — and air-drill until then.
+  for tool in &mut file.database.tools {
+    tool.drilling.depth = tool.drilling.depth.abs();
+  }
   Ok(file.database)
 }

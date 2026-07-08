@@ -8,17 +8,17 @@ Bench procedure to root-cause why the TMC2209 drivers never answer over UART (`$
 
 The problem is **NOT** in these — all verified:
 
-| Verified good                   | How                                                                            |
-|---------------------------------|--------------------------------------------------------------------------------|
-| MCU transmit + receive + levels | Firmware loopback `sent:8 got:8 match:8/8 err:none` at both 38400 and 115200   |
-| Request datagram bytes          | `read IOIN node 0` = `05 00 06 6F`, byte-identical to `tmc2209-rs` / datasheet |
-| Firmware read path              | No reply-eating race; `fifo:0` genuinely means nothing arrived                 |
-| Baud                            | 115200 (matches the proven RAMPS setup) — still silent                         |
-| CLK                             | Grounded on all drivers                                                        |
-| MS1/MS2 straps                  | X=00, Y=01, Z=10 → nodes 0/1/2 (correct)                                       |
-| VS (motor supply)               | 12.6 V at each driver's VS pin                                                 |
-| VIO                             | 3.23 V                                                                         |
-| UART pin | **BOTH TX and RX tested, each with confirmed-valid logic levels → both silent.** RX now used (1 kΩ pull-up, 3.17 V idle). |
+| Verified good                   | How                                                                                                                       |
+|---------------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| MCU transmit + receive + levels | Firmware loopback `sent:8 got:8 match:8/8 err:none` at both 38400 and 115200                                              |
+| Request datagram bytes          | `read IOIN node 0` = `05 00 06 6F`, byte-identical to `tmc2209-rs` / datasheet                                            |
+| Firmware read path              | No reply-eating race; `fifo:0` genuinely means nothing arrived                                                            |
+| Baud                            | 115200 (matches the proven RAMPS setup) — still silent                                                                    |
+| CLK                             | Grounded on all drivers                                                                                                   |
+| MS1/MS2 straps                  | X=00, Y=01, Z=10 → nodes 0/1/2 (correct)                                                                                  |
+| VS (motor supply)               | 12.6 V at each driver's VS pin                                                                                            |
+| VIO                             | 3.23 V                                                                                                                    |
+| UART pin                        | **BOTH TX and RX tested, each with confirmed-valid logic levels → both silent.** RX now used (1 kΩ pull-up, 3.17 V idle). |
 
 Two known-good driver families (BTT TMC2209 V1.3 **and** an Adafruit 6121) are both silent on this setup, and
 the same BTT drivers previously worked over UART on a **RAMPS board — with USB power only (no 12 V), single wire
@@ -164,13 +164,13 @@ The DHO804 decodes UART on-screen — this turns the scope into a protocol analy
 
 ## 4. Interpretation summary
 
-| Observation                                                     | Conclusion                                      | Fix                                                                                     |
-|-----------------------------------------------------------------|-------------------------------------------------|-----------------------------------------------------------------------------------------|
-| Request **sync-byte edges soft/rounded** (B4)                   | ⭐ Driver can't auto-baud our open-drain edges  | **Half-duplex push-pull** (push-pull on TX, high-Z during reply window), like RAMPS; or a much stronger pull-up |
-| Request clean edges (B), reply window **flat-high** (C/D)       | Chip gets a good request but won't answer       | Try a truly fresh driver; recheck EN/CLK at the chip pins; revisit core power (Test A)  |
-| Reply frame **present** on CH2 but firmware `fifo:0`            | We're mis-capturing a real reply                | Fix RX capture / reply-low level at GPIO9                                               |
-| Request decodes `05 00 06 6F`, no reply bytes (D)               | Confirms silent driver (not a TX problem)       | → edge quality / chip state                                                             |
-| **5VOUT ≈ 0 V** (Test A, only if measured)                     | Core unpowered                                  | VS continuity to chip pin; add 5VOUT cap                                                |
+| Observation                                               | Conclusion                                    | Fix                                                                                                             |
+|-----------------------------------------------------------|-----------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| Request **sync-byte edges soft/rounded** (B4)             | ⭐ Driver can't auto-baud our open-drain edges | **Half-duplex push-pull** (push-pull on TX, high-Z during reply window), like RAMPS; or a much stronger pull-up |
+| Request clean edges (B), reply window **flat-high** (C/D) | Chip gets a good request but won't answer     | Try a truly fresh driver; recheck EN/CLK at the chip pins; revisit core power (Test A)                          |
+| Reply frame **present** on CH2 but firmware `fifo:0`      | We're mis-capturing a real reply              | Fix RX capture / reply-low level at GPIO9                                                                       |
+| Request decodes `05 00 06 6F`, no reply bytes (D)         | Confirms silent driver (not a TX problem)     | → edge quality / chip state                                                                                     |
+| **5VOUT ≈ 0 V** (Test A, only if measured)                | Core unpowered                                | VS continuity to chip pin; add 5VOUT cap                                                                        |
 
 ## 5. Quick reference — expected values
 

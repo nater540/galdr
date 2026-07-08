@@ -31,7 +31,7 @@ pub mod program;
 
 pub use arc::{ArcDir, ArcOffset, bulge_to_arc};
 pub use conformance::{Reason, Violation, check_grbl_conformance, is_grbl_conformant};
-pub use emit::{CutRing, DrillJob, IsolationJob, Segment, depth_steps, emit_drilling, emit_isolation};
+pub use emit::{CutRing, DrillJob, IsolationJob, Origin, Segment, depth_steps, emit_drilling, emit_isolation};
 pub use format::{CommentStyle, LineEnding, OutputFormat};
 pub use lex::{Line, Word, lex, lex_line};
 pub use post::{ArcMove, Axes, JobContext, Postprocessor, Registry, Spindle, ToolChange};

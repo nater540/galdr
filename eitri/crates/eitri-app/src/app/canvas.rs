@@ -11,10 +11,11 @@ use eframe::egui::{self, Color32, Pos2, Rect, Stroke, vec2};
 use super::intent::{Intent, IntentSink};
 use super::scene::{Bounds, RenderScene};
 use super::theme::Palette;
+use super::view_state::Selection;
 use super::views::UiState;
 use crate::config::CanvasStyle;
 use crate::tr;
-use eitri_project::{ObjectId, ObjectKind};
+use eitri_project::{ObjectId, ObjectKind, Stock};
 
 /// The zoom bounds (px per mm): far enough out for a metre of travel, close enough in for a 0.1 mm trace.
 const ZOOM_RANGE: std::ops::RangeInclusive<f32> = 0.05..=5000.0;
@@ -123,7 +124,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
     let tol_mm = (PICK_TOLERANCE_PX / state.canvas.px_per_mm.max(f32::EPSILON)) as f64;
     let hit = hit_object(scene, world, tol_mm);
     if hit != selected {
-      sink.push(Intent::Select(hit));
+      sink.push(Intent::Select(hit.map(Selection::Object)));
     }
   }
   if let Some(pos) = response.hover_pos() {
@@ -135,7 +136,9 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
   }
 
   grid(&painter, rect, &state.canvas, palette, style);
-  origin_cross(&painter, rect, &state.canvas, palette);
+  stock_block(&painter, rect, &state.canvas, palette, state.stock);
+  let work_xy = [state.work_origin[0], state.work_origin[1]];
+  origin_cross(&painter, rect, &state.canvas, palette, work_xy, state.stock.is_some());
 
   for object in &scene.objects {
     // A hidden object contributes nothing to the paint pass (nor to picking, below).
@@ -309,15 +312,47 @@ fn grid(painter: &egui::Painter, rect: Rect, view: &CanvasView, palette: Palette
   }
 }
 
-/// The origin crosshair: a small violet cross at world (0, 0), the anchor every import lands relative to.
-fn origin_cross(painter: &egui::Painter, rect: Rect, view: &CanvasView, palette: Palette) {
-  let origin = view.to_screen([0.0, 0.0], rect);
-  if !rect.expand(12.0).contains(origin) {
+/// The stock (material block) outline: the Setup node's footprint as a dashed violet rectangle over a faint
+/// tint — visibly a machining setup overlay, distinct from every object treatment (solid copper rims, green
+/// geometry strokes, yellow trails). Shares the work-zero violet with the crosshair and the Setup row: one
+/// semantic family.
+fn stock_block(painter: &egui::Painter, rect: Rect, view: &CanvasView, palette: Palette, stock: Option<Stock>) {
+  let Some(stock) = stock else { return };
+  let (x0, y0, x1, y1) = stock.footprint();
+  let a = view.to_screen([x0, y1], rect); // top-left on screen (y1 is the top in world space).
+  let b = view.to_screen([x1, y0], rect);
+  let block = Rect::from_two_pos(a, b);
+  if !block.intersects(rect.expand(4.0)) {
     return;
   }
-  let stroke = Stroke::new(1.2, palette.origin);
-  painter.line_segment([origin - vec2(8.0, 0.0), origin + vec2(8.0, 0.0)], stroke);
-  painter.line_segment([origin - vec2(0.0, 8.0), origin + vec2(0.0, 8.0)], stroke);
+  painter.rect_filled(block, 0.0, with_opacity(palette.origin, 0.05));
+  let stroke = Stroke::new(1.2, with_opacity(palette.origin, 0.85));
+  let corners = [block.left_top(), block.right_top(), block.right_bottom(), block.left_bottom(), block.left_top()];
+  for seg in corners.windows(2) {
+    painter.extend(egui::Shape::dashed_line(seg, stroke, 6.0, 4.0));
+  }
+}
+
+/// The work-zero crosshair: a violet cross at the resolved datum — world (0, 0) in the native frame, or
+/// wherever the stock's datum corner put it. This is the point exported G-code is posted relative to.
+/// A PLACED work zero (`placed`, i.e. a committed stock) gets a ringed, longer-armed marker that must read as
+/// "work zero is HERE" at a glance; the native cross stays the quiet ambient anchor.
+fn origin_cross(painter: &egui::Painter, rect: Rect, view: &CanvasView, palette: Palette, datum: [f64; 2],
+  placed: bool) {
+  let origin = view.to_screen(datum, rect);
+  if !rect.expand(14.0).contains(origin) {
+    return;
+  }
+  if !placed && datum == [0.0, 0.0] {
+    let stroke = Stroke::new(1.2, palette.origin);
+    painter.line_segment([origin - vec2(8.0, 0.0), origin + vec2(8.0, 0.0)], stroke);
+    painter.line_segment([origin - vec2(0.0, 8.0), origin + vec2(0.0, 8.0)], stroke);
+    return;
+  }
+  let stroke = Stroke::new(1.6, palette.origin);
+  painter.line_segment([origin - vec2(12.0, 0.0), origin + vec2(12.0, 0.0)], stroke);
+  painter.line_segment([origin - vec2(0.0, 12.0), origin + vec2(0.0, 12.0)], stroke);
+  painter.circle_stroke(origin, 5.0, stroke);
 }
 
 /// The empty state: a quiet centred invitation, not a blank void.

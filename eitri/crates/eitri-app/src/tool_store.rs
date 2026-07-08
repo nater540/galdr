@@ -47,15 +47,15 @@ pub fn load() -> (ToolDatabase, Option<String>) {
 }
 
 /// A single carbide spiral-flute PCB drill entry: the diameter plus a conservative plunge feed. The drill
-/// defaults clear a 1.6 mm board — depth `-1.8 mm` (into the spoilboard), retract `2.0 mm`, a single plunge.
-/// Isolation defaults stay generic (a drill is not an isolation cutter, but the entry carries both bundles).
+/// defaults clear a 1.6 mm board — depth `1.8 mm` (a positive magnitude, into the spoilboard), retract `2.0 mm`, a
+/// single plunge. Isolation defaults stay generic (a drill is not an isolation cutter, but the entry carries both).
 fn pcb_drill(diameter_mm: f64, plunge_feed: f64) -> ToolEntry {
   ToolEntry {
     id: ToolId(0),
     name: format!("{diameter_mm:.1} mm PCB drill"),
     diameter: Length::from_mm(diameter_mm),
     isolation: IsolationDefaults::default(),
-    drilling: DrillDefaults { depth: -1.8, feed: plunge_feed, retract: 2.0, peck: None, dwell: None },
+    drilling: DrillDefaults { depth: 1.8, feed: plunge_feed, retract: 2.0, peck: None, dwell: None },
   }
 }
 
@@ -123,7 +123,7 @@ mod tests {
     // Every entry carries sensible drilling defaults: through a 1.6 mm board with a positive plunge feed that
     // grows with diameter (the smallest bit plunges slowest).
     for tool in db.iter() {
-      assert!(tool.drilling.depth < -1.6, "{} must clear a 1.6 mm board", tool.name);
+      assert!(tool.drilling.depth > 1.6, "{} must clear a 1.6 mm board", tool.name);
       assert!(tool.drilling.feed > 0.0, "{} needs a plunge feed", tool.name);
     }
     let feeds: Vec<f64> = db.iter().map(|t| t.drilling.feed).collect();

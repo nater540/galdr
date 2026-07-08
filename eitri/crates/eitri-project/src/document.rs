@@ -32,6 +32,13 @@ struct ProjectFile {
   name: String,
   /// The object collection.
   collection: ObjectCollection,
+  /// The work-zero (datum) offset `(x, y, z)` the CAM output is posted relative to. `#[serde(default)]` so a project
+  /// written before the datum existed loads as the native frame without a schema bump.
+  #[serde(default)]
+  origin: (f64, f64, f64),
+  /// The job's stock/work-zero setup, or `None`. `#[serde(default)]` for the same forward-compat reason.
+  #[serde(default)]
+  stock: Option<crate::Stock>,
 }
 
 /// Serialize a project to pretty-printed JSON at the current schema version. The re-derivable parse caches on
@@ -42,6 +49,8 @@ pub fn save_project(project: &Project) -> Result<String> {
     schema_version: SCHEMA_VERSION,
     name: project.name.clone(),
     collection: project.collection.clone(),
+    origin: project.origin,
+    stock: project.stock,
   };
   serde_json::to_string_pretty(&file).map_err(|e| ProjectError::Serialize(e.to_string()))
 }
@@ -56,7 +65,14 @@ pub fn load_project(json: &str) -> Result<Project> {
   let upgraded = upgrade(version, value)?;
   let file: ProjectFile =
     serde_json::from_value(upgraded).map_err(|e| ProjectError::Deserialize(e.to_string()))?;
-  Ok(Project { name: file.name, collection: file.collection })
+  // The stock is the source of truth when present: re-derive the work origin from it rather than trusting the
+  // separately-stored `origin`, so a hand-edited or stale JSON can never post G-code at an origin that disagrees
+  // with the stock the Setup panel shows. A stock-less project keeps its stored origin (a bare point datum).
+  let origin = match &file.stock {
+    Some(stock) => stock.origin(),
+    None => file.origin,
+  };
+  Ok(Project { name: file.name, collection: file.collection, origin, stock: file.stock })
 }
 
 /// Read the `schema_version` field from a raw document, erroring if it is absent or not an integer.

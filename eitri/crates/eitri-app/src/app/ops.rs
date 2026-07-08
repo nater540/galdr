@@ -247,6 +247,10 @@ fn run_request(mut session: Session, request: OpRequest, outcome_tx: Sender<OpOu
 
 /// The shell's session holder: exactly one of "the session is home" or "a request is in flight". Methods keep
 /// the invariant; the illegal state (both, neither) is unrepresentable.
+// `Home(Session)` is the common, near-permanent state (the app is home whenever an op is not running), so boxing
+// the session just to size-match the rare `Away` variant would add an allocation and a pointer-chase to the hot
+// path for no real benefit — the slot is a single owned value, never a large array of these.
+#[allow(clippy::large_enum_variant)]
 pub enum SessionSlot {
   /// The session is on the UI thread, available for immediate commands (select, delete, undo, export).
   Home(Session),
@@ -545,7 +549,7 @@ mod tests {
       OpRequest::Isolate { source: ObjectId(0), spec: iso_spec(), job: IsolationJob::default() }.label_key(),
       OpRequest::Drill {
         source: ObjectId(0),
-        spec: DrillSpec { depth: -1.0, feed: 100.0, retract: 2.0, peck: None, dwell: None },
+        spec: DrillSpec { depth: 1.0, feed: 100.0, retract: 2.0, peck: None, dwell: None },
         job: DrillJob::default(),
       }
       .label_key(),

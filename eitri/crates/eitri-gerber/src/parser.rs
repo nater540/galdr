@@ -401,8 +401,16 @@ impl<'a> Interpreter<'a> {
   /// Build the region's filled polygons (even-odd nesting) and add them as primitives.
   fn emit_region(&mut self) -> Result<()> {
     let contours = std::mem::take(&mut self.region_contours);
+    // A region contour can be self-touching — a KiCad pour carves each isolated-pad clearance with a zero-width
+    // bridge (the boundary runs out to the clearance and back along the same line). Fed raw into the shared
+    // same-polarity `union_all` in `finish`, that non-simple boundary interacts with the other primitives' edges
+    // and the whole pour is dropped. Normalising each region polygon on its own first resolves the bridges into a
+    // proper simply-connected fill, so only well-formed geometry enters the batch union.
     for poly in assemble_region(contours) {
-      self.primitives.push((self.polarity, poly));
+      let cleaned = self.backend.union_all(std::slice::from_ref(&poly))?;
+      for normalized in cleaned.0 {
+        self.primitives.push((self.polarity, normalized));
+      }
     }
     Ok(())
   }

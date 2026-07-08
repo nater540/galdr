@@ -18,8 +18,8 @@ use eframe::egui;
 use super::scene;
 use super::theme::Palette;
 use super::ui_test::{DEFAULT_SIZE, HarnessState, build_shell_harness, render_in};
-use super::view_state::{LogKind, OpView, TreeRow, ViewState};
-use super::views::{DockTab, SelectedInfo, UiState};
+use super::view_state::{LogKind, OpView, Selection, TreeRow, ViewState};
+use super::views::{DockTab, SelectedInfo, StockDraft, UiState};
 use eitri_gcode::IsolationJob;
 use eitri_project::{DirectionSpec, IsolationSpec, ObjectKind};
 use eitri_script::Session;
@@ -93,7 +93,8 @@ fn snapshot_shell_gerber_selected_params() {
   // The Gerber selected: the isolation parameter grid + accent Run button in the right column, the selection
   // rim on the canvas.
   let (mut state, _) = loaded_board();
-  state.view.selected = state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| r.id);
+  state.view.selected =
+    state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| Selection::Object(r.id));
   state.ui.selected_info = Some(SelectedInfo::default());
   snapshot_shell("shell_gerber_selected", DEFAULT_SIZE, state, crate::i18n::EN_US);
 }
@@ -103,7 +104,7 @@ fn snapshot_shell_gerber_selected_params() {
 fn snapshot_shell_job_selected_gcode_tab() {
   // The job selected with the G-code dock tab active: the export panel and the numbered G-code preview.
   let (mut state, job) = loaded_board();
-  state.view.selected = Some(job);
+  state.view.selected = Some(Selection::Object(job));
   state.ui.dock_tab = DockTab::Gcode;
   state.ui.selected_info = Some(SelectedInfo {
     gcode_lines: 42,
@@ -127,11 +128,48 @@ fn snapshot_shell_job_selected_gcode_tab() {
 
 #[test]
 #[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p eitri-app -- --ignored snapshot`"]
+fn snapshot_shell_setup_panel() {
+  // The Setup node selected with a stock fitted to the copper: the stock size grid, the fit affordance, the
+  // corner grid with bottom-left applied, the Z-zero pick, the 3-D work-zero readout — and the canvas showing
+  // the dashed stock block plus the placed crosshair at the footprint's min corner.
+  let (mut state, _) = loaded_board();
+  let gerber = state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| r.id);
+  let bounds = gerber.and_then(|id| state.scene.object(id)).and_then(|o| o.bounds).expect("copper has bounds");
+  state.view.selected = Some(Selection::Setup);
+  let stock = eitri_project::Stock::fit(bounds, 1.6);
+  state.ui.stock = Some(stock);
+  state.ui.stock_draft = StockDraft::from_stock(stock);
+  let (x, y, z) = stock.origin();
+  state.ui.work_origin = [x, y, z];
+  snapshot_shell("shell_setup_panel", DEFAULT_SIZE, state, crate::i18n::EN_US);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p eitri-app -- --ignored snapshot`"]
+fn snapshot_shell_setup_sv_min() {
+  // The Setup panel in Swedish at the minimum window: the longer labels ("Uppställning", "Anpassa till kort",
+  // "Ämnets undersida", "Ursprungsram (inget ämne)") are where the fixed column clips — the locale guard for
+  // the new panel, mirroring `tool_db_sv_2x`'s role for the tool dialog.
+  let (mut state, _) = loaded_board();
+  let gerber = state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| r.id);
+  let bounds = gerber.and_then(|id| state.scene.object(id)).and_then(|o| o.bounds).expect("copper has bounds");
+  state.view.selected = Some(Selection::Setup);
+  let stock = eitri_project::Stock::fit(bounds, 1.6);
+  state.ui.stock = Some(stock);
+  state.ui.stock_draft = StockDraft::from_stock(stock);
+  let (x, y, z) = stock.origin();
+  state.ui.work_origin = [x, y, z];
+  snapshot_shell("shell_setup_sv_min", MIN_SIZE, state, crate::i18n::SV_SE);
+}
+
+#[test]
+#[ignore = "needs a GPU (wgpu offscreen render) — run with `cargo test -p eitri-app -- --ignored snapshot`"]
 fn snapshot_shell_op_running() {
   // Mid-operation: the dock's progress cluster (label + determinate bar + Cancel), the busy status dot, the
   // locked parameter panel with its explanation, and the disabled toolbar/run controls.
   let (mut state, _) = loaded_board();
-  state.view.selected = state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| r.id);
+  state.view.selected =
+    state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| Selection::Object(r.id));
   state.view.op = OpView::Running { label: "Isolation routing".to_string(), done: 3, total: 8 };
   snapshot_shell("shell_op_running", DEFAULT_SIZE, state, crate::i18n::EN_US);
 }
@@ -151,7 +189,8 @@ fn snapshot_shell_op_failed_log() {
 fn snapshot_shell_narrow() {
   // The minimum supported window: everything must still fit or degrade gracefully.
   let (mut state, _) = loaded_board();
-  state.view.selected = state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| r.id);
+  state.view.selected =
+    state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| Selection::Object(r.id));
   snapshot_shell("shell_narrow", MIN_SIZE, state, crate::i18n::EN_US);
 }
 
@@ -185,7 +224,8 @@ fn snapshot_shell_sv_min() {
   // Swedish at the minimum window: the longer labels ("Isolationsfräsning", "Öppna Excellon…") stress the
   // fixed columns and the toolbar, so a translation that overflows shows up as a pixel diff.
   let (mut state, _) = loaded_board();
-  state.view.selected = state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| r.id);
+  state.view.selected =
+    state.view.tree.iter().find(|r| r.kind == ObjectKind::Gerber).map(|r| Selection::Object(r.id));
   snapshot_shell("shell_sv_min", MIN_SIZE, state, crate::i18n::SV_SE);
 }
 

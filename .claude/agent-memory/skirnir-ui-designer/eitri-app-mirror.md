@@ -34,7 +34,18 @@ workspace, built with `--manifest-path eitri/Cargo.toml`).
   (Swedish overflows).
 - No rustfmt in the eitri workspace (editorconfig 2-space only); gates are `RUSTFLAGS="-D warnings" cargo test`
   + `cargo clippy --all-targets`.
-- Remaining breadth (not built): paint/non-copper/cutout/panelize/two-sided/film panels, tool DB UI, rename,
-  visibility toggles, canvas click-select.
+- Setup node (2026-07-08): `Selection { Setup, Object(ObjectId) }` in view_state; `ViewState.selected:
+  Option<Selection>` (Setup survives set_tree; `selected_object()` adapts old callers). Pinned synthetic tree
+  row + right-panel Setup section (StockDraft in UiState → `Intent::SetStock/ClearStock/FitStock` →
+  `Session::set_stock/fit_stock_to`). Routine SetStock commits are deliberately UNLOGGED — DragValue fires
+  changed() per drag frame and would flood the log; only fit/clear/auto-fit log. First geometry-bearing object
+  auto-fits the stock in `pump` (never overrides an existing/cleared-with-geometry setup). Stock block +
+  crosshair reuse `palette.origin` (no new config palette field — ThemeOverride churn avoided). scene.rs strips
+  the importer's synthetic (0,0) start rapid from job previews (checked pre-datum-offset).
+- Known wart (pre-existing, 2026-07-08): at MIN_SIZE in sv-SE the toolbar's left group ("Anpassa vy") collides
+  with the right cluster ("Verktyg" + gear) — arrived with the tool-DB toolbar button; visible in shell_sv_min
+  and shell_setup_sv_min baselines. Needs a real toolbar overflow fix, not a label tweak.
+- Remaining breadth (not built): rename-in-params, tool DB polish; canvas click-select and visibility toggles
+  are DONE.
 
 Related: [[snapshot-harness]], [[egui-034-layout-gotchas]], [[egui-disabled-styling]]

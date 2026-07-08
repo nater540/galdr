@@ -40,3 +40,8 @@ mod ui_test;
 /// baselines. See its module docs for how to run/regenerate.
 #[cfg(test)]
 mod snapshot_test;
+
+/// The `#[ignore]`d tutorial-screenshot generator: renders the real `starter-*` board fixtures through the CAM
+/// workflow and writes tutorial PNGs to the parent repo's `docs/images/mill-a-pcb/`. Never diffs baselines.
+#[cfg(test)]
+mod tutorial_shots;

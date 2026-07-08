@@ -73,6 +73,7 @@ fn sample_project() -> Project {
         dialect: "grblHAL".to_string(),
         source: Some(gerber),
         operation: isolation_op(),
+        origin: (0.0, 0.0),
       }),
     )
     .expect("add cncjob");
@@ -250,7 +251,7 @@ fn cncjob_from_program_captures_rendered_lines() {
   let mut program = Program::new(OutputFormat::default());
   program.push("G21");
   program.push("G0 X1 Y1");
-  let job = CncJobObject::from_program(&program, "grblHAL", None, isolation_op());
+  let job = CncJobObject::from_program(&program, "grblHAL", None, isolation_op(), (0.0, 0.0));
   assert_eq!(&*job.gcode, &["G21".to_string(), "G0 X1 Y1".to_string()]);
   assert_eq!(job.render(), "G21\nG0 X1 Y1\n");
 }
@@ -390,11 +391,46 @@ fn tool_db_rejects_unsupported_version() {
 
 #[test]
 fn drill_spec_maps_peck_and_dwell() {
-  let spec = DrillSpec { depth: -2.0, feed: 120.0, retract: 3.0, peck: Some(0.5), dwell: Some(0.2) };
+  let spec = DrillSpec { depth: 2.0, feed: 120.0, retract: 3.0, peck: Some(0.5), dwell: Some(0.2) };
   let params = spec.to_params();
   assert_eq!(params.peck, Some(0.5));
   assert_eq!(params.dwell, Some(0.2));
-  assert_eq!(params.depth, -2.0);
+  assert_eq!(params.depth, 2.0);
+  // Depth is a positive magnitude: a stray negative (legacy or hand-built spec) is folded so it never air-drills.
+  let negative = DrillSpec { depth: -2.0, feed: 120.0, retract: 3.0, peck: None, dwell: None };
+  assert_eq!(negative.to_params().depth, 2.0, "to_params normalizes a negative depth to its magnitude");
+}
+
+#[test]
+fn loading_a_tool_db_folds_a_legacy_negative_drill_depth_positive() {
+  // Simulate a database written under the old signed-Z convention (drill depth stored negative).
+  let mut db = ToolDatabase::new();
+  db.add(ToolEntry {
+    id: eitri_project::ToolId(0),
+    name: "legacy".to_string(),
+    diameter: eitri_core::Length::from_mm(0.8),
+    isolation: IsolationDefaults::default(),
+    drilling: DrillDefaults { depth: -1.8, feed: 100.0, retract: 2.0, peck: None, dwell: None },
+  });
+  let json = save_tool_db(&db).unwrap();
+  let loaded = load_tool_db(&json).unwrap();
+  let depth = loaded.iter().next().expect("one tool").drilling.depth;
+  assert_eq!(depth, 1.8, "a legacy signed-Z depth is migrated to a positive magnitude on load");
+}
+
+#[test]
+fn a_stock_reconciles_a_stale_stored_origin_on_load() {
+  // The stock is authoritative: a project whose stored `origin` disagrees with `stock.origin()` (a hand-edit, or a
+  // future writer that updates the stock without re-resolving) must load with the origin re-derived from the stock,
+  // so the emitted G-code can never post at a frame the Setup panel doesn't show.
+  let stock = eitri_project::Stock::fit((10.0, 20.0, 30.0, 50.0), 1.6);
+  let mut project = Project::new("stock");
+  project.stock = Some(stock);
+  project.origin = (999.0, 999.0, 999.0); // deliberately stale
+  let json = save_project(&project).unwrap();
+  let loaded = load_project(&json).unwrap();
+  assert_eq!(loaded.origin, stock.origin(), "load re-derives the origin from the stock");
+  assert_eq!(loaded.origin, (10.0, 20.0, 0.0));
 }
 
 fn empty_geo() -> GeometryObject {
@@ -486,6 +522,7 @@ fn every_op_project() -> Project {
           dialect: "grblHAL".to_string(),
           source: None,
           operation: op,
+          origin: (0.0, 0.0),
         }),
       )
       .expect("add cncjob");

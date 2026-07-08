@@ -1,0 +1,1 @@
+- [eitri-app render harness](eitri-app-render-harness.md) — kittest render()-to-PNG pattern, fit-includes-origin-rapid wart, fmt not applicable in eitri, missing op-label ftl keys
