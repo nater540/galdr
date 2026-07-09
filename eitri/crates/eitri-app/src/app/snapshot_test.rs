@@ -18,7 +18,7 @@ use eframe::egui;
 use super::scene;
 use super::theme::Palette;
 use super::ui_test::{DEFAULT_SIZE, HarnessState, build_shell_harness, render_in};
-use super::view_state::{LogKind, OpView, Selection, TreeRow, ViewState};
+use super::view_state::{LogKind, OpView, Selection, ViewState};
 use super::views::{DockTab, SelectedInfo, StockDraft, UiState};
 use eitri_gcode::IsolationJob;
 use eitri_project::{DirectionSpec, IsolationSpec, ObjectKind};
@@ -47,24 +47,10 @@ fn loaded_board() -> (HarnessState, eitri_project::ObjectId) {
   session.move_group(gerber, 4.0, 2.0, true).expect("nudge the board on the stock");
 
   let mut view = ViewState::default();
-  let (mut rows, mut toolpaths): (Vec<TreeRow>, Vec<TreeRow>) = (Vec::new(), Vec::new());
-  for id in session.object_ids() {
-    let object = session.object(id).expect("listed ids resolve");
-    let kind = object.kind();
-    let stale = matches!(&object.payload, eitri_project::ObjectPayload::CncJob(job) if job.stale);
-    let row = TreeRow { id, name: object.meta.name.clone(), kind, visible: object.meta.visible, stale };
-    if kind == eitri_project::ObjectKind::CncJob {
-      toolpaths.push(row);
-    } else {
-      rows.push(row);
-    }
-  }
+  // Route through the live shell's partition so this fixture cannot drift from the real PROJECT/TOOLPATHS split.
+  let (rows, toolpaths, groups) = super::shell::partition_from_session(&session);
   view.set_tree(rows, toolpaths, session.can_undo(), session.can_redo());
-  view.groups = session
-    .groups()
-    .into_iter()
-    .map(|(name, members)| super::view_state::GroupView { name, members })
-    .collect();
+  view.groups = groups;
   view.log_line(LogKind::Info, "opened fixture-top (FIXTURE data)");
   view.log_line(LogKind::Ok, "Isolation routing finished");
 

@@ -33,11 +33,11 @@ use eitri_core::{Affine, CancelToken, ProgressReporter, Unit};
 use eitri_gcode::{DrillJob, IsolationJob, Origin, Postprocessor, Program, Registry, emit_drilling, emit_isolation};
 use eitri_geo::DefaultBackend;
 use eitri_project::{
-  CamOperation, CncJobObject, DrillSpec, ExcellonObject, GeometryObject, GeometryOrigin, GerberObject, History,
-  JobEmission,
+  CamOperation, CncJobObject, DEFAULT_HISTORY_LIMIT, DrillSpec, ExcellonObject, GeometryObject, GeometryOrigin,
+  GerberObject, History, JobEmission,
   ImportFormat, IsolationSpec, JobOrigin, MirrorLineSpec, NonCopperSpec, Object, ObjectCollection, ObjectId,
   ObjectKind, ObjectMeta, ObjectPayload, PaintSpec, PanelizeSpec, Project, Stock, ToolDatabase, ToolEntry, ToolId,
-  load_project, save_project,
+  WorkSetup, load_project, save_project,
 };
 use eitri_project::{CutoutSpec, load_tool_db, save_tool_db};
 use eitri_excellon::{DrillHit, ExcellonImage, parse_excellon};
@@ -69,13 +69,6 @@ pub struct Session {
   progress: ProgressReporter,
   /// The cooperative cancellation flag long ops poll.
   cancel: CancelToken,
-  /// The work-zero (datum) offset `(x, y, z)`, in the board's native frame, every CAM op posts its G-code relative
-  /// to. The emitter subtracts it from all coordinates; `(0.0, 0.0, 0.0)` is the native (unshifted) frame. Normally
-  /// derived from [`Session::stock`]; persisted with the project.
-  origin: (f64, f64, f64),
-  /// The job's stock (material block) + work-zero setup, or `None` for the native frame. When set, it drives
-  /// [`Session::origin`].
-  stock: Option<Stock>,
 }
 
 impl Session {
@@ -91,8 +84,6 @@ impl Session {
       dialect: DEFAULT_DIALECT.to_string(),
       progress: ProgressReporter::silent(),
       cancel: CancelToken::new(),
-      origin: (0.0, 0.0, 0.0),
-      stock: None,
     }
   }
 
@@ -151,25 +142,47 @@ impl Session {
   /// The current work-zero (datum) offset `(x, y, z)`, in the board's native frame; `(0.0, 0.0, 0.0)` is the native
   /// (unshifted) frame. Every CAM op posts its G-code relative to this point.
   pub fn work_origin(&self) -> (f64, f64, f64) {
-    self.origin
+    self.setup().origin
   }
 
   /// The XY datum offset — a convenience over [`Session::work_origin`] for callers that only need the plane.
   pub fn datum(&self) -> (f64, f64) {
-    (self.origin.0, self.origin.1)
+    let (x, y, _) = self.setup().origin;
+    (x, y)
   }
 
   /// The current stock (material block) + work-zero setup, or `None` for the native frame.
   pub fn stock(&self) -> Option<Stock> {
-    self.stock
+    self.setup().stock
+  }
+
+  /// The undo-tracked work-setup (datum / stock).
+  fn setup(&self) -> &WorkSetup {
+    self.history.setup()
+  }
+
+  /// Commit a new work-setup as one undoable edit that also flags every rebuildable posted job stale (its G-code
+  /// baked the old datum in). A no-op — no undo entry, no staleness — when the setup is unchanged. When `coalesce` is
+  /// set the change folds into the current undo entry rather than pushing its own: the caller asserts it continues an
+  /// in-progress gesture (a stock-spinner drag re-commits every frame; the open-time auto-fit folds into the import).
+  /// Discrete setup actions pass `coalesce = false` so they stay independently undoable (see
+  /// [`eitri_project::History::commit_setup`]).
+  fn commit_setup(&mut self, setup: WorkSetup, coalesce: bool) {
+    if *self.setup() == setup {
+      return;
+    }
+    self.history.commit_setup(coalesce, |collection, current| {
+      *current = setup;
+      flag_all_jobs_stale(collection);
+    });
   }
 
   /// Set (or clear) the job's stock, deriving the work-zero from it. `None` reverts to the native frame. This is the
   /// primary datum control: the UI edits a [`Stock`] and commits it here, and every subsequent CAM op posts relative
-  /// to the stock's datum corner and Z reference.
-  pub fn set_stock(&mut self, stock: Option<Stock>) {
-    self.origin = stock.map(|s| s.origin()).unwrap_or((0.0, 0.0, 0.0));
-    self.stock = stock;
+  /// to the stock's datum corner and Z reference. One undoable edit; `coalesce` folds a live stock-spinner drag's
+  /// per-frame re-commits into a single entry (see [`Session::commit_setup`]).
+  pub fn set_stock(&mut self, stock: Option<Stock>, coalesce: bool) {
+    self.commit_setup(WorkSetup::from_stock(stock), coalesce);
   }
 
   /// The axis-aligned XY bounds `(min_x, min_y, max_x, max_y)` of an object's geometry — what the UI auto-fits a
@@ -182,22 +195,23 @@ impl Session {
 
   /// Auto-fit the stock to `reference`'s bounds (footprint = the board's bounding box) with the given material
   /// `thickness`, a bottom-left datum, and a top Z reference — the one-call setup a freshly-loaded board seeds.
-  pub fn fit_stock_to(&mut self, reference: ObjectId, thickness: f64) -> Result<()> {
+  /// `coalesce` folds this into the current undo entry: the open-time auto-fit passes `true` so opening a board is a
+  /// single undo step (the import), while the manual "Fit Stock" button passes `false` for its own entry.
+  pub fn fit_stock_to(&mut self, reference: ObjectId, thickness: f64, coalesce: bool) -> Result<()> {
     let bounds = self.object_bounds(reference)?;
-    self.set_stock(Some(Stock::fit(bounds, thickness)));
+    self.set_stock(Some(Stock::fit(bounds, thickness)), coalesce);
     Ok(())
   }
 
   /// Post CAM output relative to an explicit native-frame point (Z0 at the surface), clearing any stock — the
-  /// "set origin here" primitive.
+  /// "set origin here" primitive. One undoable edit.
   pub fn set_datum_point(&mut self, x: f64, y: f64) {
-    self.stock = None;
-    self.origin = (x, y, 0.0);
+    self.commit_setup(WorkSetup::point(x, y), false);
   }
 
-  /// Revert to the native (source / EDA plot) coordinate frame, clearing any stock.
+  /// Revert to the native (source / EDA plot) coordinate frame, clearing any stock. One undoable edit.
   pub fn clear_datum(&mut self) {
-    self.set_stock(None);
+    self.set_stock(None, false);
   }
 
   /// Resolve `origin` against the bounds of `reference` and set an XY datum from it (no stock). Kept for scripting;
@@ -342,19 +356,21 @@ impl Session {
   /// coalesces into one undoable move.
   pub fn move_group(&mut self, anchor: ObjectId, dx: f64, dy: f64, new_edit: bool) -> Result<()> {
     self.object(anchor)?; // Validate before mutating.
-    let members = match self.collection().group_of(anchor) {
-      Some(group) => group.members.clone(),
-      None => vec![anchor],
-    };
+    let members = self.move_set(anchor);
     let shift = Affine::translate(dx, dy);
+    // One pass over the collection per drag frame: compose the shift onto each member and flag every dependent job
+    // stale in the same walk. (Routing each member through `set_object_placement` would re-scan the whole collection
+    // once per member — N passes per frame on a multi-layer grouped drag; docs review #9.) This still flags staleness
+    // on every placement path, which is the invariant #2 established — `set_placement`/`translate_object` keep using
+    // the `set_object_placement` choke point.
     let mutate = move |c: &mut ObjectCollection| {
       for object in c.iter_mut() {
         if members.contains(&object.meta.id) {
           object.meta.placement = object.meta.placement.then(shift);
         }
-        // Any job posted from a moved source no longer matches it — flag it for rebuild.
         if let ObjectPayload::CncJob(job) = &mut object.payload
           && job.source.is_some_and(|src| members.contains(&src))
+          && is_rebuildable(job)
         {
           job.stale = true;
         }
@@ -366,6 +382,16 @@ impl Session {
       self.history.amend(mutate);
     }
     Ok(())
+  }
+
+  /// The ids that move together with `anchor`: the members of its group, or just `anchor` if it is ungrouped. The
+  /// set [`Session::move_group`] repositions, exposed so the UI's drag fast-path can shift exactly the same objects
+  /// in its cached scene without rebuilding it (docs follow-up #1).
+  pub fn move_set(&self, anchor: ObjectId) -> Vec<ObjectId> {
+    match self.collection().group_of(anchor) {
+      Some(group) => group.members.clone(),
+      None => vec![anchor],
+    }
   }
 
   /// Whether there is an edit to undo.
@@ -526,7 +552,8 @@ impl Session {
     };
     let program = self.rebuild_program(&operation, &emission, source)?;
     let dialect = self.dialect.clone();
-    let origin = (self.origin.0, self.origin.1);
+    let (ox, oy, _) = self.setup().origin;
+    let origin = (ox, oy);
     let cnc = CncJobObject::from_program(&program, dialect, source, operation, origin, Some(emission));
     self.history.edit(|c| {
       if let Some(object) = c.get_mut(id) {
@@ -570,8 +597,8 @@ impl Session {
     let plan = eitri_cam::plan_drilling(&image, &config, &TwoOpt::new(), &self.progress, &self.cancel)?;
     // A drilling job runs several bits; summarize their sizes in the header (each also gets a per-tool-change note).
     let tool = (!plan.tools.is_empty()).then(|| {
-      let sizes: Vec<String> = plan.tools.iter().map(|t| format!("{:.3}", t.diameter)).collect();
-      format!("drill tools: {} mm", sizes.join(", "))
+      let diameters: Vec<f64> = plan.tools.iter().map(|t| t.diameter).collect();
+      drill_tools_note(&diameters)
     });
     let post = self.post()?;
     Ok(emit_drilling(&plan, job, self.emit_origin(), post, tool))
@@ -659,12 +686,19 @@ impl Session {
   /// Unlike [`Session::transform`], which bakes an affine into a NEW geometry object, this moves the object in place;
   /// every CAM op reads the placed geometry, so a move repositions the object's toolpaths on the next rebuild.
   pub fn set_placement(&mut self, id: ObjectId, placement: Affine) -> Result<()> {
-    self.object(id)?; // Validate the id before taking an undo snapshot, so a bad id never leaves a wasted one.
-    self.history.edit(|c| {
-      if let Some(object) = c.get_mut(id) {
-        object.meta.placement = placement;
-      }
-    });
+    let current = self.object(id)?.meta.placement; // Validate the id before taking an undo snapshot; also the no-op check.
+    // A placement must be a rigid motion (translate + rotate). A scale/shear would move a filled region and a set of
+    // drill centers by different amounts — `place_region` transforms the whole polygon, `place_hits` only the hit
+    // centers — so the emitted CAM program and the canvas preview would silently disagree (docs follow-up #4).
+    if !placement.is_rigid() {
+      return Err(ScriptError::InvalidArgument("a placement must be a rigid transform (translate/rotate only)".into()));
+    }
+    // A placement that does not actually change anything (a net-zero drag, `translate_object(id, 0, 0)`) must not push
+    // an undo entry or flag dependent jobs stale — the rebuilt G-code would be byte-identical (docs review #5).
+    if current == placement {
+      return Ok(());
+    }
+    self.history.edit(|c| set_object_placement(c, id, placement));
     Ok(())
   }
 
@@ -677,9 +711,11 @@ impl Session {
 
   /// Render a copper/geometry `source` as a positive or negative photo-film SVG (see [`eitri_cam::film_svg`]).
   /// Film is vector *output*, not a toolpath, so nothing is committed to the collection — the caller writes the
-  /// returned document wherever it wants.
+  /// returned document wherever it wants. Uses the NATIVE region: film is 1:1 artwork, so the board's placement on the
+  /// CNC stock must not offset it (and two-sided top/bottom films must share the native origin to register) —
+  /// docs review #2.
   pub fn film_svg(&self, source: ObjectId, params: &FilmParams) -> Result<String> {
-    let region = self.region_of(source)?;
+    let region = self.source_region(source)?;
     eitri_cam::film_svg(&region, params, &self.backend).map_err(Into::into)
   }
 
@@ -704,11 +740,12 @@ impl Session {
 
   /// Serialize the current project to versioned JSON.
   pub fn save_project(&self) -> Result<String> {
+    let setup = self.setup();
     let project = Project {
       name: self.name.clone(),
       collection: self.collection().clone(),
-      origin: self.origin,
-      stock: self.stock,
+      origin: setup.origin,
+      stock: setup.stock,
     };
     save_project(&project).map_err(Into::into)
   }
@@ -728,17 +765,16 @@ impl Session {
     let progress = ProgressReporter::silent();
     let cancel = CancelToken::new();
     project.hydrate(&progress, &cancel)?;
+    let setup = WorkSetup { origin: project.origin, stock: project.stock };
     Ok(Session {
       name: project.name,
-      history: History::new(project.collection),
+      history: History::with_document(project.collection, setup, DEFAULT_HISTORY_LIMIT),
       tools: ToolDatabase::new(),
       registry: Registry::with_builtins(),
       backend: DefaultBackend::new(),
       dialect: DEFAULT_DIALECT.to_string(),
       progress,
       cancel,
-      origin: project.origin,
-      stock: project.stock,
     })
   }
 
@@ -801,7 +837,8 @@ impl Session {
 
   /// The datum as the emitter's [`Origin`] type, subtracted from every emitted coordinate.
   fn emit_origin(&self) -> Origin {
-    Origin::with_z(self.origin.0, self.origin.1, self.origin.2)
+    let (x, y, z) = self.setup().origin;
+    Origin::with_z(x, y, z)
   }
 
   /// Borrow a tool by id.
@@ -809,21 +846,28 @@ impl Session {
     self.tools.get(id).ok_or_else(|| ScriptError::InvalidArgument(format!("no tool with id {id}")))
   }
 
-  /// The copper/geometry region of a source object, as a `MultiPolygon`, **placed** by the object's
-  /// [`ObjectMeta::placement`] so a moved board's toolpaths land where the operator arranged it on the stock. Gerber
-  /// yields its copper (re-parsing on the rare chance the cache is empty); Geometry yields its polygons; anything else
-  /// is a [`ScriptError::WrongKind`].
-  fn region_of(&self, id: ObjectId) -> Result<MultiPolygon<f64>> {
+  /// The copper/geometry region of a source object in its **native** frame — the artwork as authored, ignoring where
+  /// the board was arranged on the stock. Gerber yields its copper (re-parsing on the rare chance the cache is empty);
+  /// Geometry yields its polygons; anything else is a [`ScriptError::WrongKind`]. This is what placement-independent
+  /// outputs (photo film) must use; CAM toolpaths use [`Session::region_of`], which places it.
+  fn source_region(&self, id: ObjectId) -> Result<MultiPolygon<f64>> {
     let object = self.object(id)?;
-    let region = match &object.payload {
+    match &object.payload {
       ObjectPayload::Gerber(gerber) => match &gerber.image {
-        Some(image) => image.copper.clone(),
-        None => parse_gerber(&gerber.source, &self.progress, &self.cancel).map_err(eitri_core::Error::from)?.copper,
+        Some(image) => Ok(image.copper.clone()),
+        None => Ok(parse_gerber(&gerber.source, &self.progress, &self.cancel).map_err(eitri_core::Error::from)?.copper),
       },
-      ObjectPayload::Geometry(geometry) => MultiPolygon::new(geometry.polygons.clone()),
-      other => return Err(self.wrong_kind(id, "a Gerber or Geometry object", other)),
-    };
-    Ok(place_region(region, object.meta.placement))
+      ObjectPayload::Geometry(geometry) => Ok(MultiPolygon::new(geometry.polygons.clone())),
+      other => Err(self.wrong_kind(id, "a Gerber or Geometry object", other)),
+    }
+  }
+
+  /// The copper/geometry region of a source object, **placed** by the object's [`ObjectMeta::placement`] so a moved
+  /// board's toolpaths land where the operator arranged it on the stock — the CAM path. Placement-independent
+  /// consumers (film export) must use [`Session::source_region`] instead so a stock move never leaks into the artwork.
+  fn region_of(&self, id: ObjectId) -> Result<MultiPolygon<f64>> {
+    let placement = self.object(id)?.meta.placement;
+    Ok(place_region(self.source_region(id)?, placement))
   }
 
   /// The parsed drill image of an Excellon source, cloned (re-parsing if the cache is empty) and **placed** by the
@@ -854,7 +898,8 @@ impl Session {
     emission: Option<JobEmission>,
   ) -> Result<ObjectId> {
     let dialect = self.dialect.clone();
-    let origin = (self.origin.0, self.origin.1);
+    let (ox, oy, _) = self.setup().origin;
+    let origin = (ox, oy);
     let cnc = CncJobObject::from_program(&program, dialect, source, operation, origin, emission);
     let name = self.unique_name(base_name);
     self.add(name, ObjectPayload::CncJob(cnc))
@@ -943,6 +988,68 @@ fn read_named(path: impl AsRef<Path>) -> Result<(String, String)> {
 /// can see what cutter a program expects at a glance.
 fn tool_note(diameter: f64) -> String {
   format!("tool diameter {diameter:.3} mm")
+}
+
+/// The most bytes a header note may occupy, leaving ample room within the grblHAL 256-byte line limit for the comment
+/// delimiters and any prefix once it is emitted as a `(...)` line (the wire contract; see [`drill_tools_note`]).
+const HEADER_NOTE_MAX: usize = 200;
+
+/// A drilling-header note listing the bit sizes. A few tools are listed in full; a board with many distinct sizes
+/// would overrun the grblHAL line limit as one comment, so it falls back to a count + range summary that a strict
+/// grblHAL 1.1f receiver will still accept (docs review #4).
+fn drill_tools_note(diameters: &[f64]) -> String {
+  let sizes: Vec<String> = diameters.iter().map(|d| format!("{d:.3}")).collect();
+  let full = format!("drill tools: {} mm", sizes.join(", "));
+  if full.len() <= HEADER_NOTE_MAX {
+    return full;
+  }
+  let min = diameters.iter().copied().fold(f64::INFINITY, f64::min);
+  let max = diameters.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+  format!("drill tools: {} sizes, {min:.3}-{max:.3} mm", diameters.len())
+}
+
+/// Set an object's [`ObjectMeta::placement`] and flag every CNC job derived from it stale — the single
+/// placement-write choke point. Routing both [`Session::set_placement`] and [`Session::move_group`] through here
+/// means "source moved → dependent jobs need a rebuild" cannot be forgotten by a new call site. A missing id is a
+/// silent no-op (callers validate the id before taking the undo snapshot).
+fn set_object_placement(collection: &mut ObjectCollection, id: ObjectId, placement: Affine) {
+  if let Some(object) = collection.get_mut(id) {
+    object.meta.placement = placement;
+  }
+  flag_dependent_jobs_stale(collection, id);
+}
+
+/// Whether a CNC job can be rebuilt in place — only jobs that stored their emission parameters can. A legacy job
+/// (loaded from a project written before the `emission` field existed) cannot, so flagging it stale would light a ⟳
+/// rebuild badge that [`Session::rebuild_job`] then refuses, leaving it permanently and un-actionably "out of date"
+/// (docs review #4). Such jobs are left un-flagged: the operator must re-post them by hand regardless.
+fn is_rebuildable(job: &CncJobObject) -> bool {
+  job.emission.is_some()
+}
+
+/// Flag every rebuildable CNC job whose source is `moved` stale, so its posted G-code (which baked in the source's
+/// old position) no longer silently passes for current — the UI shows the ⟳ rebuild badge.
+fn flag_dependent_jobs_stale(collection: &mut ObjectCollection, moved: ObjectId) {
+  for object in collection.iter_mut() {
+    if let ObjectPayload::CncJob(job) = &mut object.payload
+      && job.source == Some(moved)
+      && is_rebuildable(job)
+    {
+      job.stale = true;
+    }
+  }
+}
+
+/// Flag *every* rebuildable posted CNC job stale — used when a project-level input every job derives from changes (the
+/// datum / stock), since each job's G-code already subtracted the old work-zero (docs follow-up #3).
+fn flag_all_jobs_stale(collection: &mut ObjectCollection) {
+  for object in collection.iter_mut() {
+    if let ObjectPayload::CncJob(job) = &mut object.payload
+      && is_rebuildable(job)
+    {
+      job.stale = true;
+    }
+  }
 }
 
 /// Apply an object's placement to its copper/geometry region. The identity placement (an unmoved object) is returned
@@ -1232,6 +1339,32 @@ mod tests {
   }
 
   #[test]
+  fn film_svg_ignores_the_board_placement_on_the_stock() {
+    // Film is 1:1 artwork: arranging the board on the CNC stock must not offset the exported film, so top/bottom
+    // films still share the native origin and register when overlaid (docs review #2).
+    let (mut s, g) = session_with_gerber();
+    let native = s.film_svg(g, &FilmParams::default()).expect("native film renders");
+    s.translate_object(g, 25.0, 40.0).unwrap(); // arrange the board far across the stock
+    let after_move = s.film_svg(g, &FilmParams::default()).expect("film still renders after the move");
+    assert_eq!(native, after_move, "the film is byte-identical regardless of where the board sits on the stock");
+  }
+
+  #[test]
+  fn drill_tools_note_lists_a_few_tools_but_caps_many_within_the_line_limit() {
+    // A handful of tools list in full.
+    let few = drill_tools_note(&[0.8, 1.0, 1.2]);
+    assert_eq!(few, "drill tools: 0.800, 1.000, 1.200 mm");
+    assert!(few.len() <= HEADER_NOTE_MAX);
+    // Many distinct sizes would overrun the grblHAL 256-byte line as one comment, so it summarizes instead of
+    // emitting an unbounded list that a strict receiver rejects with error:15 (docs review #4).
+    let many: Vec<f64> = (0..60).map(|i| 0.5 + i as f64 * 0.05).collect();
+    let note = drill_tools_note(&many);
+    assert!(note.len() <= HEADER_NOTE_MAX, "the note stays within the header budget: {} bytes", note.len());
+    assert!(note.contains("60 sizes"), "it summarizes the count when it cannot list them all: {note}");
+    assert!(note.contains("0.500") && note.contains("3.450"), "and the size range: {note}");
+  }
+
+  #[test]
   fn groups_track_membership() {
     let (mut s, g) = session_with_gerber();
     s.create_group("copper").unwrap();
@@ -1372,7 +1505,7 @@ mod tests {
     let native_job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
     let native = first_xy(&s.write_gcode(native_job).unwrap());
 
-    s.fit_stock_to(g, 1.6).unwrap();
+    s.fit_stock_to(g, 1.6, false).unwrap();
     let stock = s.stock().expect("stock is set");
     assert_eq!(stock.thickness, 1.6);
     assert_eq!(stock.datum, DatumCorner::BottomLeft);
@@ -1391,10 +1524,10 @@ mod tests {
   fn a_bottom_z_reference_lifts_the_emitted_z_by_the_thickness() {
     use eitri_project::ZReference;
     let (mut s, g) = session_with_gerber();
-    s.fit_stock_to(g, 1.6).unwrap();
+    s.fit_stock_to(g, 1.6, false).unwrap();
     let mut stock = s.stock().unwrap();
     stock.z_ref = ZReference::Bottom;
-    s.set_stock(Some(stock));
+    s.set_stock(Some(stock), false);
     assert_eq!(s.work_origin().2, -1.6, "work Z0 sits one thickness below the surface");
     let job = s.isolate(g, iso_spec(), IsolationJob { cut_depth: 0.1, pass_depth: 0.1, ..IsolationJob::default() }).unwrap();
     let gcode = s.write_gcode(job).unwrap();
@@ -1405,7 +1538,7 @@ mod tests {
   fn stock_persists_through_save_and_load() {
     use eitri_project::DatumCorner;
     let (mut s, g) = session_with_gerber();
-    s.fit_stock_to(g, 1.6).unwrap();
+    s.fit_stock_to(g, 1.6, false).unwrap();
     let json = s.save_project().unwrap();
     let reloaded = Session::load_project_str(&json).unwrap();
     let stock = reloaded.stock().expect("stock round-trips");
@@ -1440,6 +1573,61 @@ mod tests {
     assert!(s.set_datum(JobOrigin::Bounds(DatumCorner::Center), d).is_err(), "drills have no region to bound");
   }
 
+  #[test]
+  fn changing_the_datum_flags_posted_jobs_stale_and_undoes_together() {
+    // #3: the datum is a project-level input every job baked in, so moving it must stale every posted job — and the
+    // whole thing is ONE undoable edit that reverts the datum and the staleness in lockstep.
+    let (mut s, g) = session_with_gerber();
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    assert!(!is_stale(&s, job), "a freshly posted job is up to date");
+
+    s.set_datum_point(5.0, 5.0);
+    assert!(is_stale(&s, job), "changing the work-zero stales every posted job");
+    assert_eq!(s.datum(), (5.0, 5.0), "the datum moved");
+
+    assert!(s.undo(), "the datum change is one undoable edit");
+    assert_eq!(s.datum(), (0.0, 0.0), "undo restores the native datum");
+    assert!(!is_stale(&s, job), "and clears the staleness it flagged — datum and stale revert together");
+  }
+
+  #[test]
+  fn committing_an_unchanged_setup_is_a_no_op_that_pushes_no_undo_entry() {
+    let (mut s, g) = session_with_gerber();
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    assert!(!s.can_redo());
+    s.set_datum_point(0.0, 0.0); // identical to the native frame already in force
+    assert!(!is_stale(&s, job), "a no-op datum commit does not stale jobs");
+    assert!(s.undo(), "the only undoable edit is the isolate, not a phantom datum change");
+    // Undoing the isolate removes the job entirely; a phantom datum entry would have been undone first instead.
+    assert!(s.object(job).is_err(), "one undo stepped back to before the job, proving no datum entry sat on top");
+  }
+
+  #[test]
+  fn a_coalesced_stock_drag_is_one_undo_entry() {
+    // A stock spinner re-commits every frame of a drag: the first frame starts a fresh entry (coalesce=false) and the
+    // rest fold in (coalesce=true), so the whole drag is a single undo step (docs review #1).
+    let (mut s, g) = session_with_gerber();
+    s.fit_stock_to(g, 1.0, false).unwrap(); // drag start
+    for thickness in 2..=5 {
+      s.fit_stock_to(g, thickness as f64, true).unwrap(); // continuation frames fold in
+    }
+    assert_eq!(s.stock().map(|st| st.thickness), Some(5.0), "the last drag value is in force");
+    assert!(s.undo(), "one undo reverts the entire coalesced drag");
+    assert!(s.stock().is_none(), "a single undo returns to no stock, not one thickness step back");
+  }
+
+  #[test]
+  fn discrete_setup_changes_are_independent_undo_entries() {
+    // The over-coalescing fix (docs review #1): distinct deliberate setup actions (coalesce=false) must NOT merge,
+    // even back-to-back with no object edit between, so one undo reverts exactly one action.
+    let (mut s, _g) = session_with_gerber();
+    s.set_datum_point(3.0, 3.0);
+    s.set_datum_point(7.0, 7.0); // a separate discrete action right after — its own entry, not a coalesce
+    assert_eq!(s.datum(), (7.0, 7.0));
+    assert!(s.undo(), "undo the second datum change");
+    assert_eq!(s.datum(), (3.0, 3.0), "reverts only the later change, not both");
+  }
+
   // --- Placement (move on the stock) --------------------------------------------------------------------------------
 
   #[test]
@@ -1453,6 +1641,51 @@ mod tests {
     assert_eq!(s.object(id).unwrap().meta.placement, Affine::translate(4.0, -2.0), "moves accumulate");
     assert!(s.undo(), "the move is one undoable edit");
     assert_eq!(s.object(id).unwrap().meta.placement, Affine::translate(3.0, -2.0), "undo steps back one move");
+  }
+
+  #[test]
+  fn translate_object_flags_dependent_jobs_stale() {
+    // The sibling of `move_group`: repositioning a source through `translate_object` must also stale the jobs posted
+    // from it, so no placement-write path leaves a job silently out of date (docs follow-up #2).
+    let (mut s, g) = session_with_gerber();
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    assert!(!is_stale(&s, job), "a freshly posted job is up to date");
+    s.translate_object(g, 4.0, -1.0).unwrap();
+    assert!(is_stale(&s, job), "translating the source stales its dependent job");
+  }
+
+  #[test]
+  fn set_placement_flags_dependent_jobs_stale() {
+    let (mut s, g) = session_with_gerber();
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    s.set_placement(g, Affine::translate(7.0, 2.0)).unwrap();
+    assert!(is_stale(&s, job), "an explicit set_placement stales the dependent job too");
+  }
+
+  #[test]
+  fn a_no_op_placement_pushes_no_undo_entry_and_flags_nothing_stale() {
+    // A net-zero move (translate_object(id, 0, 0), or set_placement to the current value) must not push an undo entry
+    // or falsely flag toolpaths stale — the rebuilt G-code would be byte-identical (docs review #5).
+    let (mut s, g) = session_with_gerber();
+    let job = s.isolate(g, iso_spec(), IsolationJob::default()).unwrap();
+    assert!(!s.can_redo());
+    s.translate_object(g, 0.0, 0.0).unwrap();
+    assert!(!is_stale(&s, job), "a zero translate does not stale the dependent job");
+    s.set_placement(g, Affine::IDENTITY).unwrap(); // still the current placement — another no-op
+    assert!(!is_stale(&s, job), "re-setting the current placement is a no-op too");
+    // The only undoable edit is the isolate; a phantom placement entry would be undone first.
+    assert!(s.undo(), "undo steps back to before the job");
+    assert!(s.object(job).is_err(), "one undo reached pre-job state, proving no no-op placement entry sat on top");
+  }
+
+  #[test]
+  fn set_placement_rejects_a_non_rigid_transform() {
+    // A scale/shear placement would move a region and its drill centers by different amounts, so CAM and preview
+    // would diverge — the placement seam only accepts rigid motions (docs follow-up #4).
+    let (mut s, g) = session_with_gerber();
+    let err = s.set_placement(g, Affine::scale(2.0, 2.0)).unwrap_err();
+    assert!(matches!(err, ScriptError::InvalidArgument(_)), "a scale is rejected, not applied: {err:?}");
+    assert_eq!(s.object(g).unwrap().meta.placement, Affine::IDENTITY, "the rejected placement never mutated the object");
   }
 
   #[test]

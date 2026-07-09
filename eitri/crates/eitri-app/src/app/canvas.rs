@@ -103,7 +103,7 @@ impl CanvasView {
 /// selection. Returns the world position under the pointer (for the status bar readout) when the pointer is
 /// over the canvas.
 pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiState, selected: Option<ObjectId>,
-  sink: &mut IntentSink) -> Option<[f64; 2]> {
+  busy: bool, sink: &mut IntentSink) -> Option<[f64; 2]> {
   let palette = state.style.palette;
   let style = state.style.canvas;
   // A queued fit request (the toolbar's Fit, or the auto-fit after a first open) is consumed here, where the
@@ -120,13 +120,16 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
   // Input first, so this frame already paints with the updated transform (no one-frame pan lag).
   let response = ui.interact(rect, ui.id().with("canvas"), egui::Sense::click_and_drag());
   response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, ui.is_enabled(), tr!("canvas-label")));
-  // A drag decides its mode ONCE, when it starts: grabbing an object drags that object's group across the stock;
-  // grabbing empty canvas pans. The choice is latched in `state.canvas_drag` so the whole gesture keeps one mode.
+  // A drag decides its mode ONCE, when it starts: grabbing a movable SOURCE object drags that object's group across
+  // the stock; grabbing empty canvas — or a toolpath, or anything while an op is running — pans instead. The choice
+  // is latched in `state.canvas_drag` so the whole gesture keeps one mode. Excluding jobs (their `meta.placement` is
+  // inert — the scene draws them from their own posted G-code) and gating on `!busy` (a move edits the session, which
+  // is unavailable off-thread) keep a drag from committing a no-op undo entry or coalescing into a finished op.
   if response.drag_started() {
     let anchor = response.interact_pointer_pos().and_then(|pos| {
       let world = state.canvas.to_world(pos, rect);
       let tol_mm = (PICK_TOLERANCE_PX / state.canvas.px_per_mm.max(f32::EPSILON)) as f64;
-      hit_object(scene, world, tol_mm)
+      drag_anchor(scene, world, tol_mm, busy)
     });
     state.canvas_drag = anchor.map(|anchor| CanvasDrag { anchor, committed: false });
     // Grabbing an object also selects it, so the parameter panel follows the move.
@@ -152,7 +155,13 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
     }
   }
   if response.drag_stopped() {
-    state.canvas_drag = None;
+    // If this gesture was an object drag that actually moved something, ask the shell for the one authoritative
+    // refresh now — the per-frame path only shifted the cached scene (the fast-path). A pure pan needs nothing.
+    if let Some(drag) = state.canvas_drag.take()
+      && drag.committed
+    {
+      sink.push(Intent::EndTranslate);
+    }
   }
   let hover_world = response.hover_pos().map(|pos| state.canvas.to_world(pos, rect));
   // Click-select: a real click (egui already excludes drags) picks the topmost object under the pointer, or
@@ -248,6 +257,18 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, scene: &RenderScene, state: &mut UiSt
 /// The screen-space picking tolerance for click-select (points): how far a click may land from a stroked
 /// polyline (an outline ring, an imported stroke, a cut trail) and still pick its object.
 pub const PICK_TOLERANCE_PX: f32 = 6.0;
+
+/// Which object a canvas drag should MOVE at `world`, or `None` to pan instead. A drag moves only a *movable source*
+/// object: nothing while an op is running (`busy` — a move edits the session, which is away off-thread), and never a
+/// CNC job (its `meta.placement` is inert; the scene draws a toolpath from its own posted G-code, so "moving" it would
+/// only pollute undo). A job stays click-selectable via [`hit_object`]; it just isn't draggable. Pure — unit tested.
+fn drag_anchor(scene: &RenderScene, world: [f64; 2], tol_mm: f64, busy: bool) -> Option<ObjectId> {
+  if busy {
+    return None;
+  }
+  let id = hit_object(scene, world, tol_mm)?;
+  scene.object(id).filter(|entry| entry.kind != ObjectKind::CncJob).map(|_| id)
+}
 
 /// Pick the topmost visible object at `world` (mm): objects are tested in REVERSE display order (painted
 /// back-to-front, so the last is on top). A hit is a point inside a fill triangle, or within `tol_mm` of an
@@ -575,6 +596,21 @@ mod tests {
     assert_eq!(hit_object(&scene, [5.0, 5.2], 0.5), Some(ObjectId(2)), "the trail is topmost where they overlap");
     // Inside the copper but far from the diagonal: the copper wins.
     assert_eq!(hit_object(&scene, [8.0, 1.0], 0.5), Some(ObjectId(1)), "off the trail the fill is picked");
+  }
+
+  #[test]
+  fn drag_anchor_moves_a_source_but_never_a_toolpath_or_while_busy() {
+    // The copper (id 1) is draggable; the toolpath trail (id 2) is not — dragging it must fall through to a pan
+    // rather than silently mutating the job's inert placement (and polluting undo).
+    let scene = scene_of(vec![filled_square(1), trail(2)]);
+    assert_eq!(drag_anchor(&scene, [8.0, 1.0], 0.5, false), Some(ObjectId(1)), "a source object is draggable");
+    // On the trail, hit_object would return the job (id 2); drag_anchor must reject it (→ pan).
+    assert_eq!(hit_object(&scene, [5.0, 5.2], 0.5), Some(ObjectId(2)), "the trail is what the pointer is over");
+    assert_eq!(drag_anchor(&scene, [5.0, 5.2], 0.5, false), None, "but a toolpath is not draggable");
+    // While an op runs, even a source is not draggable — the move would edit the away session.
+    assert_eq!(drag_anchor(&scene, [8.0, 1.0], 0.5, true), None, "nothing is draggable while busy");
+    // Empty canvas is a pan regardless.
+    assert_eq!(drag_anchor(&scene, [50.0, 50.0], 0.5, false), None, "empty canvas pans");
   }
 
   #[test]

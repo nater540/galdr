@@ -289,6 +289,16 @@ mod tests {
   }
 
   #[test]
+  fn the_status_bar_counts_sources_and_toolpaths_together() {
+    let _locale = render_in(crate::i18n::EN_US);
+    let state = HarnessState::new(fixture_view(), UiState::default());
+    let mut harness = build_shell_harness(state, DEFAULT_SIZE);
+    harness.run_steps(2);
+    // The fixture has 2 sources (PROJECT) + 1 job (TOOLPATHS); the count must be 3, not the tree-only 2.
+    harness.get_by_label("3 objects");
+  }
+
+  #[test]
   fn clicking_a_toolpaths_rebuild_button_emits_a_rebuild_intent() {
     let _locale = render_in(crate::i18n::EN_US);
     let state = HarnessState::new(fixture_view(), UiState::default());
@@ -413,7 +423,7 @@ mod tests {
     harness.get_by_label("Bottom right").click();
     harness.run();
     let committed = harness.state().intents.iter().find_map(|i| match i {
-      Intent::SetStock(stock) => Some(*stock),
+      Intent::SetStock { stock, .. } => Some(*stock),
       _ => None,
     });
     let stock = committed.expect("clicking a corner dot must commit the drafted stock");
@@ -489,7 +499,7 @@ mod tests {
         .state()
         .intents
         .iter()
-        .any(|i| matches!(i, Intent::SetStock(..) | Intent::ClearStock | Intent::FitStock { .. })),
+        .any(|i| matches!(i, Intent::SetStock { .. } | Intent::ClearStock | Intent::FitStock { .. })),
       "the session is away — setup edits must not be queued: {:?}",
       harness.state().intents,
     );

@@ -131,6 +131,19 @@ impl Affine {
     let f = -(d * self.c + e * self.f);
     Some(Affine { a, b, c, d, e, f })
   }
+
+  /// Whether the transform is a **rigid motion** — a rotation and/or translation with no scale, shear, or reflection.
+  /// Its linear part must be orthonormal (both columns unit length and perpendicular) with a positive determinant, so
+  /// distances and orientation are preserved. Callers that apply a placement to different representations of the same
+  /// object (a filled region vs. a set of drill centers) rely on this to keep those paths from diverging under a
+  /// non-uniform transform.
+  pub fn is_rigid(self) -> bool {
+    const TOL: f64 = 1e-9;
+    let col0 = self.a * self.a + self.d * self.d; // |(a, d)|²
+    let col1 = self.b * self.b + self.e * self.e; // |(b, e)|²
+    let dot = self.a * self.b + self.d * self.e; // (a, d) · (b, e)
+    (col0 - 1.0).abs() < TOL && (col1 - 1.0).abs() < TOL && dot.abs() < TOL && self.determinant() > 0.0
+  }
 }
 
 #[cfg(test)]
@@ -235,5 +248,17 @@ mod tests {
   fn singular_transform_has_no_inverse() {
     // Scaling y to zero collapses the plane onto a line — not invertible.
     assert!(Affine::scale(2.0, 0.0).inverse().is_none());
+  }
+
+  #[test]
+  fn is_rigid_accepts_rotations_and_translations_and_rejects_scale_shear_reflection() {
+    assert!(Affine::IDENTITY.is_rigid(), "identity is rigid");
+    assert!(Affine::translate(7.0, -3.0).is_rigid(), "a pure translation is rigid");
+    assert!(Affine::rotate(PI / 3.0).is_rigid(), "a pure rotation is rigid");
+    assert!(Affine::translate(2.0, 5.0).then(Affine::rotate(PI / 4.0)).is_rigid(), "rotate + translate is rigid");
+    assert!(!Affine::scale(2.0, 2.0).is_rigid(), "a uniform scale is not rigid");
+    assert!(!Affine::scale(1.0, 0.5).is_rigid(), "a non-uniform scale is not rigid");
+    assert!(!Affine::skew_about(0.3, 0.0, 0.0, 0.0).is_rigid(), "a shear is not rigid");
+    assert!(!Affine::mirror_x_axis().is_rigid(), "a reflection flips orientation and is not rigid");
   }
 }

@@ -32,7 +32,7 @@ mod serde_ext;
 pub mod tooldb;
 
 pub use collection::{Group, ObjectCollection};
-pub use datum::{DatumCorner, JobOrigin, Stock, ZReference};
+pub use datum::{DatumCorner, JobOrigin, Stock, WorkSetup, ZReference};
 pub use document::{SCHEMA_VERSION, load_project, save_project};
 pub use error::{ProjectError, Result};
 pub use history::{DEFAULT_HISTORY_LIMIT, History};

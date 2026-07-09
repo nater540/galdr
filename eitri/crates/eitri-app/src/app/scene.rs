@@ -74,6 +74,59 @@ impl RenderScene {
   pub fn object(&self, id: ObjectId) -> Option<&ObjectScene> {
     self.objects.iter().find(|o| o.id == id)
   }
+
+  /// Shift the cached geometry of the given source objects by `(dx, dy)` millimetres, in place — the drag fast-path.
+  /// A live canvas drag repositions objects every frame; rebuilding the whole scene each frame ([`build_scene`]
+  /// re-triangulates every polygon and re-imports every job's G-code) is pure waste when only a translation changed.
+  /// This translates just the moved entries' ready-made vertices/outlines/polylines/bounds and re-folds the scene
+  /// bounds, leaving triangulation and job previews untouched. Adding `(dx, dy)` to already-placed vertices matches
+  /// what [`build_scene`] would produce for the composed placement, because a drag only ever translates.
+  ///
+  /// CNC-job entries are skipped even when they belong to a moved group: their preview is drawn from posted G-code
+  /// independent of source placement, so it stays put (now stale) until a rebuild — exactly as [`build_scene`]
+  /// leaves it. The authoritative [`build_scene`] still runs once when the drag ends, reconciling any float drift.
+  pub fn translate_objects(&mut self, ids: &[ObjectId], dx: f64, dy: f64) {
+    for entry in self.objects.iter_mut() {
+      if entry.kind != ObjectKind::CncJob && ids.contains(&entry.id) {
+        shift_entry(entry, dx, dy);
+      }
+    }
+    // Re-fold the fit-view union from scratch: only some entries moved, and a moved object can shrink the union as
+    // well as grow it. Only visible objects participate, mirroring `build_scene`.
+    self.bounds = None;
+    for entry in &self.objects {
+      if entry.visible {
+        merge_bounds(&mut self.bounds, entry.bounds);
+      }
+    }
+  }
+}
+
+/// Translate one entry's cached paint geometry — mesh vertices, ring outlines, open polylines, cut trails, rapid
+/// segments, and its bounds — by `(dx, dy)` millimetres. The triangle indices are unaffected by a translation.
+fn shift_entry(entry: &mut ObjectScene, dx: f64, dy: f64) {
+  for v in &mut entry.fill.vertices {
+    v[0] += dx;
+    v[1] += dy;
+  }
+  for ring in entry.outlines.iter_mut().chain(entry.polylines.iter_mut()).chain(entry.cuts.iter_mut()) {
+    for p in ring {
+      p[0] += dx;
+      p[1] += dy;
+    }
+  }
+  for (from, to) in &mut entry.rapids {
+    from[0] += dx;
+    from[1] += dy;
+    to[0] += dx;
+    to[1] += dy;
+  }
+  if let Some((x0, y0, x1, y1)) = &mut entry.bounds {
+    *x0 += dx;
+    *y0 += dy;
+    *x1 += dx;
+    *y1 += dy;
+  }
 }
 
 /// Build the paint-ready scene from the session's collection. Called only when the collection changes (an op
@@ -324,6 +377,50 @@ mod tests {
     assert!(copper.0 > 25.0, "the moved copper sits well right of the origin: {copper:?}");
     assert!(trails.0 <= copper.2 && trails.2 >= copper.0, "the toolpath spans the moved copper in X");
     assert!(trails.1 <= copper.3 && trails.3 >= copper.1, "and in Y");
+  }
+
+  #[test]
+  fn translate_objects_shifts_cached_geometry_to_match_a_full_rebuild() {
+    // The drag fast-path: shifting the cached scene by (dx, dy) must land exactly where a full rebuild after the same
+    // move would, so the drag looks identical whether or not it took the cheap path (docs #1).
+    let mut session = Session::new("fixture");
+    let id = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let mut scene = build_scene(&session);
+    let before = scene.object(id).unwrap().bounds.unwrap();
+    scene.translate_objects(&[id], 10.0, 5.0);
+    let fast = scene.object(id).unwrap().bounds.unwrap();
+    assert!((fast.0 - (before.0 + 10.0)).abs() < 1e-6, "fast-path min X shifts by dx");
+    assert!((fast.1 - (before.1 + 5.0)).abs() < 1e-6, "fast-path min Y shifts by dy");
+    assert_eq!(scene.bounds, Some(fast), "the fit-view union follows the sole moved object");
+
+    session.translate_object(id, 10.0, 5.0).expect("move on the stock");
+    let rebuilt = build_scene(&session).object(id).unwrap().bounds.unwrap();
+    for (a, b) in [(fast.0, rebuilt.0), (fast.1, rebuilt.1), (fast.2, rebuilt.2), (fast.3, rebuilt.3)] {
+      assert!((a - b).abs() < 1e-6, "fast-path bounds match the authoritative rebuild: {fast:?} vs {rebuilt:?}");
+    }
+  }
+
+  #[test]
+  fn translate_objects_leaves_cnc_job_previews_in_place() {
+    // A job's preview is drawn from its posted G-code, independent of source placement, so the fast-path must NOT
+    // move it even when its id is in the moved set — it stays put (now stale) until a rebuild (docs #1).
+    let mut session = Session::new("fixture");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let spec = IsolationSpec {
+      tool_diameter: 0.2,
+      passes: 1,
+      overlap: 0.0,
+      combine: false,
+      direction: DirectionSpec::Climb,
+    };
+    let job = session.isolate(gerber, spec, IsolationJob::default()).expect("isolation succeeds");
+    let mut scene = build_scene(&session);
+    let gerber_before = scene.object(gerber).unwrap().bounds.unwrap();
+    let job_before = scene.object(job).unwrap().bounds.unwrap();
+    scene.translate_objects(&[gerber, job], 20.0, 0.0);
+    let gerber_after = scene.object(gerber).unwrap().bounds.unwrap();
+    assert!((gerber_after.0 - (gerber_before.0 + 20.0)).abs() < 1e-6, "the moved source shifts by dx");
+    assert_eq!(scene.object(job).unwrap().bounds.unwrap(), job_before, "the job preview stays put, not shifted");
   }
 
   #[test]

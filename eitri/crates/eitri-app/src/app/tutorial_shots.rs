@@ -20,7 +20,7 @@ use eframe::egui;
 
 use super::scene;
 use super::ui_test::{DEFAULT_SIZE, HarnessState, build_shell_harness, render_in};
-use super::view_state::{LogKind, OpView, Selection, TreeRow, ViewState};
+use super::view_state::{LogKind, OpView, Selection, ViewState};
 use super::views::{DockTab, SelectedInfo, StockDraft, UiState};
 use eitri_project::{ObjectId, ObjectPayload};
 use eitri_script::Session;
@@ -40,25 +40,11 @@ fn shots_dir() -> PathBuf {
 /// Mirror of the shell's `refresh_from_session`: the PROJECT/TOOLPATHS rows and history flags a live window would
 /// show, partitioned by kind exactly as the shell does.
 fn synced_view(session: &Session) -> ViewState {
+  // Route through the live shell's partition so this harness cannot drift from the real PROJECT/TOOLPATHS split.
   let mut view = ViewState::default();
-  let (mut tree, mut toolpaths): (Vec<TreeRow>, Vec<TreeRow>) = (Vec::new(), Vec::new());
-  for id in session.object_ids() {
-    let Ok(object) = session.object(id) else { continue };
-    let kind = object.kind();
-    let stale = matches!(&object.payload, eitri_project::ObjectPayload::CncJob(job) if job.stale);
-    let row = TreeRow { id, name: object.meta.name.clone(), kind, visible: object.meta.visible, stale };
-    if kind == eitri_project::ObjectKind::CncJob {
-      toolpaths.push(row);
-    } else {
-      tree.push(row);
-    }
-  }
+  let (tree, toolpaths, groups) = super::shell::partition_from_session(session);
   view.set_tree(tree, toolpaths, session.can_undo(), session.can_redo());
-  view.groups = session
-    .groups()
-    .into_iter()
-    .map(|(name, members)| super::view_state::GroupView { name, members })
-    .collect();
+  view.groups = groups;
   view
 }
 
@@ -288,7 +274,7 @@ fn render_tutorial_screenshots() {
   //    1.6 mm thickness, bottom-left datum, Z0 on the material top; the dashed stock block and the placed
   //    crosshair on the canvas. (Set up BEFORE running the ops in a real workflow so every job posts near
   //    X0 Y0; here it lands after so the earlier shots stay in the native frame.) ──────────────────────────
-  session.fit_stock_to(edge, 1.6).expect("the outline bounds the stock");
+  session.fit_stock_to(edge, 1.6, false).expect("the outline bounds the stock");
   let (zero_x, zero_y, zero_z) = session.work_origin();
   let mut state = shot_state(&session);
   state.view.log_line(LogKind::Ok, "Isolation routing finished");

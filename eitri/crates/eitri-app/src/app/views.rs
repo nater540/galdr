@@ -1357,6 +1357,9 @@ fn setup_section(ui: &mut egui::Ui, palette: Palette, view: &ViewState, state: &
     ui.label(section_title(palette, &tr!("params-stock")));
     ui.add_space(4.0);
     let mut edited = false;
+    // Whether a size spinner is mid-drag this frame (a continuation, not the first frame): those per-frame commits
+    // coalesce into one undo entry, while a typed edit or the first drag frame starts a fresh one (docs review #1).
+    let mut dragging = false;
     ui.add_enabled_ui(!busy, |ui| {
       egui::Grid::new("stock-params").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
         for (label, value) in [
@@ -1365,7 +1368,9 @@ fn setup_section(ui: &mut egui::Ui, palette: Palette, view: &ViewState, state: &
           (tr!("params-stock-thickness"), &mut state.stock_draft.thickness),
         ] {
           ui.label(RichText::new(label).size(11.5).color(palette.text_dim));
-          edited |= ui.add(egui::DragValue::new(value).speed(0.1).range(0.01..=10000.0).max_decimals(3)).changed();
+          let resp = ui.add(egui::DragValue::new(value).speed(0.1).range(0.01..=10000.0).max_decimals(3));
+          edited |= resp.changed();
+          dragging |= resp.dragged() && !resp.drag_started();
           ui.end_row();
         }
       });
@@ -1429,7 +1434,9 @@ fn setup_section(ui: &mut egui::Ui, palette: Palette, view: &ViewState, state: &
       });
     });
     if edited && !busy {
-      sink.push(Intent::SetStock(state.stock_draft.to_stock()));
+      // Coalesce only the continuation frames of a spinner drag; the datum grid, the Z-ref combo, a typed size, and
+      // the first drag frame are all discrete (`dragging` is false) and get their own undo entry.
+      sink.push(Intent::SetStock { stock: state.stock_draft.to_stock(), coalesce: dragging });
     }
 
     // ── The resolved work zero: the truth about the frame every job posts in. Caption + value on separate
@@ -1664,8 +1671,10 @@ pub fn status_bar(ui: &mut egui::Ui, view: &ViewState, state: &UiState) {
   let palette = state.style.palette;
   ui.horizontal_centered(|ui| {
     ui.add_space(10.0);
+    // Count both panels: the split moved CNC jobs out of `tree` into `toolpaths`, but they are still objects.
+    let object_count = (view.tree.len() + view.toolpaths.len()) as u64;
     ui.label(
-      RichText::new(tr!("status-objects", { count: view.tree.len() as u64 })).size(10.5).color(palette.text_dim),
+      RichText::new(tr!("status-objects", { count: object_count })).size(10.5).color(palette.text_dim),
     );
     ui.add_space(10.0);
     match &view.op {
