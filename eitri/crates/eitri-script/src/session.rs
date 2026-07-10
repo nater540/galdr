@@ -368,11 +368,13 @@ impl Session {
         if members.contains(&object.meta.id) {
           object.meta.placement = object.meta.placement.then(shift);
         }
+        // Every member moves by the same `shift`, so a job derived from any member moved by exactly `shift`: stale it
+        // and carry its cutout outline along (docs review #5).
         if let ObjectPayload::CncJob(job) = &mut object.payload
           && job.source.is_some_and(|src| members.contains(&src))
           && is_rebuildable(job)
         {
-          job.stale = true;
+          carry_dependent_job(job, shift);
         }
       }
     };
@@ -500,9 +502,12 @@ impl Session {
 
   /// Isolate a copper/geometry `source` into cut rings and emit them as a CNC job. Returns the job's id.
   pub fn isolate(&mut self, source: ObjectId, spec: IsolationSpec, job: IsolationJob) -> Result<ObjectId> {
-    let program = self.isolation_program(source, &spec, &job)?;
+    // Build the operation up front so the header note is derived from it (the single source of truth for "which spec
+    // field is the tool"), not hand-picked here — panel readout and header note cannot diverge (docs review M2).
+    let operation = CamOperation::Isolation(spec);
+    let program = self.isolation_program(source, &spec, &job, header_note(&operation))?;
     let base = self.job_name(source, "isolation")?;
-    self.store_program(program, Some(source), CamOperation::Isolation(spec), &base, Some(JobEmission::Isolation(job)))
+    self.store_program(program, Some(source), operation, &base, Some(JobEmission::Isolation(job)))
   }
 
   /// Drill an Excellon `source`, ordering hits to minimize rapid travel, and emit the drilling program. `spec` is
@@ -515,24 +520,29 @@ impl Session {
 
   /// Area-clear (paint) a copper/geometry `source` with the chosen fill strategy and emit the toolpaths as a job.
   pub fn paint(&mut self, source: ObjectId, spec: PaintSpec, job: IsolationJob) -> Result<ObjectId> {
-    let program = self.paint_program(source, &spec, &job)?;
+    let operation = CamOperation::Paint(spec.clone());
+    let program = self.paint_program(source, &spec, &job, header_note(&operation))?;
     let base = self.job_name(source, "paint")?;
-    self.store_program(program, Some(source), CamOperation::Paint(spec), &base, Some(JobEmission::Isolation(job)))
+    self.store_program(program, Some(source), operation, &base, Some(JobEmission::Isolation(job)))
   }
 
   /// Clear all non-copper within a boundary around a Gerber/geometry `source`, painting the negative region, and emit
   /// the toolpaths as a job.
   pub fn noncopper(&mut self, source: ObjectId, spec: NonCopperSpec, job: IsolationJob) -> Result<ObjectId> {
-    let program = self.noncopper_program(source, &spec, &job)?;
+    let operation = CamOperation::NonCopper(spec.clone());
+    let program = self.noncopper_program(source, &spec, &job, header_note(&operation))?;
     let base = self.job_name(source, "noncopper")?;
-    self.store_program(program, Some(source), CamOperation::NonCopper(spec), &base, Some(JobEmission::Isolation(job)))
+    self.store_program(program, Some(source), operation, &base, Some(JobEmission::Isolation(job)))
   }
 
   /// Route a board cutout around the outline the `spec` owns (a rectangle or a hand-drawn silhouette), leaving
-  /// holding tabs, and emit the profile as a job. The outline is self-contained, so there is no source object.
-  pub fn cutout(&mut self, spec: CutoutSpec, job: IsolationJob) -> Result<ObjectId> {
-    let program = self.cutout_program(&spec, &job)?;
-    self.store_program(program, None, CamOperation::Cutout(spec), "cutout", Some(JobEmission::Isolation(job)))
+  /// holding tabs, and emit the profile as a job. The outline is self-contained (not re-derived from a source), but
+  /// `board` associates the cutout with the object it profiles so that moving that board carries the cutout's stored
+  /// outline along and flags it for rebuild (docs review #5); pass `None` for a standalone cutout tied to no board.
+  pub fn cutout(&mut self, spec: CutoutSpec, job: IsolationJob, board: Option<ObjectId>) -> Result<ObjectId> {
+    let operation = CamOperation::Cutout(spec.clone());
+    let program = self.cutout_program(&spec, &job, header_note(&operation))?;
+    self.store_program(program, board, operation, "cutout", Some(JobEmission::Isolation(job)))
   }
 
   /// Recompute a CNC job in place from its stored operation spec + emission parameters, against the CURRENT (placed)
@@ -572,22 +582,26 @@ impl Session {
     source: Option<ObjectId>,
   ) -> Result<Program> {
     let src = || source.ok_or_else(|| ScriptError::InvalidArgument("this job's source is gone; cannot rebuild".into()));
+    // The single-tool header note, derived once from the operation (drilling builds its own multi-tool note).
+    let tool = header_note(operation);
     match (operation, emission) {
-      (CamOperation::Isolation(spec), JobEmission::Isolation(job)) => self.isolation_program(src()?, spec, job),
+      (CamOperation::Isolation(spec), JobEmission::Isolation(job)) => self.isolation_program(src()?, spec, job, tool),
       (CamOperation::Drilling(spec), JobEmission::Drill(job)) => self.drill_program(src()?, spec, job),
-      (CamOperation::Paint(spec), JobEmission::Isolation(job)) => self.paint_program(src()?, spec, job),
-      (CamOperation::NonCopper(spec), JobEmission::Isolation(job)) => self.noncopper_program(src()?, spec, job),
-      (CamOperation::Cutout(spec), JobEmission::Isolation(job)) => self.cutout_program(spec, job),
+      (CamOperation::Paint(spec), JobEmission::Isolation(job)) => self.paint_program(src()?, spec, job, tool),
+      (CamOperation::NonCopper(spec), JobEmission::Isolation(job)) => self.noncopper_program(src()?, spec, job, tool),
+      (CamOperation::Cutout(spec), JobEmission::Isolation(job)) => self.cutout_program(spec, job, tool),
       _ => Err(ScriptError::InvalidArgument("this operation cannot be rebuilt".to_string())),
     }
   }
 
-  /// Compute the isolation G-code for a placed `source` — shared by [`Session::isolate`] and rebuild.
-  fn isolation_program(&self, source: ObjectId, spec: &IsolationSpec, job: &IsolationJob) -> Result<Program> {
+  /// Compute the isolation G-code for a placed `source` — shared by [`Session::isolate`] and rebuild. `tool` is the
+  /// header note, derived once by the caller from the [`CamOperation`] (see [`header_note`]).
+  fn isolation_program(&self, source: ObjectId, spec: &IsolationSpec, job: &IsolationJob, tool: Option<String>)
+    -> Result<Program> {
     let region = self.region_of(source)?;
     let toolpaths = eitri_cam::isolate(&self.backend, &region, &spec.to_params(), &self.progress, &self.cancel)?;
     let post = self.post()?;
-    Ok(emit_isolation(&toolpaths, job, self.emit_origin(), post, Some(tool_note(spec.tool_diameter))))
+    Ok(emit_isolation(&toolpaths, job, self.emit_origin(), post, tool))
   }
 
   /// Compute the drilling G-code for a placed Excellon `source` — shared by [`Session::drill`] and rebuild.
@@ -604,18 +618,22 @@ impl Session {
     Ok(emit_drilling(&plan, job, self.emit_origin(), post, tool))
   }
 
-  /// Compute the paint (area-clear) G-code for a placed `source` — shared by [`Session::paint`] and rebuild.
-  fn paint_program(&self, source: ObjectId, spec: &PaintSpec, job: &IsolationJob) -> Result<Program> {
+  /// Compute the paint (area-clear) G-code for a placed `source` — shared by [`Session::paint`] and rebuild. `tool`
+  /// is the header note, derived once by the caller from the [`CamOperation`] (see [`header_note`]).
+  fn paint_program(&self, source: ObjectId, spec: &PaintSpec, job: &IsolationJob, tool: Option<String>)
+    -> Result<Program> {
     let region = self.region_of(source)?;
     let strategy = spec.strategy();
     let result =
       eitri_cam::paint(&region, &spec.to_params(), strategy.as_ref(), &self.backend, &self.progress, &self.cancel)?;
     let post = self.post()?;
-    Ok(emit_isolation(&result.toolpaths(), job, self.emit_origin(), post, Some(tool_note(spec.tool_diameter))))
+    Ok(emit_isolation(&result.toolpaths(), job, self.emit_origin(), post, tool))
   }
 
   /// Compute the non-copper-clearing G-code for a placed `source` — shared by [`Session::noncopper`] and rebuild.
-  fn noncopper_program(&self, source: ObjectId, spec: &NonCopperSpec, job: &IsolationJob) -> Result<Program> {
+  /// `tool` is the header note, derived once by the caller from the [`CamOperation`] (see [`header_note`]).
+  fn noncopper_program(&self, source: ObjectId, spec: &NonCopperSpec, job: &IsolationJob, tool: Option<String>)
+    -> Result<Program> {
     let region = self.region_of(source)?;
     let strategy = spec.strategy();
     let result = eitri_cam::clear_noncopper(
@@ -628,16 +646,16 @@ impl Session {
       &self.cancel,
     )?;
     let post = self.post()?;
-    Ok(emit_isolation(&result.toolpaths(), job, self.emit_origin(), post, Some(tool_note(spec.paint.tool_diameter))))
+    Ok(emit_isolation(&result.toolpaths(), job, self.emit_origin(), post, tool))
   }
 
   /// Compute the board-cutout G-code from the spec's self-contained outline — shared by [`Session::cutout`] and
-  /// rebuild.
-  fn cutout_program(&self, spec: &CutoutSpec, job: &IsolationJob) -> Result<Program> {
+  /// rebuild. `tool` is the header note, derived once by the caller from the [`CamOperation`] (see [`header_note`]).
+  fn cutout_program(&self, spec: &CutoutSpec, job: &IsolationJob, tool: Option<String>) -> Result<Program> {
     let result =
       eitri_cam::cutout(&spec.to_outline(), &spec.to_params(), &self.backend, &self.progress, &self.cancel)?;
     let post = self.post()?;
-    Ok(emit_isolation(&result.toolpaths(), job, self.emit_origin(), post, Some(tool_note(spec.tool_diameter))))
+    Ok(emit_isolation(&result.toolpaths(), job, self.emit_origin(), post, tool))
   }
 
   /// Panelize a copper/geometry `source` into an `rows × cols` grid, returning a **geometry** object holding the
@@ -990,6 +1008,14 @@ fn tool_note(diameter: f64) -> String {
   format!("tool diameter {diameter:.3} mm")
 }
 
+/// The single-tool header note for an operation, derived from the ONE source of truth for "which spec field is the
+/// tool" — [`CamOperation::tool_diameter`] — so the parameter-panel readout and the G-code header comment cannot
+/// disagree when a new single-tool op is added (docs review M2). Multi-tool drilling has no single diameter (its
+/// `tool_diameter()` is `None`) and builds its own summary note in [`Session::drill_program`].
+fn header_note(operation: &CamOperation) -> Option<String> {
+  operation.tool_diameter().map(tool_note)
+}
+
 /// The most bytes a header note may occupy, leaving ample room within the grblHAL 256-byte line limit for the comment
 /// delimiters and any prefix once it is emitted as a `(...)` line (the wire contract; see [`drill_tools_note`]).
 const HEADER_NOTE_MAX: usize = 200;
@@ -1013,10 +1039,17 @@ fn drill_tools_note(diameters: &[f64]) -> String {
 /// means "source moved → dependent jobs need a rebuild" cannot be forgotten by a new call site. A missing id is a
 /// silent no-op (callers validate the id before taking the undo snapshot).
 fn set_object_placement(collection: &mut ObjectCollection, id: ObjectId, placement: Affine) {
+  // The movement delta the object just underwent (`old⁻¹` then `new`), needed to carry an associated cutout's outline
+  // along. For a rigid placement the inverse always exists (`set_placement` rejects non-rigid transforms upstream);
+  // the `None` arm is a defensive fallback that still stales dependents even if the inverse somehow fails.
+  let delta = collection.get(id).and_then(|o| o.meta.placement.inverse()).map(|inv| inv.then(placement));
   if let Some(object) = collection.get_mut(id) {
     object.meta.placement = placement;
   }
-  flag_dependent_jobs_stale(collection, id);
+  match delta {
+    Some(delta) => propagate_source_move(collection, id, delta),
+    None => flag_dependent_jobs_stale(collection, id),
+  }
 }
 
 /// Whether a CNC job can be rebuilt in place — only jobs that stored their emission parameters can. A legacy job
@@ -1027,8 +1060,31 @@ fn is_rebuildable(job: &CncJobObject) -> bool {
   job.emission.is_some()
 }
 
-/// Flag every rebuildable CNC job whose source is `moved` stale, so its posted G-code (which baked in the source's
-/// old position) no longer silently passes for current — the UI shows the ⟳ rebuild badge.
+/// Mark a job (already confirmed to derive from a moved board) stale, and — if it is a cutout, whose outline is
+/// self-owned rather than re-derived from a source at rebuild — carry that outline along by the board's movement
+/// `delta`, so the profile cut stays registered against the moved board once rebuilt (docs review #5).
+fn carry_dependent_job(job: &mut CncJobObject, delta: Affine) {
+  if let CamOperation::Cutout(spec) = &mut job.operation {
+    spec.outline.transform(delta);
+  }
+  job.stale = true;
+}
+
+/// Propagate a board's placement change to every rebuildable job derived from it: stale it and carry its cutout
+/// outline along by `delta` (the distance the board moved).
+fn propagate_source_move(collection: &mut ObjectCollection, moved: ObjectId, delta: Affine) {
+  for object in collection.iter_mut() {
+    if let ObjectPayload::CncJob(job) = &mut object.payload
+      && job.source == Some(moved)
+      && is_rebuildable(job)
+    {
+      carry_dependent_job(job, delta);
+    }
+  }
+}
+
+/// Flag every rebuildable CNC job whose source is `moved` stale, without carrying any outline — the fallback when a
+/// movement delta is unavailable (see [`set_object_placement`]).
 fn flag_dependent_jobs_stale(collection: &mut ObjectCollection, moved: ObjectId) {
   for object in collection.iter_mut() {
     if let ObjectPayload::CncJob(job) = &mut object.payload
@@ -1085,8 +1141,8 @@ mod tests {
   use eitri_cam::FilmKind;
   use eitri_gcode::check_grbl_conformance;
   use eitri_project::{
-    CutoutOutlineSpec, DatumCorner, DirectionSpec, DrillDefaults, IsolationDefaults, JobOrigin, PaintStrategySpec,
-    SpacingSpec, TabPlacementSpec,
+    BoundarySpec, CutoutOutlineSpec, DatumCorner, DirectionSpec, DrillDefaults, IsolationDefaults, JobOrigin,
+    PaintStrategySpec, SpacingSpec, TabPlacementSpec,
   };
 
   const GERBER: &str = include_str!("../../../fixtures/synthetic/gerber/kicad_two_pads.gbr");
@@ -1211,8 +1267,35 @@ mod tests {
         max: geo_types::Coord { x: 12.0, y: 2.0 },
       },
     };
-    let cut = s.cutout(cutout_spec, IsolationJob::default()).unwrap();
+    let cut = s.cutout(cutout_spec, IsolationJob::default(), None).unwrap();
     assert!(check_grbl_conformance(&s.write_gcode(cut).unwrap()).is_empty());
+  }
+
+  #[test]
+  fn the_header_tool_note_is_derived_from_the_operation_for_single_tool_ops() {
+    // M2: the header note is derived once from CamOperation::tool_diameter(), so it reaches the emitted G-code
+    // correctly for every single-tool op — including the non-copper indirection where the tool lives in
+    // `spec.paint.tool_diameter`. A future op that updated only one of the two places would drift the header.
+    let (mut s, g) = session_with_gerber();
+    let iso = s.isolate(g, IsolationSpec { tool_diameter: 0.35, ..iso_spec() }, IsolationJob::default()).unwrap();
+    assert!(s.write_gcode(iso).unwrap().contains("tool diameter 0.350 mm"), "isolation header shows its tool");
+
+    let noncopper_spec = NonCopperSpec {
+      boundary: BoundarySpec::BoundingBox { margin: 1.0 },
+      paint: PaintSpec {
+        tool_diameter: 0.80,
+        overlap: 0.3,
+        margin: 0.0,
+        direction: DirectionSpec::Climb,
+        finish_pass: false,
+        strategy: PaintStrategySpec::Concentric,
+      },
+    };
+    let nc = s.noncopper(g, noncopper_spec, IsolationJob::default()).unwrap();
+    assert!(
+      s.write_gcode(nc).unwrap().contains("tool diameter 0.800 mm"),
+      "the non-copper header shows spec.paint.tool_diameter via the single CamOperation mapping",
+    );
   }
 
   #[test]
@@ -1742,6 +1825,95 @@ mod tests {
     assert_eq!(s.object(top).unwrap().meta.placement, Affine::translate(12.0, -3.0), "the grabbed layer moves");
     assert_eq!(s.object(drills).unwrap().meta.placement, Affine::translate(12.0, -3.0), "its sibling moves too");
     assert!(is_stale(&s, job), "a job whose source moved is now stale");
+  }
+
+  /// The stored outline of a cutout job (panics if `job` is not a cutout).
+  fn cutout_outline(s: &Session, job: ObjectId) -> CutoutOutlineSpec {
+    match &s.object(job).unwrap().payload {
+      ObjectPayload::CncJob(j) => match &j.operation {
+        CamOperation::Cutout(spec) => spec.outline.clone(),
+        other => panic!("not a cutout op: {other:?}"),
+      },
+      other => panic!("not a cnc job: {other:?}"),
+    }
+  }
+
+  /// A rectangle cutout from (0,0) to (10,10), associated with `board` (or standalone for `None`).
+  fn rect_cutout(s: &mut Session, board: Option<ObjectId>) -> ObjectId {
+    let spec = CutoutSpec {
+      tool_diameter: 1.0,
+      tab_width: 1.0,
+      tabs: TabPlacementSpec::Count(4),
+      margin: 0.0,
+      direction: DirectionSpec::Conventional,
+      outline: CutoutOutlineSpec::Rectangle {
+        min: geo_types::Coord { x: 0.0, y: 0.0 },
+        max: geo_types::Coord { x: 10.0, y: 10.0 },
+      },
+    };
+    s.cutout(spec, IsolationJob::default(), board).unwrap()
+  }
+
+  #[test]
+  fn moving_a_board_carries_and_stales_its_associated_cutout() {
+    // #5: a cutout owns its outline (no re-derivable source), so moving the board it profiles must carry the outline
+    // along AND stale it, so a rebuild re-cuts the profile in register with the moved board.
+    let (mut s, board) = session_with_gerber();
+    let cut = rect_cutout(&mut s, Some(board));
+    assert!(!is_stale(&s, cut), "a freshly posted cutout is up to date");
+
+    s.move_group(board, 7.0, -3.0, true).unwrap();
+    assert!(is_stale(&s, cut), "moving the associated board stales the cutout");
+    match cutout_outline(&s, cut) {
+      CutoutOutlineSpec::Rectangle { min, max } => {
+        assert!((min.x - 7.0).abs() < 1e-9 && (min.y + 3.0).abs() < 1e-9, "outline min moved with the board: {min:?}");
+        assert!((max.x - 17.0).abs() < 1e-9 && (max.y - 7.0).abs() < 1e-9, "outline max moved with the board: {max:?}");
+      }
+      other => panic!("expected a rectangle outline, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn translating_a_board_carries_its_associated_cutout() {
+    // The scripting path (translate_object -> set_placement -> set_object_placement) carries the cutout too, via the
+    // computed movement delta — no placement path may forget it (docs review #5, mirroring #2's lesson).
+    let (mut s, board) = session_with_gerber();
+    let cut = rect_cutout(&mut s, Some(board));
+    s.translate_object(board, 5.0, 2.0).unwrap();
+    assert!(is_stale(&s, cut), "translating the board stales its cutout");
+    match cutout_outline(&s, cut) {
+      CutoutOutlineSpec::Rectangle { min, .. } => {
+        assert!((min.x - 5.0).abs() < 1e-9 && (min.y - 2.0).abs() < 1e-9, "outline moved by the translate: {min:?}");
+      }
+      other => panic!("expected a rectangle outline, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn a_standalone_cutout_is_untouched_by_an_unrelated_board_move() {
+    // A cutout with no board association (board = None) is neither carried nor staled when some other object moves.
+    let (mut s, board) = session_with_gerber();
+    let cut = rect_cutout(&mut s, None);
+    s.move_group(board, 9.0, 9.0, true).unwrap();
+    assert!(!is_stale(&s, cut), "a standalone cutout is untouched by an unrelated move");
+    match cutout_outline(&s, cut) {
+      CutoutOutlineSpec::Rectangle { min, .. } => assert_eq!((min.x, min.y), (0.0, 0.0), "its outline stayed put"),
+      other => panic!("expected a rectangle outline, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn rebuilding_a_carried_cutout_re_cuts_at_the_moved_position() {
+    // End-to-end: after the board moves, rebuilding the cutout emits G-code shifted by the same delta, proving the
+    // carried outline actually reaches the emitter (docs review #5).
+    let (mut s, board) = session_with_gerber();
+    let cut = rect_cutout(&mut s, Some(board));
+    let before = first_xy(&s.write_gcode(cut).unwrap());
+    s.move_group(board, 20.0, 0.0, true).unwrap();
+    s.rebuild_job(cut).unwrap();
+    assert!(!is_stale(&s, cut), "rebuild clears the stale flag");
+    let after = first_xy(&s.write_gcode(cut).unwrap());
+    assert!((after.0 - (before.0 + 20.0)).abs() < 1e-2, "the rebuilt cutout tracks the moved board: {before:?} -> {after:?}");
   }
 
   #[test]

@@ -257,7 +257,11 @@ fn render_tutorial_screenshots() {
     ..super::op_drafts::CutoutDraft::default()
   };
   session
-    .cutout(cutout_draft.to_spec(cutout_draft.rectangle_outline()), cutout_draft.job.to_job(Some("starter".to_string())))
+    .cutout(
+      cutout_draft.to_spec(cutout_draft.rectangle_outline()),
+      cutout_draft.job.to_job(Some("starter".to_string())),
+      Some(edge),
+    )
     .expect("the starter cutout succeeds");
 
   // ── 07: everything generated — copper, drills, outline, and all three toolpath jobs on the canvas. ───────

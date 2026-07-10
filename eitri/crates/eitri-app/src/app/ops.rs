@@ -95,12 +95,15 @@ pub enum OpRequest {
     /// The emission parameters.
     job: IsolationJob,
   },
-  /// Route a board cutout around the spec's own outline (no source object — the outline is self-contained).
+  /// Route a board cutout around the spec's own outline (self-contained — the outline is not re-derived from a
+  /// source), associated with the `board` it profiles so moving that board carries the cutout along (docs review #5).
   Cutout {
     /// The cutout parameters, with the outline already resolved by the shell.
     spec: CutoutSpec,
     /// The emission parameters.
     job: IsolationJob,
+    /// The board this cutout profiles, so a move of it carries and stales the cutout; `None` for a standalone cutout.
+    board: Option<ObjectId>,
   },
   /// Panelize a source into a grid, committing a **geometry** object.
   Panelize {
@@ -234,7 +237,7 @@ fn run_request(mut session: Session, request: OpRequest, outcome_tx: Sender<OpOu
     OpRequest::Drill { source, spec, job } => session.drill(source, spec, job).map(OpOutput::Object),
     OpRequest::Paint { source, spec, job } => session.paint(source, spec, job).map(OpOutput::Object),
     OpRequest::NonCopper { source, spec, job } => session.noncopper(source, spec, job).map(OpOutput::Object),
-    OpRequest::Cutout { spec, job } => session.cutout(spec, job).map(OpOutput::Object),
+    OpRequest::Cutout { spec, job, board } => session.cutout(spec, job, board).map(OpOutput::Object),
     OpRequest::Panelize { source, spec } => session.panelize(source, spec).map(OpOutput::Object),
     OpRequest::Mirror { source, line } => session.mirror(source, line).map(OpOutput::Object),
     // Rebuild recomputes the job in place; its id is unchanged, so the shell re-selects it via `Object(job)`.
@@ -540,7 +543,7 @@ mod tests {
         job: IsolationJob::default(),
       }
       .label_key(),
-      OpRequest::Cutout { spec: cutout, job: IsolationJob::default() }.label_key(),
+      OpRequest::Cutout { spec: cutout, job: IsolationJob::default(), board: None }.label_key(),
       OpRequest::Panelize {
         source: ObjectId(0),
         spec: PanelizeSpec { rows: 1, cols: 1, x: SpacingSpec::Gap(1.0), y: SpacingSpec::Gap(1.0) },

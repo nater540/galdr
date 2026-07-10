@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
   // --- Board cutout -------------------------------------------------------------------------------------------------
   // Route the profile around the real board rectangle, leaving four holding tabs so the part stays put until it is
   // snapped out. The cut goes the full board thickness in shallow passes.
-  let cutout = session.cutout(cutout_spec(board_min, board_max), cutout_job())?;
+  let cutout = session.cutout(cutout_spec(board_min, board_max), cutout_job(), Some(edge))?;
 
   // --- Write G-code + save the project ------------------------------------------------------------------------------
   let emitted = [

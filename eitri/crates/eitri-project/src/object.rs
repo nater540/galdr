@@ -593,6 +593,24 @@ impl CutoutOutlineSpec {
       CutoutOutlineSpec::Geometry(geometry) => CutoutOutline::Geometry(geometry.clone()),
     }
   }
+
+  /// Carry the outline along by `transform` — used to keep a cutout registered against the board it profiles when
+  /// that board is repositioned on the stock (the outline is self-owned, not re-derived from a source at rebuild;
+  /// docs review #5). The rectangle's two corners are transformed in place; under the pure translations the UI's
+  /// canvas drag produces this stays axis-aligned (a rotation would skew it, but the drag never rotates).
+  pub fn transform(&mut self, transform: Affine) {
+    match self {
+      CutoutOutlineSpec::Rectangle { min, max } => {
+        let (min_x, min_y) = transform.apply(min.x, min.y);
+        let (max_x, max_y) = transform.apply(max.x, max.y);
+        *min = Coord { x: min_x, y: min_y };
+        *max = Coord { x: max_x, y: max_y };
+      }
+      CutoutOutlineSpec::Geometry(geometry) => {
+        *geometry = eitri_geo::apply_affine(geometry, transform);
+      }
+    }
+  }
 }
 
 /// Operator-facing panelization parameters. Maps to [`PanelSpec`] via [`PanelizeSpec::to_params`]. The source object

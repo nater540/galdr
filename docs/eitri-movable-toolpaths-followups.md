@@ -8,9 +8,10 @@ Line numbers drift — each item names the owning function so it stays findable.
 
 ## Status (2026-07-09 follow-up pass)
 
-Items **#1, #2, #3, #4** and minors **M1, M3** are resolved on this branch (test-first, `cargo test` + `clippy` clean
-under `-D warnings`). Item **#5** is deferred with a decided approach recorded inline; minor **M2** is still open. See
-"Resolved" and the trimmed "Open follow-ups" below.
+**All items resolved** on this branch (test-first, `cargo test` + `clippy` clean under `-D warnings`): follow-ups
+**#1–#5**, the xhigh-review fixes **R1–R9**, and minors **M1–M3**. See "Resolved", "Review fixes", and "Final
+follow-ups (#5, M2)" below. The "Open follow-ups" and "Minor" sections are retained for the original problem
+statements.
 
 ## Review fixes (xhigh multi-agent review of the pass)
 
@@ -47,7 +48,29 @@ A follow-up `/code-review xhigh` on the branch surfaced 10 defects. Eight were f
   first-call amend degrades to a real snapshot instead of an un-undoable mutation. Test:
   `a_coalesce_with_no_prior_entry_falls_back_to_a_fresh_snapshot` (the sibling `commit_setup` path).
 - **Accepted as designed:** R6 (the drag stale-badge reconciles on `Intent::EndTranslate`, not per frame — egui
-  delivers `drag_stopped` reliably) and the M2 tool-field duplication (already tracked as open minor M2).
+  delivers `drag_stopped` reliably).
+
+## Final follow-ups (#5, M2)
+
+- **#5 — a cutout now follows the board it profiles.** A cutout job is associated with its board via the existing
+  `CncJobObject::source` back-reference (`Session::cutout(spec, job, board)`; the shell's `RunCutout` passes the
+  selected object, and `OpRequest::Cutout` carries it). Whenever that board's placement changes, the cutout's stored
+  outline is carried along by the same movement delta and the job is flagged stale, so a rebuild re-cuts the profile
+  in register. This holds on **every** placement path: `move_group` carries it by the drag `shift` in its single
+  pass, and `set_object_placement` (the `set_placement`/`translate_object` seam) computes the delta `old⁻¹ ∘ new` and
+  applies it. `CutoutOutlineSpec::transform` does the geometry (rectangle corners or silhouette polygons). The outline
+  is still self-owned (not re-derived from a source at rebuild), so a hand-drawn silhouette is preserved. Rebuild
+  ignores `source` for cutouts, so the association is purely for carry + staleness. Note: the carry applies the full
+  rigid delta, so a future rotation UI would rotate the outline too, though a rectangle outline would then skew (the
+  drag only translates today). Tests: `moving_a_board_carries_and_stales_its_associated_cutout`,
+  `translating_a_board_carries_its_associated_cutout`, `a_standalone_cutout_is_untouched_by_an_unrelated_board_move`,
+  `rebuilding_a_carried_cutout_re_cuts_at_the_moved_position`.
+- **M2 — one tool-diameter mapping.** The `*_program` builders no longer hand-pick `spec.tool_diameter` /
+  `spec.paint.tool_diameter` for the header note; they take the note as a parameter, derived once by `header_note(&
+  CamOperation)` from the single source of truth `CamOperation::tool_diameter()` (the same the panel readout uses).
+  The public ops build the operation up front and pass the derived note; `rebuild_program` derives it from the stored
+  operation. Drilling keeps its own multi-tool summary note. A new single-tool op now updates one place, not two.
+  Test: `the_header_tool_note_is_derived_from_the_operation_for_single_tool_ops` (covers the non-copper indirection).
 
 ## Resolved (this pass)
 
@@ -118,11 +141,9 @@ outline stays put and shows no stale badge, so the profile cut silently misregis
 move of the group they belong to, or at minimum surface a UI signal that a self-contained cutout may be out of
 registration. Requires deciding how a cutout is associated with a board (it currently has no back-reference).
 
-**Decision (2026-07-09, deferred):** deferred pending a **cutout↔board association design**. Note that flagging the
-cutout stale alone would not fix registration — `rebuild_program` recomputes from the same frozen
-`CutoutOutlineSpec`, so the outline would not move. A real fix needs either a back-reference (derive the outline from
-the board's placed bounds at rebuild) or applying the group's translation to the stored outline. Decide the
-association model deliberately before implementing.
+**RESOLVED (2026-07-09):** the cutout is now associated with its board via `CncJobObject::source`, and its stored
+outline is carried by the board's movement delta on every placement path (with the job flagged stale). See
+"Final follow-ups (#5, M2)" above for the implementation and tests.
 
 ---
 
@@ -131,8 +152,8 @@ association model deliberately before implementing.
 - **Tool-diameter knowledge in two places.** `CamOperation::tool_diameter()` (UI readout) and the per-op
   `tool_note(spec.tool_diameter)` calls in the `session.rs` `*_program` builders both encode "which spec field is the
   tool" (including the `NonCopper → spec.paint.tool_diameter` indirection). A new single-tool op must update both or
-  the header note and the panel readout diverge. Consider deriving the header note from `CamOperation` at a single
-  choke point (e.g. `store_program`).
+  the header note and the panel readout diverge. **RESOLVED (2026-07-09):** the header note is now derived once from
+  `CamOperation` via `header_note()`; see "Final follow-ups (#5, M2)" above.
 
 _(Not a divergence risk: `scene::placed` and `session::place_region` use different helper names
 (`eitri_geo::apply_affine` vs `eitri_cam::edit::transform`) but both bottom out in `apply_affine`, so they cannot

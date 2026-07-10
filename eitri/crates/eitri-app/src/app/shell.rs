@@ -357,8 +357,13 @@ impl EitriApp {
           return;
         };
         let name = self.view.selected_row().map(|row| row.name.clone());
-        let request =
-          OpRequest::Cutout { spec: self.ui.cutout.to_spec(outline), job: self.ui.cutout.job.to_job(name) };
+        // Associate the cutout with the board it profiles (the selected object), so dragging that board carries the
+        // cutout's outline along and flags it for rebuild (docs review #5).
+        let request = OpRequest::Cutout {
+          spec: self.ui.cutout.to_spec(outline),
+          job: self.ui.cutout.job.to_job(name),
+          board: Some(id),
+        };
         self.launch(request);
       }
       Intent::RunPanelize(id) => {
