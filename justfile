@@ -37,6 +37,18 @@ monitor *args: _esp-env _espflash-ok
 run *args:
   cargo run -p skirnir {{args}}
 
+# Oscilloscope (Rigol DHO804) bench tooling — a uv-managed Python project in tools/scope. Drives the
+# scope over USB-TMC/LAN for screenshots, waveform export, and the single-shot streaming-lockup catcher.
+# `just scope` alone prints *IDN? (link check); pass a subcommand + args, all forwarded through, e.g.
+# `just scope screenshot -o step.png`, `just scope waveform -c 1 -o step.csv`, `just scope catch-lockup -c 1`.
+scope *args:
+  uv run --project tools/scope scope-capture {{args}}
+
+# Sync the scope tool's Python environment (first-time setup, or after editing its dependencies).
+# Needs libusb on the host for the USB backend (macOS: `brew install libusb`).
+scope-sync:
+  uv sync --project tools/scope
+
 # Private helper: fail early with a clear message if the Espressif toolchain env is not installed.
 _esp-env:
   #!/usr/bin/env bash
