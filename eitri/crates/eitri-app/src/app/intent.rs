@@ -60,13 +60,23 @@ pub enum Intent {
   RunMirror(ObjectId),
   /// Export a copper/geometry source as a photo-film SVG via a save dialog (vector output, not an op run).
   ExportFilm(ObjectId),
+  /// Recalculate a CNC job in place from its stored operation + emission against the current source geometry (the
+  /// per-toolpath "rebuild" action). Runs off-thread like any other op.
+  RebuildJob(ObjectId),
   /// Request cancellation of the in-flight operation.
   CancelOp,
 
   // ── Setup / stock / work zero (cheap and synchronous — the shell applies these inline, not on the worker) ─
   /// Commit the Setup panel's stock (footprint, thickness, datum corner, Z reference) as the job's material
-  /// block; the work zero every posted job references derives from it.
-  SetStock(Stock),
+  /// block; the work zero every posted job references derives from it. `coalesce` is set on the continuation frames
+  /// of a live stock-spinner drag (not the first frame, not a typed/discrete edit), so the whole drag folds into a
+  /// single undo entry instead of one per frame (docs review #1).
+  SetStock {
+    /// The drafted stock to commit.
+    stock: Stock,
+    /// Whether this commit continues an active drag and should fold into the current undo entry.
+    coalesce: bool,
+  },
   /// Clear the stock and revert posting to the native (source) coordinate frame.
   ClearStock,
   /// Auto-fit the stock footprint to a reference object's bounding box at the given material thickness (mm).
@@ -80,6 +90,23 @@ pub enum Intent {
   // ── Canvas ─────────────────────────────────────────────────────────────────────────────────────────────
   /// Zoom the canvas to fit the loaded geometry.
   ZoomFit,
+  /// Move the group containing `anchor` (or just `anchor` if ungrouped) by `(dx, dy)` millimetres on the stock —
+  /// emitted per frame while dragging an object on the canvas. `new_edit` is `true` on the first frame of a drag
+  /// (start a fresh undo entry) and `false` for the rest (coalesce into it), so a whole drag undoes at once.
+  TranslateGroup {
+    /// The object grabbed on the canvas; its whole group moves with it.
+    anchor: ObjectId,
+    /// Translation this frame in world millimetres (X right).
+    dx: f64,
+    /// Translation this frame in world millimetres (Y up).
+    dy: f64,
+    /// Whether to start a new undo entry (first drag frame) rather than coalesce into the current one.
+    new_edit: bool,
+  },
+  /// A canvas object-drag has ended (mouse released). While the drag ran, [`Intent::TranslateGroup`] shifted only the
+  /// cached scene each frame (the fast-path); this triggers the one authoritative `refresh_from_session` that
+  /// reconciles the tree (stale badges), the scene, and the selection extras. Emitted once per object drag.
+  EndTranslate,
 
   // ── Appearance / settings ─────────────────────────────────────────────────────────────────────────────
   /// Open the application-settings dialog.

@@ -23,7 +23,7 @@ use eitri_cam::{
 };
 use eitri_core::{Affine, Unit};
 use eitri_geo::JoinType;
-use eitri_gcode::Program;
+use eitri_gcode::{DrillJob, IsolationJob, Program};
 use eitri_gerber::GerberImage;
 use eitri_excellon::ExcellonImage;
 use eitri_import::ImportedGeometry;
@@ -217,6 +217,27 @@ pub struct CncJobObject {
   /// so jobs written before the datum existed load as native.
   #[serde(default)]
   pub origin: (f64, f64),
+  /// Whether the job is out of date with its source — set when the source object is moved (or otherwise changed)
+  /// after the job was posted, so the UI can flag it for a rebuild. `#[serde(default)]` so a freshly posted job (and
+  /// any project written before this field existed) loads as up to date.
+  #[serde(default)]
+  pub stale: bool,
+  /// The emission parameters (depths, feeds, spindle, travel height) the job was posted with, kept alongside the
+  /// [`CamOperation`] spec so a rebuild fully reproduces the G-code — not just the geometry. `#[serde(default)]` (so
+  /// jobs written before this field existed load as `None`); a `None` job cannot be rebuilt from stored params alone.
+  #[serde(default)]
+  pub emission: Option<JobEmission>,
+}
+
+/// The emission (cutting) parameters a CNC job was posted with, tagged by which emitter produced it, so a rebuild can
+/// re-run the exact same job — feeds, depths, spindle and all — against the (possibly moved) source. Paired
+/// with the [`CamOperation`] spec: the spec is the geometry intent, this is the machine intent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JobEmission {
+  /// An isolation-style contour job (isolation, paint, non-copper, cutout all emit through [`IsolationJob`]).
+  Isolation(IsolationJob),
+  /// A drilling job.
+  Drill(DrillJob),
 }
 
 impl CncJobObject {
@@ -227,6 +248,7 @@ impl CncJobObject {
     source: Option<ObjectId>,
     operation: CamOperation,
     origin: (f64, f64),
+    emission: Option<JobEmission>,
   ) -> CncJobObject {
     CncJobObject {
       gcode: Arc::from(program.lines().to_vec()),
@@ -234,6 +256,8 @@ impl CncJobObject {
       source,
       operation,
       origin,
+      stale: false,
+      emission,
     }
   }
 
@@ -275,6 +299,21 @@ pub enum CamOperation {
   Panelize(PanelizeSpec),
   /// Two-sided alignment: a mirror line plus registration holes.
   TwoSided(TwoSidedSpec),
+}
+
+impl CamOperation {
+  /// The single cutting-tool diameter (millimetres) this operation uses, for a UI/header summary. `None` for
+  /// operations without one single tool: drilling runs several bits sized by the source drill file, and
+  /// panelize/two-sided produce geometry, not a toolpath.
+  pub fn tool_diameter(&self) -> Option<f64> {
+    match self {
+      CamOperation::Isolation(spec) => Some(spec.tool_diameter),
+      CamOperation::Paint(spec) => Some(spec.tool_diameter),
+      CamOperation::NonCopper(spec) => Some(spec.paint.tool_diameter),
+      CamOperation::Cutout(spec) => Some(spec.tool_diameter),
+      CamOperation::Drilling(_) | CamOperation::Panelize(_) | CamOperation::TwoSided(_) => None,
+    }
+  }
 }
 
 /// Operator-facing isolation parameters. Maps to [`IsolationParams`] via [`IsolationSpec::to_params`], which fills
@@ -552,6 +591,24 @@ impl CutoutOutlineSpec {
         CutoutOutline::Rectangle { min: Point::new(min.x, min.y), max: Point::new(max.x, max.y) }
       }
       CutoutOutlineSpec::Geometry(geometry) => CutoutOutline::Geometry(geometry.clone()),
+    }
+  }
+
+  /// Carry the outline along by `transform` — used to keep a cutout registered against the board it profiles when
+  /// that board is repositioned on the stock (the outline is self-owned, not re-derived from a source at rebuild;
+  /// docs review #5). The rectangle's two corners are transformed in place; under the pure translations the UI's
+  /// canvas drag produces this stays axis-aligned (a rotation would skew it, but the drag never rotates).
+  pub fn transform(&mut self, transform: Affine) {
+    match self {
+      CutoutOutlineSpec::Rectangle { min, max } => {
+        let (min_x, min_y) = transform.apply(min.x, min.y);
+        let (max_x, max_y) = transform.apply(max.x, max.y);
+        *min = Coord { x: min_x, y: min_y };
+        *max = Coord { x: max_x, y: max_y };
+      }
+      CutoutOutlineSpec::Geometry(geometry) => {
+        *geometry = eitri_geo::apply_affine(geometry, transform);
+      }
     }
   }
 }

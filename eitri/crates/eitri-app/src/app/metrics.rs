@@ -50,6 +50,8 @@ impl Metrics {
   // ── Body grid ─────────────────────────────────────────────────────────────────────────────────────────
   /// Left project-tree column width.
   pub const LEFT_COL_W: f32 = 232.0;
+  /// Default height of the TOOLPATHS section anchored at the bottom of the left column (resizable by the operator).
+  pub const TOOLPATHS_PANEL_H: f32 = 200.0;
   /// Right parameters column width.
   pub const RIGHT_COL_W: f32 = 286.0;
   /// 1px panel divider thickness.

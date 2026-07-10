@@ -18,7 +18,7 @@ use eframe::egui;
 use super::scene;
 use super::theme::Palette;
 use super::ui_test::{DEFAULT_SIZE, HarnessState, build_shell_harness, render_in};
-use super::view_state::{LogKind, OpView, Selection, TreeRow, ViewState};
+use super::view_state::{LogKind, OpView, Selection, ViewState};
 use super::views::{DockTab, SelectedInfo, StockDraft, UiState};
 use eitri_gcode::IsolationJob;
 use eitri_project::{DirectionSpec, IsolationSpec, ObjectKind};
@@ -36,21 +36,21 @@ const EXCELLON: &str = include_str!("../../../../fixtures/synthetic/excellon/met
 fn loaded_board() -> (HarnessState, eitri_project::ObjectId) {
   let mut session = Session::new("fixture-board");
   let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture gerber opens");
-  session.open_excellon_str("fixture-drills", EXCELLON).expect("fixture drills open");
+  session.add_to_import_group(gerber).expect("gerber joins the import group");
+  let drills = session.open_excellon_str("fixture-drills", EXCELLON).expect("fixture drills open");
+  session.add_to_import_group(drills).expect("drills join the import group");
   let spec =
     IsolationSpec { tool_diameter: 0.2, passes: 1, overlap: 0.0, combine: false, direction: DirectionSpec::Climb };
   let job = session.isolate(gerber, spec, IsolationJob::default()).expect("fixture isolation succeeds");
+  // Move the grouped board after posting the job, so the fixture exercises BOTH the folder tree and the ⟳ stale
+  // badge on the toolpath row.
+  session.move_group(gerber, 4.0, 2.0, true).expect("nudge the board on the stock");
 
   let mut view = ViewState::default();
-  let rows: Vec<TreeRow> = session
-    .object_ids()
-    .into_iter()
-    .map(|id| {
-      let object = session.object(id).expect("listed ids resolve");
-      TreeRow { id, name: object.meta.name.clone(), kind: object.kind(), visible: object.meta.visible }
-    })
-    .collect();
-  view.set_tree(rows, session.can_undo(), session.can_redo());
+  // Route through the live shell's partition so this fixture cannot drift from the real PROJECT/TOOLPATHS split.
+  let (rows, toolpaths, groups) = super::shell::partition_from_session(&session);
+  view.set_tree(rows, toolpaths, session.can_undo(), session.can_redo());
+  view.groups = groups;
   view.log_line(LogKind::Info, "opened fixture-top (FIXTURE data)");
   view.log_line(LogKind::Ok, "Isolation routing finished");
 
@@ -109,10 +109,12 @@ fn snapshot_shell_job_selected_gcode_tab() {
   state.ui.selected_info = Some(SelectedInfo {
     gcode_lines: 42,
     dialect: "grbl".to_string(),
+    tool_diameter: Some(0.2),
     ..SelectedInfo::default()
   });
   state.ui.gcode_preview = vec![
     "; FIXTURE isolation job (snapshot test data)".to_string(),
+    "; tool diameter 0.200 mm".to_string(),
     "G21".to_string(),
     "G90".to_string(),
     "G17".to_string(),

@@ -29,7 +29,7 @@ fn emit_then_import_recovers_the_square_contour() {
     rings: vec![IsolationRing { pass: 0, offset: 0.5, winding: WindingDirection::Ccw, geometry: square_ring() }],
   };
   let job = IsolationJob { cut_depth: 0.1, pass_depth: 0.1, ..Default::default() };
-  let text = emit_isolation(&toolpaths, &job, Origin::NATIVE, &GrblHal::new()).render();
+  let text = emit_isolation(&toolpaths, &job, Origin::NATIVE, &GrblHal::new(), None).render();
 
   let preview = import_gcode(&text).expect("import emitted g-code");
   assert!(preview.skipped.is_empty(), "clean linear g-code has nothing to skip: {:?}", preview.skipped);

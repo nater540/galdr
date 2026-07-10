@@ -272,8 +272,14 @@ fn register_cam_ops(engine: &mut Engine) {
     let id = rhai(oid(source))?;
     rhai(cam.borrow_mut().noncopper(id, spec, job)).map(|id| id.0 as i64)
   });
+  // Two-arg form: a standalone cutout tied to no board. Three-arg form: associate it with the board it profiles, so
+  // moving that board carries the cutout along (docs review #5).
   engine.register_fn("cutout", |cam: &mut ScriptSession, spec: CutoutSpec, job: IsolationJob| {
-    rhai(cam.borrow_mut().cutout(spec, job)).map(|id| id.0 as i64)
+    rhai(cam.borrow_mut().cutout(spec, job, None)).map(|id| id.0 as i64)
+  });
+  engine.register_fn("cutout", |cam: &mut ScriptSession, spec: CutoutSpec, job: IsolationJob, board: i64| {
+    let board = rhai(oid(board))?;
+    rhai(cam.borrow_mut().cutout(spec, job, Some(board))).map(|id| id.0 as i64)
   });
   engine.register_fn("panelize", |cam: &mut ScriptSession, source: i64, spec: PanelizeSpec| {
     let id = rhai(oid(source))?;

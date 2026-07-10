@@ -86,6 +86,22 @@ impl ObjectCollection {
     self.objects.iter()
   }
 
+  /// Iterate objects mutably in insertion order — for bulk edits (moving a group's members, flagging dependent
+  /// jobs stale) that touch several objects in one pass.
+  pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Object> {
+    self.objects.iter_mut()
+  }
+
+  /// The group an object belongs to, if any (an object is in at most one group).
+  pub fn group_of(&self, id: ObjectId) -> Option<&Group> {
+    self.groups.iter().find(|g| g.members.contains(&id))
+  }
+
+  /// Whether a group with this name exists.
+  pub fn has_group(&self, name: &str) -> bool {
+    self.groups.iter().any(|g| g.name == name)
+  }
+
   /// Remove an object by id, also dropping it from any group that referenced it. Returns the removed object.
   pub fn remove(&mut self, id: ObjectId) -> Option<Object> {
     let index = self.objects.iter().position(|o| o.meta.id == id)?;

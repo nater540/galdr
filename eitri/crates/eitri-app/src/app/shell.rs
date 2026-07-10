@@ -16,12 +16,12 @@ use super::metrics::Metrics;
 use super::ops::{OpOutput, OpRequest, SessionSlot};
 use super::scene::{self, RenderScene};
 use super::theme::Palette;
-use super::view_state::{LogKind, Selection, TreeRow, ViewState};
+use super::view_state::{GroupView, LogKind, Selection, TreeRow, ViewState};
 use super::views::{self, RuntimeStyle, SelectedInfo, StockDraft, UiState};
 use crate::config::Config;
 use crate::tr;
 use eitri_core::ProgressEvent;
-use eitri_project::{DirectionSpec, ObjectId, ObjectPayload, ToolDatabase};
+use eitri_project::{DirectionSpec, ObjectId, ObjectKind, ObjectPayload, ToolDatabase};
 use eitri_script::Session;
 
 /// The most G-code lines the dock preview keeps (a full job can run to hundreds of thousands; the preview is
@@ -89,18 +89,25 @@ impl EitriApp {
   /// after every collection change; a no-op while the session is away (the caller refreshes when it returns).
   fn refresh_from_session(&mut self) {
     let Some(session) = self.slot.session() else { return };
-    let rows: Vec<TreeRow> = session
-      .object_ids()
-      .into_iter()
-      .filter_map(|id| {
-        let object = session.object(id).ok()?;
-        Some(TreeRow { id, name: object.meta.name.clone(), kind: object.kind(), visible: object.meta.visible })
-      })
-      .collect();
-    self.view.set_tree(rows, session.can_undo(), session.can_redo());
+    let (tree, toolpaths, groups) = partition_from_session(session);
+    self.view.set_tree(tree, toolpaths, session.can_undo(), session.can_redo());
+    self.view.groups = groups;
     self.scene = scene::build_scene(session);
     self.sync_setup_from_session();
     self.refresh_selection_extras();
+  }
+
+  /// Refresh everything a datum/stock change affects: the Setup snapshot (the canvas stock block + crosshair), the
+  /// tree's ⟳ stale badges (a datum change stales every posted job), and the undo/redo button state (the change is
+  /// now undoable). Deliberately does NOT rebuild the scene — a datum change moves no geometry (jobs redraw from
+  /// their baked G-code, sources are datum-independent), and this fires on every frame of a stock-spinner drag, so
+  /// it must stay cheap (docs follow-up #3).
+  fn refresh_after_setup_change(&mut self) {
+    self.sync_setup_from_session();
+    let Some(session) = self.slot.session() else { return };
+    let (tree, toolpaths, groups) = partition_from_session(session);
+    self.view.set_tree(tree, toolpaths, session.can_undo(), session.can_redo());
+    self.view.groups = groups;
   }
 
   /// Snapshot the session's stock + resolved work-zero for the Setup panel, the canvas block, and the
@@ -138,6 +145,7 @@ impl EitriApp {
       ObjectPayload::CncJob(job) => {
         info.gcode_lines = job.gcode.len();
         info.dialect = job.dialect.clone();
+        info.tool_diameter = job.operation.tool_diameter();
         self.ui.gcode_preview = job.gcode.iter().take(GCODE_PREVIEW_CAP).cloned().collect();
       }
     }
@@ -177,6 +185,15 @@ impl EitriApp {
       Ok(OpOutput::Object(id)) => {
         self.view.log_line(LogKind::Ok, tr!("op-done", { label: label }));
         self.view.selected = Some(Selection::Object(id));
+        // A freshly imported layer auto-joins the managed import group, so a board's layers move together as one
+        // locked set on the stock. Folded into the import's own undo entry (see `Session::add_to_import_group`).
+        // Done BEFORE the auto-fit: the auto-fit is now its own undoable setup edit (docs #3), so the group `amend`
+        // must land on the import entry, not on the stock entry the auto-fit would otherwise push first.
+        if self.slot.session().is_some_and(|s| s.is_imported_source(id))
+          && let Some(session) = self.slot.session_mut()
+        {
+          let _ = session.add_to_import_group(id);
+        }
         self.auto_fit_stock(id);
         self.refresh_from_session();
         // The first thing loaded into an empty canvas gets framed automatically — the operator should see
@@ -208,7 +225,8 @@ impl EitriApp {
   /// is set and nothing else on the tree could have bounded one, fit the stock to the new object at the
   /// drafted thickness (the Vectric-style "the job setup knows your material" first-load seed). Quietly a
   /// no-op for boundless kinds (an Excellon opened first, a CNC job) and once the operator owns the setup —
-  /// an explicit stock, or a board already present when this one arrived, is never overridden.
+  /// an explicit stock, or a board already present when this one arrived, is never overridden. The fit folds
+  /// into the import's undo entry (coalesce), so opening a board is a single Ctrl+Z (docs review #8).
   fn auto_fit_stock(&mut self, id: ObjectId) {
     let thickness = self.ui.stock_draft.thickness.max(0.01);
     let Some(session) = self.slot.session_mut() else { return };
@@ -224,7 +242,9 @@ impl EitriApp {
           .map(|o| matches!(o.payload, ObjectPayload::Gerber(_) | ObjectPayload::Geometry(_)))
           .unwrap_or(false)
     });
-    if others_have_geometry || session.fit_stock_to(id, thickness).is_err() {
+    // coalesce = true folds the fit into the import's undo entry (it runs right after the import, before any other
+    // edit), so opening a board undoes in one step rather than leaving the auto-fitted stock behind.
+    if others_have_geometry || session.fit_stock_to(id, thickness, true).is_err() {
       return;
     }
     let (x, y, z) = session.work_origin();
@@ -337,8 +357,13 @@ impl EitriApp {
           return;
         };
         let name = self.view.selected_row().map(|row| row.name.clone());
-        let request =
-          OpRequest::Cutout { spec: self.ui.cutout.to_spec(outline), job: self.ui.cutout.job.to_job(name) };
+        // Associate the cutout with the board it profiles (the selected object), so dragging that board carries the
+        // cutout's outline along and flags it for rebuild (docs review #5).
+        let request = OpRequest::Cutout {
+          spec: self.ui.cutout.to_spec(outline),
+          job: self.ui.cutout.job.to_job(name),
+          board: Some(id),
+        };
         self.launch(request);
       }
       Intent::RunPanelize(id) => {
@@ -348,10 +373,11 @@ impl EitriApp {
         self.launch(OpRequest::Mirror { source: id, line: self.ui.mirror.to_line() });
       }
       Intent::ExportFilm(id) => self.export_film_via_dialog(id),
-      Intent::SetStock(stock) => {
+      Intent::RebuildJob(job) => self.launch(OpRequest::Rebuild { job }),
+      Intent::SetStock { stock, coalesce } => {
         if let Some(session) = self.slot.session_mut() {
-          session.set_stock(Some(stock));
-          self.sync_setup_from_session();
+          session.set_stock(Some(stock), coalesce);
+          self.refresh_after_setup_change();
           // Deliberately NOT logged: a DragValue re-commits on every frame of a drag, and a log line per frame
           // would flood the dock. The readout, the canvas block, and the crosshair are the live confirmation;
           // the discrete setup events (fit, clear, auto-fit) do log.
@@ -359,16 +385,17 @@ impl EitriApp {
       }
       Intent::ClearStock => {
         if let Some(session) = self.slot.session_mut() {
-          session.set_stock(None);
-          self.sync_setup_from_session();
+          session.set_stock(None, false);
+          self.refresh_after_setup_change();
           self.view.log_line(LogKind::Ok, tr!("stock-cleared"));
         }
       }
       Intent::FitStock { reference, thickness } => {
         if let Some(session) = self.slot.session_mut() {
-          match session.fit_stock_to(reference, thickness) {
+          // A manual Fit press is its own undo entry (coalesce = false).
+          match session.fit_stock_to(reference, thickness, false) {
             Ok(()) => {
-              self.sync_setup_from_session();
+              self.refresh_after_setup_change();
               let [x, y, z] = self.ui.work_origin;
               self.view.log_line(
                 LogKind::Ok,
@@ -386,6 +413,21 @@ impl EitriApp {
       }
 
       Intent::ZoomFit => self.ui.pending_fit = true,
+      Intent::TranslateGroup { anchor, dx, dy, new_edit } => {
+        if let Some(session) = self.slot.session_mut() {
+          match session.move_group(anchor, dx, dy, new_edit) {
+            // Fast-path: shift only the moved objects' cached scene geometry so the board follows the cursor,
+            // WITHOUT re-triangulating every polygon or re-importing every job's G-code each frame (docs #1). The
+            // full `refresh_from_session` runs once on `Intent::EndTranslate` when the drag stops.
+            Ok(()) => {
+              let members = session.move_set(anchor);
+              self.scene.translate_objects(&members, dx, dy);
+            }
+            Err(err) => self.view.log_line(LogKind::Error, err.to_string()),
+          }
+        }
+      }
+      Intent::EndTranslate => self.refresh_from_session(),
 
       Intent::OpenAppSettings => self.ui.app_settings_open = true,
       Intent::SetLanguage(locale) => {
@@ -597,6 +639,27 @@ impl EitriApp {
   }
 }
 
+/// Partition a session's collection into the PROJECT tree rows, the TOOLPATHS rows, and the group folders. CNC jobs
+/// go to TOOLPATHS, every source/geometry object to PROJECT; both keep the collection's display order. This is the
+/// single source of truth for the split so the snapshot/tutorial harnesses cannot drift from the live shell (docs
+/// cleanup: the loop previously lived in three places).
+pub(crate) fn partition_from_session(session: &Session) -> (Vec<TreeRow>, Vec<TreeRow>, Vec<GroupView>) {
+  let (mut tree, mut toolpaths): (Vec<TreeRow>, Vec<TreeRow>) = (Vec::new(), Vec::new());
+  for id in session.object_ids() {
+    let Ok(object) = session.object(id) else { continue };
+    let kind = object.kind();
+    let stale = matches!(&object.payload, ObjectPayload::CncJob(job) if job.stale);
+    let row = TreeRow { id, name: object.meta.name.clone(), kind, visible: object.meta.visible, stale };
+    if kind == ObjectKind::CncJob {
+      toolpaths.push(row);
+    } else {
+      tree.push(row);
+    }
+  }
+  let groups = session.groups().into_iter().map(|(name, members)| GroupView { name, members }).collect();
+  (tree, toolpaths, groups)
+}
+
 /// Fold one engine progress event into the view state.
 fn apply_progress(view: &mut ViewState, event: ProgressEvent) {
   match event {
@@ -706,7 +769,19 @@ pub(crate) fn shell_panels(ui: &mut egui::Ui, scene: &RenderScene, view: &ViewSt
   // and clips the content's right edge).
   let column_frame = egui::Frame::NONE.fill(palette.panel);
   egui::Panel::left("tree").resizable(false).exact_size(Metrics::LEFT_COL_W).frame(column_frame).show(ui, |ui| {
-    views::contained(ui, |ui| views::tree_panel(ui, view, state, sink));
+    // The left column stacks PROJECT over TOOLPATHS: the CNC jobs get their own resizable section anchored to the
+    // bottom, and the project tree fills the remainder above it.
+    egui::Panel::bottom("toolpaths")
+      .resizable(true)
+      .default_size(Metrics::TOOLPATHS_PANEL_H)
+      .min_size(Metrics::PANEL_CONTROL_H + 24.0)
+      .frame(egui::Frame::NONE)
+      .show(ui, |ui| {
+        views::contained(ui, |ui| views::toolpaths_panel(ui, view, state, sink));
+      });
+    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+      views::contained(ui, |ui| views::tree_panel(ui, view, state, sink));
+    });
   });
   egui::Panel::right("params").resizable(false).exact_size(Metrics::RIGHT_COL_W).frame(column_frame).show(
     ui,
@@ -852,6 +927,102 @@ mod tests {
   }
 
   #[test]
+  fn imported_layers_auto_join_one_import_group() {
+    // Imports arrive one file at a time; each auto-joins the managed import group so the board's layers stay
+    // registered and move together. Two opens must land in ONE group, not two.
+    let mut app = EitriApp::new(Config::default(), Vec::new());
+    app.launch(OpRequest::OpenGerber { name: "top".to_string(), source: GERBER.to_string() });
+    pump_until_idle(&mut app);
+    app.launch(OpRequest::OpenGerber { name: "bottom".to_string(), source: GERBER.to_string() });
+    pump_until_idle(&mut app);
+    assert_eq!(app.view.groups.len(), 1, "exactly one managed import group: {:?}", app.view.groups);
+    assert_eq!(app.view.groups[0].members.len(), 2, "both imported layers joined it");
+    assert_eq!(app.view.tree.len(), 2, "both sources are in PROJECT");
+  }
+
+  #[test]
+  fn opening_a_board_is_a_single_undo_step_even_with_auto_fit() {
+    // Opening a board auto-fits the stock; that fit folds into the import's undo entry, so one Ctrl+Z removes the
+    // whole board rather than first reverting only the auto-fitted stock (docs review #8).
+    let mut app = EitriApp::new(Config::default(), Vec::new());
+    app.launch(OpRequest::OpenGerber { name: "top".to_string(), source: GERBER.to_string() });
+    pump_until_idle(&mut app);
+    assert_eq!(app.view.tree.len(), 1, "the board loaded");
+    assert!(app.slot.session().unwrap().stock().is_some(), "and its stock was auto-fitted");
+
+    let undone = app.slot.session_mut().unwrap().undo();
+    assert!(undone, "there is one undoable step");
+    let session = app.slot.session().unwrap();
+    assert_eq!(session.len(), 0, "one undo removes the whole board, not just the auto-fit stock");
+    assert!(session.stock().is_none(), "and the stock is gone with it");
+  }
+
+  #[test]
+  fn moving_a_source_flags_its_toolpath_stale() {
+    let (mut app, id) = app_with_gerber();
+    let ctx = egui::Context::default();
+    app.handle_intent(&ctx, Intent::RunIsolate(id));
+    pump_until_idle(&mut app);
+    assert_eq!(app.view.toolpaths.len(), 1, "the isolate produced a toolpath");
+    assert!(!app.view.toolpaths[0].stale, "a freshly posted toolpath is up to date");
+
+    app.handle_intent(&ctx, Intent::TranslateGroup { anchor: id, dx: 10.0, dy: 0.0, new_edit: true });
+    // The source moves on the stock immediately (the session is staled per frame); the VIEW's stale badge, however,
+    // refreshes once at drag end — the per-frame path only shifts the cached scene (docs #1).
+    assert!(
+      app.slot.session().unwrap().object(id).unwrap().meta.placement != eitri_core::Affine::IDENTITY,
+      "the dragged source's placement changed",
+    );
+    app.handle_intent(&ctx, Intent::EndTranslate);
+    assert!(app.view.toolpaths[0].stale, "at drag end the toolpath row shows stale for rebuild");
+  }
+
+  #[test]
+  fn changing_the_datum_flags_the_toolpath_row_stale_live() {
+    // #3: a Setup datum/stock change stales every posted job, and the setup handler refreshes the tree badge live
+    // (without a scene rebuild). Fitting the stock from the native frame is a real datum change.
+    let (mut app, id) = app_with_gerber();
+    let ctx = egui::Context::default();
+    app.handle_intent(&ctx, Intent::RunIsolate(id));
+    pump_until_idle(&mut app);
+    assert!(!app.view.toolpaths[0].stale, "a freshly posted toolpath is up to date");
+
+    app.handle_intent(&ctx, Intent::FitStock { reference: id, thickness: 1.6 });
+    assert!(app.view.toolpaths[0].stale, "changing the work-zero flags the toolpath stale, shown live");
+    assert!(app.view.can_undo, "the datum change is undoable");
+  }
+
+  #[test]
+  fn rebuilding_a_stale_toolpath_refreshes_it_in_place_and_clears_stale() {
+    let (mut app, id) = app_with_gerber();
+    let ctx = egui::Context::default();
+    app.handle_intent(&ctx, Intent::RunIsolate(id));
+    pump_until_idle(&mut app);
+    let job = app.view.toolpaths[0].id;
+    app.handle_intent(&ctx, Intent::TranslateGroup { anchor: id, dx: 10.0, dy: 0.0, new_edit: true });
+    app.handle_intent(&ctx, Intent::EndTranslate);
+    assert!(app.view.toolpaths[0].stale, "the moved source staled the job");
+
+    app.handle_intent(&ctx, Intent::RebuildJob(job));
+    pump_until_idle(&mut app);
+    assert_eq!(app.view.toolpaths.len(), 1, "rebuild is in place — no second job appears");
+    assert_eq!(app.view.toolpaths[0].id, job, "the rebuilt job keeps its id");
+    assert!(!app.view.toolpaths[0].stale, "rebuild clears the stale flag");
+  }
+
+  #[test]
+  fn selecting_a_toolpath_exposes_its_tool_diameter() {
+    let (mut app, id) = app_with_gerber();
+    let ctx = egui::Context::default();
+    app.handle_intent(&ctx, Intent::RunIsolate(id));
+    pump_until_idle(&mut app);
+    let job = app.view.toolpaths[0].id;
+    app.handle_intent(&ctx, Intent::Select(Some(Selection::Object(job))));
+    let info = app.ui.selected_info.as_ref().expect("the job's facts are snapshotted on selection");
+    assert!(info.tool_diameter.is_some_and(|d| d > 0.0), "the panel exposes the isolation tool diameter");
+  }
+
+  #[test]
   fn refresh_snapshots_tree_rows_scene_and_history_flags() {
     let (app, id) = app_with_gerber();
     assert_eq!(app.view.tree.len(), 1);
@@ -874,9 +1045,13 @@ mod tests {
     assert!(matches!(app.view.op, OpView::Running { .. }));
 
     pump_until_idle(&mut app);
-    assert_eq!(app.view.tree.len(), 2, "the job landed in the collection");
+    assert_eq!(app.view.tree.len(), 1, "the source stays in PROJECT");
+    assert_eq!(app.view.toolpaths.len(), 1, "the job landed in the TOOLPATHS panel, not PROJECT");
     let job = app.view.selected_object().expect("the new job is selected");
-    assert_eq!(app.view.tree.iter().find(|r| r.id == job).map(|r| r.kind), Some(eitri_project::ObjectKind::CncJob));
+    assert_eq!(
+      app.view.toolpaths.iter().find(|r| r.id == job).map(|r| r.kind),
+      Some(eitri_project::ObjectKind::CncJob),
+    );
     assert!(app.ui.selected_info.as_ref().is_some_and(|i| i.gcode_lines > 0), "the job facts are snapshotted");
     assert!(!app.ui.gcode_preview.is_empty(), "the dock preview is populated");
     assert!(
@@ -981,7 +1156,7 @@ mod tests {
       z_ref: eitri_project::ZReference::Bottom,
       datum: eitri_project::DatumCorner::BottomRight,
     };
-    app.handle_intent(&ctx, Intent::SetStock(stock));
+    app.handle_intent(&ctx, Intent::SetStock { stock, coalesce: false });
     assert_eq!(app.ui.stock, Some(stock), "the committed stock is snapshotted for the views");
     assert_eq!(app.ui.work_origin, [22.0, 3.0, -1.6], "bottom-right/bottom resolves the 3-D work zero");
     assert_eq!(app.ui.stock_draft.datum, eitri_project::DatumCorner::BottomRight, "the draft mirrors it");

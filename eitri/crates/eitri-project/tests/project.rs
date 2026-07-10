@@ -74,6 +74,8 @@ fn sample_project() -> Project {
         source: Some(gerber),
         operation: isolation_op(),
         origin: (0.0, 0.0),
+        stale: false,
+        emission: None,
       }),
     )
     .expect("add cncjob");
@@ -251,9 +253,10 @@ fn cncjob_from_program_captures_rendered_lines() {
   let mut program = Program::new(OutputFormat::default());
   program.push("G21");
   program.push("G0 X1 Y1");
-  let job = CncJobObject::from_program(&program, "grblHAL", None, isolation_op(), (0.0, 0.0));
+  let job = CncJobObject::from_program(&program, "grblHAL", None, isolation_op(), (0.0, 0.0), None);
   assert_eq!(&*job.gcode, &["G21".to_string(), "G0 X1 Y1".to_string()]);
   assert_eq!(job.render(), "G21\nG0 X1 Y1\n");
+  assert!(!job.stale && job.emission.is_none(), "a fresh job is up to date with no captured emission");
 }
 
 #[test]
@@ -523,6 +526,8 @@ fn every_op_project() -> Project {
           source: None,
           operation: op,
           origin: (0.0, 0.0),
+          stale: false,
+          emission: None,
         }),
       )
       .expect("add cncjob");

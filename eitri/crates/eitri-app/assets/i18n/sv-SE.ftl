@@ -23,6 +23,9 @@ tip-zoom-fit = Zooma arbetsytan till den inlästa geometrin
 tree-title = Projekt
 tree-empty = Inga objekt ännu.
 tree-empty-hint = Öppna en Gerber- eller Excellon-fil för att börja.
+toolpaths-title = Verktygsbanor
+toolpaths-empty = Inga verktygsbanor ännu.
+toolpaths-empty-hint = Kör en operation för att generera G-kod.
 kind-gerber = Gerber
 kind-excellon = Excellon
 kind-geometry = Geometri
@@ -30,6 +33,7 @@ kind-cncjob = CNC-jobb
 btn-delete-object = Ta bort objekt
 vis-hide = Dölj { $name }
 vis-show = Visa { $name }
+job-rebuild = Bygg om { $name }
 
 # ── Parameterpaneler ────────────────────────────────────────────────────────────────────────────────────
 params-title = Parametrar
@@ -63,6 +67,7 @@ job-lines = { $count ->
    *[other] { $count } rader G-kod
   }
 job-dialect = Dialekt: { $dialect }
+job-tool = Verktyg: { $dia } mm
 btn-export-gcode = Exportera G-kod…
 tip-export-gcode = Skriv jobbets G-kod till en fil
 params-geometry = Geometri
@@ -188,6 +193,7 @@ op-noncopper = Röjning av ej-koppar
 op-cutout = Utfräsning
 op-panelize = Panelisering
 op-mirror = Spegling
+op-rebuild = Bygger om verktygsbana
 op-load-project = Öppna projekt
 
 # ── Docka ───────────────────────────────────────────────────────────────────────────────────────────────

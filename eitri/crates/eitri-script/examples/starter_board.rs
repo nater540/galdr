@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
   // bottom-left / top-surface datum, so every emitted program is posted relative to the board's bottom-left corner
   // (grbl coordinates land ON the board, near 0,0, not in KiCad's page frame). On the machine you zero there.
   let edge = session.open_gerber(fixtures.join("gerber/starter-Edge_Cuts.gbr"))?;
-  session.fit_stock_to(edge, 1.6)?;
+  session.fit_stock_to(edge, 1.6, false)?;
   let (board_min, board_max) = board_outline_bounds(&fixtures)?;
   let (dx, dy, dz) = session.work_origin();
   println!(
@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn Error>> {
   // --- Board cutout -------------------------------------------------------------------------------------------------
   // Route the profile around the real board rectangle, leaving four holding tabs so the part stays put until it is
   // snapped out. The cut goes the full board thickness in shallow passes.
-  let cutout = session.cutout(cutout_spec(board_min, board_max), cutout_job())?;
+  let cutout = session.cutout(cutout_spec(board_min, board_max), cutout_job(), Some(edge))?;
 
   // --- Write G-code + save the project ------------------------------------------------------------------------------
   let emitted = [

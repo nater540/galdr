@@ -19,11 +19,13 @@ use crate::arc::{ArcDir, ArcOffset};
 use crate::format::OutputFormat;
 use crate::program::Program;
 
-/// Context for the program frame hooks: an optional program name/title a dialect may print as a header comment.
+/// Context for the program frame hooks: optional header-comment metadata a dialect prints at the top of the program.
 #[derive(Debug, Clone, Default)]
 pub struct JobContext {
   /// A human-readable job name for the header comment (e.g. `"isolation"`), or `None` for no title.
   pub name: Option<String>,
+  /// A human-readable tool note for the header comment (e.g. `"tool diameter 0.200 mm"`), or `None` to omit it.
+  pub tool: Option<String>,
 }
 
 /// Spindle-on parameters.

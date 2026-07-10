@@ -139,6 +139,34 @@ impl Stock {
   }
 }
 
+/// The project's work-setup: the resolved work-zero `origin` `(x, y, z)` every CAM op posts relative to, plus the
+/// [`Stock`] that (when present) defines it. This is the datum state the undo [`crate::History`] snapshots alongside
+/// the object collection, so a datum change is one undoable edit. `origin` is normally derived from `stock`; a
+/// stock-less setup carries a bare point datum. [`WorkSetup::default`] is the native (unshifted) frame.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WorkSetup {
+  /// The work-zero offset `(x, y, z)` in the native frame; `(0, 0, 0)` is the native frame.
+  pub origin: (f64, f64, f64),
+  /// The stock/work-zero setup that defines `origin`, or `None` for a bare point datum / the native frame.
+  pub stock: Option<Stock>,
+}
+
+impl WorkSetup {
+  /// The setup a stock defines: its resolved [`Stock::origin`] and the stock itself. `None` reverts to the native
+  /// frame (no stock, origin at zero).
+  pub fn from_stock(stock: Option<Stock>) -> WorkSetup {
+    match stock {
+      Some(stock) => WorkSetup { origin: stock.origin(), stock: Some(stock) },
+      None => WorkSetup::default(),
+    }
+  }
+
+  /// A bare point datum at `(x, y)` (Z0 at the native surface), clearing any stock — the "set origin here" setup.
+  pub fn point(x: f64, y: f64) -> WorkSetup {
+    WorkSetup { origin: (x, y, 0.0), stock: None }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

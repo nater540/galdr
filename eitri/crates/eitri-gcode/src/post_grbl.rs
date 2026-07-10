@@ -51,6 +51,9 @@ impl Postprocessor for GrblHal {
     if let Some(name) = &job.name {
       prog.comment(name);
     }
+    if let Some(tool) = &job.tool {
+      prog.comment(tool);
+    }
     // Safe preamble: absolute distance, units, WCS G54, XY plane, units-per-minute feed. Units word tracks the
     // configured unit mode so an inch job emits G20 in the same slot.
     prog.push(format!("G90 {} G54 G17 G94", self.format.units_word()));
@@ -71,7 +74,7 @@ mod tests {
   fn preamble_is_the_safe_contract_preamble() {
     let post = GrblHal::new();
     let mut prog = Program::new(post.format());
-    post.start_code(&mut prog, &JobContext { name: Some("isolation".to_string()) });
+    post.start_code(&mut prog, &JobContext { name: Some("isolation".to_string()), tool: None });
     assert!(prog.lines().iter().any(|l| l == "G90 G21 G54 G17 G94"), "lines: {:?}", prog.lines());
     // The header comments are parenthesised.
     assert!(prog.lines().iter().any(|l| l.starts_with('(') && l.contains("eitri")));

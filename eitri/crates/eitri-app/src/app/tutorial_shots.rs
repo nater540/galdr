@@ -20,7 +20,7 @@ use eframe::egui;
 
 use super::scene;
 use super::ui_test::{DEFAULT_SIZE, HarnessState, build_shell_harness, render_in};
-use super::view_state::{LogKind, OpView, Selection, TreeRow, ViewState};
+use super::view_state::{LogKind, OpView, Selection, ViewState};
 use super::views::{DockTab, SelectedInfo, StockDraft, UiState};
 use eitri_project::{ObjectId, ObjectPayload};
 use eitri_script::Session;
@@ -37,18 +37,14 @@ fn shots_dir() -> PathBuf {
   dir
 }
 
-/// Mirror of the shell's `refresh_from_session`: the tree rows and history flags a live window would show.
+/// Mirror of the shell's `refresh_from_session`: the PROJECT/TOOLPATHS rows and history flags a live window would
+/// show, partitioned by kind exactly as the shell does.
 fn synced_view(session: &Session) -> ViewState {
+  // Route through the live shell's partition so this harness cannot drift from the real PROJECT/TOOLPATHS split.
   let mut view = ViewState::default();
-  let rows: Vec<TreeRow> = session
-    .object_ids()
-    .into_iter()
-    .filter_map(|id| {
-      let object = session.object(id).ok()?;
-      Some(TreeRow { id, name: object.meta.name.clone(), kind: object.kind(), visible: object.meta.visible })
-    })
-    .collect();
-  view.set_tree(rows, session.can_undo(), session.can_redo());
+  let (tree, toolpaths, groups) = super::shell::partition_from_session(session);
+  view.set_tree(tree, toolpaths, session.can_undo(), session.can_redo());
+  view.groups = groups;
   view
 }
 
@@ -261,7 +257,11 @@ fn render_tutorial_screenshots() {
     ..super::op_drafts::CutoutDraft::default()
   };
   session
-    .cutout(cutout_draft.to_spec(cutout_draft.rectangle_outline()), cutout_draft.job.to_job(Some("starter".to_string())))
+    .cutout(
+      cutout_draft.to_spec(cutout_draft.rectangle_outline()),
+      cutout_draft.job.to_job(Some("starter".to_string())),
+      Some(edge),
+    )
     .expect("the starter cutout succeeds");
 
   // ── 07: everything generated — copper, drills, outline, and all three toolpath jobs on the canvas. ───────
@@ -278,7 +278,7 @@ fn render_tutorial_screenshots() {
   //    1.6 mm thickness, bottom-left datum, Z0 on the material top; the dashed stock block and the placed
   //    crosshair on the canvas. (Set up BEFORE running the ops in a real workflow so every job posts near
   //    X0 Y0; here it lands after so the earlier shots stay in the native frame.) ──────────────────────────
-  session.fit_stock_to(edge, 1.6).expect("the outline bounds the stock");
+  session.fit_stock_to(edge, 1.6, false).expect("the outline bounds the stock");
   let (zero_x, zero_y, zero_z) = session.work_origin();
   let mut state = shot_state(&session);
   state.view.log_line(LogKind::Ok, "Isolation routing finished");

@@ -943,6 +943,7 @@ dependencies = [
  "eitri-excellon",
  "eitri-geo",
  "eitri-gerber",
+ "serde",
  "thiserror 2.0.18",
 ]
 

@@ -9,6 +9,7 @@
 //! into flat, paint-friendly arrays and tracks their combined bounds (a min/max fold — bookkeeping, not
 //! geometry).
 
+use eitri_core::Affine;
 use eitri_geo::TriangleMesh;
 use eitri_import::MotionKind;
 use eitri_project::{ObjectId, ObjectKind, ObjectPayload};
@@ -73,6 +74,59 @@ impl RenderScene {
   pub fn object(&self, id: ObjectId) -> Option<&ObjectScene> {
     self.objects.iter().find(|o| o.id == id)
   }
+
+  /// Shift the cached geometry of the given source objects by `(dx, dy)` millimetres, in place — the drag fast-path.
+  /// A live canvas drag repositions objects every frame; rebuilding the whole scene each frame ([`build_scene`]
+  /// re-triangulates every polygon and re-imports every job's G-code) is pure waste when only a translation changed.
+  /// This translates just the moved entries' ready-made vertices/outlines/polylines/bounds and re-folds the scene
+  /// bounds, leaving triangulation and job previews untouched. Adding `(dx, dy)` to already-placed vertices matches
+  /// what [`build_scene`] would produce for the composed placement, because a drag only ever translates.
+  ///
+  /// CNC-job entries are skipped even when they belong to a moved group: their preview is drawn from posted G-code
+  /// independent of source placement, so it stays put (now stale) until a rebuild — exactly as [`build_scene`]
+  /// leaves it. The authoritative [`build_scene`] still runs once when the drag ends, reconciling any float drift.
+  pub fn translate_objects(&mut self, ids: &[ObjectId], dx: f64, dy: f64) {
+    for entry in self.objects.iter_mut() {
+      if entry.kind != ObjectKind::CncJob && ids.contains(&entry.id) {
+        shift_entry(entry, dx, dy);
+      }
+    }
+    // Re-fold the fit-view union from scratch: only some entries moved, and a moved object can shrink the union as
+    // well as grow it. Only visible objects participate, mirroring `build_scene`.
+    self.bounds = None;
+    for entry in &self.objects {
+      if entry.visible {
+        merge_bounds(&mut self.bounds, entry.bounds);
+      }
+    }
+  }
+}
+
+/// Translate one entry's cached paint geometry — mesh vertices, ring outlines, open polylines, cut trails, rapid
+/// segments, and its bounds — by `(dx, dy)` millimetres. The triangle indices are unaffected by a translation.
+fn shift_entry(entry: &mut ObjectScene, dx: f64, dy: f64) {
+  for v in &mut entry.fill.vertices {
+    v[0] += dx;
+    v[1] += dy;
+  }
+  for ring in entry.outlines.iter_mut().chain(entry.polylines.iter_mut()).chain(entry.cuts.iter_mut()) {
+    for p in ring {
+      p[0] += dx;
+      p[1] += dy;
+    }
+  }
+  for (from, to) in &mut entry.rapids {
+    from[0] += dx;
+    from[1] += dy;
+    to[0] += dx;
+    to[1] += dy;
+  }
+  if let Some((x0, y0, x1, y1)) = &mut entry.bounds {
+    *x0 += dx;
+    *y0 += dy;
+    *x1 += dx;
+    *y1 += dy;
+  }
 }
 
 /// Build the paint-ready scene from the session's collection. Called only when the collection changes (an op
@@ -82,10 +136,14 @@ pub fn build_scene(session: &Session) -> RenderScene {
   for id in session.object_ids() {
     let Ok(object) = session.object(id) else { continue };
     let mut entry = ObjectScene::new(id, object.kind(), object.meta.visible);
+    // The object's placement (its position on the stock) is applied to the SOURCE geometry so the canvas shows the
+    // board where the operator arranged it. A CNC job needs no placement here — its G-code was already posted from
+    // the placed source (see `region_of`/`excellon_image_of`), so its preview draws in the right spot on its own.
+    let placement = object.meta.placement;
     match &object.payload {
       ObjectPayload::Gerber(gerber) => {
         if let Some(image) = &gerber.image {
-          fill_region(&mut entry, &image.copper);
+          fill_region(&mut entry, &placed(&image.copper, placement));
         }
       }
       ObjectPayload::Excellon(excellon) => {
@@ -98,13 +156,13 @@ pub fn build_scene(session: &Session) -> RenderScene {
               polygons.extend(geometry.0);
             }
           }
-          fill_region(&mut entry, &MultiPolygon::new(polygons));
+          fill_region(&mut entry, &placed(&MultiPolygon::new(polygons), placement));
         }
       }
       ObjectPayload::Geometry(geometry) => {
-        fill_region(&mut entry, &MultiPolygon::new(geometry.polygons.clone()));
+        fill_region(&mut entry, &placed(&MultiPolygon::new(geometry.polygons.clone()), placement));
         for line in &geometry.polylines {
-          let pts: Vec<[f64; 2]> = line.0.iter().map(|c| [c.x, c.y]).collect();
+          let pts: Vec<[f64; 2]> = line.0.iter().map(|c| place_point(c.x, c.y, placement)).collect();
           extend_bounds(&mut entry.bounds, pts.iter().copied());
           entry.polylines.push(pts);
         }
@@ -151,6 +209,22 @@ pub fn build_scene(session: &Session) -> RenderScene {
     scene.objects.push(entry);
   }
   scene
+}
+
+/// Apply an object's placement to a source region. The identity placement (an unmoved object) returns the region
+/// unchanged, so an unplaced board tessellates from bit-for-bit the same geometry it always did.
+fn placed(region: &MultiPolygon<f64>, placement: Affine) -> MultiPolygon<f64> {
+  if placement == Affine::IDENTITY {
+    region.clone()
+  } else {
+    eitri_geo::apply_affine(region, placement)
+  }
+}
+
+/// Apply an object's placement to a single point, returning it as a paint-ready `[x, y]`.
+fn place_point(x: f64, y: f64, placement: Affine) -> [f64; 2] {
+  let (px, py) = placement.apply(x, y);
+  [px, py]
 }
 
 /// Tessellate a filled region into the entry (mesh + ring outlines + bounds), all through engine geometry.
@@ -265,6 +339,88 @@ mod tests {
     let copper = scene.objects.iter().find(|o| o.kind == ObjectKind::Gerber).unwrap().bounds.unwrap();
     let trails = entry.bounds.unwrap();
     assert!(trails.0 >= copper.0 - 1.0, "the preview bounds must hug the copper, not the machine origin");
+  }
+
+  #[test]
+  fn moving_a_source_shifts_its_rendered_geometry_by_the_placement() {
+    // The canvas must show a moved board where the operator placed it: the scene applies `meta.placement` to the
+    // source geometry, so its bounds shift by exactly the translate vector.
+    let mut session = Session::new("fixture");
+    let id = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let before = build_scene(&session).object(id).unwrap().bounds.unwrap();
+    session.translate_object(id, 10.0, 5.0).expect("move on the stock");
+    let after = build_scene(&session).object(id).unwrap().bounds.unwrap();
+    assert!((after.0 - (before.0 + 10.0)).abs() < 1e-6, "min X shifts by dx");
+    assert!((after.1 - (before.1 + 5.0)).abs() < 1e-6, "min Y shifts by dy");
+    assert!((after.2 - (before.2 + 10.0)).abs() < 1e-6, "max X shifts by dx");
+    assert!((after.3 - (before.3 + 5.0)).abs() < 1e-6, "max Y shifts by dy");
+  }
+
+  #[test]
+  fn a_toolpath_previews_over_its_moved_source() {
+    // Isolating a moved board bakes the placement into the G-code, so the job's preview lands over the moved copper,
+    // not the native origin — proving placement flows through CAM into what the canvas draws.
+    let mut session = Session::new("fixture");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    session.translate_object(gerber, 30.0, 0.0).expect("move on the stock");
+    let spec = IsolationSpec {
+      tool_diameter: 0.2,
+      passes: 1,
+      overlap: 0.0,
+      combine: false,
+      direction: DirectionSpec::Climb,
+    };
+    let job = session.isolate(gerber, spec, IsolationJob::default()).expect("isolation succeeds");
+    let scene = build_scene(&session);
+    let copper = scene.object(gerber).unwrap().bounds.unwrap();
+    let trails = scene.object(job).unwrap().bounds.unwrap();
+    assert!(copper.0 > 25.0, "the moved copper sits well right of the origin: {copper:?}");
+    assert!(trails.0 <= copper.2 && trails.2 >= copper.0, "the toolpath spans the moved copper in X");
+    assert!(trails.1 <= copper.3 && trails.3 >= copper.1, "and in Y");
+  }
+
+  #[test]
+  fn translate_objects_shifts_cached_geometry_to_match_a_full_rebuild() {
+    // The drag fast-path: shifting the cached scene by (dx, dy) must land exactly where a full rebuild after the same
+    // move would, so the drag looks identical whether or not it took the cheap path (docs #1).
+    let mut session = Session::new("fixture");
+    let id = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let mut scene = build_scene(&session);
+    let before = scene.object(id).unwrap().bounds.unwrap();
+    scene.translate_objects(&[id], 10.0, 5.0);
+    let fast = scene.object(id).unwrap().bounds.unwrap();
+    assert!((fast.0 - (before.0 + 10.0)).abs() < 1e-6, "fast-path min X shifts by dx");
+    assert!((fast.1 - (before.1 + 5.0)).abs() < 1e-6, "fast-path min Y shifts by dy");
+    assert_eq!(scene.bounds, Some(fast), "the fit-view union follows the sole moved object");
+
+    session.translate_object(id, 10.0, 5.0).expect("move on the stock");
+    let rebuilt = build_scene(&session).object(id).unwrap().bounds.unwrap();
+    for (a, b) in [(fast.0, rebuilt.0), (fast.1, rebuilt.1), (fast.2, rebuilt.2), (fast.3, rebuilt.3)] {
+      assert!((a - b).abs() < 1e-6, "fast-path bounds match the authoritative rebuild: {fast:?} vs {rebuilt:?}");
+    }
+  }
+
+  #[test]
+  fn translate_objects_leaves_cnc_job_previews_in_place() {
+    // A job's preview is drawn from its posted G-code, independent of source placement, so the fast-path must NOT
+    // move it even when its id is in the moved set — it stays put (now stale) until a rebuild (docs #1).
+    let mut session = Session::new("fixture");
+    let gerber = session.open_gerber_str("fixture-top", GERBER).expect("fixture opens");
+    let spec = IsolationSpec {
+      tool_diameter: 0.2,
+      passes: 1,
+      overlap: 0.0,
+      combine: false,
+      direction: DirectionSpec::Climb,
+    };
+    let job = session.isolate(gerber, spec, IsolationJob::default()).expect("isolation succeeds");
+    let mut scene = build_scene(&session);
+    let gerber_before = scene.object(gerber).unwrap().bounds.unwrap();
+    let job_before = scene.object(job).unwrap().bounds.unwrap();
+    scene.translate_objects(&[gerber, job], 20.0, 0.0);
+    let gerber_after = scene.object(gerber).unwrap().bounds.unwrap();
+    assert!((gerber_after.0 - (gerber_before.0 + 20.0)).abs() < 1e-6, "the moved source shifts by dx");
+    assert_eq!(scene.object(job).unwrap().bounds.unwrap(), job_before, "the job preview stays put, not shifted");
   }
 
   #[test]

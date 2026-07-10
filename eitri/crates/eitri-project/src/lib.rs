@@ -32,14 +32,15 @@ mod serde_ext;
 pub mod tooldb;
 
 pub use collection::{Group, ObjectCollection};
-pub use datum::{DatumCorner, JobOrigin, Stock, ZReference};
+pub use datum::{DatumCorner, JobOrigin, Stock, WorkSetup, ZReference};
 pub use document::{SCHEMA_VERSION, load_project, save_project};
 pub use error::{ProjectError, Result};
 pub use history::{DEFAULT_HISTORY_LIMIT, History};
 pub use id::{ObjectId, ToolId};
 pub use object::{
   BoundarySpec, CamOperation, CncJobObject, CutoutOutlineSpec, CutoutSpec, DirectionSpec, DrillSpec, ExcellonObject,
-  GeometryObject, GeometryOrigin, GerberObject, ImportFormat, IsolationSpec, MirrorLineSpec, NonCopperSpec, Object,
+  GeometryObject, GeometryOrigin, GerberObject, ImportFormat, IsolationSpec, JobEmission, MirrorLineSpec,
+  NonCopperSpec, Object,
   ObjectKind, ObjectMeta, ObjectPayload, PaintSpec, PaintStrategySpec, PanelizeSpec, SpacingSpec, TabPlacementSpec,
   TwoSidedSpec,
 };
