@@ -2415,3 +2415,217 @@ Signature-B "survivable watchdog never reset the wedged board" — ROOT-CAUSED, 
 - **Belt-and-suspenders (not blocking):** a natural-Pikachu-wedge super-WDT self-reset (did not reproduce in one 30-min
   fix-build run; `provoke-b` is the fast path if desired).
 - All work UNCOMMITTED (diagnostic tree).
+
+## 18. grblHAL / ESP-IDF USB-TX comparison — is the lost-TX-wake PREVENTABLE? (bughunter, 2026-07-11, source-cited)
+
+Research question: does the grblHAL ESP32 / ESP-IDF USB-serial TX path structurally eliminate the lost-TX-done-wake
+class we root-caused in `usb_tx` over esp-hal `UsbSerialJtag`, and can we mirror that primitive? **Answer: YES — both
+reference designs make the lost-wake structurally impossible, via a RETAINED (data/count) completion signal instead of
+esp-hal's single-edge AtomicWaker-on-a-mask-bit. It is preventable, and the fix belongs primarily UPSTREAM in esp-hal
+(with a low-effort in-our-code mitigation available now).**
+
+### 18.1 Our esp-hal mechanism and the exact lost-wake vectors (source: esp-hal 1.1.1 `src/usb_serial_jtag.rs`)
+`UsbSerialJtagTx::write_async` (line 811) writes each ≤64 B chunk DIRECTLY to the EP1 FIFO, sets `wr_done`, then awaits
+a fresh `UsbSerialJtagWriteFuture` per chunk. That future (707–747): `new()` ARMS `int_ena.serial_in_empty`; `poll()`
+does `WAKER_TX.register(cx.waker())` then returns `Ready` iff `int_ena.serial_in_empty` is now CLEAR. The single ISR
+`async_interrupt_handler` (932) on TX-empty CLEARS `int_ena.serial_in_empty` (the completion latch), clears the raw
+flag, and calls `WAKER_TX.wake()`. `WAKER_TX` is ONE shared `AtomicWaker` (703). Three structural fragilities, all
+source-confirmed:
+1. **No `Drop` on `UsbSerialJtagWriteFuture`** (grep: zero `Drop` impls in the file). When our `with_timeout` fires and
+   DROPS the awaited future, `int_ena.serial_in_empty` stays ARMED. The next write re-arms an already-armed bit and the
+   arm/event/waker state is desynced — this is the captured Signature-A `iena=1` write-stage lost wake (the interrupt
+   armed but never serviced for that write).
+2. **Single, latest-only, NON-counting `AtomicWaker`.** It holds only the most recent waker and carries no count. If
+   the ISR fires + wakes but the executor's re-poll is lost/raced (our classic `iena=0 empty=0 free=1`: ISR ran, host
+   drained, future never completed), there is NO retained state to recover from — the signal is an EDGE, and a dropped
+   edge strands the write until the next unrelated event.
+3. **Completion = a mask bit, not data occupancy.** "Done" is signalled by the ISR clearing an enable bit; the payload
+   was already pushed to the FIFO with nothing retained to re-drive. One missed edge = a stranded write.
+
+### 18.2 Reference design A — ESP-IDF `usb_serial_jtag` driver (SAME peripheral as ours; source: esp-idf `components/esp_driver_usb_serial_jtag/src/usb_serial_jtag.c`)
+`usb_serial_jtag_write_bytes()` does NOT touch the FIFO directly — it `xRingbufferSend()`s into a TX RING BUFFER. The
+ISR `usb_serial_jtag_isr_handler_default()` on `USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY` `xRingbufferReceiveUpToFromISR()`s
+from the ring, `usb_serial_jtag_ll_write_txfifo()`s to refill the FIFO, stashes any leftover in `tx_stash_buf` for the
+next IRQ, and keeps SERIAL_IN_EMPTY enabled while ring data remains (disables it only when drained). Completion/backpressure
+is a RETAINED binary semaphore: `xSemaphoreGiveFromISR(tx_idle_sem)` when the ring is empty, waited on by
+`usb_serial_jtag_wait_tx_done()`. Why it can't lose a wake: the pending bytes live in the RING (retained state) and the
+ISR re-fires on every TX-empty until the ring drains — the completion is DATA-OCCUPANCY-driven and self-healing, not a
+single edge. The semaphore is a retained/counting resource, not a latest-only waker.
+
+### 18.3 Reference design B — grblHAL ESP32 actual (source: grblHAL/ESP32 `main/usb_serial.c`)
+grblHAL on ESP32-S3 uses **TinyUSB CDC** (the native USB-OTG peripheral, NOT the USB-Serial-JTAG). Its `_usb_write()`
+is a POLL loop: check `tud_cdc_write_available()`, write what fits, `tinyusb_cdcacm_write_flush()` (2 ms timeout), and if
+the FIFO is full call `hal.stream_blocking_callback()` to YIELD, then re-poll. There is NO TX-empty interrupt handler
+for the data path (the only ISR, `hw_cdc_reset_handler`, is bus-reset-only). Why it can't lose a wake: there is NO
+event-wake at all — completion is re-read from `tud_cdc_write_available()` every iteration. A poll design is immune to
+the lost-wake class by construction. (RX buffer advertised 512 B; TinyUSB staging 64 B.)
+
+### 18.4 The translatable primitive + recommendation
+The common prevention principle across A and B: **the TX-complete/room signal must be RETAINED (ring occupancy /
+counting semaphore) or RE-READ each poll (poll the FIFO-free bit) — never a single edge delivered to a latest-only
+waker.** Three ways to bring that into our esp-hal + Embassy stack:
+- **Option B (poll, mirror grblHAL) — LOW effort, in OUR code, recommended NOW.** Make `usb_tx` POLL-based: write ≤64 B
+  chunks to the FIFO, then between chunks re-read `ep1_conf.serial_in_ep_data_free` with a yield
+  (`embassy_futures::yield_now().await`, or a short `Timer`), instead of awaiting `UsbSerialJtagWriteFuture`. This is
+  EXACTLY our validated TIER-1 poll-after-arm recovery PROMOTED from a 2 s backstop to the primary loop — no waker
+  exists to lose. Cost: slightly higher poll wakeups (negligible at CNC TX rates; bounded by yielding). Stays entirely
+  in `firmware`, no upstream dependency, low risk. This makes the lost-wake structurally impossible for us.
+- **Option A (ring-buffer ISR, mirror IDF) — the "correct" root fix, HIGH effort, belongs UPSTREAM in esp-hal.** A
+  SERIAL_IN_EMPTY-ISR-drained TX ring with the ISR re-arming while data remains and an embassy-sync retained completion
+  (a `Channel`/counting signal, not a bare `AtomicWaker`). This is reimplementing the IDF driver in Rust; it is a genuine
+  esp-hal `UsbSerialJtagTx` deficiency and should be filed/fixed upstream rather than forked into our tree.
+- **Option C (minimal esp-hal patch) — cheapest upstream fix.** Add a `Drop` to `UsbSerialJtagWriteFuture` that disarms
+  `int_ena.serial_in_empty` (closes our `iena=1` with_timeout-drop vector), and make `poll()` ALSO return `Ready` on the
+  hardware `serial_in_ep_data_free` bit (data-driven, closes the latest-only-waker edge loss). Small, upstreamable, and
+  it fixes the class for every esp-hal user — but until it lands, it is not ours to rely on.
+
+**Verdict:** the lost-wake is a genuine esp-hal `UsbSerialJtagTx` design defect (edge-signalled completion + no `Drop`),
+NOT inherent to Embassy or our code. It IS preventable. Recommended path: **adopt Option B now** (poll-based `usb_tx` —
+makes the wedge impossible for us, low risk, reuses proven logic) and **file Option C upstream** to esp-hal as the
+durable ecosystem fix; keep the §17.17 executor-liveness reset→ALARM:11 as defense-in-depth. This would make the ROOT
+lost-USB-TX-wake impossible rather than merely recoverable — the prize the user asked about. PLAN-FIRST before any code.
+
+### 18.5 Streaming-contract cross-check (light)
+From `main/usb_serial.c`: grblHAL advertises a 512 B RX buffer; ours advertises 1024 B (larger — fine). Nothing in the
+TX-path review contradicts our ok/error, single-CRLF, post-error-hold, or realtime-byte-interception contract (those
+live in grblHAL `protocol.c`/`grbllib`, not the serial driver, and were not re-read here). A deeper protocol cross-check
+against grblHAL `protocol.c` is a separate focused pass if the user wants it — flag NONE from the driver layer.
+
+## 19. Option B — poll-based `usb_tx` (root prevention) — IMPLEMENTED, host-tested, awaiting BENCH (bughunter, 2026-07-11)
+
+User approved Option B (§18.4): replace `usb_tx`'s waker-based write await with a hardware-poll loop, making the
+lost-TX-wake structurally impossible (no waker to lose). This is a PRODUCTION comms-path change on the sacred streaming
+path. **STATUS: implemented on the working tree; 342 firmware-core tests green under `-D warnings`; all four Xtensa
+configs (default / capture-reset / provoke-b / provoke-executor-stall) build clean under `-D warnings`; NOT flashed
+(handed to the bench). Two refinements vs the plan sketch below, both flagged to the team:**
+- **esp-hal-exact commit sequencing (§19.6 sacred-path safety):** `write_response_polled` commits each ≤64 B packet
+  with `flush_tx_nb` (sets `wr_done` ONCE) then POLLS esp-hal's own `ep1_conf & 0b011 != 0` "commit registered"
+  condition (yielding), rather than relying on the next `write_byte_nb` to back-pressure. This mirrors esp-hal's tested
+  blocking `flush_tx`/`write` exactly and removes any dependence on unverified FIFO-buffering assumptions / a
+  commit-in-progress race on a partial final chunk. Cost: a per-packet commit-registration poll (~1 USB frame ≈ ms when
+  the host is draining), cooperative (yields), consistent with the chosen `yield_now`.
+- **`provoke-b` degenerates:** its only mechanism was the `classify_write_stage_no_recover` swap on the AWAIT path,
+  which no longer exists — so `provoke-b` now compiles as `= capture-reset` (instruments armed, no unique provocation).
+  It cannot "provoke" the lost wake because the lost-wake path is GONE; running it just watches the poll path with full
+  capture instrumentation. (If an A/B control that still wedges is wanted, the OLD await path would have to be kept
+  under a separate cfg — more retained code; recommend NOT.) The recovered-counter apparatus
+  (`USB_TX_LOST_WAKE_RECOVERED`, `record_recovered_count`, the `$I rec=` line, its RTC_FAST slot) is left DORMANT
+  (reads 0 — a "no lost-wakes" indicator) to avoid perturbing the breadcrumb layout on this change; removed with
+  `provoke-b` in the retirement cleanup.
+
+### 19.1 The primitive (esp-hal exposes exactly what we need on the Async TX)
+`UsbSerialJtagTx<'_, Dm>` (any `Dm`, incl. `Async`) exposes non-blocking, WAKER-FREE methods that re-read the hardware
+each call (esp-hal 1.1.1 `usb_serial_jtag.rs`):
+- `write_byte_nb(b) -> nb::Result<(), _>` (193): writes `b` to the EP1 FIFO IFF `ep1_conf.serial_in_ep_data_free` is
+  set, else `WouldBlock`. Re-reads the FIFO-room bit every call.
+- `flush_tx_nb() -> nb::Result<(), _>` (223): sets `wr_done`, returns `Ok` iff the packet was accepted
+  (`ep1_conf & 0b011 != 0`), else `WouldBlock`.
+Neither touches `int_ena` or `WAKER_TX` / `UsbSerialJtagWriteFuture` — the entire lost-wake surface (§18.1) is bypassed.
+
+### 19.2 Before / after control flow (exact)
+BEFORE (per response, comms.rs `usb_tx`): `RESPONSE.receive().await` → `with_timeout(2s, tx.write_all(bytes))` →
+on timeout re-read `serial_in_ep_data_free` → `classify_write_stage` (TIER-1 single-chunk widening) → if clean,
+`with_timeout(2s, tx.flush())` → `classify_split` → `WriteOutcome` {Completed | CompletedLostWakeRecovered | Stalled}
+→ K-escape counter. The `with_timeout` drop is what strands `int_ena` (§18.1 vector 1).
+
+AFTER (per response): `RESPONSE.receive().await` → poll-write the bytes, NEVER awaiting the esp-hal write future:
+```
+outcome = write_response_polled(&mut tx, resp.as_bytes(), Instant::now() + POLL_STALL_TIMEOUT):
+  for chunk in bytes.chunks(64):
+    for &b in chunk:
+      loop:
+        match tx.write_byte_nb(b):
+          Ok(())               => break               // byte in FIFO
+          Err(WouldBlock)      =>                      // FIFO full = host not draining yet
+            if Instant::now() >= deadline: return Stalled
+            yield_now().await                          // re-poll next executor tick — NO waker
+    loop:                                              // push packet + confirm host accepted it
+      match tx.flush_tx_nb():
+        Ok(())          => break
+        Err(WouldBlock) =>
+          if Instant::now() >= deadline: return Stalled
+          yield_now().await
+  return Completed
+```
+Completion is re-read from `serial_in_ep_data_free` each poll; `yield_now()` re-polls unconditionally next tick, so the
+loop makes progress every executor cycle with ZERO dependency on the TX interrupt. A genuine host-not-reading host makes
+`data_free` never set → the bounded `POLL_STALL_TIMEOUT` (keep 2 s, matching today) returns `Stalled` → drop-and-continue
++ the existing K-escape, exactly as before. Flow-control integrity (CORRECTED from the sketch's over-broad "one unit"
+claim): the flow-control-critical `ok`/`error:N` are ≤64 B = a SINGLE packet, so a stall sends the whole line or none
+(the first `write_byte_nb` blocks on a full FIFO before any byte commits) — they are never truncated. A mid-response
+stall on a MULTI-chunk response (a long `<...>` status / `$`-report) can strand its already-committed packets on the
+wire (a truncated tail), but those are NOT part of the character-count flow control (status is re-requested on the next
+`?`), and this is exactly the prior await path's behavior (a `write_all` timeout also stranded mid-response) — no
+regression.
+
+### 19.3 Relationship to the existing recovery tiers — what stays / goes / simplifies
+- **REMOVED (loses its purpose):** the entire lost-wake RECOVERY machinery — `WriteOutcome::CompletedLostWakeRecovered`,
+  `classify_write_stage`, `classify_split`, `classify_write_stage_no_recover`, the TIER-1 single-chunk widening, the
+  `USB_TX_LOST_WAKE_RECOVERED` counter, and the `SINGLE_CHUNK_MAX_BYTES` reasoning. All of it existed ONLY to
+  disambiguate "the bytes went out but the wake was lost" from "a real stall" on the await path. With polling there is
+  no lost wake to recover: `data_free` set ⇒ proceed, not set ⇒ genuine stall. `WriteOutcome` collapses to
+  {Completed, Stalled}.
+- **RETURN mostly unchanged (a REAL condition, not a lost-wake artifact):** the K-escape `UsbTxStallCounter` +
+  `handle_usb_tx_wedge` — a genuine host-not-reading stall (data_free never sets for K consecutive responses) still
+  drops-and-continues and, at K, raises production `ALARM:17` / captures in the diagnostic build. It now fires ONLY on
+  a true non-draining host, never on a phantom lost-wake.
+- **UNCHANGED, coexists (defense-in-depth):** the §17.17 executor-liveness watchdog (reset→ALARM:11). It catches a FULL
+  core-0 executor stall from ANY cause, independent of the usb_tx path. Do NOT entangle the two changes — Option B ships
+  as its own commit; the executor-liveness productionization is a separate follow-on.
+- **RETIRE after Option B lands:** the `provoke-b` feature — its whole purpose (provoke the lost-wake B by disabling
+  TIER-1 recovery) is moot once the lost-wake path is gone. Keep it only through the validation window (see §19.5),
+  then remove.
+
+### 19.4 Productionization scope + throughput/timing
+- **PRODUCTION always-on, NOT capture-reset-gated.** Option B is the root prevention; it replaces the fragile await for
+  every build. It is a production streaming-path change.
+- **Throughput (healthy host):** unchanged. When the host reads promptly `data_free` is set almost immediately, so
+  `write_byte_nb` rarely `WouldBlock`s and the poll loop barely yields — same effective latency as the await path, which
+  also completed in sub-ms when healthy. No change to the ok/status/ack cadence (usb_tx is still the single writer;
+  relative ordering is identical).
+- **Throughput (back-pressured host):** the loop cooperatively `yield_now()`s and re-polls each executor tick until
+  `data_free` — a brief cooperative spin (ms, until the host catches up), yielding to status/consumer each iteration so
+  nothing is starved. Costs a few extra executor cycles during transient backpressure, NOT throughput. If profiling
+  ever shows a spin spike, bound it with a `Timer::after(~200 µs)` between polls (adds ≤200 µs TX latency, negligible);
+  default is `yield_now` for lowest latency.
+
+### 19.5 Testability + bench validation
+- **Pure host-testable helper:** factor the per-poll decision into `firmware_core::diag`, e.g.
+  `usb_tx_poll_action(data_free: bool, deadline_exceeded: bool) -> PollAction {WriteOrFlush, Yield, Stall}`, plus a thin
+  `PollWriteOutcome` reducer over a sequence of `(data_free, elapsed)` observations → {Completed, Stalled}. Host tests:
+  data_free-always-true ⇒ Completed with N writes; data_free-always-false ⇒ Stalled at the deadline; intermittent ⇒
+  Completed. Same pure-decision / firmware-does-I/O split as `watchdog_decision`. The byte cursor + `nb` calls stay in
+  comms.rs (I/O, compile-checked).
+- **Bench validation** (absence-of-wedge is structural, but we get positive signals):
+  1. `provoke-b` should NO LONGER reproduce Signature B at all (there is no lost-wake path left to provoke) — a strong
+     positive test: run the same stream that reproduced B and confirm it now completes clean.
+  2. Full 30-min Pikachu stream completes with unchanged throughput; monitor core-0 CPU for a spin regression.
+  3. Host-not-reading test (pause the reader mid-stream) still cleanly drops → recovers → resumes (the genuine-stall
+     path preserved).
+  4. `USB_TX_LOST_WAKE_RECOVERED` (if kept transitionally) reads 0 — the class is gone, not merely quiet.
+
+### 19.6 Risk + rollback
+- **Risk: byte drop/dup on the sacred wire** (would desync ok/error flow-control). Mitigation: the pure state machine +
+  host tests; the byte cursor advances ONLY on `Ok`; `wr_done`/`data_free` semantics copied from esp-hal's own blocking
+  `write`/`flush_tx`. Catch: the grblHAL char-counting host (skirnir) desyncs loudly if an ok is dropped/duplicated.
+- **Risk: back-pressure spin starves core 0.** Mitigation: `yield_now` yields each iteration; optional `Timer` bound;
+  validate CPU over the 30-min stream.
+- **Risk: changed drop-on-stall behavior.** It is the SAME drop-and-continue the 2 s timeout does today, so host
+  flow-control behavior is preserved.
+- **Rollback:** self-contained to `usb_tx`'s write section + the removed classify helpers — one revertible commit. Keep
+  the §17.17 executor-liveness net armed as the backstop during rollout.
+
+### 19.7 Files touched + rough size
+- `crates/firmware/src/comms.rs`: rewrite `usb_tx`'s write/flush/classify section (~80 lines changed); remove the
+  TIER-1 recovery branches.
+- `crates/firmware-core/src/diag.rs`: ADD `usb_tx_poll_action` + `PollWriteOutcome` + tests (~80 lines); REMOVE
+  `CompletedLostWakeRecovered`, `classify_write_stage[_no_recover]`, `classify_split`, `SINGLE_CHUNK_MAX_BYTES` and their
+  tests (~150 lines) — net SIMPLIFICATION.
+- `crates/firmware/Cargo.toml` + call sites: retire `provoke-b` after validation.
+- Net: roughly neutral-to-smaller line count, large fragility reduction. Estimated diff ~250–350 lines touched, mostly
+  deletions.
+
+**DECISIONS FOR THE USER:** (1) `yield_now` vs a `Timer`-bounded poll (recommend `yield_now`, Timer only if profiling
+demands). (2) Remove the TIER-1 machinery now vs keep it dormant one release (recommend REMOVE — dead code on the sacred
+path is a liability, and the pure helper's tests cover the new path). (3) Retire `provoke-b` after the validation window
+(recommend yes). Nothing is written until you approve.

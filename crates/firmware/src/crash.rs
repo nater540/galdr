@@ -548,6 +548,11 @@ pub fn bump_rmt_wait_timeout() {
 /// recovered total at the next boot (the §12 bug is rare/bursty — a burst that recovers some wakes then still wedges
 /// would otherwise lose the count). Read only after a reset; no ordering. MAGIC is already set from this boot's
 /// `init_magic` by the time any write happens, so no extra stamp is needed here.
+///
+/// DORMANT since the §18/§19 poll-based `usb_tx` eliminated the lost-wake CLASS (there are no recovered lost-wakes to
+/// count). Kept — with its RTC_FAST slot + boot field — so this change does NOT perturb the breadcrumb layout on the
+/// sacred path; to be removed with the rest of the recovered-counter apparatus in the `provoke-b`-retirement cleanup.
+#[allow(dead_code)]
 pub fn record_recovered_count(count: u32) {
   BREADCRUMB[idx::RECOVERED_COUNT].store(count, Ordering::Relaxed);
 }

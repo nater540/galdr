@@ -48,9 +48,10 @@ use embassy_sync::channel::Channel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pipe::Pipe;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Timer};
 use embassy_futures::select::{select, select4, Either, Either4};
-use embedded_io_async::{Read, Write};
+use embassy_futures::yield_now;
+use embedded_io_async::Read;
 use esp_hal::usb_serial_jtag::{UsbSerialJtagRx, UsbSerialJtagTx};
 use esp_hal::Async;
 
@@ -1572,13 +1573,74 @@ pub static AUTO_REPORT_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new()
 /// a healthy stream never drops a response (which would desync the host's character-count flow control).
 const USB_TX_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The USB-Serial-JTAG IN-endpoint FIFO / packet size (bytes). Responses are committed one `wr_done` packet per chunk
+/// of this size, matching esp-hal's own `write`/`write_async` chunking and the EP1 FIFO depth.
+const USB_TX_PACKET_BYTES: usize = 64;
+
+/// Write one response over the POLL-based USB-TX path — the §18/§19 ROOT prevention of the esp-hal lost-TX-wake. Each
+/// byte is pushed with [`UsbSerialJtagTx::write_byte_nb`] (which writes IFF the IN FIFO has room), and every ≤64 B
+/// packet is committed with [`UsbSerialJtagTx::flush_tx_nb`] (`wr_done`). On a full FIFO (`WouldBlock` — the host has
+/// not drained the previous packet yet) we [`yield_now`] and re-poll. This NEVER awaits esp-hal's
+/// `UsbSerialJtagWriteFuture`, so there is NO completion waker to lose — the lost-wake CLASS is eliminated at the
+/// source (see `docs/streaming-lockup-investigation.md` §18). The per-poll decision is the host-tested
+/// [`firmware_core::diag::usb_tx_poll_action`].
+///
+/// A `WouldBlock` that persists past [`USB_TX_TIMEOUT`] is a genuine host-not-reading stall → [`WriteOutcome::Stalled`]
+/// (drop-and-continue + the K-escape). Flow-control integrity: the flow-control-critical responses (`ok` / `error:N`)
+/// are ≤64 B = a SINGLE packet, so a stall either sends the whole line or none of it — they are never truncated (the
+/// first `write_byte_nb` blocks on a full FIFO before any byte is committed). A mid-response stall on a MULTI-chunk
+/// response (a long `<...>` status or a `$`-report) can leave the already-committed packets on the wire (a truncated
+/// tail) — but those are not part of the character-count flow control (status is re-requested on the next `?`), and
+/// this matches the prior await path's behavior exactly (a `write_all` timeout also stranded mid-response), so it is
+/// no regression. esp-hal's write/flush error type is `Infallible`, so an `Err` is always `WouldBlock`. usb_tx runs on
+/// the core-0 thread-mode executor (it yields), so `Instant` advances here.
+async fn write_response_polled(
+  tx: &mut UsbSerialJtagTx<'static, Async>,
+  bytes: &[u8],
+) -> firmware_core::diag::WriteOutcome {
+  use firmware_core::diag::{PollAction, WriteOutcome, usb_tx_poll_action};
+  let deadline = Instant::now() + USB_TX_TIMEOUT;
+  for chunk in bytes.chunks(USB_TX_PACKET_BYTES) {
+    // Fill the FIFO with this chunk's bytes. `write_byte_nb` writes IFF `serial_in_ep_data_free` (room); a `WouldBlock`
+    // means the FIFO is full because the host has not drained the previous packet yet — yield and re-poll.
+    for &byte in chunk {
+      loop {
+        let progressed = tx.write_byte_nb(byte).is_ok();
+        match usb_tx_poll_action(progressed, Instant::now() >= deadline) {
+          PollAction::Advance => break,
+          PollAction::Stall => return WriteOutcome::Stalled,
+          PollAction::Yield => yield_now().await,
+        }
+      }
+    }
+    // Commit this ≤64 B packet, then WAIT for the commit to register before touching the FIFO again — mirroring
+    // esp-hal's OWN blocking `flush_tx`/`write` exactly (set `wr_done` ONCE, then poll `ep1_conf`'s low 2 bits until
+    // `!= 0`), but yielding instead of busy-waiting. `flush_tx_nb` sets `wr_done` and returns `Ok` when the commit is
+    // already registered (`ep1_conf & 0b011 != 0`); on `WouldBlock` we poll the SAME register condition directly —
+    // NOT re-calling `flush_tx_nb`, so `wr_done` is never re-triggered (no spurious zero-length packet). Waiting here
+    // (rather than relying on the next `write_byte_nb`) avoids any commit-in-progress race on a partial final chunk and
+    // keeps the byte stream faithful to esp-hal's tested sequencing.
+    if tx.flush_tx_nb().is_err() {
+      loop {
+        let committed = (esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().bits() & 0b011) != 0;
+        match usb_tx_poll_action(committed, Instant::now() >= deadline) {
+          PollAction::Advance => break,
+          PollAction::Stall => return WriteOutcome::Stalled,
+          PollAction::Yield => yield_now().await,
+        }
+      }
+    }
+  }
+  WriteOutcome::Completed
+}
+
 #[embassy_executor::task]
 pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
-  // The bounded consecutive-timeout escape for the §11 streaming-lockup capture. A COMPLETED write resets it; a
-  // timeout increments it; at `USB_TX_STALL_ESCAPE_K` (= 3 ≈ 6 s) we capture the firmware-only discriminator and
-  // force a breadcrumb-preserving software reset, converting the observed ≈16 s "1 ok / 2 s" drumbeat into a clean
-  // ~6 s self-recover whose `[MSG:CRASH usbtx: ...]` boot dump says WHY the USB TX path stalled (host-not-reading
-  // vs a lost TX-done wake (H-A) vs a downstream core-1 wedge (H-B)). The counter lives across loop turns.
+  // The bounded consecutive-stall escape. A `Completed` write resets it; a `Stalled` increments it; at
+  // `USB_TX_STALL_ESCAPE_K` (= 3) it drives the wedge handler (production `ALARM:17`, diagnostic capture+reset). Since
+  // the §18/§19 poll-based write eliminated the lost-TX-wake CLASS, a `Stalled` now means only ONE thing — the host
+  // did not drain the FIFO within the 2 s deadline (a genuine host-not-reading / disconnected-link stall), so K
+  // consecutive of them is a real non-draining host, never a phantom lost wake. The counter lives across loop turns.
   let mut stall = firmware_core::diag::UsbTxStallCounter::new();
   // The WINDOWED stall counter (§13.8) for the survivable-watchdog capture: distinguishes a PURE consecutive stall run
   // (which the K-escape catches) from an ALTERNATING recovered/stall pattern that resets the consecutive counter on
@@ -1589,90 +1651,17 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
   loop {
     crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWaitResponse);
     let resp = RESPONSE.receive().await;
-    // Sample the core-1 motion beat BEFORE the (possibly 2 s) write, so on a timeout we can tell whether core 1
-    // ADVANCED across the stall window (alive → favors a lost USB wake, H-A) or stayed frozen (favors a core-1
-    // wedge, H-B). A single relaxed load; compared after the write resolves.
+    // Sample the core-1 motion beat before the write so the capture-reset fingerprint can report whether core 1
+    // ADVANCED across a stall window (still scheduling). A single relaxed load; compared after the write resolves.
     let motion_before = MOTION_LIVENESS.load(Ordering::Relaxed);
-    // BOUND the USB write/flush. esp-hal's async USB-Serial-JTAG write/flush awaits the `serial_in_empty`
-    // (TX-FIFO-drained) event, which fires only when the HOST reads; if the host stops draining (it disconnected,
-    // or its read lagged) the await NEVER returns, parking usb_tx forever. That backs up `RESPONSE` and
-    // cascade-wedges the whole comms path. A timeout converts that hang into the drop-and-continue the host-closed
-    // path already intended: the host re-syncs on reconnect (the banner resets flow control). usb_tx runs on the
-    // core-0 thread-mode executor (it yields), so embassy time advances here — no CCOUNT needed (cf. the core-1 RMT
-    // busy-spin, which froze `Instant`).
     crate::crash::record_comms_stage(crate::crash::CommsTask::UsbTx, crate::crash::CommsStage::TxWrite);
-    // POLL-AFTER-ARM lost-wake recovery (the §12 root-cause fix), with the write and flush timed SEPARATELY so the
-    // recovery can NEVER truncate a >64 B response. esp-hal's async write future completes only when its
-    // `serial_in_empty` waker is delivered; the captured root cause (`[MSG:CRASH usbtx: lost-tx-wake free=1 empty=0
-    // iena=0 ...]`) is that this wake is LOST — the ISR ran (cleared `int_ena`+`int_raw`, woke `WAKER_TX`) but the
-    // embassy executor never re-polled, so a write whose bytes are ALREADY in the FIFO parks the full 2 s
-    // (`UsbSerialJtagWriteFuture::poll` returns Ready iff `int_ena` is clear — it WOULD have completed if re-polled).
-    // We cannot fix esp-hal's internal future, but we layer a polling backstop over its event-driven wait: on a
-    // timeout re-read the "host drained the FIFO" bit and, if set, treat the write as a recovered lost-wake (resets
-    // the stall run) instead of escalating — breaking the drumbeat WITHOUT a reset.
-    //
-    // ## Why write and flush are timed separately (truncation safety, team-lead review)
-    // `write_async` pushes the response in ≤64 B chunks and awaits the TX-empty wake BETWEEN chunks, so a lost-wake
-    // can strand `write_all` AFTER the first chunk — at which point `serial_in_ep_data_free` is `true` (the host
-    // drained chunk 1) yet the REMAINING bytes were never written. Recovering THAT would advance to the next response
-    // and emit a TRUNCATED line. So the recovery is sound ONLY once all bytes are provably in the FIFO — i.e. at the
-    // FLUSH stage. A `write_all` timeout is therefore always a genuine stall (possibly-unwritten bytes → it counts
-    // toward the K-escape; a clean reset beats a silent truncation); only a FLUSH timeout consults `data_free`.
-    // `classify_split` encodes exactly this (host-tested). usb_tx runs on the core-0 thread-mode executor (it
-    // yields), so embassy time advances here — no CCOUNT needed (cf. the core-1 RMT busy-spin, which froze `Instant`).
-    // The write stage has THREE dispositions, decided by the host-tested `classify_write_stage`: a TIMEOUT (`Err`)
-    // is a possibly-mid-write stall; a write ERROR (`Ok(Err)`) is the host having CLOSED the port — NOT a stall, a
-    // clean drop-and-continue that the reconnect / banner path re-syncs, so it must not flow into the flush or count
-    // toward the K-escape (matching the pre-split behavior, which discarded write errors); only `Ok(Ok)` (→ `None`)
-    // means all bytes reached the FIFO and we proceed to flush. (For USB-Serial-JTAG a host close usually surfaces
-    // as a write TIMEOUT, not `Ok(Err)`, so the error arm is rare — but handling it explicitly keeps "write-error ≠
-    // stall" unambiguous.)
-    let write_result = with_timeout(USB_TX_TIMEOUT, tx.write_all(resp.as_bytes())).await;
-    let write_timed_out = write_result.is_err();
-    let write_errored = matches!(write_result, Ok(Err(_)));
-    // TIER 1 (the §13.1 single-chunk write-stage widening): on a WRITE-stage timeout, re-read the host-drained bit
-    // so `classify_write_stage` can RECOVER a single-chunk (≤64 B) lost wake in place instead of K-escaping. The
-    // captured Signature A is exactly this — `wstg=1 rlen=4 free=1`: a 4-byte `ok` whose bytes the host drained but
-    // whose esp-hal completion wake was lost. A ≤64 B response is pushed to the FIFO in ONE chunk before the write
-    // future parks, so a drained FIFO proves the bytes left → dropping + continuing cannot truncate. This stops the
-    // K-escape `software_reset()` firing (and corrupting the part) on the common mid-cut wedge. The recheck is only
-    // meaningful on a write timeout; a clean write reads `true` (unused). A `>64 B` write timeout stays `Stalled`
-    // regardless (possible unwritten tail — the truncation guard), as does a `data_free=0` stall (host not reading).
-    let write_data_free = if write_timed_out {
-      esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().serial_in_ep_data_free().bit_is_set()
-    } else {
-      true
-    };
-    // Record WHICH stage a genuine stall occurred at, for the breadcrumb's Signature-A discriminator. A write-stage
-    // timeout is the lost wake the FLUSH-stage-only recovery cannot catch; the breadcrumb records this bit directly
-    // instead of inferring write-vs-flush from `int_ena`. Only meaningful when the outcome below is `Stalled` (a
-    // clean write, a TIER-1 recovered single-chunk wake, or a flush stall sets it false in effect).
-    let stall_at_write_stage = write_timed_out;
-    // PRODUCTION + plain capture build: TIER-1 single-chunk write-stage recovery is ON (`classify_write_stage`).
-    #[cfg(not(feature = "provoke-b"))]
-    let write_stage = firmware_core::diag::WriteOutcome::classify_write_stage(write_timed_out, write_errored, resp.len(), write_data_free);
-    // PROVOKE-B diagnostic build (§17.14): TIER-1 recovery is DISABLED via the host-tested no-recover sibling, so a
-    // single-chunk write-stage lost wake is NOT rescued — it cascades exactly as on the pre-fix build, re-enabling the
-    // genuine in-stream Signature B for capture. The ONLY behavior change vs the line above; everything else is shared.
-    #[cfg(feature = "provoke-b")]
-    let write_stage =
-      firmware_core::diag::WriteOutcome::classify_write_stage_no_recover(write_timed_out, write_errored, resp.len(), write_data_free);
-    let outcome = match write_stage {
-      // The write stage already decided it (a mid-write stall, or a host-closed clean drop).
-      Some(o) => o,
-      // Clean write — all bytes are in the FIFO; only the FLUSH stage can now strand on a lost-wake (the sole
-      // recoverable case). Bound the flush, recheck the host-drained bit on a flush timeout, and classify.
-      None => {
-        let flush_timed_out = with_timeout(USB_TX_TIMEOUT, tx.flush()).await.is_err();
-        let data_free_after = if flush_timed_out {
-          esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().serial_in_ep_data_free().bit_is_set()
-        } else {
-          true
-        };
-        // `write_timed_out = false` here (the write completed): `classify_split` defers to the flush-stage classify.
-        firmware_core::diag::WriteOutcome::classify_split(false, flush_timed_out, data_free_after)
-      }
-    };
+    // POLL-BASED write (§18/§19 ROOT prevention): `write_response_polled` pushes the response via `write_byte_nb` /
+    // `flush_tx_nb`, yielding on a full FIFO — it NEVER awaits esp-hal's `UsbSerialJtagWriteFuture`, so there is NO
+    // completion waker to lose. That eliminates the lost-TX-wake CLASS at the source, so the entire TIER-1
+    // classify/recover apparatus (and its `CompletedLostWakeRecovered` outcome) is gone. The result is now binary:
+    // `Completed` (all bytes handed to the FIFO) or `Stalled` (the host did not drain within the 2 s deadline — a
+    // genuine host-not-reading stall that drops-and-continues and feeds the K-escape below).
+    let outcome = write_response_polled(&mut tx, resp.as_bytes()).await;
     // Publish the survivable-watchdog fingerprint (capture-at-withhold, §17.10/§17.11). The TIMG1 ISR feeds the dogs
     // and, on a stall-driven withhold, captures the breadcrumb — but it cannot cheaply read the USB_DEVICE registers
     // from interrupt context. So here, where the discriminator is already in hand, publish (1) the WINDOWED stall
@@ -1695,9 +1684,10 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
           int_ena_armed: int_ena.serial_in_empty().bit_is_set(),
           motion_advancing: MOTION_LIVENESS.load(Ordering::Relaxed) != motion_before,
           executor_running: EXECUTOR_RUNNING.load(Ordering::Acquire),
-          // A stall reaching here is necessarily a `write_all`-stage park (the §17.1 proof: `flush_tx_async`
-          // early-returns when the FIFO is free, so a stall with bytes pending is a write park), hence `true`.
-          write_stage_stall: write_timed_out,
+          // With the poll-based write there is no write-vs-flush await stage: a `Stalled` here is a FIFO that stayed
+          // full past the deadline = the host is not draining (`data_free == false` above). Record `false` — the
+          // Signature-A write-stage-lost-wake distinction no longer exists (§18/§19 eliminated the await path).
+          write_stage_stall: false,
           response_depth: RESPONSE.len().min(u8::MAX as usize) as u8,
           timeout_count: stall.count().saturating_add(1),
         };
@@ -1705,16 +1695,8 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
         USB_TX_STALL_FINGERPRINT_LEN.store(resp.len().min(u16::MAX as usize) as u32, Ordering::Relaxed);
       }
     }
-    if outcome.is_recovered_lost_wake() {
-      // A recovered lost-wake: count it (a live "the §12 bug fired but we recovered" signal) but do NOT escalate.
-      // The host already has the bytes, so the next `RESPONSE` item proceeds and the comms path keeps flowing
-      // instead of limping at 1 ack / 2 s. The runtime counter is `$I`-readable live; mirror it into the RTC_FAST
-      // breadcrumb so a partial-fix K-escape reset still surfaces the prior run's recovered total at the next boot.
-      let n = USB_TX_LOST_WAKE_RECOVERED.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-      crate::crash::record_recovered_count(n);
-    }
-    // Comms-progress heartbeat (the §11.6 watchdog-mask fix): bump ONLY on a non-stall outcome (a completed write OR
-    // a recovered lost-wake — both delivered bytes to the host). A GENUINE stall no longer advances the counter, so
+    // Comms-progress heartbeat (the §11.6 watchdog-mask fix): bump ONLY on a non-stall outcome (a completed write
+    // delivered bytes to the host). A GENUINE stall no longer advances the counter, so
     // a stalled writer stops masking the 3 s comms-stall watchdog detector (the prior per-loop bump at the 2 s
     // cadence kept the dog fed and let the wedge limp ~16 s). The other two bumpers (status_responder, comms_consumer)
     // are unchanged, so a back-pressured-but-answering board still advances the counter.
@@ -1741,14 +1723,15 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
       // can reset the board is the survivable-watchdog ISR's WITHHELD dog. In the first force-withhold run the usb_tx
       // K-escape (`CoreSw`, `n=3 host-not-reading`) software-reset the board and MASKED whether a dog bites at all —
       // this build removes that confound, so a self-reset can ONLY be a dog (read `[MSG:RESET super-WDT|...rtc-WDT]`).
+      // `write_stage_stall` is now always `false` (the poll path has no write-vs-flush await stage; a stall is a
+      // host-not-reading FIFO-full past the deadline). Kept in the signature for the breadcrumb's field layout.
       #[cfg(not(feature = "force-withhold"))]
-      handle_usb_tx_wedge(motion_before, stall.count(), stall_at_write_stage, resp.len());
+      handle_usb_tx_wedge(motion_before, stall.count(), false, resp.len());
       // Production (non-capture) AND the force-withhold dog-isolation build both fall through here (in force-withhold
       // `handle_usb_tx_wedge` is not called, so usb_tx must keep serving); clear the stall run so a single residual
       // wedge does not immediately re-trip. Only the plain `capture-reset` build diverges inside the helper (reset).
       #[cfg(any(not(feature = "capture-reset"), feature = "force-withhold"))]
       {
-        let _ = stall_at_write_stage;
         stall = firmware_core::diag::UsbTxStallCounter::new();
       }
     }
