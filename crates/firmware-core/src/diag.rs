@@ -21,16 +21,6 @@
 /// `COMMS_PROGRESS` bump at the 2 s cadence was evading the 3 s comms-stall detector).
 pub const USB_TX_STALL_ESCAPE_K: u16 = 3;
 
-/// The largest response (in bytes) that esp-hal's async USB-Serial-JTAG `write_async` pushes to the EP1 FIFO in a
-/// SINGLE chunk before its completion future can park. The driver writes in ≤64-byte chunks and awaits the TX-empty
-/// wake only BETWEEN chunks, so a response of `<= 64` bytes is whole-or-nothing: all its bytes are in the FIFO before
-/// the future ever parks. That is the load-bearing precondition for the TIER 1 / §13.1 single-chunk write-stage
-/// widening — on a write-stage lost wake (a timeout) for such a response, the host having drained the FIFO proves the
-/// bytes left, so dropping the response and continuing CANNOT truncate. A `> 64` byte response is multi-chunk and may
-/// have unwritten later chunks at a write timeout (even with the FIFO drained of an earlier chunk), so it stays a
-/// `Stalled` — the truncation guard. Matches the esp-hal EP1 IN endpoint FIFO depth (64 bytes).
-pub const SINGLE_CHUNK_MAX_BYTES: usize = 64;
-
 /// The bounded consecutive-timeout counter for the `usb_tx` write path. A COMPLETED write resets it to zero; a
 /// timeout increments it. When it reaches [`USB_TX_STALL_ESCAPE_K`] the caller captures the discriminator and
 /// resets the board. Saturating so a pathological run can never wrap the count back below the threshold.
@@ -65,154 +55,89 @@ impl UsbTxStallCounter {
   }
 }
 
-/// The classified outcome of one `usb_tx` write attempt, AFTER applying the poll-after-arm completion recheck (the
-/// fix for the §12 lost-wake root cause). The esp-hal async write future completes only when its `serial_in_empty`
-/// waker is delivered; the captured root cause is that the wake is LOST (the ISR ran, cleared `int_ena`, woke
-/// `WAKER_TX`, but the embassy executor never re-polled), so a write whose bytes ALREADY left for the host parks
-/// for the full 2 s `USB_TX_TIMEOUT`. We cannot fix esp-hal's internal future from the task, but we CAN layer a
-/// polling backstop over its event-driven wait: when the timeout fires, re-read the hardware "host drained the
-/// FIFO" bit (`serial_in_ep_data_free`) and decide what actually happened.
+/// The terminal outcome of writing one `usb_tx` response over the §18/§19 POLL-BASED path. With polling there is no
+/// waker to lose (the lost-wake CLASS is eliminated at the source), so only two outcomes remain: the response's bytes
+/// were all handed to the FIFO ([`Completed`](WriteOutcome::Completed)), or the FIFO stayed full past the bounded
+/// poll deadline because the host is genuinely not draining ([`Stalled`](WriteOutcome::Stalled), which still feeds the
+/// K-escape / `handle_usb_tx_wedge`). The old `CompletedLostWakeRecovered` variant and the `classify*` helpers are
+/// GONE — they existed only to disambiguate a lost wake from a real stall on the await path, which no longer exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteOutcome {
-  /// The `with_timeout` future resolved normally — the write/flush completed within the bound (the healthy path,
-  /// and the path once the lost-wake fix lands, since most writes will not even reach the timeout).
+  /// Every byte of the response was accepted into the IN FIFO (each packet committed with `wr_done`). The host
+  /// receives them as it reads; a non-draining host is caught on the FOLLOWING response's first poll.
   Completed,
-  /// The `with_timeout` TIMED OUT, but the post-timeout recheck found the host HAD drained the FIFO
-  /// (`serial_in_ep_data_free == true`): the bytes are out, only the esp-hal completion wake was lost. The write
-  /// effectively SUCCEEDED — treat it as completed (reset the stall counter, do not escalate), which breaks the
-  /// 2 s lost-wake drumbeat. Distinguished from [`Completed`] only so the caller can COUNT recovered lost-wakes
-  /// (a live "this bug is happening" signal) without changing control flow.
-  CompletedLostWakeRecovered,
-  /// The `with_timeout` TIMED OUT and the FIFO was still NOT drained (`serial_in_ep_data_free == false`): the host
-  /// genuinely is not reading (or the peripheral is truly stuck). This is a REAL stall — it counts toward the
-  /// [`USB_TX_STALL_ESCAPE_K`] bounded escape exactly as before.
+  /// The IN FIFO stayed full for the whole [`USB_TX_TIMEOUT`](crate) poll deadline — the host is not reading (or the
+  /// link dropped). A genuine stall: drop-and-continue + count toward the [`USB_TX_STALL_ESCAPE_K`] bounded escape.
   Stalled,
 }
 
 impl WriteOutcome {
-  /// Classify a `usb_tx` write attempt from the `with_timeout` result and (on a timeout) the post-timeout
-  /// host-drained state. `timed_out` is `with_timeout(...).is_err()`; `data_free_after_timeout` is
-  /// `ep1_conf.serial_in_ep_data_free` re-read AFTER the timeout (only consulted when `timed_out`). This is the
-  /// poll-after-arm recheck: a timeout with the FIFO drained is a recovered lost-wake, not a stall.
-  pub fn classify(timed_out: bool, data_free_after_timeout: bool) -> WriteOutcome {
-    if !timed_out {
-      return WriteOutcome::Completed;
-    }
-    if data_free_after_timeout {
-      // The timeout fired but the host HAS drained the FIFO — the write's bytes are gone, only the wake was lost.
-      WriteOutcome::CompletedLostWakeRecovered
-    } else {
-      // The FIFO is still full at the timeout: a genuine stall (host not reading / peripheral stuck).
-      WriteOutcome::Stalled
-    }
-  }
-
-  /// Whether this outcome counts as a STALL toward the bounded escape. Only a genuine [`Stalled`](WriteOutcome::
-  /// Stalled) does; both completed variants reset the run (the write made progress). This is what feeds
-  /// [`UsbTxStallCounter::record`].
+  /// Whether this outcome counts as a STALL toward the bounded escape. Only [`Stalled`](WriteOutcome::Stalled) does;
+  /// a [`Completed`](WriteOutcome::Completed) made progress. This is what feeds [`UsbTxStallCounter::record`].
   pub fn is_stall(self) -> bool {
     matches!(self, WriteOutcome::Stalled)
   }
+}
 
-  /// Whether this outcome is a RECOVERED lost-wake (a timeout the recheck rescued). The caller bumps a diagnostic
-  /// counter on this so a live build can report "the lost-wake bug fired N times but recovered" without wedging.
-  pub fn is_recovered_lost_wake(self) -> bool {
-    matches!(self, WriteOutcome::CompletedLostWakeRecovered)
+/// The action the poll-based `usb_tx` write loop takes after ONE non-blocking `write_byte_nb`/`flush_tx_nb` attempt
+/// (the pure decision behind the §19 loop, host-tested here so the sacred-path policy has a single source of truth).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollAction {
+  /// The nb op made progress (the byte went into the FIFO / the packet committed) — advance to the next byte/chunk.
+  Advance,
+  /// The nb op returned `WouldBlock` (FIFO full = host not draining yet) but the deadline has NOT passed — the loop
+  /// must `yield_now().await` and re-poll. Re-reads the hardware each poll, so there is no waker to lose.
+  Yield,
+  /// The nb op returned `WouldBlock` AND the bounded poll deadline has passed — a genuine host-not-reading stall.
+  Stall,
+}
+
+/// The pure per-poll decision for the poll-based `usb_tx` write loop (§19). `made_progress` is `nb_result.is_ok()`
+/// (the esp-hal error type is `Infallible`, so an `Err` is always `WouldBlock`); `deadline_exceeded` is
+/// `Instant::now() >= deadline`. Progress always wins (a byte that went out is never a stall even at the deadline);
+/// otherwise a passed deadline is a stall and a live deadline yields.
+pub fn usb_tx_poll_action(made_progress: bool, deadline_exceeded: bool) -> PollAction {
+  if made_progress {
+    PollAction::Advance
+  } else if deadline_exceeded {
+    PollAction::Stall
+  } else {
+    PollAction::Yield
+  }
+}
+
+/// A pure model of one response's poll-write, so the stall-vs-complete POLICY is host-testable end-to-end without
+/// hardware (the firmware loop feeds live `write_byte_nb`/`flush_tx_nb` results through [`usb_tx_poll_action`]; this
+/// reducer feeds a scripted sequence of the same observations). `total_ops` is the number of write/flush ops that must
+/// each make progress for the response to complete (in the firmware that is bytes + one commit per chunk; in tests it
+/// is any convenient count). Each [`step`](Self::step) returns `Some` once the write terminates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PollWriteProgress {
+  ops_remaining: u32,
+}
+
+impl PollWriteProgress {
+  /// A reducer for a response requiring `total_ops` successful ops. `0` completes on the first `step` (nothing to
+  /// send — never happens on the wire, but defined for totality).
+  pub fn new(total_ops: u32) -> Self {
+    PollWriteProgress { ops_remaining: total_ops }
   }
 
-  /// Classify the WRITE stage of a `usb_tx` response, returning a terminal [`WriteOutcome`] when the write stage
-  /// already decides it, or `None` when the write completed cleanly and the caller must proceed to the FLUSH stage.
-  /// The write-stage dispositions:
-  /// - `write_timed_out` AND the response is a SINGLE `write_async` chunk (`resp_len <= `[`SINGLE_CHUNK_MAX_BYTES`])
-  ///   AND the host has drained the FIFO (`data_free`) ⇒ [`CompletedLostWakeRecovered`](WriteOutcome::
-  ///   CompletedLostWakeRecovered): the TIER 1 / §13.1 single-chunk widening. A ≤64 B response is pushed to the
-  ///   FIFO in ONE chunk BEFORE the write future ever parks, so when the host has drained it the bytes are provably
-  ///   out — only esp-hal's completion wake was lost (the captured Signature-A `wstg=1 rlen=4 free=1`). Dropping and
-  ///   continuing CANNOT truncate, so we recover in place (reset the K-escape, no `software_reset()`), which is what
-  ///   stops the part-corrupting mid-cut reset on the common wedge.
-  /// - `write_timed_out` otherwise (a `> 64 B` MULTI-CHUNK response, OR the FIFO not drained) ⇒ [`Stalled`](
-  ///   WriteOutcome::Stalled): a multi-chunk write can have UNWRITTEN later chunks even with `data_free=1` (the host
-  ///   drained only an earlier chunk), so recovering would truncate — it counts toward the K-escape (a clean reset
-  ///   beats a silent truncation). A FIFO-not-drained timeout is the genuine host-not-reading stall. The truncation
-  ///   guard is fully intact.
-  /// - `write_errored` (the embedded-io `Ok(Err)` host-closed-port case) ⇒ [`Completed`](WriteOutcome::Completed):
-  ///   a clean drop-and-continue that the reconnect / banner path re-syncs — NOT a stall, so it must not flow to
-  ///   the flush or count toward the escape (matching the pre-split behavior, which discarded write errors).
-  /// - otherwise (`None`) ⇒ all bytes reached the FIFO; defer to [`classify_split`](WriteOutcome::classify_split)
-  ///   for the flush-stage recovery decision.
-  ///
-  /// A timeout takes precedence over an error (a timed-out write never produced an `Ok(Err)` in the first place).
-  /// `resp_len` is the response's byte length; `data_free` is `ep1_conf.serial_in_ep_data_free` re-read AFTER the
-  /// write timeout (both consulted ONLY on `write_timed_out`).
-  pub fn classify_write_stage(write_timed_out: bool, write_errored: bool, resp_len: usize, data_free: bool) -> Option<WriteOutcome> {
-    if write_timed_out {
-      if resp_len <= SINGLE_CHUNK_MAX_BYTES && data_free {
-        // TIER 1: a single-chunk response whose bytes the host has drained — a recoverable lost wake, not a stall.
-        Some(WriteOutcome::CompletedLostWakeRecovered)
-      } else {
-        // Multi-chunk (possible unwritten tail) or FIFO still full (host not reading): a genuine stall.
-        Some(WriteOutcome::Stalled)
+  /// Feed one poll observation. Returns `Some(Completed)` once all ops have progressed, `Some(Stalled)` on a
+  /// deadline-exceeded `WouldBlock`, or `None` while more polls are needed (a progress that is not the last op, or a
+  /// yield). A yield does NOT consume an op — the same op is retried next poll.
+  pub fn step(&mut self, made_progress: bool, deadline_exceeded: bool) -> Option<WriteOutcome> {
+    if self.ops_remaining == 0 {
+      return Some(WriteOutcome::Completed);
+    }
+    match usb_tx_poll_action(made_progress, deadline_exceeded) {
+      PollAction::Advance => {
+        self.ops_remaining -= 1;
+        if self.ops_remaining == 0 { Some(WriteOutcome::Completed) } else { None }
       }
-    } else if write_errored {
-      Some(WriteOutcome::Completed)
-    } else {
-      None
+      PollAction::Yield => None,
+      PollAction::Stall => Some(WriteOutcome::Stalled),
     }
-  }
-
-  /// The PROVOKE-B variant of [`classify_write_stage`](WriteOutcome::classify_write_stage): identical EXCEPT the
-  /// single-chunk recoverable case returns [`Stalled`](WriteOutcome::Stalled) instead of
-  /// [`CompletedLostWakeRecovered`](WriteOutcome::CompletedLostWakeRecovered). It exists ONLY for the diagnostic
-  /// `provoke-b` build (docs §17.14): by NOT recovering the single-chunk write-stage lost wake, the lost wake is left
-  /// to cascade exactly as it did on the PRE-TIER-1 build — re-enabling the genuine in-stream Signature B (the §13.8
-  /// pre-K-escape hard lock) at its native rate so it can be captured with the now-complete instrument. EVERY other
-  /// disposition is unchanged: a `>64 B` multi-chunk timeout and a `data_free=0` timeout were already `Stalled`; a
-  /// `write_errored` clean drop is still `Completed`; a clean write still returns `None` to defer to the flush stage.
-  /// So this differs from the production classifier on EXACTLY one input class — the recoverable single-chunk lost
-  /// wake — which is precisely the wedge TIER 1 mitigates and the thing we want to let happen for the capture. The
-  /// production [`classify_write_stage`](WriteOutcome::classify_write_stage) is untouched; the firmware selects this
-  /// sibling via a single `#[cfg(feature = "provoke-b")]` swap at the call site.
-  pub fn classify_write_stage_no_recover(
-    write_timed_out: bool,
-    write_errored: bool,
-    resp_len: usize,
-    data_free: bool,
-  ) -> Option<WriteOutcome> {
-    if write_timed_out {
-      // PROVOKE-B: do NOT recover the single-chunk lost wake — treat EVERY write timeout as a genuine stall so it
-      // cascades (the `resp_len`/`data_free` recovery guard is deliberately bypassed). The two args are kept in the
-      // signature so the call site is a drop-in `#[cfg]` swap for `classify_write_stage`.
-      let _ = (resp_len, data_free);
-      Some(WriteOutcome::Stalled)
-    } else if write_errored {
-      Some(WriteOutcome::Completed)
-    } else {
-      None
-    }
-  }
-
-  /// Classify a `usb_tx` response when the write and flush are timed SEPARATELY (the truncation-safe two-stage
-  /// sequencing). This is the SAFE variant of [`classify`](WriteOutcome::classify): the poll-after-arm recovery is
-  /// only valid once ALL bytes are provably in the FIFO, which is true at the FLUSH stage but NOT mid-`write_all`.
-  ///
-  /// `write_async` (esp-hal) pushes the response in ≤64-byte chunks and awaits the TX-empty wake BETWEEN chunks, so a
-  /// lost-wake can strand `write_all` AFTER the first chunk — at which point `serial_in_ep_data_free` is `true` (the
-  /// host drained chunk 1) yet the REMAINING bytes were never written. Treating that as recovered would advance to
-  /// the next response and emit a TRUNCATED line. So:
-  /// - `write_timed_out == true` ⇒ a mid-write timeout, possibly with UNWRITTEN bytes ⇒ [`Stalled`](WriteOutcome::
-  ///   Stalled), NEVER recovered (it counts toward the K-escape; a clean reset beats a silent truncation).
-  /// - otherwise the write completed (all bytes are in the FIFO) and only the FLUSH could have stranded, so defer to
-  ///   [`classify`](WriteOutcome::classify) with the flush-stage timeout + the post-flush `data_free` recheck — the
-  ///   ONLY place the recovery is sound.
-  ///
-  /// `data_free_after_flush` is only consulted when `!write_timed_out && flush_timed_out`.
-  pub fn classify_split(write_timed_out: bool, flush_timed_out: bool, data_free_after_flush: bool) -> WriteOutcome {
-    if write_timed_out {
-      // Bytes may be unwritten — recovery would truncate. A genuine stall, full stop.
-      return WriteOutcome::Stalled;
-    }
-    // All bytes are in the FIFO; only a flush-stage lost-wake is recoverable (the captured case).
-    WriteOutcome::classify(flush_timed_out, data_free_after_flush)
   }
 }
 
@@ -446,14 +371,29 @@ pub const CORE1_STALL_TICKS: u32 = 16;
 /// ISR's 250 ms cadence `12 * 250 ms = 3 s` — the same ~3 s order as the async feeder's 500 ms × 6.
 pub const COMMS_STALL_TICKS: u32 = 12;
 
+/// The number of consecutive feed intervals the core-0 EXECUTOR-LIVENESS beat may stay frozen before
+/// [`watchdog_decision`] declares a full core-0 async-executor stall. This is the §17.15 root-cause FIX detector: an
+/// UNGATED beat that a dedicated core-0 async task bumps every interval, so it advances on a healthy board WHETHER OR
+/// NOT there is host traffic, motion, or queued responses — unlike the three work-driven detectors, all of which are
+/// gated off in exactly the executor-stall wedge (host aged out + motion idle + RESPONSE drained). At the ISR's 250 ms
+/// cadence `16 * 250 ms = 4 s` — comfortably above any legitimate core-0 quiesce during streaming, well below the
+/// point of no return, and matching [`CORE1_STALL_TICKS`].
+pub const EXECUTOR_STALL_TICKS: u32 = 16;
+
 /// Which wedge class made [`watchdog_decision`] withhold the watchdog feed. A PURE mirror of the firmware's
 /// `crash::WithholdReason`, kept here so the survivable-watchdog ISR's decision is fully host-tested; `crash.rs` maps
 /// this to its existing on-wire `WithholdReason`. The precedence when several conditions hold at once is
-/// `Core1Motion > Core0Comms > DeadZone` — the most-specific (the core-1 stage marker pins an exact RMT channel) wins.
+/// `Core1Motion > Core0ExecutorStall > Core0Comms > DeadZone` — the most-specific first (the core-1 stage marker pins
+/// an exact RMT channel), then the definitive core-0 executor-dead signal, then its finer-grained sub-cases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithholdKind {
   /// The core-1 motion beat froze while a block was in flight — a core-1 / RMT wedge.
   Core1Motion,
+  /// The core-0 async EXECUTOR itself stalled: the ungated executor-liveness beat froze for [`EXECUTOR_STALL_TICKS`]
+  /// while the hardware ISR kept firing. The §17.15 root-cause catch — the full-executor-stall wedge the three
+  /// work-driven detectors below all structurally miss (they are gated by host/motion/response state, all of which
+  /// evaluate quiescent in exactly this wedge). Subsumes `Core0Comms` and `DeadZone` when the whole executor is dead.
+  Core0ExecutorStall,
   /// The host was driving the board but the core-0 comms path stopped making forward progress.
   Core0Comms,
   /// The dead-zone backstop: responses queued yet `usb_tx` completed no write for [`DEAD_ZONE_STALL_TICKS`] —
@@ -476,6 +416,15 @@ pub struct WatchdogInputs {
   /// Consecutive feed intervals `usb_tx` has completed NO write (the [`USB_TX_COMPLETED`] beat frozen). The ISR
   /// resets this to 0 on any completed/recovered write. Ungated by host/executor state — that is the dead zone.
   pub tx_complete_frozen_ticks: u32,
+  /// Consecutive feed intervals the core-0 EXECUTOR-LIVENESS beat has stayed frozen. The ISR resets this to 0 whenever
+  /// the beat advances; it is UNGATED (no host/motion/response condition) — that is the whole point, since the beat is
+  /// bumped by a dedicated core-0 async task that runs on a healthy board regardless of work, so a freeze means the
+  /// executor itself stalled. The ISR only STARTS counting once the beat has advanced at least once (a boot guard so
+  /// the pre-first-bump zero does not accrue a false stall). `0` in builds without the detector wired.
+  pub executor_alive_frozen_ticks: u32,
+  /// The core-0 executor-stall threshold to apply (defaults to [`EXECUTOR_STALL_TICKS`]). `0` disables the detector
+  /// (a threshold of 0 would false-trip immediately, so the firmware passes 0 only in builds that do not wire it).
+  pub executor_stall_ticks: u32,
   /// The current `RESPONSE` channel occupancy. The dead-zone backstop fires ONLY when this is `> 0` (responses are
   /// queued to send), the false-trip guard against resetting a truly idle board that legitimately sends nothing.
   pub response_depth: usize,
@@ -506,18 +455,25 @@ pub struct WatchdogDecision {
 }
 
 /// The pure survivable-watchdog decision for one feed interval (the core the ISR calls so the ISR is a thin shell).
-/// REPLICATES the existing `watchdog_feed` withhold logic exactly: a core-1 motion wedge (`core1_frozen_ticks >=
-/// core1_stall_ticks`), a core-0 comms wedge (`comms_frozen_ticks >= comms_stall_ticks`), or the dead-zone backstop
-/// ([`dead_zone_withhold`] on `response_depth` + `tx_complete_frozen_ticks`) ⇒ WITHHOLD BOTH dogs, with precedence
-/// `Core1Motion > Core0Comms > DeadZone`; otherwise FEED BOTH. The frozen-tick counters are assumed already gated by
-/// the caller (the ISR zeroes `core1_frozen_ticks` when no block is in flight and `comms_frozen_ticks` when the host
-/// is inactive), exactly as `watchdog_feed` does — so this function is a pure threshold comparison + precedence.
+/// Any of: a core-1 motion wedge (`core1_frozen_ticks >= core1_stall_ticks`), a full core-0 executor stall
+/// (`executor_alive_frozen_ticks >= executor_stall_ticks`, the §17.15 root-cause catch, disabled when
+/// `executor_stall_ticks == 0`), a core-0 comms wedge (`comms_frozen_ticks >= comms_stall_ticks`), or the dead-zone
+/// backstop ([`dead_zone_withhold`] on `response_depth` + `tx_complete_frozen_ticks`) ⇒ WITHHOLD BOTH dogs, with
+/// precedence `Core1Motion > Core0ExecutorStall > Core0Comms > DeadZone`; otherwise FEED BOTH. The frozen-tick counters
+/// are assumed already gated by the caller (the ISR zeroes `core1_frozen_ticks` when no block is in flight,
+/// `comms_frozen_ticks` when the host is inactive, and only accrues `executor_alive_frozen_ticks` once the beat has
+/// advanced at least once) — so this function is a pure threshold comparison + precedence.
 pub fn watchdog_decision(inputs: WatchdogInputs) -> WatchdogDecision {
   let core1_wedged = inputs.core1_frozen_ticks >= inputs.core1_stall_ticks;
+  // The executor-stall detector is DISABLED when its threshold is 0 (a build that does not wire the beat), so a
+  // permanently-zero frozen count can never trip it. Otherwise a frozen beat past the threshold is a full core-0 stall.
+  let executor_stalled = inputs.executor_stall_ticks > 0 && inputs.executor_alive_frozen_ticks >= inputs.executor_stall_ticks;
   let comms_wedged = inputs.comms_frozen_ticks >= inputs.comms_stall_ticks;
   let dead_zone = dead_zone_withhold(inputs.response_depth, inputs.tx_complete_frozen_ticks);
   let withhold_reason = if core1_wedged {
     Some(WithholdKind::Core1Motion)
+  } else if executor_stalled {
+    Some(WithholdKind::Core0ExecutorStall)
   } else if comms_wedged {
     Some(WithholdKind::Core0Comms)
   } else if dead_zone {
@@ -645,203 +601,72 @@ mod tests {
   }
 
   #[test]
-  fn write_outcome_completed_when_not_timed_out() {
-    // A normal completion — `data_free_after_timeout` is irrelevant (not consulted) when not timed out.
-    assert_eq!(WriteOutcome::classify(false, false), WriteOutcome::Completed);
-    assert_eq!(WriteOutcome::classify(false, true), WriteOutcome::Completed);
-    assert!(!WriteOutcome::classify(false, false).is_stall());
-    assert!(!WriteOutcome::classify(false, false).is_recovered_lost_wake());
+  fn write_outcome_is_stall_only_for_stalled() {
+    // The collapsed outcome: only `Stalled` counts toward the escape; `Completed` made progress.
+    assert!(WriteOutcome::Stalled.is_stall());
+    assert!(!WriteOutcome::Completed.is_stall());
   }
 
   #[test]
-  fn write_outcome_recovers_lost_wake_when_timeout_but_fifo_drained() {
-    // THE FIX: the 2 s timeout fired, but the host HAD drained the FIFO (data_free=true) → the bytes are out and
-    // only the esp-hal wake was lost. Treat as a recovered completion, NOT a stall — this breaks the drumbeat.
-    let o = WriteOutcome::classify(true, true);
-    assert_eq!(o, WriteOutcome::CompletedLostWakeRecovered);
-    assert!(!o.is_stall(), "a recovered lost-wake must NOT count toward the escape");
-    assert!(o.is_recovered_lost_wake(), "and it IS countable as a recovered lost-wake for diagnostics");
+  fn poll_action_advances_on_progress_even_past_the_deadline() {
+    // Progress ALWAYS wins: a byte that went into the FIFO is never a stall, even if the deadline has also passed.
+    assert_eq!(usb_tx_poll_action(true, false), PollAction::Advance);
+    assert_eq!(usb_tx_poll_action(true, true), PollAction::Advance);
   }
 
   #[test]
-  fn write_outcome_is_stall_when_timeout_and_fifo_still_full() {
-    // A genuine stall: timeout AND the FIFO is still full (host not reading / peripheral stuck) → counts toward K.
-    let o = WriteOutcome::classify(true, false);
-    assert_eq!(o, WriteOutcome::Stalled);
-    assert!(o.is_stall());
-    assert!(!o.is_recovered_lost_wake());
+  fn poll_action_yields_before_the_deadline_and_stalls_after() {
+    // WouldBlock (no progress): yield while the deadline is live, stall once it passes.
+    assert_eq!(usb_tx_poll_action(false, false), PollAction::Yield);
+    assert_eq!(usb_tx_poll_action(false, true), PollAction::Stall);
   }
 
   #[test]
-  fn split_mid_write_timeout_is_always_a_stall_never_recovered() {
-    // THE TRUNCATION GUARD: a write-stage timeout may leave unwritten bytes (write_async parks between 64B chunks),
-    // so it must NEVER be classified as recovered — even if the host had drained an earlier chunk (data_free=true).
-    // It is a genuine stall that counts toward the K-escape; a clean reset beats a silent truncation.
-    let o = WriteOutcome::classify_split(true, false, true);
-    assert_eq!(o, WriteOutcome::Stalled);
-    assert!(o.is_stall());
-    assert!(!o.is_recovered_lost_wake());
-    // ...and the same regardless of the flush/data_free args, since a write timeout short-circuits.
-    assert_eq!(WriteOutcome::classify_split(true, true, true), WriteOutcome::Stalled);
-    assert_eq!(WriteOutcome::classify_split(true, false, false), WriteOutcome::Stalled);
+  fn poll_write_progress_completes_when_every_op_progresses() {
+    // A response needing 3 ops (bytes + commits): three progressing polls complete it, and not before.
+    let mut p = PollWriteProgress::new(3);
+    assert_eq!(p.step(true, false), None, "op 1 done, more to go");
+    assert_eq!(p.step(true, false), None, "op 2 done, more to go");
+    assert_eq!(p.step(true, false), Some(WriteOutcome::Completed), "op 3 completes the response");
   }
 
   #[test]
-  fn write_stage_error_is_a_clean_drop_not_a_stall() {
-    // A write ERROR (host closed the port, embedded-io `Ok(Err)`) is NOT a stall — it's a clean drop-and-continue
-    // (Completed), matching the pre-split behavior that discarded write errors. It must NOT count toward the escape
-    // and must NOT flow to the flush stage. (write_timed_out=false, write_errored=true → Some(Completed).) The
-    // `resp_len`/`data_free` widening args are irrelevant when the write did not time out.
-    let o = WriteOutcome::classify_write_stage(false, true, 4, true);
-    assert_eq!(o, Some(WriteOutcome::Completed));
-    assert!(!o.unwrap().is_stall(), "a host-closed write error is not a stall");
-    assert!(!o.unwrap().is_recovered_lost_wake());
+  fn poll_write_progress_yields_do_not_advance() {
+    // A yield (WouldBlock before the deadline) does NOT consume an op — the same op is retried until it progresses.
+    let mut p = PollWriteProgress::new(2);
+    assert_eq!(p.step(false, false), None, "yield: no progress, deadline live");
+    assert_eq!(p.step(false, false), None, "still yielding");
+    assert_eq!(p.step(true, false), None, "op 1 finally progresses");
+    assert_eq!(p.step(true, false), Some(WriteOutcome::Completed), "op 2 completes");
   }
 
   #[test]
-  fn write_stage_timeout_wins_over_error() {
-    // A write TIMEOUT is a possibly-mid-write event and takes precedence (a timed-out write never produced Ok(Err)).
-    // With a >64 B response (multi-chunk, possibly-unwritten tail) it is a genuine stall regardless of `data_free`.
-    assert_eq!(WriteOutcome::classify_write_stage(true, false, 90, true), Some(WriteOutcome::Stalled));
-    assert_eq!(WriteOutcome::classify_write_stage(true, true, 90, true), Some(WriteOutcome::Stalled));
+  fn poll_write_progress_stalls_on_a_deadline_would_block() {
+    // Some progress, then the FIFO stays full past the deadline → Stalled, regardless of ops remaining.
+    let mut p = PollWriteProgress::new(5);
+    assert_eq!(p.step(true, false), None);
+    assert_eq!(p.step(false, true), Some(WriteOutcome::Stalled), "deadline WouldBlock is a genuine stall");
   }
 
   #[test]
-  fn write_stage_clean_defers_to_the_flush_stage() {
-    // A clean write (no timeout, no error) returns None → the caller proceeds to time + classify the flush stage.
-    // The widening args are irrelevant on the clean path.
-    assert_eq!(WriteOutcome::classify_write_stage(false, false, 4, true), None);
-    assert_eq!(WriteOutcome::classify_write_stage(false, false, 200, false), None);
+  fn poll_write_progress_zero_ops_completes_immediately() {
+    // Totality: an empty response (never on the wire) completes on the first step without any progress.
+    let mut p = PollWriteProgress::new(0);
+    assert_eq!(p.step(false, false), Some(WriteOutcome::Completed));
   }
 
   #[test]
-  fn write_stage_recovers_single_chunk_lost_wake_when_fifo_drained() {
-    // TIER 1 (the §13.1 single-chunk widening) — THE captured Signature-A state `wstg=1 rlen=4 free=1`: a write-stage
-    // timeout on a ≤64 B response (one `write_async` chunk, fully pushed before the future parks) whose host HAS
-    // drained the FIFO is a recovered lost-wake, NOT a stall. The bytes are out; dropping + continuing cannot
-    // truncate. This is what stops the K-escape `software_reset()` firing on the common mid-cut Signature-A wedge.
-    let o = WriteOutcome::classify_write_stage(true, false, 4, true);
-    assert_eq!(o, Some(WriteOutcome::CompletedLostWakeRecovered));
-    assert!(!o.unwrap().is_stall(), "a recovered single-chunk lost-wake must NOT count toward the escape");
-    assert!(o.unwrap().is_recovered_lost_wake(), "and it IS countable as a recovered lost-wake for diagnostics");
-  }
-
-  #[test]
-  fn write_stage_recovers_at_the_64_byte_boundary_inclusive() {
-    // The boundary is INCLUSIVE: a 64-byte response is exactly one `write_async` chunk, so it is still whole-or-
-    // nothing and recoverable when the FIFO drained. 65 bytes is two chunks → not recoverable (the next test).
-    let o = WriteOutcome::classify_write_stage(true, false, 64, true);
-    assert_eq!(o, Some(WriteOutcome::CompletedLostWakeRecovered));
-  }
-
-  #[test]
-  fn write_stage_over_64_bytes_is_still_a_stall_even_when_fifo_drained() {
-    // THE TRUNCATION GUARD stays fully intact: a >64 B response is MULTI-CHUNK, so a write-stage timeout can have
-    // unwritten LATER chunks even though the host drained an EARLIER one (`data_free=1`). Recovering would truncate
-    // the line, so it MUST remain a stall (counts toward the K-escape; a clean reset beats a silent truncation).
-    let o = WriteOutcome::classify_write_stage(true, false, 65, true);
-    assert_eq!(o, Some(WriteOutcome::Stalled));
-    assert!(o.unwrap().is_stall());
-    assert!(!o.unwrap().is_recovered_lost_wake());
-    // A full ~90 B status report is the canonical multi-chunk case.
-    assert_eq!(WriteOutcome::classify_write_stage(true, false, 90, true), Some(WriteOutcome::Stalled));
-  }
-
-  #[test]
-  fn write_stage_single_chunk_is_still_a_stall_when_fifo_not_drained() {
-    // The other half of the guard: even a ≤64 B response is a genuine stall when the FIFO is NOT free — the host is
-    // not reading (or the peripheral is stuck), so the bytes are NOT confirmed out. Recovery requires BOTH ≤64 B
-    // AND `data_free`. This is the host-not-reading wedge that the K-escape correctly catches.
-    let o = WriteOutcome::classify_write_stage(true, false, 4, false);
-    assert_eq!(o, Some(WriteOutcome::Stalled));
-    assert!(o.unwrap().is_stall());
-    assert!(!o.unwrap().is_recovered_lost_wake());
-  }
-
-  #[test]
-  fn provoke_no_recover_stalls_the_single_chunk_lost_wake_the_production_path_recovers() {
-    // The DEFINING difference (§17.14): the EXACT captured Signature-A input `wstg=1 rlen=4 free=1` that the
-    // production classifier RECOVERS, the provoke variant treats as a STALL — so the lost wake is NOT rescued and
-    // cascades, re-enabling the genuine in-stream B for capture. Same inputs, opposite single-chunk disposition.
-    let prod = WriteOutcome::classify_write_stage(true, false, 4, true);
-    let provoke = WriteOutcome::classify_write_stage_no_recover(true, false, 4, true);
-    assert_eq!(prod, Some(WriteOutcome::CompletedLostWakeRecovered), "production recovers the single-chunk lost wake");
-    assert_eq!(provoke, Some(WriteOutcome::Stalled), "provoke does NOT recover it — it cascades as a stall");
-    assert!(provoke.unwrap().is_stall(), "the provoked outcome counts toward the K-escape / cascade");
-    assert!(!provoke.unwrap().is_recovered_lost_wake());
-    // The 64-byte inclusive boundary is also stalled under provoke (production recovers it).
-    assert_eq!(WriteOutcome::classify_write_stage_no_recover(true, false, 64, true), Some(WriteOutcome::Stalled));
-  }
-
-  #[test]
-  fn provoke_no_recover_matches_production_on_every_non_recoverable_input() {
-    // The provoke variant differs from production on EXACTLY one input class (the recoverable single-chunk lost wake
-    // above); on every OTHER disposition it is byte-identical, so the provoke build only re-enables the cascade and
-    // changes nothing else. Verify the three shared dispositions match the production classifier exactly:
-    // - a >64 B multi-chunk write timeout is a stall in BOTH;
-    assert_eq!(
-      WriteOutcome::classify_write_stage_no_recover(true, false, 90, true),
-      WriteOutcome::classify_write_stage(true, false, 90, true),
-    );
-    // - a ≤64 B timeout with the FIFO NOT drained is a stall in BOTH (the provoke path also stalls it, same result);
-    assert_eq!(WriteOutcome::classify_write_stage_no_recover(true, false, 4, false), Some(WriteOutcome::Stalled));
-    assert_eq!(
-      WriteOutcome::classify_write_stage_no_recover(true, false, 4, false),
-      WriteOutcome::classify_write_stage(true, false, 4, false),
-    );
-    // - a write ERROR (no timeout) is a clean Completed drop in BOTH;
-    assert_eq!(
-      WriteOutcome::classify_write_stage_no_recover(false, true, 4, true),
-      WriteOutcome::classify_write_stage(false, true, 4, true),
-    );
-    assert_eq!(WriteOutcome::classify_write_stage_no_recover(false, true, 4, true), Some(WriteOutcome::Completed));
-    // - a clean write (no timeout, no error) defers to the flush stage (None) in BOTH.
-    assert_eq!(
-      WriteOutcome::classify_write_stage_no_recover(false, false, 4, true),
-      WriteOutcome::classify_write_stage(false, false, 4, true),
-    );
-    assert_eq!(WriteOutcome::classify_write_stage_no_recover(false, false, 4, true), None);
-  }
-
-  #[test]
-  fn split_recovers_only_at_the_flush_stage() {
-    // The write completed (all bytes in the FIFO), and the FLUSH stranded with the host having drained → the safe,
-    // recoverable lost-wake (the captured case). This is where recovery is sound.
-    let o = WriteOutcome::classify_split(false, true, true);
-    assert_eq!(o, WriteOutcome::CompletedLostWakeRecovered);
-    assert!(o.is_recovered_lost_wake());
-    assert!(!o.is_stall());
-  }
-
-  #[test]
-  fn split_flush_timeout_with_fifo_full_is_a_genuine_stall() {
-    // Write completed, flush timed out, but the FIFO is STILL full (host not reading) → a genuine stall toward K.
-    assert_eq!(WriteOutcome::classify_split(false, true, false), WriteOutcome::Stalled);
-  }
-
-  #[test]
-  fn split_clean_write_and_flush_is_completed() {
-    // Neither stage timed out → a clean completion (the healthy path).
-    assert_eq!(WriteOutcome::classify_split(false, false, true), WriteOutcome::Completed);
-    // data_free arg is irrelevant when flush did not time out.
-    assert_eq!(WriteOutcome::classify_split(false, false, false), WriteOutcome::Completed);
-  }
-
-  #[test]
-  fn recovered_lost_wake_resets_the_stall_counter_like_a_completion() {
-    // Wiring contract: feeding the counter `is_stall()` means a recovered lost-wake (is_stall == false) RESETS the
-    // run exactly like a clean completion, so a stream of recovered lost-wakes never trips the K-escape — only a
-    // run of GENUINE stalls does. This is what makes the fix break the drumbeat instead of just resetting on it.
+  fn stalled_outcome_feeds_the_k_escape_and_completed_resets_it() {
+    // Wiring contract: `Stalled.is_stall()` accrues toward the K-escape; a `Completed` resets the run — so only a run
+    // of GENUINE (host-not-reading) stalls trips the escape, exactly K of them.
     let mut c = UsbTxStallCounter::new();
-    assert!(!c.record(WriteOutcome::classify(true, false).is_stall())); // genuine stall #1
-    assert!(!c.record(WriteOutcome::classify(true, false).is_stall())); // genuine stall #2
-    // A recovered lost-wake breaks the run even though it arrived via a timeout.
-    assert!(!c.record(WriteOutcome::classify(true, true).is_stall()));
-    assert_eq!(c.count(), 0, "a recovered lost-wake resets the run");
-    // Only a fresh K genuine stalls fires the escape.
-    assert!(!c.record(WriteOutcome::classify(true, false).is_stall()));
-    assert!(!c.record(WriteOutcome::classify(true, false).is_stall()));
-    assert!(c.record(WriteOutcome::classify(true, false).is_stall()));
+    assert!(!c.record(WriteOutcome::Stalled.is_stall())); // genuine stall #1
+    assert!(!c.record(WriteOutcome::Stalled.is_stall())); // genuine stall #2
+    assert!(!c.record(WriteOutcome::Completed.is_stall())); // a completion breaks the run
+    assert_eq!(c.count(), 0, "a completed write resets the run");
+    assert!(!c.record(WriteOutcome::Stalled.is_stall()));
+    assert!(!c.record(WriteOutcome::Stalled.is_stall()));
+    assert!(c.record(WriteOutcome::Stalled.is_stall()), "K consecutive genuine stalls trips the escape");
   }
 
   #[test]
@@ -1013,6 +838,8 @@ mod tests {
       core1_frozen_ticks: 0,
       comms_frozen_ticks: 0,
       tx_complete_frozen_ticks: 0,
+      executor_alive_frozen_ticks: 0,
+      executor_stall_ticks: EXECUTOR_STALL_TICKS,
       response_depth: 0,
       block_in_flight: true,
       host_active: true,
@@ -1092,19 +919,60 @@ mod tests {
   }
 
   #[test]
-  fn watchdog_precedence_is_core1_then_comms_then_dead_zone() {
-    // When ALL three conditions hold at once, the most-specific (core-1, which carries the exact RMT stage marker)
-    // wins, then core-0 comms, then the dead-zone backstop — the same precedence `watchdog_feed` applies.
+  fn watchdog_withholds_on_executor_stall_when_all_work_detectors_are_quiescent() {
+    // The §17.15 ROOT-CAUSE case: a full core-0 executor stall where the three work-driven detectors are ALL gated off
+    // — no block in flight (core-1 idle), host inactive (aged out), and NO responses queued (usb_tx drained). The old
+    // decision would FEED here (the wedge that never reset); the ungated executor-liveness detector now catches it.
+    let inputs = WatchdogInputs {
+      executor_alive_frozen_ticks: EXECUTOR_STALL_TICKS,
+      block_in_flight: false,
+      host_active: false,
+      response_depth: 0,
+      ..healthy_inputs()
+    };
+    let d = watchdog_decision(inputs);
+    assert_eq!(d.withhold_reason, Some(WithholdKind::Core0ExecutorStall), "an executor stall must withhold");
+    assert!(!d.feed_rwdt && !d.feed_swd, "an executor stall withholds BOTH dogs");
+    // One short of the threshold still feeds (the boundary is `>=`).
+    let near = WatchdogInputs { executor_alive_frozen_ticks: EXECUTOR_STALL_TICKS - 1, ..inputs };
+    assert_eq!(watchdog_decision(near).withhold_reason, None, "one short of the executor threshold still feeds");
+  }
+
+  #[test]
+  fn watchdog_executor_stall_detector_is_disabled_when_threshold_is_zero() {
+    // A build that does not wire the executor-liveness beat passes `executor_stall_ticks = 0`; the permanently-zero
+    // frozen count must NEVER trip (a threshold of 0 with `>=` would otherwise false-trip every interval).
+    let inputs = WatchdogInputs {
+      executor_stall_ticks: 0,
+      executor_alive_frozen_ticks: 0,
+      block_in_flight: false,
+      host_active: false,
+      ..healthy_inputs()
+    };
+    assert_eq!(watchdog_decision(inputs).withhold_reason, None, "threshold 0 disables the detector");
+    // Even a large frozen count cannot trip a disabled detector.
+    let big = WatchdogInputs { executor_alive_frozen_ticks: 10_000, ..inputs };
+    assert_eq!(watchdog_decision(big).withhold_reason, None, "a disabled detector ignores any frozen count");
+  }
+
+  #[test]
+  fn watchdog_precedence_is_core1_then_executor_then_comms_then_dead_zone() {
+    // When ALL conditions hold at once, the most-specific (core-1, which carries the exact RMT stage marker) wins,
+    // then the definitive core-0 executor-dead signal, then core-0 comms, then the dead-zone backstop.
     let all = WatchdogInputs {
       core1_frozen_ticks: CORE1_STALL_TICKS,
+      executor_alive_frozen_ticks: EXECUTOR_STALL_TICKS,
       comms_frozen_ticks: COMMS_STALL_TICKS,
       response_depth: 8,
       tx_complete_frozen_ticks: DEAD_ZONE_STALL_TICKS,
       ..healthy_inputs()
     };
     assert_eq!(watchdog_decision(all).withhold_reason, Some(WithholdKind::Core1Motion));
-    // Drop core-1 → comms wins over dead-zone.
-    let comms_and_dz = WatchdogInputs { core1_frozen_ticks: 0, ..all };
+    // Drop core-1 → the executor-stall detector wins over comms + dead-zone.
+    let no_core1 = WatchdogInputs { core1_frozen_ticks: 0, ..all };
+    assert_eq!(watchdog_decision(no_core1).withhold_reason, Some(WithholdKind::Core0ExecutorStall));
+    // Drop executor too → comms wins over dead-zone.
+    let comms_and_dz = WatchdogInputs { executor_alive_frozen_ticks: 0, ..no_core1 };
     assert_eq!(watchdog_decision(comms_and_dz).withhold_reason, Some(WithholdKind::Core0Comms));
     // Drop comms too → dead-zone is the residual.
     let dz_only = WatchdogInputs { comms_frozen_ticks: 0, ..comms_and_dz };

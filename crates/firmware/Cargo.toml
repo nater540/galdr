@@ -97,18 +97,36 @@ defmt = ["dep:defmt", "firmware-core/defmt", "esp-println/defmt-espflash"]
 # and a diagnostic image can never accidentally ship armed.
 capture-reset = []
 
-# DIAGNOSTIC "provoke-and-capture" build (docs/streaming-lockup-investigation.md §17.14). DISABLES TIER 1's
-# single-chunk write-stage lost-wake RECOVERY so a lost wake is NOT rescued in place and cascades exactly as it did on
-# the PRE-fix build — letting the genuine in-stream Signature B reproduce at its native rate for capture with the
-# now-complete instrument (survivable watchdog + `[MSG:RESET]` replay). It is PURELY a way to reproduce the HISTORICAL
-# wedge for diagnosis; it is NEVER a production path. It composes WITH (and REQUIRES) `capture-reset` — provoking B
-# without the capture channel armed is pointless (the wedge would leave no trace) and unsafe, so this feature pulls
-# `capture-reset` in. The minimal lever is a single `#[cfg]` swap at the `usb_tx` write-stage classify call from the
-# pure `classify_write_stage` to its host-tested no-recover sibling `classify_write_stage_no_recover`; the production
-# `classify_write_stage` and the default build are byte-for-byte UNCHANGED. The K-escape + survivable watchdog +
-# `[MSG:RESET]` replay all stay ON, so whichever way B manifests (K-escape reset, ISR-withhold→dog, or the §13.8
-# alternating hard-lock) leaves a readable breadcrumb. Build+flash combo: `--features provoke-b` (pulls capture-reset).
-provoke-b = ["capture-reset"]
+# DIAGNOSTIC positive-control build (docs/streaming-lockup-investigation.md §17.16) for the (a)-vs-(b) watchdog
+# question. When ENABLED, the survivable-watchdog TIMG1 ISR UNCONDITIONALLY withholds both dog feeds after a fixed
+# boot delay (regardless of `watchdog_decision`), so a healthy, idle board is FORCED into the withhold path. If the
+# dogs are wired correctly the RWDT then resets the board ~8 s later, retaining the RTC_FAST withhold breadcrumb
+# across that (WDT, not EN) reset — proving the whole withhold→dog→reset→breadcrumb chain works on THIS board without
+# needing a physical GPIO probe or a reproduced wedge. It is the retention-safe test of hypothesis (b) ("a withhold
+# fires but the dogs don't reset"): a clean self-reset + `MSG:RESET` (rtcwdt) + a withhold breadcrumb refutes (b). It
+# REQUIRES `capture-reset` (the ISR feed path + armed dogs live there) and is NEVER a production path.
+force-withhold = ["capture-reset"]
+
+# DIAGNOSTIC end-to-end validation of the §17.17 executor-liveness FIX (docs/streaming-lockup-investigation.md §17.18).
+# When ENABLED, a core-0 async task waits ~10 s (letting the board boot and `EXECUTOR_ALIVE` establish), then enters a
+# NON-YIELDING busy loop that starves the cooperative core-0 thread-mode executor — the exact §17.15 full-executor-stall
+# CLASS (a task that never awaits stops `watchdog_heartbeat`, so `EXECUTOR_ALIVE` freezes) but induced DETERMINISTICALLY
+# instead of waiting for the non-deterministic usb_tx lost-wake wedge. The survivable TIMG1 ISR (a hardware interrupt,
+# unaffected by the executor stall) then sees the freeze, withholds both dogs, and the SuperWDT resets the board ~6 s
+# later with a `core0-executor-stall` breadcrumb — proving the FIX's detector→withhold→dog chain end-to-end on a REAL
+# executor stall (unlike `force-withhold`, which forces the withhold directly and does NOT exercise `EXECUTOR_ALIVE`).
+# REQUIRES `capture-reset` (the detector + ISR feed live there); NEVER a production path.
+provoke-executor-stall = ["capture-reset"]
+
+# DIAGNOSTIC PRODUCTION stall-inducer (docs/streaming-lockup-investigation.md §20) — the SAME ~10 s-delay non-yielding
+# busy-loop as `provoke-executor-stall`, but WITHOUT `capture-reset`, so it runs on an otherwise-PRODUCTION build. It
+# induces a full core-0 executor stall to exercise the Design A production recovery END-TO-END: the async
+# `watchdog_feed` (sole RWDT feeder) dies → the unfed RWDT resets the board at ~8 s (`sys-rtc-WDT`) AND the production
+# detector-only `stall_detector` ISR records the `core0-executor-stall` breadcrumb → the next boot comes up LOCKED in
+# the fail-safe alarm (`ALARM:11` with `$22=1`, `ALARM:3` with `$22=0`). (It ALSO served the §20.5-step-1 reframing
+# verification — that verify was done BEFORE Design A landed, when the non-capture build had no detector.) NEVER a
+# production path — the busy-loop is deliberate self-sabotage.
+provoke-stall-bare = []
 
 # DIAGNOSTIC continuous-TX build for a scope-free multimeter test of the TMC single-wire bus (GPIO9). When ENABLED,
 # `tmc_manager` skips all normal operation (init/presence/poll) and instead transmits `0x00` bytes back-to-back

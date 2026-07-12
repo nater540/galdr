@@ -75,6 +75,11 @@ mod storage;
 // from the production default build, which keeps the core-0 async `watchdog_feed` + the ALARM:17 fail-safe unchanged.
 #[cfg(feature = "capture-reset")]
 mod survivable_watchdog;
+// The PRODUCTION detector-only stall ISR (Design A, §20): records the `core0-executor-stall` breadcrumb on a full
+// core-0 executor stall so the next boot comes up in the fail-safe alarm. Uses TIMG1 in the default build (the
+// capture-reset build uses TIMG1 for `survivable_watchdog` instead — the two never coexist).
+#[cfg(not(feature = "capture-reset"))]
+mod stall_detector;
 mod tmc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -516,6 +521,14 @@ async fn main(spawner: Spawner) {
   // required) when homing is enabled — a host must `$H`/`$X` before streaming — else boots Idle. The boot
   // `ALARM:N` push is emitted after the banner below so a sender detects the locked state on connect.
   comms::init_control_state(homing_enabled);
+  // Design A (§20): if the PRIOR reset was the production stall detector's `core0-executor-stall` wedge (the
+  // breadcrumb read above names it), OVERRIDE the default boot state with the fail-safe wedge alarm so the board comes
+  // up LOCKED — never a silent resume in a now-suspect position. Homing ENABLED is already `ALARM:11` (idempotent);
+  // homing DISABLED overrides the default `Idle` with `ALARM:3` (position lost). The breadcrumb is the discriminator
+  // vs any ordinary reset. The named cause also appears in the `[MSG:CRASH core0-executor-stall …]` boot dump below.
+  if crash::withhold_was_executor_stall(breadcrumb.withhold) {
+    comms::force_wedge_alarm(homing_enabled);
+  }
   // Seed the `$21` hard-limit-enable mirror so the core-1 executor's hard-limit check reads the persisted state
   // (DOC-06). The limit inputs are configured above; the executor samples them at block boundaries / on the ISR.
   comms::init_limit_settings(settings.hard_limits_enabled(), settings.limit_invert, settings.homing_debounce_ms);
@@ -530,10 +543,18 @@ async fn main(spawner: Spawner) {
   // 4. Bring up the RMT step channels + DIR/STEP_EN GPIO and build the step sink. STEP_EN is driven enabled
   //    (active-low → low) so the steppers hold. Both the sink and STEP_EN are parked in `StaticCell`s so
   //    their RMT channels / pins live for the program's lifetime (the motion task borrows the sink `'static`).
+  // A-STEP (RMT ch3) pin selection. PRODUCTION: GPIO18 (DOC-00 spare 4th axis; PROVISIONAL, DOC-10 Phase 5). The
+  // DIAGNOSTIC `capture-reset` build instead hands GPIO18 to the survivable-watchdog scope heartbeat (below), so the
+  // never-driven A-STEP channel binds to `NoPin` (nothing) here — inert, since the A axis is bench-unverified and
+  // never transmits in this build. `motion::init` is generic in the 4th step pin, so no `cfg` leaks into `motion.rs`.
+  #[cfg(not(feature = "capture-reset"))]
+  let a_step_pin = peripherals.GPIO18;
+  #[cfg(feature = "capture-reset")]
+  let a_step_pin = esp_hal::gpio::NoPin;
   let (sink, step_enable) = motion::init(
     peripherals.RMT,
-    // A-STEP on the spare RMT ch3/GPIO18; A-DIR on GPIO38. PROVISIONAL (DOC-10 Phase 5, bench-unverified).
-    (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4, peripherals.GPIO18),
+    // A-STEP on the spare RMT ch3 (see `a_step_pin` above); A-DIR on GPIO38. PROVISIONAL (DOC-10 Phase 5).
+    (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4, a_step_pin),
     (peripherals.GPIO5, peripherals.GPIO6, peripherals.GPIO7, peripherals.GPIO38),
     peripherals.GPIO8,
     &motion_config,
@@ -707,13 +728,32 @@ async fn main(spawner: Spawner) {
   //   `StaticCell` (dogs armed) but is NOT handed to any feeder — the ISR feeds register-side, no `&mut Rtc` needed.
   #[cfg(not(feature = "capture-reset"))]
   spawner.spawn(comms::watchdog_feed(rtc).expect("spawn watchdog_feed"));
+  // Design A (§20): the PRODUCTION detector-only stall ISR on TIMG1 — records the `core0-executor-stall` breadcrumb on
+  // a full core-0 executor stall so the next boot comes up in the fail-safe alarm. Detector-only: it feeds/withholds
+  // NO dog and drives NO GPIO — the async `watchdog_feed` above still owns the RWDT (unchanged), and the unfed RWDT
+  // (that feeder dies in the stall) does the resetting. TIMG1 is free in the production build.
+  #[cfg(not(feature = "capture-reset"))]
+  stall_detector::start(peripherals.TIMG1);
+  // §20.5 step-1 BARE stall-inducer: on a PRODUCTION build (no capture-reset → no survivable ISR), stall the executor
+  // ~10 s after boot so the async `watchdog_feed` above dies → the unfed RWDT resets the board at ~8 s → reboot into
+  // `ALARM:11` (homing enabled). Verifies the production-recovery reframing (§20.1) WITHOUT the capture-reset ISR that
+  // would otherwise feed/withhold the dogs. Only compiled with `--features provoke-stall-bare`.
+  #[cfg(feature = "provoke-stall-bare")]
+  spawner.spawn(comms::provoke_executor_stall().expect("spawn provoke_executor_stall (bare)"));
   #[cfg(feature = "capture-reset")]
   {
     // The `Rtc` is owned by the `StaticCell` for `'static` (dogs stay armed); the ISR feeds via raw PAC, not through
     // this borrow. Bind `_ = rtc` so the unused `&'static mut` does not warn while keeping it conceptually alive.
     let _ = rtc;
-    survivable_watchdog::start(peripherals.TIMG1);
+    // GPIO18 (freed from RMT ch3 above in this build) drives the free-running ~2 Hz scope heartbeat toggled by the
+    // TIMG1 ISR — a hard-wedge detector independent of any STEP line (see `survivable_watchdog`).
+    survivable_watchdog::start(peripherals.TIMG1, peripherals.GPIO18, peripherals.GPIO17);
     spawner.spawn(comms::watchdog_heartbeat().expect("spawn watchdog_heartbeat"));
+    // §17.18 fix-validation build: deterministically stall the core-0 executor ~10 s after boot so the executor-
+    // liveness detector (the §17.17 fix) fires on a REAL `EXECUTOR_ALIVE` freeze → SuperWDT reset + `core0-executor-
+    // stall` breadcrumb. No effect on any other build (the task is `provoke-executor-stall`-gated).
+    #[cfg(feature = "provoke-executor-stall")]
+    spawner.spawn(comms::provoke_executor_stall().expect("spawn provoke_executor_stall"));
   }
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be

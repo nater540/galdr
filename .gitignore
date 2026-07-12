@@ -5,3 +5,8 @@
 *.elf
 *.bin
 *.map
+
+# uv / Python (tools/scope). Commit uv.lock; ignore the resolved venv and caches.
+.venv/
+__pycache__/
+*.pyc

@@ -2159,3 +2159,623 @@ B without the capture channel would be pointless + unsafe, so the feature pulls 
 provoke-b / defmt+provoke-b) build clean under explicit `RUSTFLAGS="-D warnings -C link-arg=-Tlinkall.x"`. Files:
 `firmware-core/src/diag.rs` (+`classify_write_stage_no_recover` + 2 tests), `firmware/src/comms.rs` (cfg swap at the
 write-stage classify), `firmware/Cargo.toml` (`provoke-b = ["capture-reset"]`).
+
+### 17.12 GPIO18 scope heartbeat — an out-of-band "is the chip alive" probe (firmware-engineer, 2026-07-11)
+
+The breadcrumb/`[MSG:RESET]` post-mortems tell us WHY the last reset fired, but only AFTER the WDT bites and the board
+reboots. For live bench triage of a Signature-B hard lock we want a real-time, toolpath-independent "is the chip still
+executing anything" signal on the scope. Watching a STEP line does not give this — STEP is idle between/within moves by
+design, so a flat STEP line is ambiguous (idle vs wedged).
+
+**The signal.** The survivable-watchdog TIMG1 ISR (`firmware/src/survivable_watchdog.rs`, `capture-reset`-gated) now
+ALSO toggles **GPIO18** once per fire, BEFORE its feed/withhold branch — a FREE-RUNNING ~2 Hz square wave (250 ms
+half-period). Because this ISR is a hardware timer that survives a core-0 executor stall (that is its whole reason to
+exist), the square wave keeps running through the comms/motion wedges the STEP line cannot disambiguate. It stops ONLY
+when the chip is so hard-locked that even this ISR cannot run, or at the eventual WDT reset. A flat GPIO18 is therefore
+the "chip is fundamentally dead" signal; a still-toggling GPIO18 with a dead stream says the wedge is above the ISR
+(a stuck task / lost wake), not a total CPU lock. The toggle is a raw-PAC `out_w1ts`/`out_w1tc` write (GPIO18 `< 32`),
+touching only the GPIO output register — zero RMT / core-1 / step-timing impact.
+
+**Pin note.** GPIO18 is the DOC-00 spare RMT ch3 (provisional 4th axis). In the `capture-reset` build `main` binds that
+never-driven channel to `NoPin` and hands GPIO18 to the heartbeat instead, so there is no contention; production builds
+are unchanged (GPIO18 → ch3). Probe GPIO18 on the carrier header (pin 11).
+
+**Scope usage.** Enable with `--features capture-reset` (or `provoke-b`, which pulls it in). On the DHO804 bench tool
+(`tools/scope`), watch GPIO18 with the `catch-lockup` recipe at a ~600 ms Timeout trigger: healthy = a steady ~2 Hz
+square wave; a Timeout capture (no edge for >600 ms) fires exactly at a true hard wedge or the reset, catching the lock
+the moment the chip stops — independent of what the toolpath was doing.
+
+### 17.15 FRESH REPRODUCED B (2026-07-11) — heartbeat ALIVE through the wedge, board NEVER reset (bughunter)
+
+**Reproduced on the `capture-reset` heartbeat build:** streaming `128-Pikachu.tap` wedged at line 1583/4474 (WPos
+268.4, 88.0, Z-5). Abrupt SILENT mid-stream cut (clean `ok`s right up to it, then skirnir `IoDisconnect: controller not
+responding`, exit 4). NO ALARM, NO reset banner. Measured LIVE on the scope during the wedge: **CH3 GPIO18 heartbeat =
+~2 Hz TOGGLING, CH1/CH2 X/Y-step = FLAT.** So: motion dead, USB comms dead, but the core-0 TIMG1 hardware ISR is STILL
+being serviced (it toggles the heartbeat AND therefore evaluates `watchdog_decision` every 250 ms). The board sat wedged
+for MINUTES; port stayed enumerated (no re-enum); an `espflash reset` (EN) booted it clean with NO withhold breadcrumb.
+
+**The question:** the ISR ran the whole time, yet the dogs never bit. Two hypotheses:
+- **(a) the withhold decision NEVER fired** — every 250 ms `watchdog_decision` returned `None`, so the ISR kept FEEDING
+  both dogs → no reset.
+- **(b) the withhold DID fire but the RWDT/SuperWDT did not reset** — the §17.8 "RWDT mysteriously did not fire" mystery.
+
+**CODE-ANALYSIS FINDING — (a) is strongly predicted; here is the exact mechanism.** `watchdog_decision`
+(`firmware-core/src/diag.rs`) has exactly THREE withhold conditions, and at this wedge ALL THREE are gated OFF:
+
+1. **core-1 motion withhold** needs `core1_frozen_ticks >= 16` which requires `EXECUTOR_RUNNING` (a block in flight).
+   Core 1 is INDEPENDENT of core 0: when core 0 stalls it can no longer refill the `BlockQueue`, so core 1 drains its
+   queued blocks and PARKS (`EXECUTOR_RUNNING=false`) within a second or two — matching the FLAT X/Y step lines. A
+   parked executor resets `CORE1_FROZEN` to 0, so this detector correctly does NOT fire (core 1 is idle, not wedged).
+2. **core-0 comms withhold** needs `comms_frozen_ticks >= 12` which requires `host_active` (RX advanced within
+   `RX_ACTIVE_TICKS=24` ⇒ 6 s). The host detects the disconnect and STOPS sending → `RX_ACTIVITY` freezes → `host_active`
+   ages out ~6 s after the wedge → `COMMS_FROZEN` is reset to 0. The comms withhold is BLIND to a wedge that coincides
+   with / precedes the host going quiet (the reset-loop guard, working as designed but structurally blind here).
+3. **dead-zone backstop** needs `response_depth > 0 && tx_complete_frozen_ticks >= 16`. The `tx_complete_frozen` side is
+   satisfied within 4 s (a full executor stall freezes `USB_TX_COMPLETED`). The BLOCKER is `response_depth =
+   RESPONSE.len()`: `usb_tx` dequeues its response with `RESPONSE.receive().await` into a LOCAL frame BEFORE parking in
+   the write await (`comms.rs:1579`), and with the executor stalled + the host quiet NOTHING refills the channel, so
+   `RESPONSE.len()` is FROZEN at its wedge-instant depth — which for a writer that was keeping up (RESPONSE near-empty)
+   is **0**. `dead_zone_withhold(0, …)` is `false` by its false-trip guard. So the one ungated backstop is structurally
+   blind to exactly this wedge.
+
+⇒ `watchdog_decision` returns `withhold_reason = None` every fire → the ISR feeds both dogs forever → no reset. This
+also PREDICTS the observed non-determinism (§17.7 self-reset-with-breadcrumb vs §17.13-style hard-lock): whether the
+board self-resets depends purely on whether `RESPONSE.len()` happened to be `> 0` at the freeze instant.
+
+**Why this is a FULL core-0 executor stall, not merely `usb_tx` parked.** If the async executor were alive with only
+`usb_tx` parked, `usb_tx`'s own 2 s `with_timeout` would fire → TIER 1 recovers the single-chunk lost wake in place →
+`USB_TX_COMPLETED` bumps → comms flows again. The observed HARD lock (no acks for minutes, reconnect fails) means the
+2 s timeout is NOT firing ⇒ embassy-time is not being serviced for that future ⇒ the whole core-0 thread-mode executor
+is stalled. The hardware TIMG1 ISR (heartbeat) runs regardless — which is exactly why it is a survivable feed, and
+exactly why it keeps FEEDING the dogs through the stall.
+
+**(b) is not dismissed but has no live support.** The §17.8 ">60 s RWDT did not fire" was on the PRODUCTION async
+feeder, where the dead-zone is `DEAD_ZONE_BACKSTOP_ARMED = false` (comms.rs:3278) — i.e. the feeder KEPT FEEDING for the
+same gating reason (a). RWDT resets ARE observed on this board (`CpuRtcWdt` reset reason), and both dogs are armed in
+this build (main.rs:449-460), so an unfed RWDT should bite in ≤8 s — the minutes-long wedge is far more consistent with
+"still being fed" than "unfed but silicon won't reset."
+
+**INSTRUMENT (built + compiles, `capture-reset`-gated) — decisive (a)-vs-(b) probe on GPIO17 / scope CH4.** The TIMG1
+ISR now drives **GPIO17** as a LIVE mirror of `decision.withhold_reason.is_some()` each fire (raw `out_w1ts`/`out_w1tc`,
+same discipline as the GPIO18 heartbeat; zero step-timing impact). `survivable_watchdog::start` now takes GPIO17
+alongside GPIO18. Predictions on a re-reproduced wedge:
+- **CH4 stays LOW the entire wedge ⇒ hypothesis (a) confirmed:** the withhold decision never fired; the fix is to add an
+  ungated core-0 executor-liveness detector (an embassy task bumps an `EXECUTOR_ALIVE` beat every tick; the ISR
+  withholds if that beat freezes for N ticks while the hardware ISR keeps firing) — this catches ANY full-executor
+  stall regardless of host/response/motion state, which the three current detectors structurally cannot.
+- **CH4 goes HIGH yet the board still does not reset ⇒ hypothesis (b):** the withhold fired but the dogs did not bite —
+  pivot to the raw-PAC RWDT/Swd feed/withhold correctness (is Stage0's action actually `reset`, is the write-protect
+  key right, does `Swd::enable` actually leave a biting dog).
+
+Bench recipe: `just flash --features capture-reset`; scope CH4 → GPIO17 (carrier header), same 10x/2V setup as CH3;
+`skirnir --cli /dev/cu.usbmodem31101 128-Pikachu.tap`; watch CH4 vs CH3 through the wedge.
+
+### 17.16 RTC memory is WIPED by an EN reset — both breadcrumb-via-EN paths are UNSOUND (bughunter, 2026-07-11)
+
+The first wedge's EN-reset boot dump (`MSG:RESET other`, no withhold line) was floated as (a) evidence. It is NOT.
+**On the ESP32-S3, toggling EN/CHIP_PU is treated as a power-on reset that powers down the RTC domain — RTC_FAST
+(`#[ram(rtc_fast, persistent)]`) AND any RTC-NOINIT word are both LOST** ([ESP-IDF forum](https://esp32.com/viewtopic.php?t=34596),
+[memory-types](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-guides/memory-types.html)). The
+breadcrumb is gated by `crash::MAGIC`; an EN reset clears the magic → `Breadcrumb::is_valid` fails → the WHOLE
+breadcrumb (withhold word included) is discarded. So "no withhold line after an EN reset" is what you see WHETHER OR NOT
+a withhold latched — it cannot distinguish (a) from (b). This kills BOTH probe-free breadcrumb paths (the one-shot word
+AND an RTC-NOINIT counter — same RTC power domain, same wipe). Corollary: **any RTC-memory breadcrumb is useless for a
+wedge that never self-resets, because reading it requires an EN reset that erases it.** The trace MUST live on a channel
+that survives / needs no reset: the GPIO17 live probe, or an actual WDT reset (RTC_FAST survives a WDT reset, just not
+EN). RWDT resets ARE observed on this board (`CpuRtcWdt`) so the dog itself is real.
+
+**Retention-safe positive control (built, `force-withhold` feature; §17.16).** To test hypothesis (b) — "a withhold
+fires but the dogs don't reset" — WITHOUT the physical probe or a reproduced wedge: the `force-withhold` build makes the
+TIMG1 ISR UNCONDITIONALLY withhold after `FORCE_WITHHOLD_AT_FIRES=20` fires (~5 s post-boot), overriding
+`watchdog_decision`. Expected on a healthy idle board: steady ~2 Hz GPIO18 heartbeat for ~5 s, then both feeds stop, and
+the RWDT resets the board ~13 s after boot. Because a WDT reset (unlike EN) RETAINS RTC_FAST, the boot dump should then
+show `MSG:RESET` (rtcwdt) + a withhold breadcrumb — validating the ENTIRE withhold→dog→reset→breadcrumb chain on this
+board. Outcomes: a clean self-reset ⇒ (b) REFUTED (dogs bite when withheld) ⇒ the wedge's failure to reset is purely
+(a) no-withhold-fired, corroborating the minutes-no-reset inference. NO self-reset after the forced withhold ⇒ (b) is
+real (raw-PAC feed/withhold or dog-arm defect). Uses only the existing GPIO18 scope probe + serial. Recipe:
+`just flash --features force-withhold`; watch GPIO18 on the scope + the serial monitor for the ~13 s self-reset + boot
+dump. (Also note: even absent any of this, the minutes-long non-reset with both dogs armed and RWDT known-functional is
+already strong (a); the probe and this positive control just make it airtight and rule out the silicon-(b) corner.)
+
+**FORCE-WITHHOLD RESULT #1 (2026-07-11) — the board self-resets, but via `CoreSw`, NOT a dog — the dog test was
+CONFOUNDED.** Boot-loops ~every 13 s (USB re-enumerates); the breadcrumb survives + prints every loop:
+`MSG:CRASH dead-zone-silent-lock stage=idle_waiting … wdog=24` / `usbtx: host-not-reading free=0 empty=0 iena=1 wstg=1
+… rdepth=2 rlen=126 n=3 …` / **`MSG:RESET core-sw-reset`**. Interpretation, from code:
+- `core-sw-reset` decodes to **`CoreSw`** (main.rs:353), which is a `software_reset()` — NOT a dog (a dog prints
+  `super-WDT` for `SysSuperWdt` (main.rs:360) or `…rtc-WDT`). The only two `software_reset()` sites are the panic
+  handler (main.rs:110 — not hit; no panic breadcrumb) and the **usb_tx K-escape** (`capture_usb_tx_stall_and_reset`,
+  comms.rs:1801). The `n=3 host-not-reading free=0` in the dump is the K-escape's own fingerprint ⇒ **the usb_tx
+  K-escape software-reset the board.**
+- Timing corroborates: `wdog=24` vs the `FORCE_WITHHOLD_AT_FIRES=20` withhold start = reset ~4 fires (~1 s) after the
+  withhold — far short of the 8 s RWDT, and the K-escape's 3×2 s fuse (started at boot as the host failed to drain the
+  126-byte status report during the messy reconnect) comes due at ~6 s ISR-uptime = exactly `wdog≈24`. So the usb_tx
+  K-escape won the race; my forced withhold was incidental and **a dog never got the chance to bite.**
+- ⇒ This run VALIDATES the capture→retain-across-CoreSw→print machinery, but does NOT establish that a bare withhold
+  makes a dog reset. The silicon-(b) corner ("dogs don't reset when unfed") is therefore NOT closed. This is
+  load-bearing: in the REAL executor-stall wedge usb_tx is DEAD and cannot software-reset, so a DOG is the only
+  possible resetter — we must prove a dog bites.
+
+**DOG-ISOLATION BUILD (`force-withhold` extended, 2026-07-11; all 3 configs compile clean).** `force-withhold` now
+ALSO cfg's out the usb_tx K-escape `software_reset()` (the `handle_usb_tx_wedge` call at comms.rs:1728 is
+`#[cfg(not(feature="force-withhold"))]`; usb_tx just resets its stall run and keeps serving). So in this build the ONLY
+thing that can reset the board is the survivable-watchdog ISR's WITHHELD dog. DECISIVE outcomes on `just flash
+--features force-withhold`:
+- **Board self-resets ~1–8 s after the forced withhold with `MSG:RESET super-WDT` (or `…rtc-WDT`) ⇒ a dog DOES bite on
+  a withhold.** Combined with the real Pikachu wedge NEVER resetting (minutes, heartbeat alive), this proves the
+  withhold decision never fired in the real wedge ⇒ **(a) CONFIRMED, and (b) refuted** — no probe / no user needed.
+- **Board does NOT self-reset (heartbeat keeps toggling, no re-enum for ≥20 s) ⇒ the dogs DON'T bite when unfed ⇒ (b)
+  is REAL:** the survivable-watchdog can never reset a real (executor-dead) wedge, which reframes the fix (the ISR must
+  reset the chip ITSELF — e.g. call `software_reset()` directly after `capture_withhold`, which we KNOW works, the
+  CoreSw path just did — rather than relying on the dog silicon).
+Either way this closes (a)/(b) from the bench WITHOUT the physical GPIO17 probe. Read `MSG:RESET <reason>` + whether the
+GPIO18 heartbeat gaps (a dog reset) vs keeps toggling (no reset).
+
+**DOG-ISOLATION RESULT (2026-07-11) — `MSG:RESET super-WDT`: (b) REFUTED, (a) CONFIRMED.** The dog-isolation build
+self-reset via **the SuperWDT** (`SysSuperWdt`), ~2 s after the forced withhold (`wdog=20`→`28`), `n=1` (K-escape gone —
+purely the dog). So a withheld dog DOES reset the board; the dog silicon works ⇒ **(b) refuted**. Combined with the real
+Pikachu wedge NEVER resetting (minutes, heartbeat alive) ⇒ the withhold decision NEVER fired there ⇒ **(a) CONFIRMED.**
+Root cause, closed from the bench with no probe and no user: the three withhold detectors are all structurally gated off
+in a full core-0 executor stall (host aged out, motion idle, RESPONSE drained), so the survivable ISR fed both dogs
+forever. The SuperWDT (fast, ~seconds) is the effective resetter, not the 8 s RWDT.
+
+### 17.17 ROOT-CAUSE FIX — ungated core-0 executor-liveness detector (bughunter, 2026-07-11; host-tested, builds clean)
+
+The fix adds the ONE detector the three work-driven ones lack: an UNGATED core-0 executor-liveness beat. A dedicated
+core-0 async task ([`comms::watchdog_heartbeat`], `capture-reset`) bumps `EXECUTOR_ALIVE` every interval
+unconditionally, so it advances on a healthy board regardless of host/motion/response state; a full executor stall
+FREEZES it while the survivable TIMG1 ISR keeps firing. The ISR tracks the freeze (ungated except a boot guard: only
+accrue once the beat has advanced past its initial 0) and passes it to the pure host-tested
+`firmware_core::diag::watchdog_decision`, which withholds both dogs once frozen ≥ `EXECUTOR_STALL_TICKS` (16 × 250 ms =
+4 s) → the SuperWDT then resets the board ~2 s later, leaving the `core0-executor-stall` breadcrumb. Precedence:
+`Core1Motion > Core0ExecutorStall > Core0Comms > DeadZone`. Threshold 4 s is well above any legitimate core-0 quiesce
+during streaming and (Pikachu does no mid-stream flash writes) carries no false-trip risk. Files:
+`firmware-core/src/diag.rs` (new `WithholdKind::Core0ExecutorStall`, `EXECUTOR_STALL_TICKS`, two `WatchdogInputs`
+fields, folded into `watchdog_decision`; 3 new host tests, 351 firmware-core tests green),
+`firmware/src/crash.rs` (`WithholdReason::Core0ExecutorStall` = `4` → label `core0-executor-stall`),
+`firmware/src/comms.rs` (`EXECUTOR_ALIVE` beat + bump in `watchdog_heartbeat`),
+`firmware/src/survivable_watchdog.rs` (sample + freeze-track + wire). All three Xtensa configs
+(default / capture-reset / force-withhold) build clean; **production default UNCHANGED** (the detector is
+`capture-reset`-gated — the production async feeder can't use it, it dies in the same stall it would detect).
+
+**END-TO-END VALIDATION (pending on the bench):** `just flash --features capture-reset`, re-stream `128-Pikachu.tap`.
+Expected: at the wedge the board now self-resets ~6 s later (4 s detect + ~2 s SuperWDT) with **`MSG:RESET super-WDT`**
+and a **`MSG:CRASH core0-executor-stall …`** breadcrumb (was: sat forever, heartbeat alive, no reset). On the scope,
+GPIO18 keeps toggling through the wedge + the 4 s withhold, then GAPS at the SuperWDT reset and resumes. Confirm the
+reset follows a genuine stream stall (skirnir stops getting acks THEN ~6 s later the reset), not a mid-healthy-stream
+false trip.
+
+**OPEN — PRODUCTION recovery is a separate USER decision (option A tension).** This diagnostic fix RESETS on the wedge;
+the user's option A forbids silent auto-recovery in production (a mid-cut reset loses gcode / resumes in the wrong
+place). But a full executor stall CANNOT run a graceful ALARM+halt (that logic is on the dead executor) — only the
+survivable ISR is alive, and its only lever is a reset. The likely production answer: ISR resets → reboot into
+`ALARM:11` (require re-home) so the board returns to a safe known state that the host must re-zero, NOT a silent resume
+— which honors option A's fail-safe intent. Needs the user's call before wiring the detector into the production feed
+path (which itself requires moving production to the survivable-ISR feed, since the async feeder dies in the stall).
+
+### 17.18 Deterministic fix validation — `provoke-executor-stall` (bughunter, 2026-07-11; builds clean)
+
+The `capture-reset` fix build behaved perfectly on the bench — idle-stable, GPIO17 flat-low, and **zero false-trips over
+a full 30-min Pikachu stream** (past the first run's wedge point, X330+) — but the non-deterministic wedge did NOT
+reproduce, so the fix was not yet seen catching a REAL stall. Rather than grind 15–30-min runs, decompose the fix chain:
+**L1** `EXECUTOR_ALIVE` freezes in the real stall → **L2** the ISR detects + withholds → **L3** withhold → SuperWDT
+reset. L2 is host-tested; L3 is bench-proven (§17.16 dog-isolation). Only **L1** is unproven-by-observation — and it is
+FORCED by the same deduction that established (a): both `usb_tx`'s 2 s `with_timeout` and `watchdog_heartbeat`'s
+`Timer::after` depend on embassy-time, so the minutes-long total silence requires that mechanism dead, which freezes
+`EXECUTOR_ALIVE` too (a state where `watchdog_heartbeat` keeps advancing while `usb_tx` stays permanently stuck is
+self-contradictory — both need the timer).
+
+`provoke-executor-stall` tests L1→L2→L3 as a chain DETERMINISTICALLY: a core-0 task waits ~10 s then enters a
+non-yielding busy loop, starving the cooperative core-0 executor (incl. `watchdog_heartbeat`) — the exact
+full-executor-stall CLASS the memory names as the likely B root — so `EXECUTOR_ALIVE` genuinely freezes and the ISR's
+detector must catch it. Expected ~6 s after the stall onset: **`MSG:RESET super-WDT`** + **`MSG:CRASH
+core0-executor-stall …`**, CH4/GPIO17 HIGH at the withhold, CH3 heartbeat gapping at the reset. This exercises the
+REAL new code path (`EXECUTOR_ALIVE` freeze → `watchdog_decision` → withhold → dog) on a genuine stall, unlike
+`force-withhold` (which forces the withhold directly, bypassing `EXECUTOR_ALIVE`). Recipe: `just flash --features
+provoke-executor-stall`; the board should self-reset ~16 s after boot and boot-loop. Files: `Cargo.toml`
+(`provoke-executor-stall` feature), `comms.rs` (`provoke_executor_stall` task), `main.rs` (spawn). All Xtensa configs
+build clean; production default UNCHANGED.
+
+For the NATURAL-wedge catch (belt-and-suspenders), `provoke-b` (§17.14, disables TIER-1 so B cascades at its native
+rate — and it pulls in `capture-reset`, so the fix is active) reproduces B far faster than stock Pikachu. Caveat: a
+`provoke-b` wedge can be EITHER the usb_tx K-escape variant (executor still alive → `core-sw-reset`, CH4 low — the fix
+correctly does NOT fire) OR the full-executor-stall variant (the fix's target → `super-WDT`, CH4 high); the reset reason
++ CH4 tell them apart. Assessment: after `provoke-executor-stall` proves the chain deterministically, the fix is
+validated to a high bar; a natural-wedge super-WDT catch is desirable confirmation of L1 but not blocking.
+
+**CAPSTONE PROVEN (2026-07-11).** `provoke-executor-stall` boot dump:
+`MSG:CRASH core0-executor-stall stage=idle_waiting comms-stage=consumer-wait-line comms-froze-first beats comms=0
+motion=191 wdog=67` / `usbtx: host-not-reading … n=2 …` / **`MSG:RESET super-WDT`**. Scope: CH4/GPIO17 = clean square,
+HIGH ~2 s (the withhold→SuperWDT window) then reset; CH3 heartbeat toggling through it; board boot-loops via super-WDT.
+Every link confirmed: the `core0-executor-stall` label = the NEW detector fired (not one of the old three);
+`comms=0`/`motion=191` = core-0 frozen while core 1 ran (the expected stall signature); `wdog=67` (~16.75 s uptime) =
+10 s stall-delay + ~4 s detect + ~2 s SuperWDT. **L1 (EXECUTOR_ALIVE froze) → L2 (detect+withhold) → L3 (super-WDT
+reset) proven on a GENUINE executor stall.**
+
+### 17.19 VALIDATION CLOSE-OUT (bughunter, 2026-07-11)
+
+Signature-B "survivable watchdog never reset the wedged board" — ROOT-CAUSED, FIXED, and VALIDATED:
+- **Root cause (a) CONFIRMED:** in a full core-0 executor stall the three withhold detectors are all structurally gated
+  off (core-1 needs `EXECUTOR_RUNNING`, comms needs `host_active`, dead-zone needs `RESPONSE.len()>0` — all quiescent),
+  so the ISR fed both dogs forever. (b) REFUTED: a withheld dog DOES reset (super-WDT, §17.16 dog-isolation).
+- **Fix (§17.17):** an ungated core-0 executor-liveness detector (`EXECUTOR_ALIVE` beat + `WithholdKind::
+  Core0ExecutorStall`). Host-tested (351 firmware-core tests), false-trip-safe (idle + 30-min real stream, GPIO17
+  flat-low), and proven to fire on a genuine stall (§17.18 capstone). Production default UNCHANGED (capture-reset-gated).
+- **Instruments left in the tree (all capture-reset-gated, production-inert):** GPIO18 heartbeat, GPIO17 withhold
+  mirror, `force-withhold` (dog test), `provoke-executor-stall` (fix capstone), `provoke-b` (fast natural-B repro).
+- **PRODUCTION RECOVERY POLICY — DECIDED by the user (2026-07-11): reset → reboot into `ALARM:11` (require re-home).**
+  On an executor-stall wedge the survivable ISR resets the chip; the board boots locked in `ALARM:11` so the operator
+  must re-home/re-zero — a fail-safe known state, NOT a silent resume that would resume cutting in the wrong place
+  (honors option A). Productionization is DEFERRED (safety-critical; the diagnostic tree is uncommitted — the user is
+  deciding sequencing: commit the diagnostic work first vs. go straight to production wiring) and will come back to the
+  bug-hunter as a PLAN-FIRST ask. Implementation notes for that work: it requires moving the PRODUCTION watchdog feed
+  onto the survivable-ISR path (the async `watchdog_feed` dies in the same stall it must detect, so it cannot be the
+  production feeder for this class); the `EXECUTOR_ALIVE` beat + the `Core0ExecutorStall` detector then move out of the
+  `capture-reset` gate; and the boot path must force `ALARM:11` when the reset reason is the survivable-ISR dog
+  (super-WDT) with a `core0-executor-stall` breadcrumb, rather than resuming.
+- **Belt-and-suspenders (not blocking):** a natural-Pikachu-wedge super-WDT self-reset (did not reproduce in one 30-min
+  fix-build run; `provoke-b` is the fast path if desired).
+- All work UNCOMMITTED (diagnostic tree).
+
+## 18. grblHAL / ESP-IDF USB-TX comparison — is the lost-TX-wake PREVENTABLE? (bughunter, 2026-07-11, source-cited)
+
+Research question: does the grblHAL ESP32 / ESP-IDF USB-serial TX path structurally eliminate the lost-TX-done-wake
+class we root-caused in `usb_tx` over esp-hal `UsbSerialJtag`, and can we mirror that primitive? **Answer: YES — both
+reference designs make the lost-wake structurally impossible, via a RETAINED (data/count) completion signal instead of
+esp-hal's single-edge AtomicWaker-on-a-mask-bit. It is preventable, and the fix belongs primarily UPSTREAM in esp-hal
+(with a low-effort in-our-code mitigation available now).**
+
+### 18.1 Our esp-hal mechanism and the exact lost-wake vectors (source: esp-hal 1.1.1 `src/usb_serial_jtag.rs`)
+`UsbSerialJtagTx::write_async` (line 811) writes each ≤64 B chunk DIRECTLY to the EP1 FIFO, sets `wr_done`, then awaits
+a fresh `UsbSerialJtagWriteFuture` per chunk. That future (707–747): `new()` ARMS `int_ena.serial_in_empty`; `poll()`
+does `WAKER_TX.register(cx.waker())` then returns `Ready` iff `int_ena.serial_in_empty` is now CLEAR. The single ISR
+`async_interrupt_handler` (932) on TX-empty CLEARS `int_ena.serial_in_empty` (the completion latch), clears the raw
+flag, and calls `WAKER_TX.wake()`. `WAKER_TX` is ONE shared `AtomicWaker` (703). Three structural fragilities, all
+source-confirmed:
+1. **No `Drop` on `UsbSerialJtagWriteFuture`** (grep: zero `Drop` impls in the file). When our `with_timeout` fires and
+   DROPS the awaited future, `int_ena.serial_in_empty` stays ARMED. The next write re-arms an already-armed bit and the
+   arm/event/waker state is desynced — this is the captured Signature-A `iena=1` write-stage lost wake (the interrupt
+   armed but never serviced for that write).
+2. **Single, latest-only, NON-counting `AtomicWaker`.** It holds only the most recent waker and carries no count. If
+   the ISR fires + wakes but the executor's re-poll is lost/raced (our classic `iena=0 empty=0 free=1`: ISR ran, host
+   drained, future never completed), there is NO retained state to recover from — the signal is an EDGE, and a dropped
+   edge strands the write until the next unrelated event.
+3. **Completion = a mask bit, not data occupancy.** "Done" is signalled by the ISR clearing an enable bit; the payload
+   was already pushed to the FIFO with nothing retained to re-drive. One missed edge = a stranded write.
+
+### 18.2 Reference design A — ESP-IDF `usb_serial_jtag` driver (SAME peripheral as ours; source: esp-idf `components/esp_driver_usb_serial_jtag/src/usb_serial_jtag.c`)
+`usb_serial_jtag_write_bytes()` does NOT touch the FIFO directly — it `xRingbufferSend()`s into a TX RING BUFFER. The
+ISR `usb_serial_jtag_isr_handler_default()` on `USB_SERIAL_JTAG_INTR_SERIAL_IN_EMPTY` `xRingbufferReceiveUpToFromISR()`s
+from the ring, `usb_serial_jtag_ll_write_txfifo()`s to refill the FIFO, stashes any leftover in `tx_stash_buf` for the
+next IRQ, and keeps SERIAL_IN_EMPTY enabled while ring data remains (disables it only when drained). Completion/backpressure
+is a RETAINED binary semaphore: `xSemaphoreGiveFromISR(tx_idle_sem)` when the ring is empty, waited on by
+`usb_serial_jtag_wait_tx_done()`. Why it can't lose a wake: the pending bytes live in the RING (retained state) and the
+ISR re-fires on every TX-empty until the ring drains — the completion is DATA-OCCUPANCY-driven and self-healing, not a
+single edge. The semaphore is a retained/counting resource, not a latest-only waker.
+
+### 18.3 Reference design B — grblHAL ESP32 actual (source: grblHAL/ESP32 `main/usb_serial.c`)
+grblHAL on ESP32-S3 uses **TinyUSB CDC** (the native USB-OTG peripheral, NOT the USB-Serial-JTAG). Its `_usb_write()`
+is a POLL loop: check `tud_cdc_write_available()`, write what fits, `tinyusb_cdcacm_write_flush()` (2 ms timeout), and if
+the FIFO is full call `hal.stream_blocking_callback()` to YIELD, then re-poll. There is NO TX-empty interrupt handler
+for the data path (the only ISR, `hw_cdc_reset_handler`, is bus-reset-only). Why it can't lose a wake: there is NO
+event-wake at all — completion is re-read from `tud_cdc_write_available()` every iteration. A poll design is immune to
+the lost-wake class by construction. (RX buffer advertised 512 B; TinyUSB staging 64 B.)
+
+### 18.4 The translatable primitive + recommendation
+The common prevention principle across A and B: **the TX-complete/room signal must be RETAINED (ring occupancy /
+counting semaphore) or RE-READ each poll (poll the FIFO-free bit) — never a single edge delivered to a latest-only
+waker.** Three ways to bring that into our esp-hal + Embassy stack:
+- **Option B (poll, mirror grblHAL) — LOW effort, in OUR code, recommended NOW.** Make `usb_tx` POLL-based: write ≤64 B
+  chunks to the FIFO, then between chunks re-read `ep1_conf.serial_in_ep_data_free` with a yield
+  (`embassy_futures::yield_now().await`, or a short `Timer`), instead of awaiting `UsbSerialJtagWriteFuture`. This is
+  EXACTLY our validated TIER-1 poll-after-arm recovery PROMOTED from a 2 s backstop to the primary loop — no waker
+  exists to lose. Cost: slightly higher poll wakeups (negligible at CNC TX rates; bounded by yielding). Stays entirely
+  in `firmware`, no upstream dependency, low risk. This makes the lost-wake structurally impossible for us.
+- **Option A (ring-buffer ISR, mirror IDF) — the "correct" root fix, HIGH effort, belongs UPSTREAM in esp-hal.** A
+  SERIAL_IN_EMPTY-ISR-drained TX ring with the ISR re-arming while data remains and an embassy-sync retained completion
+  (a `Channel`/counting signal, not a bare `AtomicWaker`). This is reimplementing the IDF driver in Rust; it is a genuine
+  esp-hal `UsbSerialJtagTx` deficiency and should be filed/fixed upstream rather than forked into our tree.
+- **Option C (minimal esp-hal patch) — cheapest upstream fix.** Add a `Drop` to `UsbSerialJtagWriteFuture` that disarms
+  `int_ena.serial_in_empty` (closes our `iena=1` with_timeout-drop vector), and make `poll()` ALSO return `Ready` on the
+  hardware `serial_in_ep_data_free` bit (data-driven, closes the latest-only-waker edge loss). Small, upstreamable, and
+  it fixes the class for every esp-hal user — but until it lands, it is not ours to rely on.
+
+**Verdict:** the lost-wake is a genuine esp-hal `UsbSerialJtagTx` design defect (edge-signalled completion + no `Drop`),
+NOT inherent to Embassy or our code. It IS preventable. Recommended path: **adopt Option B now** (poll-based `usb_tx` —
+makes the wedge impossible for us, low risk, reuses proven logic) and **file Option C upstream** to esp-hal as the
+durable ecosystem fix; keep the §17.17 executor-liveness reset→ALARM:11 as defense-in-depth. This would make the ROOT
+lost-USB-TX-wake impossible rather than merely recoverable — the prize the user asked about. PLAN-FIRST before any code.
+
+### 18.5 Streaming-contract cross-check (light)
+From `main/usb_serial.c`: grblHAL advertises a 512 B RX buffer; ours advertises 1024 B (larger — fine). Nothing in the
+TX-path review contradicts our ok/error, single-CRLF, post-error-hold, or realtime-byte-interception contract (those
+live in grblHAL `protocol.c`/`grbllib`, not the serial driver, and were not re-read here). A deeper protocol cross-check
+against grblHAL `protocol.c` is a separate focused pass if the user wants it — flag NONE from the driver layer.
+
+## 19. Option B — poll-based `usb_tx` (root prevention) — IMPLEMENTED, host-tested, awaiting BENCH (bughunter, 2026-07-11)
+
+User approved Option B (§18.4): replace `usb_tx`'s waker-based write await with a hardware-poll loop, making the
+lost-TX-wake structurally impossible (no waker to lose). This is a PRODUCTION comms-path change on the sacred streaming
+path. **STATUS: implemented on the working tree; 342 firmware-core tests green under `-D warnings`; all four Xtensa
+configs (default / capture-reset / provoke-b / provoke-executor-stall) build clean under `-D warnings`; NOT flashed
+(handed to the bench). Two refinements vs the plan sketch below, both flagged to the team:**
+- **esp-hal-exact commit sequencing (§19.6 sacred-path safety):** `write_response_polled` commits each ≤64 B packet
+  with `flush_tx_nb` (sets `wr_done` ONCE) then POLLS esp-hal's own `ep1_conf & 0b011 != 0` "commit registered"
+  condition (yielding), rather than relying on the next `write_byte_nb` to back-pressure. This mirrors esp-hal's tested
+  blocking `flush_tx`/`write` exactly and removes any dependence on unverified FIFO-buffering assumptions / a
+  commit-in-progress race on a partial final chunk. Cost: a per-packet commit-registration poll (~1 USB frame ≈ ms when
+  the host is draining), cooperative (yields), consistent with the chosen `yield_now`.
+- **`provoke-b` degenerates:** its only mechanism was the `classify_write_stage_no_recover` swap on the AWAIT path,
+  which no longer exists — so `provoke-b` now compiles as `= capture-reset` (instruments armed, no unique provocation).
+  It cannot "provoke" the lost wake because the lost-wake path is GONE; running it just watches the poll path with full
+  capture instrumentation. (If an A/B control that still wedges is wanted, the OLD await path would have to be kept
+  under a separate cfg — more retained code; recommend NOT.) The recovered-counter apparatus
+  (`USB_TX_LOST_WAKE_RECOVERED`, `record_recovered_count`, the `$I rec=` line, its RTC_FAST slot) is left DORMANT
+  (reads 0 — a "no lost-wakes" indicator) to avoid perturbing the breadcrumb layout on this change; removed with
+  `provoke-b` in the retirement cleanup.
+
+### 19.1 The primitive (esp-hal exposes exactly what we need on the Async TX)
+`UsbSerialJtagTx<'_, Dm>` (any `Dm`, incl. `Async`) exposes non-blocking, WAKER-FREE methods that re-read the hardware
+each call (esp-hal 1.1.1 `usb_serial_jtag.rs`):
+- `write_byte_nb(b) -> nb::Result<(), _>` (193): writes `b` to the EP1 FIFO IFF `ep1_conf.serial_in_ep_data_free` is
+  set, else `WouldBlock`. Re-reads the FIFO-room bit every call.
+- `flush_tx_nb() -> nb::Result<(), _>` (223): sets `wr_done`, returns `Ok` iff the packet was accepted
+  (`ep1_conf & 0b011 != 0`), else `WouldBlock`.
+Neither touches `int_ena` or `WAKER_TX` / `UsbSerialJtagWriteFuture` — the entire lost-wake surface (§18.1) is bypassed.
+
+### 19.2 Before / after control flow (exact)
+BEFORE (per response, comms.rs `usb_tx`): `RESPONSE.receive().await` → `with_timeout(2s, tx.write_all(bytes))` →
+on timeout re-read `serial_in_ep_data_free` → `classify_write_stage` (TIER-1 single-chunk widening) → if clean,
+`with_timeout(2s, tx.flush())` → `classify_split` → `WriteOutcome` {Completed | CompletedLostWakeRecovered | Stalled}
+→ K-escape counter. The `with_timeout` drop is what strands `int_ena` (§18.1 vector 1).
+
+AFTER (per response): `RESPONSE.receive().await` → poll-write the bytes, NEVER awaiting the esp-hal write future:
+```
+outcome = write_response_polled(&mut tx, resp.as_bytes(), Instant::now() + POLL_STALL_TIMEOUT):
+  for chunk in bytes.chunks(64):
+    for &b in chunk:
+      loop:
+        match tx.write_byte_nb(b):
+          Ok(())               => break               // byte in FIFO
+          Err(WouldBlock)      =>                      // FIFO full = host not draining yet
+            if Instant::now() >= deadline: return Stalled
+            yield_now().await                          // re-poll next executor tick — NO waker
+    loop:                                              // push packet + confirm host accepted it
+      match tx.flush_tx_nb():
+        Ok(())          => break
+        Err(WouldBlock) =>
+          if Instant::now() >= deadline: return Stalled
+          yield_now().await
+  return Completed
+```
+Completion is re-read from `serial_in_ep_data_free` each poll; `yield_now()` re-polls unconditionally next tick, so the
+loop makes progress every executor cycle with ZERO dependency on the TX interrupt. A genuine host-not-reading host makes
+`data_free` never set → the bounded `POLL_STALL_TIMEOUT` (keep 2 s, matching today) returns `Stalled` → drop-and-continue
++ the existing K-escape, exactly as before. Flow-control integrity (CORRECTED from the sketch's over-broad "one unit"
+claim): the flow-control-critical `ok`/`error:N` are ≤64 B = a SINGLE packet, so a stall sends the whole line or none
+(the first `write_byte_nb` blocks on a full FIFO before any byte commits) — they are never truncated. A mid-response
+stall on a MULTI-chunk response (a long `<...>` status / `$`-report) can strand its already-committed packets on the
+wire (a truncated tail), but those are NOT part of the character-count flow control (status is re-requested on the next
+`?`), and this is exactly the prior await path's behavior (a `write_all` timeout also stranded mid-response) — no
+regression.
+
+### 19.3 Relationship to the existing recovery tiers — what stays / goes / simplifies
+- **REMOVED (loses its purpose):** the entire lost-wake RECOVERY machinery — `WriteOutcome::CompletedLostWakeRecovered`,
+  `classify_write_stage`, `classify_split`, `classify_write_stage_no_recover`, the TIER-1 single-chunk widening, the
+  `USB_TX_LOST_WAKE_RECOVERED` counter, and the `SINGLE_CHUNK_MAX_BYTES` reasoning. All of it existed ONLY to
+  disambiguate "the bytes went out but the wake was lost" from "a real stall" on the await path. With polling there is
+  no lost wake to recover: `data_free` set ⇒ proceed, not set ⇒ genuine stall. `WriteOutcome` collapses to
+  {Completed, Stalled}.
+- **RETURN mostly unchanged (a REAL condition, not a lost-wake artifact):** the K-escape `UsbTxStallCounter` +
+  `handle_usb_tx_wedge` — a genuine host-not-reading stall (data_free never sets for K consecutive responses) still
+  drops-and-continues and, at K, raises production `ALARM:17` / captures in the diagnostic build. It now fires ONLY on
+  a true non-draining host, never on a phantom lost-wake.
+- **UNCHANGED, coexists (defense-in-depth):** the §17.17 executor-liveness watchdog (reset→ALARM:11). It catches a FULL
+  core-0 executor stall from ANY cause, independent of the usb_tx path. Do NOT entangle the two changes — Option B ships
+  as its own commit; the executor-liveness productionization is a separate follow-on.
+- **RETIRE after Option B lands:** the `provoke-b` feature — its whole purpose (provoke the lost-wake B by disabling
+  TIER-1 recovery) is moot once the lost-wake path is gone. Keep it only through the validation window (see §19.5),
+  then remove.
+
+### 19.4 Productionization scope + throughput/timing
+- **PRODUCTION always-on, NOT capture-reset-gated.** Option B is the root prevention; it replaces the fragile await for
+  every build. It is a production streaming-path change.
+- **Throughput (healthy host):** unchanged. When the host reads promptly `data_free` is set almost immediately, so
+  `write_byte_nb` rarely `WouldBlock`s and the poll loop barely yields — same effective latency as the await path, which
+  also completed in sub-ms when healthy. No change to the ok/status/ack cadence (usb_tx is still the single writer;
+  relative ordering is identical).
+- **Throughput (back-pressured host):** the loop cooperatively `yield_now()`s and re-polls each executor tick until
+  `data_free` — a brief cooperative spin (ms, until the host catches up), yielding to status/consumer each iteration so
+  nothing is starved. Costs a few extra executor cycles during transient backpressure, NOT throughput. If profiling
+  ever shows a spin spike, bound it with a `Timer::after(~200 µs)` between polls (adds ≤200 µs TX latency, negligible);
+  default is `yield_now` for lowest latency.
+
+### 19.5 Testability + bench validation
+- **Pure host-testable helper:** factor the per-poll decision into `firmware_core::diag`, e.g.
+  `usb_tx_poll_action(data_free: bool, deadline_exceeded: bool) -> PollAction {WriteOrFlush, Yield, Stall}`, plus a thin
+  `PollWriteOutcome` reducer over a sequence of `(data_free, elapsed)` observations → {Completed, Stalled}. Host tests:
+  data_free-always-true ⇒ Completed with N writes; data_free-always-false ⇒ Stalled at the deadline; intermittent ⇒
+  Completed. Same pure-decision / firmware-does-I/O split as `watchdog_decision`. The byte cursor + `nb` calls stay in
+  comms.rs (I/O, compile-checked).
+- **Bench validation** (absence-of-wedge is structural, but we get positive signals):
+  1. `provoke-b` should NO LONGER reproduce Signature B at all (there is no lost-wake path left to provoke) — a strong
+     positive test: run the same stream that reproduced B and confirm it now completes clean.
+  2. Full 30-min Pikachu stream completes with unchanged throughput; monitor core-0 CPU for a spin regression.
+  3. Host-not-reading test (pause the reader mid-stream) still cleanly drops → recovers → resumes (the genuine-stall
+     path preserved).
+  4. `USB_TX_LOST_WAKE_RECOVERED` (if kept transitionally) reads 0 — the class is gone, not merely quiet.
+
+### 19.6 Risk + rollback
+- **Risk: byte drop/dup on the sacred wire** (would desync ok/error flow-control). Mitigation: the pure state machine +
+  host tests; the byte cursor advances ONLY on `Ok`; `wr_done`/`data_free` semantics copied from esp-hal's own blocking
+  `write`/`flush_tx`. Catch: the grblHAL char-counting host (skirnir) desyncs loudly if an ok is dropped/duplicated.
+- **Risk: back-pressure spin starves core 0.** Mitigation: `yield_now` yields each iteration; optional `Timer` bound;
+  validate CPU over the 30-min stream.
+- **Risk: changed drop-on-stall behavior.** It is the SAME drop-and-continue the 2 s timeout does today, so host
+  flow-control behavior is preserved.
+- **Rollback:** self-contained to `usb_tx`'s write section + the removed classify helpers — one revertible commit. Keep
+  the §17.17 executor-liveness net armed as the backstop during rollout.
+
+### 19.7 Files touched + rough size
+- `crates/firmware/src/comms.rs`: rewrite `usb_tx`'s write/flush/classify section (~80 lines changed); remove the
+  TIER-1 recovery branches.
+- `crates/firmware-core/src/diag.rs`: ADD `usb_tx_poll_action` + `PollWriteOutcome` + tests (~80 lines); REMOVE
+  `CompletedLostWakeRecovered`, `classify_write_stage[_no_recover]`, `classify_split`, `SINGLE_CHUNK_MAX_BYTES` and their
+  tests (~150 lines) — net SIMPLIFICATION.
+- `crates/firmware/Cargo.toml` + call sites: retire `provoke-b` after validation.
+- Net: roughly neutral-to-smaller line count, large fragility reduction. Estimated diff ~250–350 lines touched, mostly
+  deletions.
+
+**DECISIONS FOR THE USER:** (1) `yield_now` vs a `Timer`-bounded poll (recommend `yield_now`, Timer only if profiling
+demands). (2) Remove the TIER-1 machinery now vs keep it dormant one release (recommend REMOVE — dead code on the sacred
+path is a liability, and the pure helper's tests cover the new path). (3) Retire `provoke-b` after the validation window
+(recommend yes). Nothing is written until you approve.
+
+## 20. PRODUCTION-WIRING PLAN — executor-stall recovery = reset → reboot into ALARM:11 — PLAN-FIRST, NO CODE (bughunter, 2026-07-11)
+
+User-approved policy (§17.19): on a full core-0 executor-stall wedge, RESET and reboot into `ALARM:11` (require re-home)
+— a fail-safe known state, never a silent resume. This plan drafts that productionization for the user's review. Code
+held until approved.
+
+### 20.1 HEADLINE REFRAMING (verified from code) — production likely ALREADY reset→ALARM:11s; scope is smaller than §17.19 implied
+§17.19 assumed we must "move the production feed onto the survivable-ISR path." Re-checking the wiring changes that:
+- The SOLE production RWDT feeder is the async `comms::watchdog_feed` task (main.rs:717, `#[cfg(not(capture-reset))]`),
+  which pets the RWDT every 500 ms. RWDT Stage0 = `WATCHDOG_TIMEOUT` (8 s) → system reset (main.rs:450).
+- A FULL core-0 executor stall (the remaining wedge class now that §18/§19 Option B eliminated the lost-wake) stops
+  ALL core-0 tasks INCLUDING `watchdog_feed` (it is a timer-driven async task) → the RWDT goes unfed → **it resets the
+  board on its own at ~8 s.** There is no survivable ISR feeding it in production, so nothing defeats that reset (unlike
+  the capture-reset build, where the survivable ISR kept feeding — the §17.15 "sat for minutes" cause).
+- Boot: when `$22` homing is enabled, `init_control_state` latches `ALARM:11` and `send_boot_alarm` emits it
+  (main.rs:518/754, comms.rs:708/1263). So on ANY reset — including this wedge RWDT reset — a homing-enabled machine
+  **already reboots LOCKED in `ALARM:11` requiring `$H`.**
+
+⇒ For a homing-enabled machine (which any real CNC should be, precisely for lost-position safety), production ALREADY
+achieves the user's policy: executor-stall wedge → unfed-RWDT reset (~8 s) → reboot into `ALARM:11`. **This must be
+BENCH-VERIFIED before building anything (§20.5 step 1) — it is a high-confidence code deduction, not yet observed on a
+production build.** If it holds, the productionization is only two value-adds, NOT a feed-path replacement:
+(a) a DIAGNOSTIC BREADCRUMB naming the cause (`core0-executor-stall`) so a wedge-reset is distinguishable from any other
+RWDT reset; (b) DETERMINISTIC `ALARM:11` even when homing is DISABLED (else a homing-off board reboots `Idle` and could
+resume — violating the fail-safe).
+
+### 20.2 Design A (RECOMMENDED, low-risk) — detector-only ISR + UNCHANGED async feed
+Keep the sacred RWDT feed path exactly as-is; add a survivable detector that only RECORDS, and gate the boot alarm on
+its breadcrumb.
+- **`EXECUTOR_ALIVE` production-live:** ungate it from `capture-reset` and bump it from the production `watchdog_feed`
+  loop (it is the liveness producer — it advances iff the core-0 executor runs tasks). One `fetch_add` per loop.
+- **Detector-only TIMG1 ISR (production):** a STRIPPED survivable-watchdog — samples `EXECUTOR_ALIVE`, tracks the freeze
+  (boot-guarded), and when frozen ≥ `EXECUTOR_STALL_TICKS` (4 s) records the `Core0ExecutorStall` withhold breadcrumb
+  ONCE. It does NOT feed or withhold any dog, does NOT drive GPIO18/17, does NOT arm the SuperWDT. So it CANNOT perturb
+  step timing (it only reads atomics + writes one RTC_FAST word) and CANNOT cause a false reset (it never touches the
+  RWDT feed). The unfed RWDT (async feeder already dead in the stall) does the resetting at ~8 s; the ISR just leaves
+  the breadcrumb in the 4 s→8 s window (RTC_FAST survives the WDT reset).
+- **Boot ALARM gating:** in `main`/boot, decode the withhold breadcrumb; if it is `Core0ExecutorStall`, force the
+  machine into `ALARM:11` (locked, require `$H`) + emit a diagnostic line — REGARDLESS of the `$22` homing setting.
+  The breadcrumb IS the discriminator ("our detector's reset" vs any other RWDT reset): present ⇒ wedge reset ⇒ alarm;
+  absent ⇒ ordinary reset ⇒ existing boot behavior.
+- **Files:** `firmware/src/comms.rs` (ungate `EXECUTOR_ALIVE`, bump it in `watchdog_feed`), a production
+  detector-only variant in `firmware/src/survivable_watchdog.rs` (or a small new module) started in `main` for the
+  default build, `firmware/src/main.rs` (start the detector + the boot-alarm gating on the breadcrumb),
+  `firmware/src/crash.rs` (the `Core0ExecutorStall` reason already exists — reused). `firmware-core::diag` unchanged
+  (the detector reuses `watchdog_decision`/`EXECUTOR_STALL_TICKS` or a thin threshold check).
+- **Sacred-path safety:** the RWDT feed (async `watchdog_feed`) is byte-for-byte UNCHANGED. The new ISR is
+  detector-only — its worst-case failure is a FALSE breadcrumb → a spurious `ALARM:11` on the next reset, which is
+  itself fail-safe (requires `$H`, never a wrong-position resume). No path where it wedges or false-resets a healthy
+  board.
+
+### 20.3 Design B (alternative, §17.19's approach) — ISR-owned feed + withhold + SuperWDT
+Move the RWDT feed onto the survivable ISR, arm the SuperWDT, and WITHHOLD both dogs on detect (the capture-reset
+mechanism, productionized). Gains: faster recovery (~6 s = 4 s detect + ~2 s SuperWDT vs ~8 s RWDT) and determinism
+(does not rely on the async feeder dying). Costs: REPLACES the sacred RWDT feed path (higher risk), requires arming +
+software-feeding the SuperWDT in production, and a mis-withhold could false-reset a healthy board. **Not recommended**
+unless the ~2 s faster recovery is judged worth the sacred-path risk — Design A already meets the policy.
+
+### 20.4 Homing-disabled sub-decision
+`ALARM:11` means "homing required" — coherent only when `$22` homing is enabled. On a homing-DISABLED machine the
+equivalent fail-safe is a generic position-untrusted alarm requiring a manual re-zero (`$X` unlock + operator re-set
+work zero), NOT `ALARM:11` (whose `$H` would error). Proposal: homing-enabled ⇒ `ALARM:11`; homing-disabled ⇒ a
+locked position-lost alarm (reuse an existing locked `AlarmCode`, or the boot alarm path with a "position lost after
+wedge reset — re-zero" message). Needs the user's pick.
+
+### 20.5 Testability
+1. **VERIFY THE REFRAMING FIRST — `--features provoke-stall-bare` (BUILT):** the bare stall-inducer is the
+   `provoke-executor-stall` busy-loop WITHOUT `capture-reset` (no survivable ISR to feed/withhold), so it runs on an
+   otherwise-production build. Expected on `just flash --features provoke-stall-bare`: the board runs ~18 s (≈10 s stall
+   delay + ~8 s RWDT), then self-resets via the unfed RWDT — reset reason `MSG:RESET sys-rtc-WDT` (RWDT Stage0 =
+   `ResetSystem` → `SysRtcWdt` 0x10; any `…-rtc-WDT` variant passes; NOT `core-sw-reset`, NOT `super-WDT`) — and with
+   `$22=1` (homing enabled; DEFAULT is `homing_flags=0` = disabled, so it must be set + saved first) reboots LOCKED in
+   `ALARM:11`. With `$22=0` it reboots `Idle` — the gap Design A closes. If it does NOT self-reset (no reset in ~15 s
+   after the stall), the reframing is wrong → fall back to Design B. This test gates the whole plan.
+2. **After Design A lands:** `provoke-executor-stall` on a default build → RWDT reset ~8 s → boot dump shows the
+   `core0-executor-stall` breadcrumb → forced `ALARM:11` (verify it holds even with homing DISABLED). Host tests for
+   any new pure gating logic. The deterministic capstone already proved detect→breadcrumb on capture-reset (§17.18); this
+   extends it to the production feed/boot path.
+
+### 20.6 Interaction with Option B + rollback
+- Option B (now production) eliminated the usb_tx LOST-WAKE class, so this net is NOT for lost wakes — it is the
+  backstop for a full core-0 executor stall from ANY OTHER cause (a non-yielding task / deadlock / a future bug). The
+  two are independent and complementary: Option B prevents the known wedge; this catches-and-fail-safes an unknown one.
+- **Rollback:** Design A is additive (a detector ISR + a boot-gating branch) and touches neither the RWDT feed nor the
+  Option B write path — revertible as one commit, and disabling it returns to the current "unfed-RWDT reset without a
+  breadcrumb" behavior (still safe on a homing-enabled machine). Recommend landing it as its own commit, separate from
+  the Option B commit and the executor-liveness diagnostic (already committed).
+
+### 20.7 §20.5 step-1 VERIFIED + a DESIGN SIMPLIFICATION (Design A′) (bughunter, 2026-07-11)
+Bench (provoke-stall-bare, near-production): the reframing HOLDS. `MSG:RESET sys-rtc-WDT` (unfed RWDT, not core-sw/not
+super-WDT); ~18 s boot-loop (≈10 s stall + ~8 s RWDT); `$22=1` → reboots into `Alarm:11` + `$H`/`$X` prompt,
+`?`→`<Alarm:11|…>`. So a homing-enabled production board ALREADY does the user's policy (reset→ALARM:11) with ZERO new
+code. `$22=0` reboots `Idle` — the only real gap.
+
+**Alarm:17 wrinkle (homing-disabled catches):** intermittently the board showed `Alarm:17` (MotorFault) with no fresh
+`MSG:RESET`. This is the PRODUCTION usb_tx K-escape (host-not-reading) firing during the ~10 s HEALTHY window of a
+boot-loop iteration — the repeated re-enumeration makes the monitor's USB read lag ≥K×2 s = 6 s, so usb_tx accrues K
+host-not-reading stalls → `handle_usb_tx_wedge` raises the LOCKED `ALARM:17`. It is NOT the executor-stall path (the
+busy-loop kills usb_tx, so it cannot raise 17 after the stall) and NOT a reset — a separate, already-fail-safe in-place
+fault. It does NOT change the executor-stall recovery design (that gates on the WDT reset, a distinct path). Side note
+for later (NOT blocking): post-Option-B the K-escape→ALARM:17 only fires on genuine host-not-reading; a 6 s host pause
+while IDLE locking the board is arguably aggressive — fine during a job, worth a glance for the idle case. Separate
+decision.
+
+**Design A′ (RECOMMENDED refinement — even lighter than Design A):** `main` ALREADY computes the reset reason and a
+`reset_was_watchdog_or_fault` flag (main.rs:380/402). So the executor-stall recovery needs NO detector ISR, NO
+`EXECUTOR_ALIVE` production wiring, NO breadcrumb — just gate the boot alarm on the reset REASON:
+- Add a NARROW predicate `reset_was_hardware_watchdog` = the RTC/super watchdogs THIS firmware arms only
+  (`SysRtcWdt | CoreRtcWdt | CpuRtcWdt | SysSuperWdt`) — EXCLUDING `CoreSw`/`CpuSw` (a host `0x18` soft-reset / panic
+  must NOT force this) and the MWDT/efuse/clock variants. In production the RWDT resets ONLY when the async feeder dies
+  (a real hang), so this unambiguously means "an unexpected hang the watchdog caught."
+- Boot gating: on such a reset, force the fail-safe locked alarm. Homing ENABLED ⇒ the board is ALREADY
+  `Alarm(HomingRequired)` (ALARM:11) — leave it (unchanged; the existing `[MSG:RESET …-rtc-WDT]` line already names the
+  cause). Homing DISABLED ⇒ OVERRIDE the `Idle` boot to `Alarm(AbortDuringCycle)` (ALARM:3 — grbl's "reset/abort mid-
+  cycle, position suspect", cleared by `$X` + a manual re-zero; the natural code, and it does NOT require `$H` the way
+  ALARM:11 would). This CLOSES the homing-disabled silent-resume gap and is the ONLY behavior change for a
+  homing-enabled machine (none).
+- Cost: ~15 lines in `main`'s boot path + a predicate; touches NEITHER the RWDT feed NOR adds any ISR — lowest possible
+  sacred-path risk. Host-testable: a pure `stall_reset_alarm(homing_enabled) -> AlarmCode` (HomingRequired vs
+  AbortDuringCycle) + the predicate.
+- What A′ gives up vs Design A: the finer `core0-executor-stall` LABEL (A′ only knows "a hardware-watchdog reset", which
+  the `sys-rtc-WDT` reset reason already conveys). Post-Option-B nearly every production WDT reset IS an executor stall
+  (a bring-up hang is the only other), so the finer label is a marginal DIAGNOSTIC nicety, not load-bearing for the
+  recovery. The detector+breadcrumb (Design A) remains an optional Phase-2 add if the specific label is wanted.
+
+RECOMMENDATION: implement Design A′ (reset-reason-gated boot alarm) as the production recovery — it meets the user's
+policy with the least sacred-path risk. Add the Design A detector only if the operator-facing `core0-executor-stall`
+label is judged worth a new survivable ISR.
+
+### 20.8 Design A IMPLEMENTED (bughunter, 2026-07-11) — user chose the detector + breadcrumb over A′
+User picked the full Design A (the operator-facing `core0-executor-stall` label) over the minimal A′. Implemented on the
+working tree; 345 firmware-core tests green under `-D warnings` (incl. 3 new `wedge_reset_alarm` tests); all four Xtensa
+configs (default / capture-reset / provoke-executor-stall / provoke-stall-bare) build clean under `-D warnings`; NOT
+flashed. Sacred RWDT feed (`watchdog_feed`) UNCHANGED; additive; one revertible commit.
+- `firmware-core/src/protocol.rs`: pure `wedge_reset_alarm(homing_enabled) -> AlarmCode` (HomingRequired / AbortDuringCycle) + tests.
+- `firmware/src/crash.rs`: `withhold_was_executor_stall(packed)` predicate; `Core0ExecutorStall` un-`allow(dead_code)`d (now production-live).
+- `firmware/src/comms.rs`: `EXECUTOR_ALIVE` ungated + bumped by the production `watchdog_feed`; `force_wedge_alarm(homing_enabled)` (sets the alarm state + clears `HOMED`).
+- `firmware/src/stall_detector.rs` (NEW): the production detector-only TIMG1 ISR — samples `EXECUTOR_ALIVE`, boot-guarded freeze count, records `core0-executor-stall` ONCE at `EXECUTOR_STALL_TICKS` (4 s). NO feed/withhold/GPIO/SuperWDT.
+- `firmware/src/main.rs`: `stall_detector::start(TIMG1)` in the production path; boot gating after `init_control_state` — `if crash::withhold_was_executor_stall(breadcrumb.withhold) { comms::force_wedge_alarm(homing_enabled) }`.
+
+**Zero-step-timing-impact guarantee (confirmed):** the detector ISR is TIMG1 (a core-0 hardware timer, independent of
+the core-1 RMT/motion path) and touches ONLY `AtomicU32`s + one RTC_FAST breadcrumb word — NEVER a mutex, `&mut Rtc`,
+RMT, or any core-1 state — exactly like the capture-reset survivable ISR. It feeds/withholds NO dog, so it cannot
+false-reset a healthy board; the unfed production RWDT does the resetting.
+
+**Bench validation (hand-back):** `just flash --features provoke-stall-bare` (production build + the stall inducer +
+the detector). Expect ~18 s boot-loop; each cycle: `MSG:RESET sys-rtc-WDT` + a `[MSG:CRASH core0-executor-stall …]`
+boot dump, and the machine LOCKED — `Alarm:11` with `$22=1` (no regression) / `Alarm:3` with `$22=0` (the gap closed).
+Serial-only (no GPIO), so a powered-off scope is fine.

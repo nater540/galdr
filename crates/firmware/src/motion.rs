@@ -1285,14 +1285,17 @@ fn publish_limit_levels(limits: &[RmtLimitInput; AXES]) {
 /// peripheral or claim a step pin is an unrecoverable wiring/config fault, not a runtime condition
 /// (CLAUDE.md permits `expect` in init). It never executes after boot.
 #[allow(clippy::type_complexity)]
-pub fn init(
+pub fn init<A>(
   rmt: esp_hal::peripherals::RMT<'static>,
   step_pins: (
     esp_hal::peripherals::GPIO1<'static>,
     esp_hal::peripherals::GPIO2<'static>,
     esp_hal::peripherals::GPIO4<'static>,
-    // A-STEP on the documented spare RMT ch3 (GPIO18, DOC-00). PROVISIONAL / bench-unverified (DOC-10 Phase 5).
-    esp_hal::peripherals::GPIO18<'static>,
+    // A-STEP on the documented spare RMT ch3. Generic in the 4th pin so the caller chooses it: GPIO18 in production
+    // (DOC-00; PROVISIONAL / bench-unverified, DOC-10 Phase 5), or `NoPin` in the `capture-reset` diagnostic build,
+    // where GPIO18 is handed to the survivable-watchdog heartbeat instead and this never-driven channel binds to
+    // nothing. `with_pin` type-erases the pin (returns `Self`), so this generic never leaks into `RmtStepSink`.
+    A,
   ),
   dir_pins: (
     esp_hal::peripherals::GPIO5<'static>,
@@ -1303,7 +1306,10 @@ pub fn init(
   ),
   step_enable_pin: esp_hal::peripherals::GPIO8<'static>,
   config: &MotionConfig,
-) -> (RmtStepSink, Output<'static>) {
+) -> (RmtStepSink, Output<'static>)
+where
+  A: esp_hal::gpio::interconnect::PeripheralOutput<'static>,
+{
   use esp_hal::rmt::Rmt;
   use esp_hal::time::Rate;
 

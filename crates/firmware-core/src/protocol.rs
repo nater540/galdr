@@ -401,6 +401,21 @@ impl AlarmCode {
   }
 }
 
+/// The fail-safe alarm the board comes up in after a core-0 EXECUTOR-STALL watchdog reset (Design A, §20): the machine
+/// must come up LOCKED so it can NEVER silently resume in a now-suspect position. With `$22` homing ENABLED the natural
+/// lock is [`AlarmCode::HomingRequired`] (`ALARM:11`) — clear it by re-homing (`$H`), which re-establishes machine zero
+/// (the user's chosen policy). With homing DISABLED there is no machine reference to re-home to, so
+/// [`AlarmCode::AbortDuringCycle`] (`ALARM:3`, grbl's "reset while in motion — position lost") is the coherent fail-safe:
+/// it rejects streaming until the operator acknowledges (reset / `$X`) and manually re-zeros — never a silent `Idle`
+/// resume (the homing-disabled gap this closes). Pure so the boot-gating decision is host-tested.
+pub fn wedge_reset_alarm(homing_enabled: bool) -> AlarmCode {
+  if homing_enabled {
+    AlarmCode::HomingRequired
+  } else {
+    AlarmCode::AbortDuringCycle
+  }
+}
+
 /// The authoritative, latched control mode of the machine — the single source of truth the `firmware` bin
 /// shares across its comms tasks and the status reporter (DOC-08 Stage 2). It is deliberately SMALLER than
 /// [`MachineState`]: the Run-vs-Idle distinction in [`MachineState`] is *derived* from live execution facts
@@ -2713,6 +2728,32 @@ mod tests {
   use std::vec::Vec as StdVec;
 
   use super::*;
+
+  // --- Wedge-reset fail-safe alarm (Design A, §20) --------------------------------------------------
+
+  #[test]
+  fn wedge_reset_alarm_is_homing_required_when_homing_enabled() {
+    // Homing on → re-home to re-establish machine zero (ALARM:11, the user's chosen policy).
+    assert_eq!(wedge_reset_alarm(true), AlarmCode::HomingRequired);
+    assert_eq!(wedge_reset_alarm(true).code(), 11);
+  }
+
+  #[test]
+  fn wedge_reset_alarm_is_abort_during_cycle_when_homing_disabled() {
+    // Homing off → no machine reference to re-home to, so the coherent fail-safe is the "reset while in motion,
+    // position lost" alarm (ALARM:3): it still rejects streaming until acknowledged, never a silent Idle resume.
+    assert_eq!(wedge_reset_alarm(false), AlarmCode::AbortDuringCycle);
+    assert_eq!(wedge_reset_alarm(false).code(), 3);
+  }
+
+  #[test]
+  fn wedge_reset_alarm_never_returns_a_homing_requiring_alarm_when_homing_is_off() {
+    // Guard the coherence property: the homing-off alarm must NOT be one whose unlock path needs `$H` (which errors
+    // when homing is disabled). ALARM:3 unlocks via reset/`$X`, so it is safe.
+    let off = wedge_reset_alarm(false);
+    assert_ne!(off, AlarmCode::HomingRequired, "homing-off must not demand $H");
+    assert_ne!(off.code(), 11);
+  }
 
   // --- Real-time classification ---------------------------------------------------------------------
 

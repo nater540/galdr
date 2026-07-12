@@ -125,3 +125,55 @@ fingerprint (stream tail): last `<Run>` status at +1585.012 s, status then STOPS
 300-700 ms → final two gaps 2666 ms / 1902 ms (the ~2 s usb_tx drumbeat ONSETTING) → hard silent at +1599.351 s.
 So B here is an A-family lost-TX-wake stall that progressed to a hard lock, NOT an unrelated mode. Lesson: a 64 B cut
 at +46ms is skirnir's read granularity on a boot replay, never a wedge.
+
+**RESOLVES the RESIDUAL HW UNKNOWN above (2026-07-11, web-source-confirmed): an EN/CHIP_PU (external-pin) reset is a
+POWER-ON-class reset that powers down the RTC domain → RTC_FAST (`#[ram(rtc_fast,persistent)]`) AND RTC-NOINIT are BOTH
+WIPED.** (ESP-IDF forum t=34596 + esp32s3 memory-types docs.) A WDT/software reset still RETAINS RTC_FAST (unchanged).
+Consequence for the Signature-B no-self-reset wedge: `espflash reset` (EN) to "read the breadcrumb" is USELESS — it
+clears `crash::MAGIC` so `Breadcrumb::is_valid` fails and the whole breadcrumb (withhold word included) is discarded, so
+"no withhold line after an EN reset" looks identical whether or not a withhold latched. Any RTC-memory breadcrumb is
+unreadable for a wedge that never self-resets (reading needs an EN reset that erases it). The only sound traces are a
+LIVE GPIO probe or an ACTUAL WDT reset. See [[streaming-lockup-doc]] §17.16.
+
+**2026-07-11 FRESH REPRODUCED B on the `capture-reset` heartbeat build (doc §17.15/§17.16): wedged mid-stream, GPIO18
+heartbeat kept toggling (core-0 TIMG1 ISR alive & evaluating `watchdog_decision` every 250 ms), motion+USB dead, board
+sat MINUTES with NO reset.** LEADING (not-yet-bench-confirmed) root cause = hypothesis (a) the withhold decision NEVER
+fired: at a FULL core-0 executor stall (proven — usb_tx's 2 s `with_timeout` never firing rules out a merely-parked
+usb_tx that TIER 1 would recover) with host quiet + motion drained, ALL THREE `watchdog_decision` withholds are gated
+off — core1 needs `EXECUTOR_RUNNING` (cleared when core 1 drains its BlockQueue), comms needs `host_active` (ages out
+~6 s after RX stops), dead-zone needs `response_depth>0` (but usb_tx dequeued its response into a LOCAL frame at
+comms.rs:1579 and the stalled executor + quiet host never refill RESPONSE → frozen len 0). So the ISR FEEDS forever.
+Predicts the self-reset-vs-hard-lock non-determinism (just whether RESPONSE.len() was >0 at freeze). FIX direction if
+(a) confirmed: an UNGATED core-0 executor-liveness beat (async task bumps it every tick; ISR withholds if it freezes
+while the hardware ISR keeps firing). Two retention-safe instruments BUILT (both compile, capture-reset-gated):
+GPIO17/CH4 live mirror of `decision.withhold_reason.is_some()` (needs a physical probe), and the `force-withhold`
+feature (ISR unconditionally withholds ~5 s after boot → a clean ~13 s RWDT self-reset REFUTES the silicon-(b) corner
+using only the existing GPIO18 scope + serial, no probe/wedge needed). Awaiting bench.
+
+**CLOSED 2026-07-11 (bench-proven, both corners): (a) CONFIRMED, (b) REFUTED.** force-withhold pass 1 self-reset via
+`MSG:RESET core-sw-reset` = `CoreSw` = the usb_tx K-escape `software_reset()` (comms.rs:1801, `n=3`), NOT a dog — the
+dog test was CONFOUNDED (usb_tx software-reset won the race). So `force-withhold` was EXTENDED to a DOG-ISOLATION build:
+it also cfg's OUT the usb_tx K-escape (`handle_usb_tx_wedge` call `#[cfg(not(feature="force-withhold"))]`), leaving the
+ISR's withheld dog as the ONLY resetter. Pass 2 → **`MSG:RESET super-WDT`** = the **SuperWDT (`SysSuperWdt`) bit ~2 s
+after the withhold** (`wdog=20`→`28`), `n=1`. ⇒ dog silicon WORKS (b refuted); real Pikachu wedge never reset ⇒
+withhold never fired (a confirmed). KEY: the effective fast dog is the **SuperWDT (~seconds), NOT the 8 s RWDT** — and
+its reset reason prints as **`super-WDT`** (`SysSuperWdt`, main.rs:360); `CoreSw`/`core-sw-reset` (main.rs:353) is a
+`software_reset()`, the ONLY two sites being the panic handler (main.rs:110) and the usb_tx K-escape (comms.rs:1801).
+Reset-reason labels live in `reset_reason_label` (main.rs:349).
+
+**ROOT-CAUSE FIX BUILT + host-tested (doc §17.17): an UNGATED core-0 executor-liveness detector.** `EXECUTOR_ALIVE`
+(comms.rs, capture-reset-gated) bumped every tick by `watchdog_heartbeat`; the survivable ISR withholds if it freezes
+≥ `EXECUTOR_STALL_TICKS` (16×250 ms=4 s) with a boot guard (accrue only after the beat passes its initial 0). Pure
+`firmware_core::diag::watchdog_decision` gains `WithholdKind::Core0ExecutorStall` (precedence Core1Motion > ExecutorStall
+> Comms > DeadZone), `crash::WithholdReason::Core0ExecutorStall=4` → label `core0-executor-stall`. 351 firmware-core
+tests green; all 3 Xtensa configs clean; production default UNCHANGED (detector capture-reset-gated — the async feeder
+dies in the same stall it would detect). **FIX VALIDATED 2026-07-11:** no false-trip at idle NOR over a 30-min real
+Pikachu stream (GPIO17/CH4 flat-low); the deterministic capstone `--features provoke-executor-stall` (a core-0 task
+busy-loops after ~10 s → genuinely freezes EXECUTOR_ALIVE) produced `MSG:CRASH core0-executor-stall` + `MSG:RESET
+super-WDT` with CH4 HIGH ~2 s before each reset — L1→L2→L3 proven on a genuine stall. Natural-Pikachu-wedge catch = the
+only belt-and-suspenders left (non-blocking; `provoke-b` is the fast path). PRODUCTION RECOVERY DECIDED by user
+(2026-07-11): reset → reboot into `ALARM:11` (require re-home) — fail-safe known state, NOT a silent resume (honors
+option A). Productionization DEFERRED + will return as a PLAN-FIRST ask; it requires moving the production watchdog feed
+onto the survivable-ISR path (the async feeder dies in the stall it must detect), moving `EXECUTOR_ALIVE` + the
+`Core0ExecutorStall` detector out of the `capture-reset` gate, and forcing `ALARM:11` at boot when the reset reason is
+the survivable-ISR dog + a `core0-executor-stall` breadcrumb. All this session's work is UNCOMMITTED diagnostic tree.
