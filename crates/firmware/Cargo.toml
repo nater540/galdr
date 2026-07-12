@@ -118,6 +118,16 @@ force-withhold = ["capture-reset"]
 # REQUIRES `capture-reset` (the detector + ISR feed live there); NEVER a production path.
 provoke-executor-stall = ["capture-reset"]
 
+# DIAGNOSTIC PRODUCTION stall-inducer (docs/streaming-lockup-investigation.md §20) — the SAME ~10 s-delay non-yielding
+# busy-loop as `provoke-executor-stall`, but WITHOUT `capture-reset`, so it runs on an otherwise-PRODUCTION build. It
+# induces a full core-0 executor stall to exercise the Design A production recovery END-TO-END: the async
+# `watchdog_feed` (sole RWDT feeder) dies → the unfed RWDT resets the board at ~8 s (`sys-rtc-WDT`) AND the production
+# detector-only `stall_detector` ISR records the `core0-executor-stall` breadcrumb → the next boot comes up LOCKED in
+# the fail-safe alarm (`ALARM:11` with `$22=1`, `ALARM:3` with `$22=0`). (It ALSO served the §20.5-step-1 reframing
+# verification — that verify was done BEFORE Design A landed, when the non-capture build had no detector.) NEVER a
+# production path — the busy-loop is deliberate self-sabotage.
+provoke-stall-bare = []
+
 # DIAGNOSTIC continuous-TX build for a scope-free multimeter test of the TMC single-wire bus (GPIO9). When ENABLED,
 # `tmc_manager` skips all normal operation (init/presence/poll) and instead transmits `0x00` bytes back-to-back
 # forever, keeping the TX FIFO saturated. Each `0x00` UART frame is a start bit plus eight zero data bits — 9 of

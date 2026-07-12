@@ -75,6 +75,11 @@ mod storage;
 // from the production default build, which keeps the core-0 async `watchdog_feed` + the ALARM:17 fail-safe unchanged.
 #[cfg(feature = "capture-reset")]
 mod survivable_watchdog;
+// The PRODUCTION detector-only stall ISR (Design A, §20): records the `core0-executor-stall` breadcrumb on a full
+// core-0 executor stall so the next boot comes up in the fail-safe alarm. Uses TIMG1 in the default build (the
+// capture-reset build uses TIMG1 for `survivable_watchdog` instead — the two never coexist).
+#[cfg(not(feature = "capture-reset"))]
+mod stall_detector;
 mod tmc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -516,6 +521,14 @@ async fn main(spawner: Spawner) {
   // required) when homing is enabled — a host must `$H`/`$X` before streaming — else boots Idle. The boot
   // `ALARM:N` push is emitted after the banner below so a sender detects the locked state on connect.
   comms::init_control_state(homing_enabled);
+  // Design A (§20): if the PRIOR reset was the production stall detector's `core0-executor-stall` wedge (the
+  // breadcrumb read above names it), OVERRIDE the default boot state with the fail-safe wedge alarm so the board comes
+  // up LOCKED — never a silent resume in a now-suspect position. Homing ENABLED is already `ALARM:11` (idempotent);
+  // homing DISABLED overrides the default `Idle` with `ALARM:3` (position lost). The breadcrumb is the discriminator
+  // vs any ordinary reset. The named cause also appears in the `[MSG:CRASH core0-executor-stall …]` boot dump below.
+  if crash::withhold_was_executor_stall(breadcrumb.withhold) {
+    comms::force_wedge_alarm(homing_enabled);
+  }
   // Seed the `$21` hard-limit-enable mirror so the core-1 executor's hard-limit check reads the persisted state
   // (DOC-06). The limit inputs are configured above; the executor samples them at block boundaries / on the ISR.
   comms::init_limit_settings(settings.hard_limits_enabled(), settings.limit_invert, settings.homing_debounce_ms);
@@ -715,6 +728,18 @@ async fn main(spawner: Spawner) {
   //   `StaticCell` (dogs armed) but is NOT handed to any feeder — the ISR feeds register-side, no `&mut Rtc` needed.
   #[cfg(not(feature = "capture-reset"))]
   spawner.spawn(comms::watchdog_feed(rtc).expect("spawn watchdog_feed"));
+  // Design A (§20): the PRODUCTION detector-only stall ISR on TIMG1 — records the `core0-executor-stall` breadcrumb on
+  // a full core-0 executor stall so the next boot comes up in the fail-safe alarm. Detector-only: it feeds/withholds
+  // NO dog and drives NO GPIO — the async `watchdog_feed` above still owns the RWDT (unchanged), and the unfed RWDT
+  // (that feeder dies in the stall) does the resetting. TIMG1 is free in the production build.
+  #[cfg(not(feature = "capture-reset"))]
+  stall_detector::start(peripherals.TIMG1);
+  // §20.5 step-1 BARE stall-inducer: on a PRODUCTION build (no capture-reset → no survivable ISR), stall the executor
+  // ~10 s after boot so the async `watchdog_feed` above dies → the unfed RWDT resets the board at ~8 s → reboot into
+  // `ALARM:11` (homing enabled). Verifies the production-recovery reframing (§20.1) WITHOUT the capture-reset ISR that
+  // would otherwise feed/withhold the dogs. Only compiled with `--features provoke-stall-bare`.
+  #[cfg(feature = "provoke-stall-bare")]
+  spawner.spawn(comms::provoke_executor_stall().expect("spawn provoke_executor_stall (bare)"));
   #[cfg(feature = "capture-reset")]
   {
     // The `Rtc` is owned by the `StaticCell` for `'static` (dogs stay armed); the ISR feeds via raw PAC, not through

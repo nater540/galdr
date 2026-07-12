@@ -420,8 +420,7 @@ pub enum WithholdReason {
   /// the survivable hardware ISR kept firing. Unlike [`Core0Comms`] / [`DeadZone`] (gated by host / response state,
   /// both quiescent in a full stall) this fires purely on "the core-0 executor stopped running its tasks" — the wedge
   /// that previously fed the dogs forever. Subsumes the other two core-0 withholds when the whole executor is dead.
-  // Constructed only by the `capture-reset` survivable ISR; the production async feeder never reaches this class.
-  #[cfg_attr(not(feature = "capture-reset"), allow(dead_code))]
+  /// Recorded by the capture-reset survivable ISR AND (Design A, §20) the production detector-only stall ISR.
   Core0ExecutorStall = 4,
 }
 
@@ -448,6 +447,14 @@ pub fn withhold_label(packed: u32) -> Option<&'static str> {
     4 => Some("core0-executor-stall"),
     _ => None,
   }
+}
+
+/// Whether a decoded [`idx::WITHHOLD`] word is the [`WithholdReason::Core0ExecutorStall`] class (Design A, §20): the
+/// production stall-detector ISR recorded this before the unfed RWDT reset, so the boot path can force the fail-safe
+/// alarm (via [`super::wedge_reset_alarm`]) and name the cause. Guards the tag so a cold-boot / garbage word is not
+/// mistaken for a wedge. Reads the SAME word `withhold_label` decodes.
+pub fn withhold_was_executor_stall(packed: u32) -> bool {
+  packed & 0xFFFF_0000 == WITHHOLD_TAG && (packed & 0xFF) as u8 == WithholdReason::Core0ExecutorStall as u8
 }
 
 /// Tag in the high half of the [`idx::RMT_FLAGS`] word, marking a real RMT-hang capture vs cold-boot garbage.

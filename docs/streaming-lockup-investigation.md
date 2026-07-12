@@ -2629,3 +2629,153 @@ regression.
 demands). (2) Remove the TIER-1 machinery now vs keep it dormant one release (recommend REMOVE — dead code on the sacred
 path is a liability, and the pure helper's tests cover the new path). (3) Retire `provoke-b` after the validation window
 (recommend yes). Nothing is written until you approve.
+
+## 20. PRODUCTION-WIRING PLAN — executor-stall recovery = reset → reboot into ALARM:11 — PLAN-FIRST, NO CODE (bughunter, 2026-07-11)
+
+User-approved policy (§17.19): on a full core-0 executor-stall wedge, RESET and reboot into `ALARM:11` (require re-home)
+— a fail-safe known state, never a silent resume. This plan drafts that productionization for the user's review. Code
+held until approved.
+
+### 20.1 HEADLINE REFRAMING (verified from code) — production likely ALREADY reset→ALARM:11s; scope is smaller than §17.19 implied
+§17.19 assumed we must "move the production feed onto the survivable-ISR path." Re-checking the wiring changes that:
+- The SOLE production RWDT feeder is the async `comms::watchdog_feed` task (main.rs:717, `#[cfg(not(capture-reset))]`),
+  which pets the RWDT every 500 ms. RWDT Stage0 = `WATCHDOG_TIMEOUT` (8 s) → system reset (main.rs:450).
+- A FULL core-0 executor stall (the remaining wedge class now that §18/§19 Option B eliminated the lost-wake) stops
+  ALL core-0 tasks INCLUDING `watchdog_feed` (it is a timer-driven async task) → the RWDT goes unfed → **it resets the
+  board on its own at ~8 s.** There is no survivable ISR feeding it in production, so nothing defeats that reset (unlike
+  the capture-reset build, where the survivable ISR kept feeding — the §17.15 "sat for minutes" cause).
+- Boot: when `$22` homing is enabled, `init_control_state` latches `ALARM:11` and `send_boot_alarm` emits it
+  (main.rs:518/754, comms.rs:708/1263). So on ANY reset — including this wedge RWDT reset — a homing-enabled machine
+  **already reboots LOCKED in `ALARM:11` requiring `$H`.**
+
+⇒ For a homing-enabled machine (which any real CNC should be, precisely for lost-position safety), production ALREADY
+achieves the user's policy: executor-stall wedge → unfed-RWDT reset (~8 s) → reboot into `ALARM:11`. **This must be
+BENCH-VERIFIED before building anything (§20.5 step 1) — it is a high-confidence code deduction, not yet observed on a
+production build.** If it holds, the productionization is only two value-adds, NOT a feed-path replacement:
+(a) a DIAGNOSTIC BREADCRUMB naming the cause (`core0-executor-stall`) so a wedge-reset is distinguishable from any other
+RWDT reset; (b) DETERMINISTIC `ALARM:11` even when homing is DISABLED (else a homing-off board reboots `Idle` and could
+resume — violating the fail-safe).
+
+### 20.2 Design A (RECOMMENDED, low-risk) — detector-only ISR + UNCHANGED async feed
+Keep the sacred RWDT feed path exactly as-is; add a survivable detector that only RECORDS, and gate the boot alarm on
+its breadcrumb.
+- **`EXECUTOR_ALIVE` production-live:** ungate it from `capture-reset` and bump it from the production `watchdog_feed`
+  loop (it is the liveness producer — it advances iff the core-0 executor runs tasks). One `fetch_add` per loop.
+- **Detector-only TIMG1 ISR (production):** a STRIPPED survivable-watchdog — samples `EXECUTOR_ALIVE`, tracks the freeze
+  (boot-guarded), and when frozen ≥ `EXECUTOR_STALL_TICKS` (4 s) records the `Core0ExecutorStall` withhold breadcrumb
+  ONCE. It does NOT feed or withhold any dog, does NOT drive GPIO18/17, does NOT arm the SuperWDT. So it CANNOT perturb
+  step timing (it only reads atomics + writes one RTC_FAST word) and CANNOT cause a false reset (it never touches the
+  RWDT feed). The unfed RWDT (async feeder already dead in the stall) does the resetting at ~8 s; the ISR just leaves
+  the breadcrumb in the 4 s→8 s window (RTC_FAST survives the WDT reset).
+- **Boot ALARM gating:** in `main`/boot, decode the withhold breadcrumb; if it is `Core0ExecutorStall`, force the
+  machine into `ALARM:11` (locked, require `$H`) + emit a diagnostic line — REGARDLESS of the `$22` homing setting.
+  The breadcrumb IS the discriminator ("our detector's reset" vs any other RWDT reset): present ⇒ wedge reset ⇒ alarm;
+  absent ⇒ ordinary reset ⇒ existing boot behavior.
+- **Files:** `firmware/src/comms.rs` (ungate `EXECUTOR_ALIVE`, bump it in `watchdog_feed`), a production
+  detector-only variant in `firmware/src/survivable_watchdog.rs` (or a small new module) started in `main` for the
+  default build, `firmware/src/main.rs` (start the detector + the boot-alarm gating on the breadcrumb),
+  `firmware/src/crash.rs` (the `Core0ExecutorStall` reason already exists — reused). `firmware-core::diag` unchanged
+  (the detector reuses `watchdog_decision`/`EXECUTOR_STALL_TICKS` or a thin threshold check).
+- **Sacred-path safety:** the RWDT feed (async `watchdog_feed`) is byte-for-byte UNCHANGED. The new ISR is
+  detector-only — its worst-case failure is a FALSE breadcrumb → a spurious `ALARM:11` on the next reset, which is
+  itself fail-safe (requires `$H`, never a wrong-position resume). No path where it wedges or false-resets a healthy
+  board.
+
+### 20.3 Design B (alternative, §17.19's approach) — ISR-owned feed + withhold + SuperWDT
+Move the RWDT feed onto the survivable ISR, arm the SuperWDT, and WITHHOLD both dogs on detect (the capture-reset
+mechanism, productionized). Gains: faster recovery (~6 s = 4 s detect + ~2 s SuperWDT vs ~8 s RWDT) and determinism
+(does not rely on the async feeder dying). Costs: REPLACES the sacred RWDT feed path (higher risk), requires arming +
+software-feeding the SuperWDT in production, and a mis-withhold could false-reset a healthy board. **Not recommended**
+unless the ~2 s faster recovery is judged worth the sacred-path risk — Design A already meets the policy.
+
+### 20.4 Homing-disabled sub-decision
+`ALARM:11` means "homing required" — coherent only when `$22` homing is enabled. On a homing-DISABLED machine the
+equivalent fail-safe is a generic position-untrusted alarm requiring a manual re-zero (`$X` unlock + operator re-set
+work zero), NOT `ALARM:11` (whose `$H` would error). Proposal: homing-enabled ⇒ `ALARM:11`; homing-disabled ⇒ a
+locked position-lost alarm (reuse an existing locked `AlarmCode`, or the boot alarm path with a "position lost after
+wedge reset — re-zero" message). Needs the user's pick.
+
+### 20.5 Testability
+1. **VERIFY THE REFRAMING FIRST — `--features provoke-stall-bare` (BUILT):** the bare stall-inducer is the
+   `provoke-executor-stall` busy-loop WITHOUT `capture-reset` (no survivable ISR to feed/withhold), so it runs on an
+   otherwise-production build. Expected on `just flash --features provoke-stall-bare`: the board runs ~18 s (≈10 s stall
+   delay + ~8 s RWDT), then self-resets via the unfed RWDT — reset reason `MSG:RESET sys-rtc-WDT` (RWDT Stage0 =
+   `ResetSystem` → `SysRtcWdt` 0x10; any `…-rtc-WDT` variant passes; NOT `core-sw-reset`, NOT `super-WDT`) — and with
+   `$22=1` (homing enabled; DEFAULT is `homing_flags=0` = disabled, so it must be set + saved first) reboots LOCKED in
+   `ALARM:11`. With `$22=0` it reboots `Idle` — the gap Design A closes. If it does NOT self-reset (no reset in ~15 s
+   after the stall), the reframing is wrong → fall back to Design B. This test gates the whole plan.
+2. **After Design A lands:** `provoke-executor-stall` on a default build → RWDT reset ~8 s → boot dump shows the
+   `core0-executor-stall` breadcrumb → forced `ALARM:11` (verify it holds even with homing DISABLED). Host tests for
+   any new pure gating logic. The deterministic capstone already proved detect→breadcrumb on capture-reset (§17.18); this
+   extends it to the production feed/boot path.
+
+### 20.6 Interaction with Option B + rollback
+- Option B (now production) eliminated the usb_tx LOST-WAKE class, so this net is NOT for lost wakes — it is the
+  backstop for a full core-0 executor stall from ANY OTHER cause (a non-yielding task / deadlock / a future bug). The
+  two are independent and complementary: Option B prevents the known wedge; this catches-and-fail-safes an unknown one.
+- **Rollback:** Design A is additive (a detector ISR + a boot-gating branch) and touches neither the RWDT feed nor the
+  Option B write path — revertible as one commit, and disabling it returns to the current "unfed-RWDT reset without a
+  breadcrumb" behavior (still safe on a homing-enabled machine). Recommend landing it as its own commit, separate from
+  the Option B commit and the executor-liveness diagnostic (already committed).
+
+### 20.7 §20.5 step-1 VERIFIED + a DESIGN SIMPLIFICATION (Design A′) (bughunter, 2026-07-11)
+Bench (provoke-stall-bare, near-production): the reframing HOLDS. `MSG:RESET sys-rtc-WDT` (unfed RWDT, not core-sw/not
+super-WDT); ~18 s boot-loop (≈10 s stall + ~8 s RWDT); `$22=1` → reboots into `Alarm:11` + `$H`/`$X` prompt,
+`?`→`<Alarm:11|…>`. So a homing-enabled production board ALREADY does the user's policy (reset→ALARM:11) with ZERO new
+code. `$22=0` reboots `Idle` — the only real gap.
+
+**Alarm:17 wrinkle (homing-disabled catches):** intermittently the board showed `Alarm:17` (MotorFault) with no fresh
+`MSG:RESET`. This is the PRODUCTION usb_tx K-escape (host-not-reading) firing during the ~10 s HEALTHY window of a
+boot-loop iteration — the repeated re-enumeration makes the monitor's USB read lag ≥K×2 s = 6 s, so usb_tx accrues K
+host-not-reading stalls → `handle_usb_tx_wedge` raises the LOCKED `ALARM:17`. It is NOT the executor-stall path (the
+busy-loop kills usb_tx, so it cannot raise 17 after the stall) and NOT a reset — a separate, already-fail-safe in-place
+fault. It does NOT change the executor-stall recovery design (that gates on the WDT reset, a distinct path). Side note
+for later (NOT blocking): post-Option-B the K-escape→ALARM:17 only fires on genuine host-not-reading; a 6 s host pause
+while IDLE locking the board is arguably aggressive — fine during a job, worth a glance for the idle case. Separate
+decision.
+
+**Design A′ (RECOMMENDED refinement — even lighter than Design A):** `main` ALREADY computes the reset reason and a
+`reset_was_watchdog_or_fault` flag (main.rs:380/402). So the executor-stall recovery needs NO detector ISR, NO
+`EXECUTOR_ALIVE` production wiring, NO breadcrumb — just gate the boot alarm on the reset REASON:
+- Add a NARROW predicate `reset_was_hardware_watchdog` = the RTC/super watchdogs THIS firmware arms only
+  (`SysRtcWdt | CoreRtcWdt | CpuRtcWdt | SysSuperWdt`) — EXCLUDING `CoreSw`/`CpuSw` (a host `0x18` soft-reset / panic
+  must NOT force this) and the MWDT/efuse/clock variants. In production the RWDT resets ONLY when the async feeder dies
+  (a real hang), so this unambiguously means "an unexpected hang the watchdog caught."
+- Boot gating: on such a reset, force the fail-safe locked alarm. Homing ENABLED ⇒ the board is ALREADY
+  `Alarm(HomingRequired)` (ALARM:11) — leave it (unchanged; the existing `[MSG:RESET …-rtc-WDT]` line already names the
+  cause). Homing DISABLED ⇒ OVERRIDE the `Idle` boot to `Alarm(AbortDuringCycle)` (ALARM:3 — grbl's "reset/abort mid-
+  cycle, position suspect", cleared by `$X` + a manual re-zero; the natural code, and it does NOT require `$H` the way
+  ALARM:11 would). This CLOSES the homing-disabled silent-resume gap and is the ONLY behavior change for a
+  homing-enabled machine (none).
+- Cost: ~15 lines in `main`'s boot path + a predicate; touches NEITHER the RWDT feed NOR adds any ISR — lowest possible
+  sacred-path risk. Host-testable: a pure `stall_reset_alarm(homing_enabled) -> AlarmCode` (HomingRequired vs
+  AbortDuringCycle) + the predicate.
+- What A′ gives up vs Design A: the finer `core0-executor-stall` LABEL (A′ only knows "a hardware-watchdog reset", which
+  the `sys-rtc-WDT` reset reason already conveys). Post-Option-B nearly every production WDT reset IS an executor stall
+  (a bring-up hang is the only other), so the finer label is a marginal DIAGNOSTIC nicety, not load-bearing for the
+  recovery. The detector+breadcrumb (Design A) remains an optional Phase-2 add if the specific label is wanted.
+
+RECOMMENDATION: implement Design A′ (reset-reason-gated boot alarm) as the production recovery — it meets the user's
+policy with the least sacred-path risk. Add the Design A detector only if the operator-facing `core0-executor-stall`
+label is judged worth a new survivable ISR.
+
+### 20.8 Design A IMPLEMENTED (bughunter, 2026-07-11) — user chose the detector + breadcrumb over A′
+User picked the full Design A (the operator-facing `core0-executor-stall` label) over the minimal A′. Implemented on the
+working tree; 345 firmware-core tests green under `-D warnings` (incl. 3 new `wedge_reset_alarm` tests); all four Xtensa
+configs (default / capture-reset / provoke-executor-stall / provoke-stall-bare) build clean under `-D warnings`; NOT
+flashed. Sacred RWDT feed (`watchdog_feed`) UNCHANGED; additive; one revertible commit.
+- `firmware-core/src/protocol.rs`: pure `wedge_reset_alarm(homing_enabled) -> AlarmCode` (HomingRequired / AbortDuringCycle) + tests.
+- `firmware/src/crash.rs`: `withhold_was_executor_stall(packed)` predicate; `Core0ExecutorStall` un-`allow(dead_code)`d (now production-live).
+- `firmware/src/comms.rs`: `EXECUTOR_ALIVE` ungated + bumped by the production `watchdog_feed`; `force_wedge_alarm(homing_enabled)` (sets the alarm state + clears `HOMED`).
+- `firmware/src/stall_detector.rs` (NEW): the production detector-only TIMG1 ISR — samples `EXECUTOR_ALIVE`, boot-guarded freeze count, records `core0-executor-stall` ONCE at `EXECUTOR_STALL_TICKS` (4 s). NO feed/withhold/GPIO/SuperWDT.
+- `firmware/src/main.rs`: `stall_detector::start(TIMG1)` in the production path; boot gating after `init_control_state` — `if crash::withhold_was_executor_stall(breadcrumb.withhold) { comms::force_wedge_alarm(homing_enabled) }`.
+
+**Zero-step-timing-impact guarantee (confirmed):** the detector ISR is TIMG1 (a core-0 hardware timer, independent of
+the core-1 RMT/motion path) and touches ONLY `AtomicU32`s + one RTC_FAST breadcrumb word — NEVER a mutex, `&mut Rtc`,
+RMT, or any core-1 state — exactly like the capture-reset survivable ISR. It feeds/withholds NO dog, so it cannot
+false-reset a healthy board; the unfed production RWDT does the resetting.
+
+**Bench validation (hand-back):** `just flash --features provoke-stall-bare` (production build + the stall inducer +
+the detector). Expect ~18 s boot-loop; each cycle: `MSG:RESET sys-rtc-WDT` + a `[MSG:CRASH core0-executor-stall …]`
+boot dump, and the machine LOCKED — `Alarm:11` with `$22=1` (no regression) / `Alarm:3` with `$22=0` (the gap closed).
+Serial-only (no GPIO), so a powered-off scope is fine.

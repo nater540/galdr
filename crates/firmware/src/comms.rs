@@ -415,10 +415,10 @@ pub static USB_TX_COMPLETED: AtomicU32 = AtomicU32::new(0);
 /// core-0 thread-mode executor stalls (the Signature-B wedge), that task cannot run and this beat FREEZES while the
 /// survivable hardware TIMG1 ISR keeps firing; the ISR watches for that freeze and withholds both dogs so a reset
 /// fires. `Relaxed`: advancement, not magnitude, is what matters; the ISR is the sole reader. Starts at 0 and the ISR
-/// only accrues a stall once it has advanced past 0 (the boot guard against the pre-first-bump zero). Wired only in the
-/// `capture-reset` build (the survivable ISR consumer + the [`watchdog_heartbeat`] bumper both live there); the
-/// production async feeder cannot use it (it dies in the same stall it would detect), so this is `capture-reset`-gated.
-#[cfg(feature = "capture-reset")]
+/// only accrues a stall once it has advanced past 0 (the boot guard against the pre-first-bump zero). Bumped by
+/// whichever core-0 feed task the build runs — [`watchdog_heartbeat`] (capture-reset) OR the production
+/// [`watchdog_feed`] — so it advances iff the core-0 executor is scheduling tasks. Consumed by the capture-reset
+/// survivable ISR AND (Design A, §20) the production detector-only stall ISR (`crate::stall_detector`).
 pub static EXECUTOR_ALIVE: AtomicU32 = AtomicU32::new(0);
 
 /// The latest `usb_tx` stall FINGERPRINT, published by [`usb_tx`] on each write timeout for the survivable-watchdog
@@ -1115,9 +1115,15 @@ fn format_crash_report(breadcrumb: &crate::crash::Breadcrumb) -> Option<Response
   if let Some(label) = stuck_comms_stage_label(&breadcrumb.comms_stages) {
     let _ = write!(inner, " comms-stage={}", label);
   }
-  // Which side stopped advancing first, from the snapshot ring (comms = core-0 side, motion = core-1 side).
-  let verdict = crate::crash::froze_first(&breadcrumb.snapshots);
-  let _ = write!(inner, " {}", verdict);
+  // Which side stopped advancing first, from the snapshot ring (comms = core-0 side, motion = core-1 side). OMITTED
+  // for the `core0-executor-stall` class: there the WHOLE core-0 executor died at once (taking the snapshot pusher with
+  // it), so the ring shows the last HEALTHY comms/motion progress and the comms-vs-motion "froze-first" verdict is not
+  // meaningful — it would read a contradictory `no-stall` next to `core0-executor-stall`. The absolute `beats` below
+  // still convey the last-known counters.
+  if !crate::crash::withhold_was_executor_stall(breadcrumb.withhold) {
+    let verdict = crate::crash::froze_first(&breadcrumb.snapshots);
+    let _ = write!(inner, " {}", verdict);
+  }
   // Newest beats (index 0 of the newest-first ring): `comms` is the core-0 host-facing progress counter, `motion`
   // the core-1 executor beat — so the operator sees the absolute counters too.
   let newest = breadcrumb.snapshots[0];
@@ -1264,6 +1270,21 @@ pub async fn send_boot_alarm() {
   if let ControlState::Alarm(code) = control_state() {
     emit_alarm(code).await;
   }
+}
+
+/// Force the machine into the fail-safe wedge-reset alarm (Design A, §20), called at boot by `main` when the prior
+/// reset was the production stall-detector's `core0-executor-stall` wedge (`crate::crash::withhold_was_executor_stall`).
+/// Overrides the default boot state so the board comes up LOCKED and can NEVER silently resume in a now-suspect
+/// position: homing ENABLED ⇒ `ALARM:11` (re-home) — usually already the boot state, so this is idempotent; homing
+/// DISABLED ⇒ `ALARM:3` (position lost, reset/`$X` + re-zero) instead of the default `Idle` — the gap this closes.
+/// The alarm CODE is the host-tested [`firmware_core::protocol::wedge_reset_alarm`]. Synchronous (a single latched
+/// store); the boot path emits it via the subsequent [`send_boot_alarm`]. Also un-sets `HOMED` so an operator cannot
+/// jog/stream against the suspect position without re-establishing it.
+pub fn force_wedge_alarm(homing_enabled: bool) {
+  let code = firmware_core::protocol::wedge_reset_alarm(homing_enabled);
+  set_control_state(ControlState::Alarm(code));
+  // Position is suspect after the wedge reset — treat the machine as unhomed so the re-home / re-zero is required.
+  HOMED.store(false, Ordering::Relaxed);
 }
 
 /// Emit the banner WITHOUT blocking, for the reader half's `0x18` handler: the reader must never block (it
@@ -3319,6 +3340,12 @@ pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) ->
     // dump's `wdog=` value reveals whether THIS task ran through a wedge (climbed → B-1 fed-but-fooled) or died
     // (froze → B-2). Off the gated logic below, so it is a pure "did the feed loop execute" beat.
     crate::crash::bump_watchdog_heartbeat();
+    // The UNGATED core-0 executor-liveness beat (Design A, §20): this production feeder is the liveness producer, so
+    // `EXECUTOR_ALIVE` advances iff the core-0 executor is scheduling tasks. A full executor stall stops this loop →
+    // the beat FREEZES → the production `crate::stall_detector` TIMG1 ISR (which survives the stall) records the
+    // `core0-executor-stall` breadcrumb before the (also unfed) RWDT resets the board. UNCONDITIONAL, like the
+    // heartbeat above.
+    EXECUTOR_ALIVE.fetch_add(1, Ordering::Relaxed);
 
     let core1 = MOTION_LIVENESS.load(Ordering::Relaxed);
     let comms = COMMS_PROGRESS.load(Ordering::Relaxed);
@@ -3450,11 +3477,17 @@ pub async fn watchdog_heartbeat() -> ! {
 /// climb (and any stream reaches steady state), then enters a NON-YIELDING busy loop that monopolizes the cooperative
 /// core-0 thread-mode executor — starving every other core-0 task including [`watchdog_heartbeat`], so `EXECUTOR_ALIVE`
 /// FREEZES. This is the exact stall CLASS the fix targets (a task wedged in a non-yielding section), induced on demand.
-/// The survivable TIMG1 ISR (a hardware interrupt, NOT on this executor) keeps firing, detects the freeze after
-/// [`EXECUTOR_STALL_TICKS`], withholds both dogs, and the SuperWDT resets the board — expected boot dump
-/// `MSG:RESET super-WDT` + `MSG:CRASH core0-executor-stall …`, and CH4/GPIO17 asserts HIGH at the withhold. Never
-/// returns (the busy loop runs until the reset).
-#[cfg(feature = "provoke-executor-stall")]
+/// Two consumers select this via a feature:
+/// - `provoke-executor-stall` (pulls `capture-reset`, §17.18): the survivable TIMG1 ISR detects the freeze after
+///   [`EXECUTOR_STALL_TICKS`], withholds both dogs, and the SuperWDT resets ~6 s later with a `MSG:RESET super-WDT` +
+///   `MSG:CRASH core0-executor-stall …` breadcrumb — validating the FIX's detector→withhold→dog chain.
+/// - `provoke-stall-bare` (NO `capture-reset`, §20): the PRODUCTION recovery path — the async `watchdog_feed` (sole
+///   RWDT feeder) dies in the stall so the unfed RWDT resets at ~8 s (`MSG:RESET …rtc-WDT`), AND the production
+///   detector-only `crate::stall_detector` ISR records the `core0-executor-stall` breadcrumb → the next boot comes up
+///   in the fail-safe alarm (`ALARM:11` / `ALARM:3`). Exercises Design A end-to-end.
+///
+/// Never returns (the busy loop runs until the reset).
+#[cfg(any(feature = "provoke-executor-stall", feature = "provoke-stall-bare"))]
 #[embassy_executor::task]
 pub async fn provoke_executor_stall() -> ! {
   Timer::after(Duration::from_secs(10)).await;
