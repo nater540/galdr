@@ -446,14 +446,29 @@ pub const CORE1_STALL_TICKS: u32 = 16;
 /// ISR's 250 ms cadence `12 * 250 ms = 3 s` — the same ~3 s order as the async feeder's 500 ms × 6.
 pub const COMMS_STALL_TICKS: u32 = 12;
 
+/// The number of consecutive feed intervals the core-0 EXECUTOR-LIVENESS beat may stay frozen before
+/// [`watchdog_decision`] declares a full core-0 async-executor stall. This is the §17.15 root-cause FIX detector: an
+/// UNGATED beat that a dedicated core-0 async task bumps every interval, so it advances on a healthy board WHETHER OR
+/// NOT there is host traffic, motion, or queued responses — unlike the three work-driven detectors, all of which are
+/// gated off in exactly the executor-stall wedge (host aged out + motion idle + RESPONSE drained). At the ISR's 250 ms
+/// cadence `16 * 250 ms = 4 s` — comfortably above any legitimate core-0 quiesce during streaming, well below the
+/// point of no return, and matching [`CORE1_STALL_TICKS`].
+pub const EXECUTOR_STALL_TICKS: u32 = 16;
+
 /// Which wedge class made [`watchdog_decision`] withhold the watchdog feed. A PURE mirror of the firmware's
 /// `crash::WithholdReason`, kept here so the survivable-watchdog ISR's decision is fully host-tested; `crash.rs` maps
 /// this to its existing on-wire `WithholdReason`. The precedence when several conditions hold at once is
-/// `Core1Motion > Core0Comms > DeadZone` — the most-specific (the core-1 stage marker pins an exact RMT channel) wins.
+/// `Core1Motion > Core0ExecutorStall > Core0Comms > DeadZone` — the most-specific first (the core-1 stage marker pins
+/// an exact RMT channel), then the definitive core-0 executor-dead signal, then its finer-grained sub-cases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WithholdKind {
   /// The core-1 motion beat froze while a block was in flight — a core-1 / RMT wedge.
   Core1Motion,
+  /// The core-0 async EXECUTOR itself stalled: the ungated executor-liveness beat froze for [`EXECUTOR_STALL_TICKS`]
+  /// while the hardware ISR kept firing. The §17.15 root-cause catch — the full-executor-stall wedge the three
+  /// work-driven detectors below all structurally miss (they are gated by host/motion/response state, all of which
+  /// evaluate quiescent in exactly this wedge). Subsumes `Core0Comms` and `DeadZone` when the whole executor is dead.
+  Core0ExecutorStall,
   /// The host was driving the board but the core-0 comms path stopped making forward progress.
   Core0Comms,
   /// The dead-zone backstop: responses queued yet `usb_tx` completed no write for [`DEAD_ZONE_STALL_TICKS`] —
@@ -476,6 +491,15 @@ pub struct WatchdogInputs {
   /// Consecutive feed intervals `usb_tx` has completed NO write (the [`USB_TX_COMPLETED`] beat frozen). The ISR
   /// resets this to 0 on any completed/recovered write. Ungated by host/executor state — that is the dead zone.
   pub tx_complete_frozen_ticks: u32,
+  /// Consecutive feed intervals the core-0 EXECUTOR-LIVENESS beat has stayed frozen. The ISR resets this to 0 whenever
+  /// the beat advances; it is UNGATED (no host/motion/response condition) — that is the whole point, since the beat is
+  /// bumped by a dedicated core-0 async task that runs on a healthy board regardless of work, so a freeze means the
+  /// executor itself stalled. The ISR only STARTS counting once the beat has advanced at least once (a boot guard so
+  /// the pre-first-bump zero does not accrue a false stall). `0` in builds without the detector wired.
+  pub executor_alive_frozen_ticks: u32,
+  /// The core-0 executor-stall threshold to apply (defaults to [`EXECUTOR_STALL_TICKS`]). `0` disables the detector
+  /// (a threshold of 0 would false-trip immediately, so the firmware passes 0 only in builds that do not wire it).
+  pub executor_stall_ticks: u32,
   /// The current `RESPONSE` channel occupancy. The dead-zone backstop fires ONLY when this is `> 0` (responses are
   /// queued to send), the false-trip guard against resetting a truly idle board that legitimately sends nothing.
   pub response_depth: usize,
@@ -506,18 +530,25 @@ pub struct WatchdogDecision {
 }
 
 /// The pure survivable-watchdog decision for one feed interval (the core the ISR calls so the ISR is a thin shell).
-/// REPLICATES the existing `watchdog_feed` withhold logic exactly: a core-1 motion wedge (`core1_frozen_ticks >=
-/// core1_stall_ticks`), a core-0 comms wedge (`comms_frozen_ticks >= comms_stall_ticks`), or the dead-zone backstop
-/// ([`dead_zone_withhold`] on `response_depth` + `tx_complete_frozen_ticks`) ⇒ WITHHOLD BOTH dogs, with precedence
-/// `Core1Motion > Core0Comms > DeadZone`; otherwise FEED BOTH. The frozen-tick counters are assumed already gated by
-/// the caller (the ISR zeroes `core1_frozen_ticks` when no block is in flight and `comms_frozen_ticks` when the host
-/// is inactive), exactly as `watchdog_feed` does — so this function is a pure threshold comparison + precedence.
+/// Any of: a core-1 motion wedge (`core1_frozen_ticks >= core1_stall_ticks`), a full core-0 executor stall
+/// (`executor_alive_frozen_ticks >= executor_stall_ticks`, the §17.15 root-cause catch, disabled when
+/// `executor_stall_ticks == 0`), a core-0 comms wedge (`comms_frozen_ticks >= comms_stall_ticks`), or the dead-zone
+/// backstop ([`dead_zone_withhold`] on `response_depth` + `tx_complete_frozen_ticks`) ⇒ WITHHOLD BOTH dogs, with
+/// precedence `Core1Motion > Core0ExecutorStall > Core0Comms > DeadZone`; otherwise FEED BOTH. The frozen-tick counters
+/// are assumed already gated by the caller (the ISR zeroes `core1_frozen_ticks` when no block is in flight,
+/// `comms_frozen_ticks` when the host is inactive, and only accrues `executor_alive_frozen_ticks` once the beat has
+/// advanced at least once) — so this function is a pure threshold comparison + precedence.
 pub fn watchdog_decision(inputs: WatchdogInputs) -> WatchdogDecision {
   let core1_wedged = inputs.core1_frozen_ticks >= inputs.core1_stall_ticks;
+  // The executor-stall detector is DISABLED when its threshold is 0 (a build that does not wire the beat), so a
+  // permanently-zero frozen count can never trip it. Otherwise a frozen beat past the threshold is a full core-0 stall.
+  let executor_stalled = inputs.executor_stall_ticks > 0 && inputs.executor_alive_frozen_ticks >= inputs.executor_stall_ticks;
   let comms_wedged = inputs.comms_frozen_ticks >= inputs.comms_stall_ticks;
   let dead_zone = dead_zone_withhold(inputs.response_depth, inputs.tx_complete_frozen_ticks);
   let withhold_reason = if core1_wedged {
     Some(WithholdKind::Core1Motion)
+  } else if executor_stalled {
+    Some(WithholdKind::Core0ExecutorStall)
   } else if comms_wedged {
     Some(WithholdKind::Core0Comms)
   } else if dead_zone {
@@ -1013,6 +1044,8 @@ mod tests {
       core1_frozen_ticks: 0,
       comms_frozen_ticks: 0,
       tx_complete_frozen_ticks: 0,
+      executor_alive_frozen_ticks: 0,
+      executor_stall_ticks: EXECUTOR_STALL_TICKS,
       response_depth: 0,
       block_in_flight: true,
       host_active: true,
@@ -1092,19 +1125,60 @@ mod tests {
   }
 
   #[test]
-  fn watchdog_precedence_is_core1_then_comms_then_dead_zone() {
-    // When ALL three conditions hold at once, the most-specific (core-1, which carries the exact RMT stage marker)
-    // wins, then core-0 comms, then the dead-zone backstop — the same precedence `watchdog_feed` applies.
+  fn watchdog_withholds_on_executor_stall_when_all_work_detectors_are_quiescent() {
+    // The §17.15 ROOT-CAUSE case: a full core-0 executor stall where the three work-driven detectors are ALL gated off
+    // — no block in flight (core-1 idle), host inactive (aged out), and NO responses queued (usb_tx drained). The old
+    // decision would FEED here (the wedge that never reset); the ungated executor-liveness detector now catches it.
+    let inputs = WatchdogInputs {
+      executor_alive_frozen_ticks: EXECUTOR_STALL_TICKS,
+      block_in_flight: false,
+      host_active: false,
+      response_depth: 0,
+      ..healthy_inputs()
+    };
+    let d = watchdog_decision(inputs);
+    assert_eq!(d.withhold_reason, Some(WithholdKind::Core0ExecutorStall), "an executor stall must withhold");
+    assert!(!d.feed_rwdt && !d.feed_swd, "an executor stall withholds BOTH dogs");
+    // One short of the threshold still feeds (the boundary is `>=`).
+    let near = WatchdogInputs { executor_alive_frozen_ticks: EXECUTOR_STALL_TICKS - 1, ..inputs };
+    assert_eq!(watchdog_decision(near).withhold_reason, None, "one short of the executor threshold still feeds");
+  }
+
+  #[test]
+  fn watchdog_executor_stall_detector_is_disabled_when_threshold_is_zero() {
+    // A build that does not wire the executor-liveness beat passes `executor_stall_ticks = 0`; the permanently-zero
+    // frozen count must NEVER trip (a threshold of 0 with `>=` would otherwise false-trip every interval).
+    let inputs = WatchdogInputs {
+      executor_stall_ticks: 0,
+      executor_alive_frozen_ticks: 0,
+      block_in_flight: false,
+      host_active: false,
+      ..healthy_inputs()
+    };
+    assert_eq!(watchdog_decision(inputs).withhold_reason, None, "threshold 0 disables the detector");
+    // Even a large frozen count cannot trip a disabled detector.
+    let big = WatchdogInputs { executor_alive_frozen_ticks: 10_000, ..inputs };
+    assert_eq!(watchdog_decision(big).withhold_reason, None, "a disabled detector ignores any frozen count");
+  }
+
+  #[test]
+  fn watchdog_precedence_is_core1_then_executor_then_comms_then_dead_zone() {
+    // When ALL conditions hold at once, the most-specific (core-1, which carries the exact RMT stage marker) wins,
+    // then the definitive core-0 executor-dead signal, then core-0 comms, then the dead-zone backstop.
     let all = WatchdogInputs {
       core1_frozen_ticks: CORE1_STALL_TICKS,
+      executor_alive_frozen_ticks: EXECUTOR_STALL_TICKS,
       comms_frozen_ticks: COMMS_STALL_TICKS,
       response_depth: 8,
       tx_complete_frozen_ticks: DEAD_ZONE_STALL_TICKS,
       ..healthy_inputs()
     };
     assert_eq!(watchdog_decision(all).withhold_reason, Some(WithholdKind::Core1Motion));
-    // Drop core-1 → comms wins over dead-zone.
-    let comms_and_dz = WatchdogInputs { core1_frozen_ticks: 0, ..all };
+    // Drop core-1 → the executor-stall detector wins over comms + dead-zone.
+    let no_core1 = WatchdogInputs { core1_frozen_ticks: 0, ..all };
+    assert_eq!(watchdog_decision(no_core1).withhold_reason, Some(WithholdKind::Core0ExecutorStall));
+    // Drop executor too → comms wins over dead-zone.
+    let comms_and_dz = WatchdogInputs { executor_alive_frozen_ticks: 0, ..no_core1 };
     assert_eq!(watchdog_decision(comms_and_dz).withhold_reason, Some(WithholdKind::Core0Comms));
     // Drop comms too → dead-zone is the residual.
     let dz_only = WatchdogInputs { comms_frozen_ticks: 0, ..comms_and_dz };

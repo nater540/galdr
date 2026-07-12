@@ -65,7 +65,7 @@ three TMC2209 stepper drivers, while controlling a WS55-220 brushless spindle dr
 | Spindle direction     | SPIN_DIR  | GPIO15 | GPIO out         | WS55-220 F/R selection                 |
 | Feed hold (optional)  | FHOLD     | GPIO16 | GPIO in + IRQ    | NC recommended                         |
 | Cycle start (optional)| CYCSTART  | GPIO17 | GPIO in + IRQ    |                                        |
-| RMT TX ch3 (spare)    | —         | GPIO18 | RMT TX ch3       | Reserved for 4th axis or future use    |
+| RMT TX ch3 (spare)    | —         | GPIO18 | RMT TX ch3       | Reserved for 4th axis; `capture-reset` build repurposes it as the ~2 Hz watchdog scope heartbeat (ch3 → NoPin) |
 | USB D−                | USB_DM    | GPIO19 | USB Serial/JTAG  | Reserved — do not use                  |
 | USB D+                | USB_DP    | GPIO20 | USB Serial/JTAG  | Reserved — do not use                  |
 | Probe (Z touch-off)   | PROBE     | GPIO21 | GPIO in          | G38.x touch-off; pull-up unless $19; $6 inverts |

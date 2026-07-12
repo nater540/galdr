@@ -418,6 +418,18 @@ pub static USB_TX_LOST_WAKE_RECOVERED: AtomicU32 = AtomicU32::new(0);
 /// `Relaxed`: read only by the watchdog feed task; advancement, not magnitude, is what matters.
 pub static USB_TX_COMPLETED: AtomicU32 = AtomicU32::new(0);
 
+/// UNGATED core-0 executor-liveness beat (§17.15 root-cause fix). A dedicated core-0 async task
+/// ([`watchdog_heartbeat`]) bumps this every interval unconditionally, so on a healthy board it advances REGARDLESS of
+/// host traffic, motion, or queued responses — the one signal the three work-driven detectors lack. When the whole
+/// core-0 thread-mode executor stalls (the Signature-B wedge), that task cannot run and this beat FREEZES while the
+/// survivable hardware TIMG1 ISR keeps firing; the ISR watches for that freeze and withholds both dogs so a reset
+/// fires. `Relaxed`: advancement, not magnitude, is what matters; the ISR is the sole reader. Starts at 0 and the ISR
+/// only accrues a stall once it has advanced past 0 (the boot guard against the pre-first-bump zero). Wired only in the
+/// `capture-reset` build (the survivable ISR consumer + the [`watchdog_heartbeat`] bumper both live there); the
+/// production async feeder cannot use it (it dies in the same stall it would detect), so this is `capture-reset`-gated.
+#[cfg(feature = "capture-reset")]
+pub static EXECUTOR_ALIVE: AtomicU32 = AtomicU32::new(0);
+
 /// The latest `usb_tx` stall FINGERPRINT, published by [`usb_tx`] on each write timeout for the survivable-watchdog
 /// TIMG1 ISR (the §17.10/§17.11 capture-at-withhold instrument, `capture-reset`-gated). The ISR cannot cheaply read
 /// the USB_DEVICE registers from interrupt context, but `usb_tx` already computes the Signature-A discriminator at
@@ -1725,12 +1737,18 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
       // - PRODUCTION build (default): raise the LOCKED `ALARM:17` (MotorFault) — feed-hold + require re-home — and
       //   reset the local stall run so usb_tx keeps serving the alarm/banner traffic. NEVER a silent reset the host
       //   streams through (which would resume cutting in the wrong place, §14.3).
+      // DOG-ISOLATION (`force-withhold`, §17.16): SKIP the usb_tx K-escape `software_reset()` so the ONLY thing that
+      // can reset the board is the survivable-watchdog ISR's WITHHELD dog. In the first force-withhold run the usb_tx
+      // K-escape (`CoreSw`, `n=3 host-not-reading`) software-reset the board and MASKED whether a dog bites at all —
+      // this build removes that confound, so a self-reset can ONLY be a dog (read `[MSG:RESET super-WDT|...rtc-WDT]`).
+      #[cfg(not(feature = "force-withhold"))]
       handle_usb_tx_wedge(motion_before, stall.count(), stall_at_write_stage, resp.len());
-      // Production only reaches here (the diagnostic `capture-reset` build resets the chip inside the helper, so the
-      // call diverges there). Clear the stall run so a single residual wedge does not immediately re-trip the alarm
-      // every K timeouts. Gated off the capture build where it would be unreachable after the diverging reset.
-      #[cfg(not(feature = "capture-reset"))]
+      // Production (non-capture) AND the force-withhold dog-isolation build both fall through here (in force-withhold
+      // `handle_usb_tx_wedge` is not called, so usb_tx must keep serving); clear the stall run so a single residual
+      // wedge does not immediately re-trip. Only the plain `capture-reset` build diverges inside the helper (reset).
+      #[cfg(any(not(feature = "capture-reset"), feature = "force-withhold"))]
       {
+        let _ = stall_at_write_stage;
         stall = firmware_core::diag::UsbTxStallCounter::new();
       }
     }
@@ -1744,7 +1762,9 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
 /// PRODUCTION default build it raises the LOCKED [`AlarmCode::MotorFault`] (`ALARM:17`) via [`MOTION_FAULT`] — the
 /// grbl lost-step-sync contract: feed-hold + require re-home, NEVER a silent reset the host streams through — and
 /// RETURNS so usb_tx keeps serving the alarm + banner traffic to the host.
-#[cfg(feature = "capture-reset")]
+// Not compiled under `force-withhold` (§17.16 dog-isolation): there the K-escape call site is cfg'd out so usb_tx
+// never software-resets, leaving the ISR's withheld dog as the sole resetter.
+#[cfg(all(feature = "capture-reset", not(feature = "force-withhold")))]
 fn handle_usb_tx_wedge(motion_before: u32, timeout_count: u16, write_stage_stall: bool, response_len: usize) -> ! {
   capture_usb_tx_stall_and_reset(motion_before, timeout_count, write_stage_stall, response_len);
 }
@@ -1773,8 +1793,8 @@ fn handle_usb_tx_wedge(_motion_before: u32, _timeout_count: u16, _write_stage_st
 ///
 /// The register reads are plain, side-effect-free volatile loads of the USB_DEVICE block (no lock, safe from this
 /// task), mirroring `motion.rs`'s `capture_rmt_hang`. `software_reset()` is `CoreSw`, which preserves RTC_FAST.
-/// `-> !`: this never returns (it resets the chip).
-#[cfg(feature = "capture-reset")]
+/// `-> !`: this never returns (it resets the chip). Not compiled under `force-withhold` (dog-isolation, §17.16).
+#[cfg(all(feature = "capture-reset", not(feature = "force-withhold")))]
 fn capture_usb_tx_stall_and_reset(motion_before: u32, timeout_count: u16, write_stage_stall: bool, response_len: usize) -> ! {
   let usb = esp_hal::peripherals::USB_DEVICE::regs();
   let ep1 = usb.ep1_conf().read();
@@ -3446,12 +3466,39 @@ pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) ->
 #[embassy_executor::task]
 pub async fn watchdog_heartbeat() -> ! {
   loop {
+    // The UNGATED core-0 executor-liveness beat (§17.15 fix): bumped every iteration, unconditionally. This runs on
+    // the core-0 thread-mode executor, so it advances iff that executor is scheduling tasks — a healthy board keeps it
+    // climbing whether idle or busy, and a full executor stall FREEZES it. The survivable TIMG1 ISR watches this beat
+    // and withholds both dogs on a freeze — the one detector not blind to the host-quiet + motion-idle + RESPONSE-empty
+    // wedge. Bumped FIRST so even if `push_snapshot` were to stall, the liveness proof still advances.
+    EXECUTOR_ALIVE.fetch_add(1, Ordering::Relaxed);
     // Push a liveness snapshot (genuine work-driven counters) into the RTC_FAST crash ring so a reset's boot dump can
     // determine which side stopped advancing first. Off the real-time path; no feeding here (the ISR owns the dogs).
     let core1 = MOTION_LIVENESS.load(Ordering::Relaxed);
     let comms = COMMS_PROGRESS.load(Ordering::Relaxed);
     crate::crash::push_snapshot(comms, core1);
     Timer::after(WATCHDOG_FEED_INTERVAL).await;
+  }
+}
+
+/// DIAGNOSTIC (`provoke-executor-stall`, §17.18): deterministically induce a full core-0 executor stall to validate the
+/// §17.17 executor-liveness FIX end-to-end. Waits ~10 s so the board boots and `EXECUTOR_ALIVE` establishes a healthy
+/// climb (and any stream reaches steady state), then enters a NON-YIELDING busy loop that monopolizes the cooperative
+/// core-0 thread-mode executor — starving every other core-0 task including [`watchdog_heartbeat`], so `EXECUTOR_ALIVE`
+/// FREEZES. This is the exact stall CLASS the fix targets (a task wedged in a non-yielding section), induced on demand.
+/// The survivable TIMG1 ISR (a hardware interrupt, NOT on this executor) keeps firing, detects the freeze after
+/// [`EXECUTOR_STALL_TICKS`], withholds both dogs, and the SuperWDT resets the board — expected boot dump
+/// `MSG:RESET super-WDT` + `MSG:CRASH core0-executor-stall …`, and CH4/GPIO17 asserts HIGH at the withhold. Never
+/// returns (the busy loop runs until the reset).
+#[cfg(feature = "provoke-executor-stall")]
+#[embassy_executor::task]
+pub async fn provoke_executor_stall() -> ! {
+  Timer::after(Duration::from_secs(10)).await;
+  // A never-yielding loop: the cooperative executor can now schedule nothing else on core 0 → `EXECUTOR_ALIVE` freezes.
+  // `spin_loop` is a hint only; the point is that this future never `.await`s again, so the executor never regains
+  // control. The hardware ISR still preempts and runs the detector.
+  loop {
+    core::hint::spin_loop();
   }
 }
 

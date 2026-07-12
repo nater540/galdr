@@ -420,6 +420,13 @@ pub enum WithholdReason {
   /// two withholds structurally miss (host gone quiet + executor idle → neither fires → fed forever). The boot
   /// `wdog=` heartbeat then says whether the feed task was alive-but-fooled (B-1) or had itself died (B-2).
   DeadZone = 3,
+  /// The core-0 async EXECUTOR itself stalled (§17.15 root-cause fix): the UNGATED executor-liveness beat froze while
+  /// the survivable hardware ISR kept firing. Unlike [`Core0Comms`] / [`DeadZone`] (gated by host / response state,
+  /// both quiescent in a full stall) this fires purely on "the core-0 executor stopped running its tasks" — the wedge
+  /// that previously fed the dogs forever. Subsumes the other two core-0 withholds when the whole executor is dead.
+  // Constructed only by the `capture-reset` survivable ISR; the production async feeder never reaches this class.
+  #[cfg_attr(not(feature = "capture-reset"), allow(dead_code))]
+  Core0ExecutorStall = 4,
 }
 
 /// Tag in the high half of the [`idx::WITHHOLD`] word, distinct from the [`pack_stage`] tag, so a garbage/zeroed
@@ -442,6 +449,7 @@ pub fn withhold_label(packed: u32) -> Option<&'static str> {
     1 => Some("core1-motion-wedge"),
     2 => Some("core0-comms-wedge"),
     3 => Some("dead-zone-silent-lock"),
+    4 => Some("core0-executor-stall"),
     _ => None,
   }
 }

@@ -530,10 +530,18 @@ async fn main(spawner: Spawner) {
   // 4. Bring up the RMT step channels + DIR/STEP_EN GPIO and build the step sink. STEP_EN is driven enabled
   //    (active-low → low) so the steppers hold. Both the sink and STEP_EN are parked in `StaticCell`s so
   //    their RMT channels / pins live for the program's lifetime (the motion task borrows the sink `'static`).
+  // A-STEP (RMT ch3) pin selection. PRODUCTION: GPIO18 (DOC-00 spare 4th axis; PROVISIONAL, DOC-10 Phase 5). The
+  // DIAGNOSTIC `capture-reset` build instead hands GPIO18 to the survivable-watchdog scope heartbeat (below), so the
+  // never-driven A-STEP channel binds to `NoPin` (nothing) here — inert, since the A axis is bench-unverified and
+  // never transmits in this build. `motion::init` is generic in the 4th step pin, so no `cfg` leaks into `motion.rs`.
+  #[cfg(not(feature = "capture-reset"))]
+  let a_step_pin = peripherals.GPIO18;
+  #[cfg(feature = "capture-reset")]
+  let a_step_pin = esp_hal::gpio::NoPin;
   let (sink, step_enable) = motion::init(
     peripherals.RMT,
-    // A-STEP on the spare RMT ch3/GPIO18; A-DIR on GPIO38. PROVISIONAL (DOC-10 Phase 5, bench-unverified).
-    (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4, peripherals.GPIO18),
+    // A-STEP on the spare RMT ch3 (see `a_step_pin` above); A-DIR on GPIO38. PROVISIONAL (DOC-10 Phase 5).
+    (peripherals.GPIO1, peripherals.GPIO2, peripherals.GPIO4, a_step_pin),
     (peripherals.GPIO5, peripherals.GPIO6, peripherals.GPIO7, peripherals.GPIO38),
     peripherals.GPIO8,
     &motion_config,
@@ -712,8 +720,15 @@ async fn main(spawner: Spawner) {
     // The `Rtc` is owned by the `StaticCell` for `'static` (dogs stay armed); the ISR feeds via raw PAC, not through
     // this borrow. Bind `_ = rtc` so the unused `&'static mut` does not warn while keeping it conceptually alive.
     let _ = rtc;
-    survivable_watchdog::start(peripherals.TIMG1);
+    // GPIO18 (freed from RMT ch3 above in this build) drives the free-running ~2 Hz scope heartbeat toggled by the
+    // TIMG1 ISR — a hard-wedge detector independent of any STEP line (see `survivable_watchdog`).
+    survivable_watchdog::start(peripherals.TIMG1, peripherals.GPIO18, peripherals.GPIO17);
     spawner.spawn(comms::watchdog_heartbeat().expect("spawn watchdog_heartbeat"));
+    // §17.18 fix-validation build: deterministically stall the core-0 executor ~10 s after boot so the executor-
+    // liveness detector (the §17.17 fix) fires on a REAL `EXECUTOR_ALIVE` freeze → SuperWDT reset + `core0-executor-
+    // stall` breadcrumb. No effect on any other build (the task is `provoke-executor-stall`-gated).
+    #[cfg(feature = "provoke-executor-stall")]
+    spawner.spawn(comms::provoke_executor_stall().expect("spawn provoke_executor_stall"));
   }
 
   // 8. Emit the welcome banner on boot so a host detects readiness immediately (native USB cannot be
