@@ -163,16 +163,48 @@ def cmd_waveform(scope, channel, path, mode="RAW"):
   eprint(f"Wrote {len(raw):,} samples -> {path}")
 
 
-def cmd_catch_lockup(scope, channel, timeout_s, png_path, csv_path, poll_s, wait_limit_s):
+def prep_acquisition(scope, mdepth=None, tscale=None):
+  """Optionally set acquisition memory depth and horizontal time/div before arming.
+
+  Deep memory widens the captured window held around the wedge; a slower time/div spans more real
+  time inside it, so the last good pulses before the stall land in the pre-trigger buffer. Both
+  default to the scope's current setup unless overridden here.
+  """
+  if mdepth is None and tscale is None:
+    return
+  if mdepth is not None:
+    scope.write(f":ACQuire:MDEPth {mdepth}")  # e.g. 1M, 10M, 25M, AUTO (max depends on active channels)
+  if tscale is not None:
+    scope.write(f":TIMebase:MAIN:SCALe {tscale}")  # seconds/div
+  check_errors(scope, "acquisition prep")
+  eprint(f"Acquisition: mem depth {scope.query(':ACQuire:MDEPth?').strip()}, "
+         f"{scope.query(':TIMebase:MAIN:SCALe?').strip()} s/div")
+
+
+def _set_trigger_level(scope, level_v):
+  """Set the timeout-trigger threshold (the HIGH/LOW split for a 3.3 V edge). Non-fatal: if this
+  firmware lacks the command, warn and leave the level as-is rather than erroring on every run."""
+  scope.write(f":TRIGger:TIMeout:LEVel {level_v}")
+  err = scope.query(":SYSTem:ERRor?").strip()
+  if not (err.startswith("0,") or err.startswith("+0,")):
+    eprint(f"Note: ':TRIG:TIMeout:LEVel' was rejected ({err}); leaving the trigger level unchanged. "
+           f"If RFAL doesn't detect edges, set the level to ~{level_v} V by hand (see the programming guide).")
+
+
+def cmd_catch_lockup(scope, channel, timeout_s, png_path, csv_path, poll_s, wait_limit_s,
+                     level_v=1.6, mdepth=None, tscale=None):
   """Arm a single-shot Timeout trigger on the STEP channel; on flatline, dump screen + waveform.
 
   The Timeout trigger fires when the source stops changing for longer than `timeout_s`. While a job
   streams, every STEP pulse re-arms the timer so it never fires; when the board wedges and STEP goes
   quiet, the timer elapses, the scope triggers, and deep memory freezes the window around the last edge.
+  `mdepth`/`tscale` optionally prep the acquisition window; `level_v` sets the edge-detect threshold.
   """
+  prep_acquisition(scope, mdepth, tscale)
   scope.write(":TRIGger:MODE TIMeout")
   scope.write(f":TRIGger:TIMeout:SOURce CHANnel{channel}")
   scope.write(f":TRIGger:TIMeout:TIMe {timeout_s}")
+  _set_trigger_level(scope, level_v)
   # RFAL = fire when there's been no rising OR falling edge for `timeout_s` — a level-independent
   # dropout detector, so it catches a wedge whether STEP froze high (mid-pulse) or low (idle between
   # pulses). Verified on DHO804 fw 00.01.05: POS/NEG/RFAL are accepted, 'EITHer' is not (-222).
@@ -181,7 +213,7 @@ def cmd_catch_lockup(scope, channel, timeout_s, png_path, csv_path, poll_s, wait
   check_errors(scope, "timeout trigger setup")
 
   scope.write(":SINGle")  # arm one acquisition
-  eprint(f"Armed single-shot Timeout trigger on CH{channel}, {timeout_s}s idle. "
+  eprint(f"Armed single-shot Timeout trigger on CH{channel}, {timeout_s}s idle, level {level_v} V. "
          f"Stream your job now; waiting for STEP to flatline ...")
 
   waited = 0.0
@@ -228,6 +260,14 @@ def build_parser():
   cl.add_argument("--poll", type=float, default=0.2, help="Trigger-status poll interval (s).")
   cl.add_argument("--wait-limit", type=float, default=0.0,
                   help="Give up after this many seconds (0 = wait forever).")
+  cl.add_argument("--level", type=float, default=1.6,
+                  help="Edge-detect threshold in volts (default 1.6 for 3.3 V logic).")
+  cl.add_argument("--mdepth", default=None,
+                  help="Set acquisition memory depth before arming, e.g. 1M, 10M, 25M, AUTO "
+                       "(widens the captured window; default leaves the scope's setting).")
+  cl.add_argument("--tscale", type=float, default=None,
+                  help="Set horizontal time/div in seconds before arming, e.g. 0.001 "
+                       "(default leaves the scope's setting).")
   return p
 
 
@@ -246,7 +286,8 @@ def main(argv=None):
       cmd_waveform(scope, args.channel, args.out, args.mode)
     elif args.cmd == "catch-lockup":
       cmd_catch_lockup(scope, args.channel, args.timeout, args.png, args.csv,
-                       args.poll, args.wait_limit or None)
+                       args.poll, args.wait_limit or None,
+                       level_v=args.level, mdepth=args.mdepth, tscale=args.tscale)
     else:
       cmd_idn(scope)  # default: prove the link works
   finally:
