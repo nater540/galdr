@@ -97,19 +97,6 @@ defmt = ["dep:defmt", "firmware-core/defmt", "esp-println/defmt-espflash"]
 # and a diagnostic image can never accidentally ship armed.
 capture-reset = []
 
-# DIAGNOSTIC "provoke-and-capture" build (docs/streaming-lockup-investigation.md §17.14). DISABLES TIER 1's
-# single-chunk write-stage lost-wake RECOVERY so a lost wake is NOT rescued in place and cascades exactly as it did on
-# the PRE-fix build — letting the genuine in-stream Signature B reproduce at its native rate for capture with the
-# now-complete instrument (survivable watchdog + `[MSG:RESET]` replay). It is PURELY a way to reproduce the HISTORICAL
-# wedge for diagnosis; it is NEVER a production path. It composes WITH (and REQUIRES) `capture-reset` — provoking B
-# without the capture channel armed is pointless (the wedge would leave no trace) and unsafe, so this feature pulls
-# `capture-reset` in. The minimal lever is a single `#[cfg]` swap at the `usb_tx` write-stage classify call from the
-# pure `classify_write_stage` to its host-tested no-recover sibling `classify_write_stage_no_recover`; the production
-# `classify_write_stage` and the default build are byte-for-byte UNCHANGED. The K-escape + survivable watchdog +
-# `[MSG:RESET]` replay all stay ON, so whichever way B manifests (K-escape reset, ISR-withhold→dog, or the §13.8
-# alternating hard-lock) leaves a readable breadcrumb. Build+flash combo: `--features provoke-b` (pulls capture-reset).
-provoke-b = ["capture-reset"]
-
 # DIAGNOSTIC positive-control build (docs/streaming-lockup-investigation.md §17.16) for the (a)-vs-(b) watchdog
 # question. When ENABLED, the survivable-watchdog TIMG1 ISR UNCONDITIONALLY withholds both dog feeds after a fixed
 # boot delay (regardless of `watchdog_decision`), so a healthy, idle board is FORCED into the withhold path. If the

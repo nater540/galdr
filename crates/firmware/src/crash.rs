@@ -142,52 +142,48 @@ mod idx {
   /// == 0` nails the drumbeat as USB-TX, not RMT, by evidence rather than inference (§11.1). No tag — a plain
   /// saturating count, valid only when the breadcrumb [`MAGIC`] is set.
   pub const RMT_WAIT_COUNT: usize = PANIC_BUILD_ID + 2;
-  /// The last-seen runtime count of RECOVERED lost-wake writes (`USB_TX_LOST_WAKE_RECOVERED`), mirrored here on each
-  /// recovery bump so a partial-fix K-escape reset still surfaces the PRIOR run's recovered total at the next boot.
-  /// The §12 lost-wake bug is RARE/BURSTY, so a burst that recovers some wakes then still wedges (one slips through)
-  /// would otherwise lose the count on the reset — this preserves it. `0` means no recovery happened (or cold boot).
-  pub const RECOVERED_COUNT: usize = PANIC_BUILD_ID + 3;
   /// A FREE-RUNNING heartbeat bumped by `watchdog_feed` every loop iteration (Signature-B instrumentation). Unlike
   /// the gated COMMS/MOTION beats, this advances UNCONDITIONALLY whenever the feed task runs, so its value at boot
-  /// says whether `watchdog_feed` itself was ALIVE through the wedge (climbed → B-1, the dog was fed but fooled —
-  /// recovered-lost-wakes kept `COMMS_PROGRESS` advancing so the comms-stall withhold never tripped) or DIED (froze →
-  /// B-2, the core-0 executor/feed task itself stopped). Survives a watchdog/software reset (RTC_FAST), NOT a
-  /// power-cycle — so on a dead-zone hang that the new backstop converts into a reset, this distinguishes B-1 vs B-2.
-  pub const WATCHDOG_HEARTBEAT: usize = PANIC_BUILD_ID + 4;
+  /// says whether `watchdog_feed` itself was ALIVE through the wedge (climbed → B-1, the dog was fed but fooled) or
+  /// DIED (froze → B-2, the core-0 executor/feed task itself stopped). Survives a watchdog/software reset (RTC_FAST),
+  /// NOT a power-cycle — so on a dead-zone hang that the new backstop converts into a reset, this distinguishes B-1 vs
+  /// B-2. (The former `RECOVERED_COUNT` slot at `+3` was retired with the §18/§19 poll-based `usb_tx`, which eliminated
+  /// the lost-wake CLASS — there are no recovered lost-wakes to count; the following slots renumbered down by one.)
+  pub const WATCHDOG_HEARTBEAT: usize = PANIC_BUILD_ID + 3;
   /// The byte length of the response whose write stalled at the K-escape (the §13.1 single-chunk-widening
   /// discriminator). Carried in its OWN word because the packed [`super::USB_TX_STALL`] bit-word is full; the boot
   /// dump emits it as `len=N`. `len <= 64` ⇒ the stalled response was a single `write_async` chunk (all bytes pushed
   /// before the future parked) ⇒ the widening fix can recover it without truncation; `len > 64` stays a genuine
   /// stall. A plain saturating count, valid only alongside a captured [`super::USB_TX_STALL`].
-  pub const USB_TX_STALL_LEN: usize = PANIC_BUILD_ID + 5;
+  pub const USB_TX_STALL_LEN: usize = PANIC_BUILD_ID + 4;
   /// FREE-RUNNING total count of silently-swallowed `run_block` truncations (the §15 silent-skip probe), bumped by
   /// the core-1 executor at the `let _ = run_block_scaled` swallow site. Lives in RTC_FAST (NOT a plain `.bss`
   /// atomic) so it SURVIVES the K-escape `software_reset` that fires on a `usb_tx` wedge — otherwise a run that
   /// wedges+resets zeroes the count mid-run (the run-1 confound). NOT consumed/cleared by [`take_breadcrumb`]: it
   /// free-runs across resets for the whole power-on session, so a single end-of-run `$I` poll reads the cumulative
   /// total even through intervening resets. Saturating.
-  pub const RUN_BLOCK_TRUNCATED: usize = PANIC_BUILD_ID + 6;
+  pub const RUN_BLOCK_TRUNCATED: usize = PANIC_BUILD_ID + 5;
   /// FREE-RUNNING packed per-SOURCE split of [`RUN_BLOCK_TRUNCATED`] (§15): `twait` (RMT wait-err arm) in bits 0..10,
   /// `ttx` (transmit-start arm) in bits 10..20, `tlong` (burst-too-long) in bits 20..26, and the last-truncation
   /// axis+1 in bits 26..29. Each sub-count saturates at its field width (ample for a diagnostic — the split only needs
   /// to show WHICH arm dominates, not an exact magnitude). Same RTC_FAST survive-the-reset + free-run rationale.
-  pub const RUN_BLOCK_TRUNC_SPLIT: usize = PANIC_BUILD_ID + 7;
+  pub const RUN_BLOCK_TRUNC_SPLIT: usize = PANIC_BUILD_ID + 6;
   /// The [`super::BUILD_ID`] of the image that last wrote the free-running §15 truncation words. RTC_FAST survives a
   /// software reset AND an `espflash` flash, so the trunc words would otherwise carry a PRIOR image's bytes into a
   /// fresh build (read as a bogus huge `trunc`). Stamped at boot by [`super::reset_truncation_on_new_build`]; when it
   /// does NOT match this image's `BUILD_ID`, the trunc words are ZEROED first (a clean per-build baseline) while still
   /// surviving same-image software_resets (the actual requirement).
-  pub const TRUNC_BUILD_ID: usize = PANIC_BUILD_ID + 8;
+  pub const TRUNC_BUILD_ID: usize = PANIC_BUILD_ID + 7;
   /// The last-seen WINDOWED `usb_tx`-stall count (`firmware_core::diag::WindowedStallCounter::count`, §13.8), mirrored
   /// here on each capturing reset so the boot dump can tell a PURE consecutive stall run (Signature A) from an
   /// ALTERNATING recovered/stall pattern that resets the consecutive K counter yet still represents a degraded /
   /// intermittently-locking link. Emitted as `wnd=N` on the `[MSG:CRASH usbtx: ...]` line. Written DIAGNOSTIC-only
   /// (`capture-reset`) by [`super::record_usb_tx_stall_window`]; the DECODE side is unconditional so a production board
   /// still replays a prior diagnostic run's window. A plain count, meaningful only alongside a captured USB-TX stall.
-  pub const USB_TX_STALL_WINDOW: usize = PANIC_BUILD_ID + 9;
+  pub const USB_TX_STALL_WINDOW: usize = PANIC_BUILD_ID + 8;
   /// First word of the snapshot ring (after the comms-stage + panic slots). Each snapshot is [`super::SNAP_WORDS`]
   /// words.
-  pub const RING_BASE: usize = PANIC_BUILD_ID + 10;
+  pub const RING_BASE: usize = PANIC_BUILD_ID + 9;
 }
 
 /// Number of instrumented core-0 tasks, each with its own comms-stage breadcrumb slot. One per [`CommsTask`].
@@ -543,20 +539,6 @@ pub fn bump_rmt_wait_timeout() {
   BREADCRUMB[idx::MAGIC].store(MAGIC, Ordering::Relaxed);
 }
 
-/// Mirror the runtime recovered-lost-wake count into the breadcrumb (called from `usb_tx` on each recovery). A
-/// single relaxed store of the already-incremented count, so a partial-fix K-escape reset surfaces the PRIOR run's
-/// recovered total at the next boot (the §12 bug is rare/bursty — a burst that recovers some wakes then still wedges
-/// would otherwise lose the count). Read only after a reset; no ordering. MAGIC is already set from this boot's
-/// `init_magic` by the time any write happens, so no extra stamp is needed here.
-///
-/// DORMANT since the §18/§19 poll-based `usb_tx` eliminated the lost-wake CLASS (there are no recovered lost-wakes to
-/// count). Kept — with its RTC_FAST slot + boot field — so this change does NOT perturb the breadcrumb layout on the
-/// sacred path; to be removed with the rest of the recovered-counter apparatus in the `provoke-b`-retirement cleanup.
-#[allow(dead_code)]
-pub fn record_recovered_count(count: u32) {
-  BREADCRUMB[idx::RECOVERED_COUNT].store(count, Ordering::Relaxed);
-}
-
 /// Which `emit_burst` arm abandoned a block, for the §15 truncation split. Mirrors `motion::TruncationSource` but
 /// kept here as a tiny discriminant so `crash.rs` owns the RTC_FAST bit layout (the motion enum carries the axis).
 #[derive(Clone, Copy)]
@@ -742,10 +724,6 @@ pub struct Breadcrumb {
   /// a captured [`usb_tx_stall`](Self::usb_tx_stall) whose `timeout_count >= K` and this `== 0`, the boot dump
   /// POSITIVELY excludes the RMT theory for the drumbeat (§11.1).
   pub rmt_wait_count: u32,
-  /// The PRIOR run's RECOVERED lost-wake count (mirrored from `USB_TX_LOST_WAKE_RECOVERED`). Non-zero on a boot that
-  /// followed a partial-fix K-escape reset where the poll-after-arm recovered some lost wakes before one still
-  /// wedged — the boot dump emits it as `[MSG:USBTX rec=N]` so the bursty bug's recovery activity is not lost.
-  pub recovered_count: u32,
   /// The PRIOR run's free-running watchdog heartbeat (bumped by `watchdog_feed` each loop). Compared against this
   /// run's count (always small at boot) it shows whether the feed task ran through the wedge: a large value means
   /// `watchdog_feed` was ALIVE but FOOLED (B-1, the dog kept being fed); a small/frozen value means the feed task
@@ -831,7 +809,6 @@ pub fn take_breadcrumb() -> Breadcrumb {
   // Decoded unconditionally so a production build replays a prior diagnostic run's window.
   let usb_tx_stall_window = BREADCRUMB[idx::USB_TX_STALL_WINDOW].load(Ordering::Relaxed);
   let rmt_wait_count = BREADCRUMB[idx::RMT_WAIT_COUNT].load(Ordering::Relaxed);
-  let recovered_count = BREADCRUMB[idx::RECOVERED_COUNT].load(Ordering::Relaxed);
   let watchdog_heartbeat = BREADCRUMB[idx::WATCHDOG_HEARTBEAT].load(Ordering::Relaxed);
   // The newest snapshot is at `(head + RING_LEN - 1) % RING_LEN`; walk backwards so index 0 is the most recent.
   let head = (BREADCRUMB[idx::HEAD].load(Ordering::Relaxed) as usize) % RING_LEN;
@@ -855,7 +832,6 @@ pub fn take_breadcrumb() -> Breadcrumb {
   BREADCRUMB[idx::USB_TX_STALL_LEN].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::USB_TX_STALL_WINDOW].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::RMT_WAIT_COUNT].store(0, Ordering::Relaxed);
-  BREADCRUMB[idx::RECOVERED_COUNT].store(0, Ordering::Relaxed);
   BREADCRUMB[idx::WATCHDOG_HEARTBEAT].store(0, Ordering::Relaxed);
   for i in 0..COMMS_TASK_COUNT {
     BREADCRUMB[idx::COMMS_STAGE_BASE + i].store(0, Ordering::Relaxed);
@@ -871,7 +847,6 @@ pub fn take_breadcrumb() -> Breadcrumb {
     usb_tx_stall_len,
     usb_tx_stall_window,
     rmt_wait_count,
-    recovered_count,
     watchdog_heartbeat,
     snapshots,
   }

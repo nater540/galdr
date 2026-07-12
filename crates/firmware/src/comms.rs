@@ -401,16 +401,6 @@ pub static MOTION_LIVENESS: AtomicU32 = AtomicU32::new(0);
 /// feed-task self-bump (removed). `Relaxed` lock-free; only advancement (not magnitude) is read.
 pub static COMMS_PROGRESS: AtomicU32 = AtomicU32::new(0);
 
-/// Count of LOST-WAKE writes the [`usb_tx`] poll-after-arm recheck RECOVERED this run (a 2 s write timeout where the
-/// host had in fact drained the FIFO — only esp-hal's completion wake was lost; the §12 root cause). A live "the
-/// lost-wake bug is still firing but is being recovered" signal: a non-zero, CLIMBING value while a stream RUNS TO
-/// COMPLETION proves the fix is doing real work on THIS hardware (vs the bug merely not firing — it is RARE/BURSTY,
-/// so a quiet run reads 0 and is INCONCLUSIVE, not a failure). Surfaced TWO ways: live on the `$I` build-info query
-/// as a `[MSG:USBTX rec=N]` line, AND — mirrored into the RTC_FAST breadcrumb on each bump — on the next boot after a
-/// partial-fix K-escape reset (so a burst that still wedged is not lost). `Relaxed`: a diagnostic counter, bumped
-/// only on the recovered path, read on demand.
-pub static USB_TX_LOST_WAKE_RECOVERED: AtomicU32 = AtomicU32::new(0);
-
 /// Count of COMPLETED `usb_tx` writes (a clean write OR a recovered lost-wake — anything that delivered bytes to the
 /// host). Distinct from [`COMMS_PROGRESS`] (which THREE tasks bump): this is `usb_tx`-SPECIFIC, so the dead-zone
 /// watchdog backstop can tell whether the WRITER is making progress independent of the status reporter / consumer.
@@ -1050,15 +1040,6 @@ pub async fn maybe_emit_crash_report(breadcrumb: &crate::crash::Breadcrumb, rese
   }
   if let Some(comms_line) = format_comms_stage_report(&breadcrumb.comms_stages) {
     let _ = lines.push(comms_line);
-  }
-  // The PERSISTED lost-wake recovered count (the §12 fix readout, boot half): non-zero only after a partial-fix
-  // K-escape reset where the poll-after-arm recovered some wakes before one still wedged. Emitting it here means a
-  // bursty bug's recovery activity survives the reset and is read on the next boot (the live `$I` readout covers
-  // the no-reset case).
-  if breadcrumb.recovered_count > 0
-    && let Some(rec_line) = format_usb_tx_recovered(breadcrumb.recovered_count)
-  {
-    let _ = lines.push(rec_line);
   }
   // Stash a copy for the first-`$I`/`?` replay (reconnect race), then emit now over the guaranteed-delivery path.
   CRASH_REPORT.lock(|c| c.set(lines.clone()));
@@ -4882,16 +4863,6 @@ async fn send_build_info(extended: bool) {
       }
     }
   }
-  // Surface the live lost-wake recovery count (the §12 fix-confirmation signal) on `$I` so the host can read it on
-  // demand WITHOUT a wedge/reset: a climbing `rec=` while a stream runs to completion PROVES lost wakes occurred AND
-  // were recovered (not merely that the rare/bursty wedge didn't fire). Emitted only when non-zero so a clean run
-  // adds no line. A formatting/capacity failure simply skips it; the `ok` still terminates the response.
-  let recovered = USB_TX_LOST_WAKE_RECOVERED.load(Ordering::Relaxed);
-  if recovered > 0 {
-    if let Some(line) = format_usb_tx_recovered(recovered) {
-      enqueue(line).await;
-    }
-  }
   // OBSERVE-ONLY air-run readout (task #22, gcode-chunk-skip): the four diagnostic counters on every `$I`, so a host
   // polling `$I` periodically sees them advance and diverge live — even on a partial run with no wedge. Emitted
   // UNCONDITIONALLY (unlike `rec=`) so a value of 0 is itself informative (`drop=0` ⇒ the overflow path did NOT fire
@@ -4946,18 +4917,6 @@ fn format_skip_probes() -> Option<Response> {
     taxis,
   )
   .ok()?;
-  let mut out = Response::new();
-  ResponseWriter::message(&mut out, inner.as_str()).ok()?;
-  Some(out)
-}
-
-/// Render the `[MSG:USBTX rec=N]` line for the live `$I` lost-wake-recovery readout (and reused by the boot dump for
-/// the persisted prior-run count). Returns `None` only on a formatting/capacity failure (never in practice — the
-/// line is tiny). Pure formatting; no I/O.
-fn format_usb_tx_recovered(recovered: u32) -> Option<Response> {
-  use core::fmt::Write as _;
-  let mut inner: heapless::String<32> = heapless::String::new();
-  write!(inner, "USBTX rec={recovered}").ok()?;
   let mut out = Response::new();
   ResponseWriter::message(&mut out, inner.as_str()).ok()?;
   Some(out)

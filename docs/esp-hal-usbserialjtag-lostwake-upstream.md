@@ -1,4 +1,4 @@
-# DRAFT esp-hal upstream issue — `UsbSerialJtagTx` async write can lose its TX-done wake (do NOT file until the user approves)
+# esp-hal upstream issue — `UsbSerialJtagTx` async write can lose its TX-done wake (APPROVED to file 2026-07-11; file manually at https://github.com/esp-rs/esp-hal/issues/new — `gh` was unavailable in-session)
 
 Prepared 2026-07-11 by the Galdr firmware team (embedded-bug-hunter). This is a ready-to-file draft for
 `esp-rs/esp-hal`; it is Option C of `docs/streaming-lockup-investigation.md` §18 — the durable upstream root fix,
