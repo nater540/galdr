@@ -313,7 +313,7 @@ fn fire() {
       // fire whose wedge has since cleared, so a later unrelated reset does not spuriously boot LOCKED. Ordered AFTER
       // the feeds (a knife-edge dog expiry still boots locked); this ISR is the sole withhold writer, so the CAS never
       // contends. `swap(0)` reads-and-resets the tracked reason so the clear runs at most once per recovery.
-      if let Some(reason) = last_captured_reason(LAST_CAPTURED_WITHHOLD.swap(0, Ordering::Relaxed)) {
+      if let Some(reason) = crate::crash::WithholdReason::from_u8(LAST_CAPTURED_WITHHOLD.swap(0, Ordering::Relaxed) as u8) {
         crate::crash::clear_withhold_if(reason);
       }
     }
@@ -368,20 +368,6 @@ fn bump_or_reset(slot: &AtomicU32, frozen: bool) -> u32 {
 /// published (so even a hard Signature-B lock that never reached the K-escape carries its last-known state) and the
 /// windowed stall count. All three usb_tx words are republished by `usb_tx` on every write timeout, so they hold the
 /// freshest stall snapshot available — the ISR just copies them into the breadcrumb words.
-/// Reconstruct the [`crate::crash::WithholdReason`] a prior [`capture_withhold`] stored in [`LAST_CAPTURED_WITHHOLD`]
-/// (as its `u8` discriminant), so the recovery-clear can name the exact word to erase. `0` / any unknown value → `None`
-/// (nothing to clear). Local to this capture-reset-only module, so it is never dead code in the production build.
-fn last_captured_reason(value: u32) -> Option<crate::crash::WithholdReason> {
-  use crate::crash::WithholdReason;
-  match value {
-    1 => Some(WithholdReason::Core1Motion),
-    2 => Some(WithholdReason::Core0Comms),
-    3 => Some(WithholdReason::DeadZone),
-    4 => Some(WithholdReason::Core0ExecutorStall),
-    _ => None,
-  }
-}
-
 fn capture_withhold(reason: firmware_core::diag::WithholdKind) {
   use firmware_core::diag::WithholdKind;
   let withhold = match reason {

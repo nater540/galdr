@@ -1271,8 +1271,9 @@ pub async fn send_boot_alarm() {
   }
 }
 
-/// Force the machine into the fail-safe wedge-reset alarm (Design A, §20), called at boot by `main` when the prior
-/// reset was the production stall-detector's `core0-executor-stall` wedge (`crate::crash::withhold_was_executor_stall`).
+/// Force the machine into the fail-safe wedge-reset alarm (Design A, §20 / Fix #1), called at boot by `main` when the
+/// prior reset was ANY watchdog-withheld wedge (`crate::crash::withhold_was_wedge` — core-1 motion, core-0 comms, the
+/// dead-zone backstop, or the core-0 executor stall; all leave the position suspect, not just the executor stall).
 /// Overrides the default boot state so the board comes up LOCKED and can NEVER silently resume in a now-suspect
 /// position: homing ENABLED ⇒ `ALARM:11` (re-home) — usually already the boot state, so this is idempotent; homing
 /// DISABLED ⇒ `ALARM:3` (position lost, reset/`$X` + re-zero) instead of the default `Idle` — the gap this closes.
@@ -1603,7 +1604,19 @@ async fn write_response_polled(
   tx: &mut UsbSerialJtagTx<'static, Async>,
   bytes: &[u8],
 ) -> firmware_core::diag::WriteOutcome {
-  use firmware_core::diag::{PollAction, WriteOutcome, usb_tx_poll_action};
+  use firmware_core::diag::{PollAction, WriteOutcome};
+  // Fix #5: the per-poll decision shared by the byte-push and commit loops below. On progress take `Advance` DIRECTLY
+  // (no clock read — the §13 lazy-clock: the happy path never pays for a timestamp); otherwise consult this chunk's
+  // `deadline` via the host-tested `usb_tx_poll_action`. A nested fn so the two loops are byte-for-byte identical and
+  // the stall-vs-yield policy has one source. Self-contained `use` so it does not depend on the enclosing imports.
+  fn step(progressed: bool, deadline: Instant) -> PollAction {
+    use firmware_core::diag::{PollAction, usb_tx_poll_action};
+    if progressed {
+      PollAction::Advance
+    } else {
+      usb_tx_poll_action(false, Instant::now() >= deadline)
+    }
+  }
   for chunk in bytes.chunks(USB_TX_PACKET_BYTES) {
     // Fix #2/#13: a FRESH stall deadline PER CHUNK, reset at chunk START (not per byte). Each ≤64 B chunk — its bytes
     // AND its commit — gets a full `USB_TX_TIMEOUT` budget, so the final chunk's flush never inherits a budget drained
@@ -1615,16 +1628,7 @@ async fn write_response_polled(
     // means the FIFO is full because the host has not drained the previous packet yet — yield and re-poll.
     for &byte in chunk {
       loop {
-        // Fix #13: read the clock ONLY when a byte did NOT go out. On the progress path `Advance` is chosen directly
-        // (no `Instant::now()`), so the happy path never pays for a timestamp read; the deadline is consulted solely to
-        // classify a stall. This also keeps the `Advance` arm reachable via the `progressed` short-circuit only.
-        let progressed = tx.write_byte_nb(byte).is_ok();
-        let action = if progressed {
-          PollAction::Advance
-        } else {
-          usb_tx_poll_action(false, Instant::now() >= deadline)
-        };
-        match action {
+        match step(tx.write_byte_nb(byte).is_ok(), deadline) {
           PollAction::Advance => break,
           PollAction::Stall => return WriteOutcome::Stalled,
           PollAction::Yield => yield_now().await,
@@ -1640,15 +1644,9 @@ async fn write_response_polled(
     // keeps the byte stream faithful to esp-hal's tested sequencing.
     if tx.flush_tx_nb().is_err() {
       loop {
-        // Fix #13: same lazy-clock shape as the byte loop — read `Instant::now()` only when the commit has NOT yet
-        // registered. The commit budget shares this chunk's fresh deadline (Fix #2).
+        // Commit budget shares this chunk's fresh deadline (Fix #2); `step` reads the clock only when not yet committed.
         let committed = (esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().bits() & 0b011) != 0;
-        let action = if committed {
-          PollAction::Advance
-        } else {
-          usb_tx_poll_action(false, Instant::now() >= deadline)
-        };
-        match action {
+        match step(committed, deadline) {
           PollAction::Advance => break,
           PollAction::Stall => return WriteOutcome::Stalled,
           PollAction::Yield => yield_now().await,
