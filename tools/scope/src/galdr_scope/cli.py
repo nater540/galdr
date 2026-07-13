@@ -103,6 +103,11 @@ def read_preamble(scope):
   fields = scope.query(":WAVeform:PREamble?").strip().split(",")
   keys = ("format", "type", "points", "count", "xincrement", "xorigin",
           "xreference", "yincrement", "yorigin", "yreference")
+  # Validate the field count before zipping: `dict(zip(...))` silently TRUNCATES on a short list, so a firmware
+  # quirk or an errored/truncated SCPI read (e.g. '-113' or an empty string) would drop keys and the numeric
+  # conversion below would raise a bare KeyError. Fail with a diagnosable message instead (#6).
+  if len(fields) < len(keys):
+    raise RuntimeError(f"unexpected :WAVeform:PREamble? response ({len(fields)} fields, need {len(keys)}): {fields!r}")
   pre = dict(zip(keys, fields))
   for k in ("xincrement", "xorigin", "yincrement", "yorigin", "yreference"):
     pre[k] = float(pre[k])
@@ -216,18 +221,31 @@ def cmd_catch_lockup(scope, channel, timeout_s, png_path, csv_path, poll_s, wait
   eprint(f"Armed single-shot Timeout trigger on CH{channel}, {timeout_s}s idle, level {level_v} V. "
          f"Stream your job now; waiting for STEP to flatline ...")
 
-  waited = 0.0
+  # Wait for the single-shot arm to actually register before watching for STOP (#7): a scope that was STOPped
+  # before `:SINGle` can briefly still report the stale "STOP", which the STOP-watch below would read as an
+  # instant false "triggered". The Timeout trigger cannot reach STOP until `timeout_s` of idle elapses, so an
+  # armed WAIT/RUN state is always observable first. This arm-confirm loop is itself bounded, so a scope that
+  # never reports WAIT degrades to falling through — never a hang.
+  arm_deadline = time.monotonic() + max(2.0, poll_s * 5)
+  while time.monotonic() < arm_deadline:
+    if scope.query(":TRIGger:STATus?").strip() in ("WAIT", "RUN"):
+      break
+    time.sleep(poll_s)
+
+  start = time.monotonic()
   while True:
     status = scope.query(":TRIGger:STATus?").strip()
     if status == "STOP":
       eprint("Triggered — STEP went quiet. Freezing buffer.")
       break
-    if wait_limit_s and waited >= wait_limit_s:
+    # Bound the give-up against the WALL CLOCK (#4): accumulating `poll_s` under-counts the time spent inside the
+    # blocking status query, and `--poll 0` would never advance a counter (an infinite busy-loop). `wait_limit_s == 0`
+    # means wait-forever, so the truthiness guard must stay.
+    if wait_limit_s and (time.monotonic() - start) >= wait_limit_s:
       eprint(f"Gave up after {wait_limit_s}s (status={status}). No lockup captured; "
              f"the run may have completed cleanly.")
       return
     time.sleep(poll_s)
-    waited += poll_s
 
   cmd_screenshot(scope, png_path)
   cmd_waveform(scope, channel, csv_path)

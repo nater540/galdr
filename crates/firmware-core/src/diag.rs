@@ -106,27 +106,31 @@ pub fn usb_tx_poll_action(made_progress: bool, deadline_exceeded: bool) -> PollA
   }
 }
 
-/// A pure model of one response's poll-write, so the stall-vs-complete POLICY is host-testable end-to-end without
-/// hardware (the firmware loop feeds live `write_byte_nb`/`flush_tx_nb` results through [`usb_tx_poll_action`]; this
-/// reducer feeds a scripted sequence of the same observations). `total_ops` is the number of write/flush ops that must
-/// each make progress for the response to complete (in the firmware that is bytes + one commit per chunk; in tests it
-/// is any convenient count). Each [`step`](Self::step) returns `Some` once the write terminates.
+/// A pure TEST-ONLY model of one response's poll-write, used solely by this module's unit tests to exercise the
+/// stall-vs-complete POLICY end-to-end without hardware. It is NOT the live loop's source of truth (finding #12): the
+/// firmware's `write_response_polled` drives its own byte/commit loop and, after the §18/§19 poll rewrite, chooses
+/// `Advance` DIRECTLY on progress — routing only the non-progress case through [`usb_tx_poll_action`] (the genuinely
+/// shared policy). This reducer feeds a scripted sequence of the same observations so the tests can assert the
+/// terminating outcome; it is `#[cfg(test)]` because nothing ships against it. `total_ops` is the number of ops that
+/// must each make progress for the response to complete. Each [`step`](Self::step) returns `Some` once it terminates.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PollWriteProgress {
+struct PollWriteProgress {
   ops_remaining: u32,
 }
 
+#[cfg(test)]
 impl PollWriteProgress {
   /// A reducer for a response requiring `total_ops` successful ops. `0` completes on the first `step` (nothing to
   /// send — never happens on the wire, but defined for totality).
-  pub fn new(total_ops: u32) -> Self {
+  fn new(total_ops: u32) -> Self {
     PollWriteProgress { ops_remaining: total_ops }
   }
 
   /// Feed one poll observation. Returns `Some(Completed)` once all ops have progressed, `Some(Stalled)` on a
   /// deadline-exceeded `WouldBlock`, or `None` while more polls are needed (a progress that is not the last op, or a
   /// yield). A yield does NOT consume an op — the same op is retried next poll.
-  pub fn step(&mut self, made_progress: bool, deadline_exceeded: bool) -> Option<WriteOutcome> {
+  fn step(&mut self, made_progress: bool, deadline_exceeded: bool) -> Option<WriteOutcome> {
     if self.ops_remaining == 0 {
       return Some(WriteOutcome::Completed);
     }
@@ -169,12 +173,6 @@ pub struct UsbTxStall {
   /// The `RESPONSE` channel occupancy at the timeout — non-zero confirms the writer is the bottleneck (responses
   /// are queued behind it), the head-of-line-blocking story that starves the status reporter.
   pub response_depth: u8,
-  /// Whether the final timeout that tripped the K-escape was at the `write_all` STAGE (`true`) rather than the flush
-  /// stage (`false`). This is the directly-recorded Signature-A discriminator: a write-stage stall is the lost wake
-  /// the deployed flush-stage-only recovery cannot catch (`classify_write_stage` returns `Stalled` unconditionally on
-  /// a write timeout, and `flush_tx_async` parks only when the FIFO is NOT free — so a `data_free=1` stall is
-  /// necessarily a `write_all` park). Recorded instead of inferred from `int_ena`, since the gap is STAGE not flavor.
-  pub write_stage_stall: bool,
   /// The consecutive-timeout count when captured (≥ [`USB_TX_STALL_ESCAPE_K`]). Packed into 6 bits (saturates at
   /// 63) — ample for a "reached K and kept timing out" diagnostic; the exact magnitude past K is not load-bearing.
   pub timeout_count: u16,
@@ -255,23 +253,24 @@ pub const USB_TX_STALL_TAG: u32 = 0x5554_0000; // "UT".
 mod bits {
   // All packed fields MUST stay within the low 16 bits — the high half (`0xFFFF_0000`) is the tag, and any field
   // bleeding into bit 16 would corrupt the tag check on decode (a bug TDD caught: a byte-wide count at shift 9
-  // reached bit 16). Layout: six flag bits (0..6), a depth nibble (6..10), a 6-bit count (10..16).
+  // reached bit 16). Layout: five flag bits (0..5), a RESERVED bit (5), a depth nibble (6..10), a 6-bit count
+  // (10..16). The depth/count shifts MUST stay fixed even though bit 5 is now unused — a surviving cross-version
+  // breadcrumb is decoded on its face, so renumbering them would corrupt a prior run's depth/count on the next boot.
   pub const DATA_FREE: u32 = 1 << 0;
   pub const SERIAL_IN_EMPTY: u32 = 1 << 1;
   pub const MOTION_ADVANCING: u32 = 1 << 2;
   pub const EXECUTOR_RUNNING: u32 = 1 << 3;
   pub const INT_ENA_ARMED: u32 = 1 << 4;
-  /// Whether the FINAL `usb_tx` timeout that tripped the K-escape was at the `write_all` STAGE (vs the flush stage).
-  /// Recorded directly rather than inferred from `int_ena`: a write-stage stall is the Signature-A lost wake the
-  /// deployed flush-stage-only recovery structurally cannot catch (`flush_tx_async` early-returns when the FIFO is
-  /// free, so a `data_free=1` stall is necessarily a `write_all` park — see `docs/streaming-lockup-investigation.md`).
-  pub const WRITE_STAGE_STALL: u32 = 1 << 5;
+  // Bit 5 is RESERVED — formerly `write_stage_stall`, retired once §18/§19 collapsed `usb_tx` to a poll path with no
+  // write-vs-flush await stage (the flag was always `false`). The bit is left UNUSED (the packer never sets it and the
+  // decoder never reads it) rather than reclaimed: renumbering the depth/count shifts below would misdecode a
+  // cross-version breadcrumb from a prior image, so the numeric layout MUST stay fixed. No const is defined for it.
   /// Response depth in bits 6..10 (a nibble; the depth-8 channel → 0..=8 fits, clamp at 15).
   pub const RESPONSE_DEPTH_SHIFT: u32 = 6;
   pub const RESPONSE_DEPTH_MASK: u32 = 0xF << RESPONSE_DEPTH_SHIFT;
   /// Timeout count in bits 10..16 (6 bits, saturated to [`TIMEOUT_COUNT_CLAMP`]). 6 bits is ample for a ≥K
   /// diagnostic — the exact magnitude past the escape is not load-bearing, only "it reached K and kept timing out"
-  /// (`K = 3`, and 63 ≫ 3). The 7th bit was reclaimed for [`WRITE_STAGE_STALL`].
+  /// (`K = 3`, and 63 ≫ 3). Bit 5 below it is the reserved former `write_stage_stall` slot; the shift stays at 10.
   pub const TIMEOUT_COUNT_SHIFT: u32 = 10;
   pub const TIMEOUT_COUNT_MASK: u32 = 0x3F << TIMEOUT_COUNT_SHIFT;
   /// The saturation ceiling for the 6-bit packed timeout count.
@@ -298,9 +297,8 @@ pub fn pack_usb_tx_stall(stall: &UsbTxStall) -> u32 {
   if stall.int_ena_armed {
     word |= bits::INT_ENA_ARMED;
   }
-  if stall.write_stage_stall {
-    word |= bits::WRITE_STAGE_STALL;
-  }
+  // Bit 5 is intentionally left clear — it is the retired `write_stage_stall` slot, reserved so the depth/count
+  // shifts stay stable across versions (see the `bits` module).
   word |= (stall.response_depth.min(15) as u32) << bits::RESPONSE_DEPTH_SHIFT;
   word |= (stall.timeout_count.min(bits::TIMEOUT_COUNT_CLAMP) as u32) << bits::TIMEOUT_COUNT_SHIFT;
   word
@@ -319,7 +317,7 @@ pub fn decode_usb_tx_stall(word: u32) -> Option<UsbTxStall> {
     motion_advancing: word & bits::MOTION_ADVANCING != 0,
     executor_running: word & bits::EXECUTOR_RUNNING != 0,
     int_ena_armed: word & bits::INT_ENA_ARMED != 0,
-    write_stage_stall: word & bits::WRITE_STAGE_STALL != 0,
+    // Bit 5 (retired `write_stage_stall`) is intentionally not read — see the `bits` module reserved-slot note.
     response_depth: ((word & bits::RESPONSE_DEPTH_MASK) >> bits::RESPONSE_DEPTH_SHIFT) as u8,
     timeout_count: ((word & bits::TIMEOUT_COUNT_MASK) >> bits::TIMEOUT_COUNT_SHIFT) as u16,
   })
@@ -553,7 +551,6 @@ mod tests {
       motion_advancing: true,
       executor_running: false,
       int_ena_armed: false,
-      write_stage_stall: false,
       response_depth: 8,
       timeout_count: 3,
     }
@@ -695,7 +692,6 @@ mod tests {
       motion_advancing: false,
       executor_running: true,
       int_ena_armed: false,
-      write_stage_stall: true,
       response_depth: 0,
       timeout_count: 50, // within the 6-bit packed width, so it round-trips exactly.
     };
@@ -710,20 +706,6 @@ mod tests {
     assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&armed)), Some(armed));
     assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&unarmed)), Some(unarmed));
     assert_ne!(pack_usb_tx_stall(&armed), pack_usb_tx_stall(&unarmed), "the bit must change the word");
-  }
-
-  #[test]
-  fn write_stage_stall_round_trips_independently() {
-    // The directly-recorded write-vs-flush stage bit must round-trip and must NOT collide with the depth/count
-    // fields it now sits just below (the count was narrowed 7→6 bits to free this bit). Worst case: both polarities
-    // with maxed neighbours.
-    let write = UsbTxStall { write_stage_stall: true, response_depth: 15, timeout_count: 63, ..base() };
-    let flush = UsbTxStall { write_stage_stall: false, response_depth: 15, timeout_count: 63, ..base() };
-    assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&write)), Some(write));
-    assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&flush)), Some(flush));
-    assert_ne!(pack_usb_tx_stall(&write), pack_usb_tx_stall(&flush), "the stage bit must change the word");
-    // And it must not perturb the neighbouring count: a write-stage stall with a known count decodes that count.
-    assert_eq!(decode_usb_tx_stall(pack_usb_tx_stall(&write)).unwrap().timeout_count, 63);
   }
 
   #[test]
@@ -752,7 +734,6 @@ mod tests {
       motion_advancing: true,
       executor_running: true,
       int_ena_armed: true,
-      write_stage_stall: true,
       response_depth: 15,
       timeout_count: 63,
     };
@@ -806,7 +787,6 @@ mod tests {
       int_ena_armed: false,
       motion_advancing: true,
       executor_running: true,
-      write_stage_stall: false,
       response_depth: 8,
       timeout_count: 3,
     };

@@ -149,6 +149,13 @@ mod idx {
   /// NOT a power-cycle — so on a dead-zone hang that the new backstop converts into a reset, this distinguishes B-1 vs
   /// B-2. (The former `RECOVERED_COUNT` slot at `+3` was retired with the §18/§19 poll-based `usb_tx`, which eliminated
   /// the lost-wake CLASS — there are no recovered lost-wakes to count; the following slots renumbered down by one.)
+  /// CROSS-VERSION CAVEAT: this word — and the other UNTAGGED companion words (`stall_len`, `stall_window`, and
+  /// `rmt_wait_count`) — carries no per-word build stamp, so a reflash to a DIFFERENT image (RTC_FAST survives an
+  /// `espflash` flash) can decode a prior image's bytes here for exactly ONE boot. That is COSMETIC and self-clearing:
+  /// [`take_breadcrumb`] clears the whole breadcrumb every boot, so the stale value never survives past the first dump,
+  /// and the TAGGED primary ([`super::USB_TX_STALL`], carrying its own `USB_TX_STALL_TAG`) still decodes correctly —
+  /// only these untagged secondary numerics can read garbled for that one boot. No validity gate is added (a
+  /// whole-breadcrumb build-id gate would break the documented cross-version `[MSG:CRASH usbtx: ...]` REPLAY contract).
   pub const WATCHDOG_HEARTBEAT: usize = PANIC_BUILD_ID + 3;
   /// The byte length of the response whose write stalled at the K-escape (the §13.1 single-chunk-widening
   /// discriminator). Carried in its OWN word because the packed [`super::USB_TX_STALL`] bit-word is full; the boot
@@ -424,29 +431,68 @@ pub enum WithholdReason {
   Core0ExecutorStall = 4,
 }
 
+impl WithholdReason {
+  /// Decode a raw reason byte (the low byte of a tagged [`idx::WITHHOLD`] word, or a value stashed by a detector)
+  /// back into the enum, or `None` for `0`/an unknown value. The SINGLE owner of the `u8` ⇄ variant mapping, so
+  /// every decode site (the boot label, the survivable ISR's recovery-clear) shares one discriminant table.
+  pub fn from_u8(value: u8) -> Option<WithholdReason> {
+    match value {
+      1 => Some(WithholdReason::Core1Motion),
+      2 => Some(WithholdReason::Core0Comms),
+      3 => Some(WithholdReason::DeadZone),
+      4 => Some(WithholdReason::Core0ExecutorStall),
+      _ => None,
+    }
+  }
+}
+
 /// Tag in the high half of the [`idx::WITHHOLD`] word, distinct from the [`pack_stage`] tag, so a garbage/zeroed
 /// word never decodes as a plausible reason.
 const WITHHOLD_TAG: u32 = 0x5748_0000; // "WH".
 
+/// Pack a [`WithholdReason`] into its tagged [`idx::WITHHOLD`] word — the ONE encoder, so the tag/reason layout lives
+/// in a single place that every writer and predicate below agrees with.
+fn withhold_word(reason: WithholdReason) -> u32 {
+  WITHHOLD_TAG | (reason as u8 as u32)
+}
+
+/// Whether a packed [`idx::WITHHOLD`] word carries the valid tag (vs cold-boot zero / garbage). The ONE tag check,
+/// shared by every decoder below.
+fn withhold_tag_ok(packed: u32) -> bool {
+  packed & 0xFFFF_0000 == WITHHOLD_TAG
+}
+
 /// Record why the watchdog is about to withhold the feed (force a reset). A single relaxed store from the core-0
 /// watchdog task; read only after the reset, so no ordering is needed.
 pub fn record_withhold(reason: WithholdReason) {
-  BREADCRUMB[idx::WITHHOLD].store(WITHHOLD_TAG | (reason as u8 as u32), Ordering::Relaxed);
+  BREADCRUMB[idx::WITHHOLD].store(withhold_word(reason), Ordering::Relaxed);
+}
+
+/// Clear the withhold breadcrumb IFF it still holds exactly `reason` under the valid tag (Fix #3 / H2 recovery-clear).
+/// A relaxed `compare_exchange` from `WITHHOLD_TAG | reason` → bare `0`: a withhold-writing detector calls this when it
+/// observes the executor RECOVER before the unfed RWDT resets, so a later unrelated reset does not spuriously boot the
+/// board LOCKED on a stale wedge word. The CAS makes it race-safe — each withhold writer owns a DISJOINT reason, so a
+/// clear can never clobber a different writer's freshly-stored reason. The result is ignored: a mismatch means the word
+/// already changed (a different reason stored, or already cleared), which is exactly the no-op we want. Correctness
+/// rests on the CAS atomicity + read-only-after-reset, not ordering, so `Relaxed`/`Relaxed` matches the rest of the
+/// breadcrumb protocol. Has a caller in every build config (stall detector + watchdog_feed in production, the
+/// survivable ISR in capture-reset), so it needs no `#[cfg]` gate.
+pub fn clear_withhold_if(reason: WithholdReason) {
+  let _ = BREADCRUMB[idx::WITHHOLD].compare_exchange(withhold_word(reason), 0, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 /// Decode the withhold word into a short label for the boot report, or `None` if the dog fired some other way
 /// (untagged / zero — e.g. the feed task itself stopped, which leaves no withhold marker).
 pub fn withhold_label(packed: u32) -> Option<&'static str> {
-  if packed & 0xFFFF_0000 != WITHHOLD_TAG {
+  if !withhold_tag_ok(packed) {
     return None;
   }
-  match (packed & 0xFF) as u8 {
-    1 => Some("core1-motion-wedge"),
-    2 => Some("core0-comms-wedge"),
-    3 => Some("dead-zone-silent-lock"),
-    4 => Some("core0-executor-stall"),
-    _ => None,
-  }
+  Some(match WithholdReason::from_u8((packed & 0xFF) as u8)? {
+    WithholdReason::Core1Motion => "core1-motion-wedge",
+    WithholdReason::Core0Comms => "core0-comms-wedge",
+    WithholdReason::DeadZone => "dead-zone-silent-lock",
+    WithholdReason::Core0ExecutorStall => "core0-executor-stall",
+  })
 }
 
 /// Whether a decoded [`idx::WITHHOLD`] word is the [`WithholdReason::Core0ExecutorStall`] class (Design A, §20): the
@@ -454,7 +500,18 @@ pub fn withhold_label(packed: u32) -> Option<&'static str> {
 /// alarm (via [`super::wedge_reset_alarm`]) and name the cause. Guards the tag so a cold-boot / garbage word is not
 /// mistaken for a wedge. Reads the SAME word `withhold_label` decodes.
 pub fn withhold_was_executor_stall(packed: u32) -> bool {
-  packed & 0xFFFF_0000 == WITHHOLD_TAG && (packed & 0xFF) as u8 == WithholdReason::Core0ExecutorStall as u8
+  withhold_tag_ok(packed) && (packed & 0xFF) as u8 == WithholdReason::Core0ExecutorStall as u8
+}
+
+/// Whether a decoded [`idx::WITHHOLD`] word names ANY wedge class — the valid tag with a NONZERO reason byte (Fix #1,
+/// the Option-A fail-safe boot-lock). This is deliberately NOT a literal `1..=4` match: [`record_withhold`] only ever
+/// writes a valid reason under the tag and [`take_breadcrumb`] clears the word to a bare `0`, so "tag present AND
+/// nonzero low byte" is EXACT today AND auto-covers any future [`WithholdReason`] 5+. A literal range would silently
+/// boot a new wedge class UNLOCKED — the exact silent-resume this fix prevents. Superset of
+/// [`withhold_was_executor_stall`] (which asks the narrower "was it the executor-stall class"); the two cannot
+/// disagree. Reads the SAME word [`withhold_label`] decodes.
+pub fn withhold_was_wedge(packed: u32) -> bool {
+  withhold_tag_ok(packed) && (packed & 0xFF) != 0
 }
 
 /// Tag in the high half of the [`idx::RMT_FLAGS`] word, marking a real RMT-hang capture vs cold-boot garbage.

@@ -59,6 +59,23 @@ static EXECUTOR_ALIVE_FROZEN: AtomicU32 = AtomicU32::new(0);
 /// stall (not every 250 ms until the RWDT resets). Reset to `0` whenever the beat advances (the executor recovered).
 static STALL_LATCHED: AtomicU32 = AtomicU32::new(0);
 
+/// Consecutive NON-frozen samples observed since the last frozen sample, for the DEBOUNCED recovery-clear of a
+/// recorded `core0-executor-stall` breadcrumb (Fix #3). Reset to `0` on any frozen sample; the breadcrumb is erased
+/// only once this crosses [`FROZEN_RECOVERY_DEBOUNCE_TICKS`].
+static FROZEN_RECOVERY_TICKS: AtomicU32 = AtomicU32::new(0);
+
+/// Consecutive non-frozen samples required before ERASING a recorded `core0-executor-stall` breadcrumb on recovery
+/// (Fix #3, `docs/streaming-lockup-investigation.md` §20). This detector CANNOT feed the RWDT itself, so it must wait
+/// until the async [`crate::comms::watchdog_feed`] has PROVABLY re-fed the dog before clearing the fail-safe marker:
+/// `K * SAMPLE_INTERVAL >= WATCHDOG_FEED_INTERVAL` guarantees at least one feed interval has elapsed since the executor
+/// recovered, canceling any pending reset. Any RWDT reset that was already inevitable fires before this debounced clear
+/// → the board still boots LOCKED. `ceil(500 ms / 250 ms) = 2`.
+const FROZEN_RECOVERY_DEBOUNCE_TICKS: u32 = {
+  let feed_ms = crate::comms::WATCHDOG_FEED_INTERVAL.as_millis();
+  let sample_ms = SAMPLE_INTERVAL.as_millis();
+  ((feed_ms + sample_ms - 1) / sample_ms) as u32 // Ceiling division so a non-integer ratio still spans a full feed.
+};
+
 /// Build the TIMG1 periodic timer, bind the [`fire`] ISR, and start it. Called once from `main` on ProCpu (so the
 /// interrupt is core-0-fielded), in the PRODUCTION (non-`capture-reset`) build only. Detector-only: it never touches
 /// the RWDT the async [`crate::comms::watchdog_feed`] owns.
@@ -107,6 +124,8 @@ fn fire() {
   // `!= 0` guard stops the pre-first-bump zero (before the feeder is scheduled) from accruing a false stall at boot.
   let frozen = alive != 0 && alive == last;
   let frozen_ticks = if frozen {
+    // A frozen sample restarts the recovery debounce: recovery must be measured from the LAST freeze, not from boot.
+    FROZEN_RECOVERY_TICKS.store(0, Ordering::Relaxed);
     EXECUTOR_ALIVE_FROZEN.load(Ordering::Relaxed).saturating_add(1)
   } else {
     0
@@ -120,7 +139,19 @@ fn fire() {
       crate::crash::record_withhold(crate::crash::WithholdReason::Core0ExecutorStall);
     }
   } else if !frozen {
-    // The executor advanced — clear the latch so a future stall records afresh.
+    // The executor advanced — clear the record-once latch so a future stall records afresh.
     STALL_LATCHED.store(0, Ordering::Relaxed);
+    // DEBOUNCED recovery-clear (Fix #3): erase a recorded breadcrumb only after >= K consecutive non-frozen samples, so
+    // the async `watchdog_feed` has provably re-fed the RWDT (K * 250 ms >= the 500 ms feed interval) — canceling any
+    // pending reset before we drop the fail-safe marker. Fire the clear EXACTLY on crossing K, then hold at K (the CAS
+    // is a no-op once the word is already bare 0), so we do not re-CAS the RTC_FAST word every 250 ms forever.
+    let recovered = FROZEN_RECOVERY_TICKS.load(Ordering::Relaxed);
+    if recovered < FROZEN_RECOVERY_DEBOUNCE_TICKS {
+      let next = recovered + 1;
+      FROZEN_RECOVERY_TICKS.store(next, Ordering::Relaxed);
+      if next >= FROZEN_RECOVERY_DEBOUNCE_TICKS {
+        crate::crash::clear_withhold_if(crate::crash::WithholdReason::Core0ExecutorStall);
+      }
+    }
   }
 }
