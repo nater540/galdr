@@ -537,7 +537,7 @@ async fn main(spawner: Spawner) {
   // on any DETECTED-then-RECOVERED wedge, so a word still set at reset time provably means "this run wedged and did NOT
   // recover" — no `reset_was_watchdog` guard is needed (it would wrongly suppress a real wedge that coincides with a
   // non-watchdog reset). The named cause also appears in the `[MSG:CRASH …]` boot dump below.
-  if crash::withhold_was_wedge(breadcrumb.withhold) {
+  if crash::position_suspect(breadcrumb.withhold) {
     comms::force_wedge_alarm(homing_enabled);
   }
   // Seed the `$21` hard-limit-enable mirror so the core-1 executor's hard-limit check reads the persisted state

@@ -273,6 +273,9 @@ fn fire() {
   // guard `executor_alive != 0` — once the core-0 heartbeat task has run at least once, ANY subsequent freeze is a
   // stall, regardless of host / motion / response state (the blind spot the other three detectors share). The `!= 0`
   // guard stops the pre-first-bump zero (before the task is scheduled) from accruing a false stall at boot.
+  // NOTE: this seed → boot-guard → frozen-tick machine is mirrored host-testably by
+  // `firmware_core::diag::ExecutorFreezeTracker` (#11); it also matches `crate::stall_detector`'s copy. Until the bench
+  // rewire folds both ISRs onto `observe()` (homing-bench-checklist §10), these are PARALLEL copies — keep in lockstep.
   let executor_frozen = bump_or_reset(&EXECUTOR_ALIVE_FROZEN, executor_alive != 0 && executor_alive == last_executor_alive);
 
   let decision = firmware_core::diag::watchdog_decision(firmware_core::diag::WatchdogInputs {

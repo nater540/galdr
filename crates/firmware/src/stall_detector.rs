@@ -122,6 +122,9 @@ fn fire() {
   // Frozen iff the beat did not advance — gated ONLY by the boot guard `alive != 0` (once the production feeder has run
   // at least once, ANY subsequent freeze is a full-executor stall, regardless of host / motion / response state). The
   // `!= 0` guard stops the pre-first-bump zero (before the feeder is scheduled) from accruing a false stall at boot.
+  // NOTE: this seed → boot-guard → frozen-tick → threshold-cross machine is mirrored host-testably by
+  // `firmware_core::diag::ExecutorFreezeTracker` (#11). Until the bench rewire folds this ISR onto `observe()`
+  // (homing-bench-checklist §10), the two are PARALLEL copies — keep any edit here in lockstep with that reducer.
   let frozen = alive != 0 && alive == last;
   let frozen_ticks = if frozen {
     // A frozen sample restarts the recovery debounce: recovery must be measured from the LAST freeze, not from boot.
