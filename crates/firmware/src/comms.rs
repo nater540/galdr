@@ -1587,7 +1587,11 @@ const USB_TX_PACKET_BYTES: usize = 64;
 /// source (see `docs/streaming-lockup-investigation.md` §18). The per-poll decision is the host-tested
 /// [`firmware_core::diag::usb_tx_poll_action`].
 ///
-/// A `WouldBlock` that persists past [`USB_TX_TIMEOUT`] is a genuine host-not-reading stall → [`WriteOutcome::Stalled`]
+/// The stall deadline is PER CHUNK (Fix #2): each ≤64 B chunk — its byte-push AND its commit — gets a fresh
+/// [`USB_TX_TIMEOUT`] budget, reset at chunk start (NOT per byte, so partial progress does not extend it). This restores
+/// per-stage tolerance (the final chunk's flush no longer inherits a budget drained by earlier bytes) while keeping the
+/// worst case bounded at nchunks × [`USB_TX_TIMEOUT`]; single-chunk flow-control responses are unaffected. A `WouldBlock`
+/// that persists past that per-chunk deadline is a genuine host-not-reading stall → [`WriteOutcome::Stalled`]
 /// (drop-and-continue + the K-escape). Flow-control integrity: the flow-control-critical responses (`ok` / `error:N`)
 /// are ≤64 B = a SINGLE packet, so a stall either sends the whole line or none of it — they are never truncated (the
 /// first `write_byte_nb` blocks on a full FIFO before any byte is committed). A mid-response stall on a MULTI-chunk
@@ -1601,14 +1605,27 @@ async fn write_response_polled(
   bytes: &[u8],
 ) -> firmware_core::diag::WriteOutcome {
   use firmware_core::diag::{PollAction, WriteOutcome, usb_tx_poll_action};
-  let deadline = Instant::now() + USB_TX_TIMEOUT;
   for chunk in bytes.chunks(USB_TX_PACKET_BYTES) {
+    // Fix #2/#13: a FRESH stall deadline PER CHUNK, reset at chunk START (not per byte). Each ≤64 B chunk — its bytes
+    // AND its commit — gets a full `USB_TX_TIMEOUT` budget, so the final chunk's flush never inherits a budget drained
+    // by earlier bytes. The budget is NOT extended by per-byte progress, so a chunk that cannot push+commit within the
+    // timeout still trips at the timeout; worst case is bounded at nchunks × `USB_TX_TIMEOUT`, and flow-control
+    // responses (`ok`/`error:N`, ≤64 B) are a single chunk = behaviorally identical to a single whole-response budget.
+    let deadline = Instant::now() + USB_TX_TIMEOUT;
     // Fill the FIFO with this chunk's bytes. `write_byte_nb` writes IFF `serial_in_ep_data_free` (room); a `WouldBlock`
     // means the FIFO is full because the host has not drained the previous packet yet — yield and re-poll.
     for &byte in chunk {
       loop {
+        // Fix #13: read the clock ONLY when a byte did NOT go out. On the progress path `Advance` is chosen directly
+        // (no `Instant::now()`), so the happy path never pays for a timestamp read; the deadline is consulted solely to
+        // classify a stall. This also keeps the `Advance` arm reachable via the `progressed` short-circuit only.
         let progressed = tx.write_byte_nb(byte).is_ok();
-        match usb_tx_poll_action(progressed, Instant::now() >= deadline) {
+        let action = if progressed {
+          PollAction::Advance
+        } else {
+          usb_tx_poll_action(false, Instant::now() >= deadline)
+        };
+        match action {
           PollAction::Advance => break,
           PollAction::Stall => return WriteOutcome::Stalled,
           PollAction::Yield => yield_now().await,
@@ -1624,8 +1641,15 @@ async fn write_response_polled(
     // keeps the byte stream faithful to esp-hal's tested sequencing.
     if tx.flush_tx_nb().is_err() {
       loop {
+        // Fix #13: same lazy-clock shape as the byte loop — read `Instant::now()` only when the commit has NOT yet
+        // registered. The commit budget shares this chunk's fresh deadline (Fix #2).
         let committed = (esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().bits() & 0b011) != 0;
-        match usb_tx_poll_action(committed, Instant::now() >= deadline) {
+        let action = if committed {
+          PollAction::Advance
+        } else {
+          usb_tx_poll_action(false, Instant::now() >= deadline)
+        };
+        match action {
           PollAction::Advance => break,
           PollAction::Stall => return WriteOutcome::Stalled,
           PollAction::Yield => yield_now().await,
@@ -3222,7 +3246,9 @@ pub async fn coolant(controller: &'static mut crate::coolant::Coolant) {
 /// single late wake (e.g. a brief flash-write quiesce that parks core 0 for tens of ms) cannot trip the dog. 500 ms
 /// gives a 16x margin: the timeout only expires after ~8 s of the core-0 thread-mode executor never running this
 /// task at all — i.e. a genuine core-0 wedge, exactly the condition we want a reset for, never a normal stall.
-const WATCHDOG_FEED_INTERVAL: Duration = Duration::from_millis(500);
+// `pub(crate)` so the production stall detector can derive its recovery-clear debounce (Fix #3) from the SAME feed
+// interval — the debounce must span at least one feed so the RWDT is provably re-fed before a breadcrumb is erased.
+pub(crate) const WATCHDOG_FEED_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Number of consecutive [`WATCHDOG_FEED_INTERVAL`] ticks over which the core-1 liveness beat may stay frozen WHILE
 /// a block is actively executing before [`watchdog_feed`] declares a core-1-only wedge and withholds the feed (Goal
@@ -3335,6 +3361,11 @@ pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) ->
   // must not count as "host active" before the first real RX byte arrives (else the comms-stall check could trip on
   // a host-less board in the first few seconds — a reset loop). The first RX advance resets this to 0.
   let mut rx_idle_ticks: u32 = RX_ACTIVE_TICKS;
+  // Fix #3/H2 recovery-clear: the wedge class this task last RECORDED, held across iterations so a detected-then-
+  // recovered wedge (frozen counters reset → we fall through to the feed path) can erase its now-stale breadcrumb.
+  // DECLARED OUTSIDE THE LOOP IS LOAD-BEARING: inside the loop it would reset to `None` on every feed-path entry and
+  // the clear would never fire (a silent no-op). Set in the wedge block; consumed AFTER the feed on the healthy path.
+  let mut withheld: Option<crate::crash::WithholdReason> = None;
   loop {
     // Free-running heartbeat (Signature-B instrumentation): bumped EVERY iteration, unconditionally, so the boot
     // dump's `wdog=` value reveals whether THIS task ran through a wedge (climbed → B-1 fed-but-fooled) or died
@@ -3417,6 +3448,10 @@ pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) ->
         crate::crash::WithholdReason::DeadZone
       };
       crate::crash::record_withhold(reason);
+      // Remember the class we just recorded so a LATER healthy tick (frozen counters reset → fed) can erase the stale
+      // breadcrumb after the feed (Fix #3/H2). We overwrite any prior pending reason — `record_withhold` already
+      // overwrote the breadcrumb word, so tracking the latest keeps the two consistent.
+      withheld = Some(reason);
       #[cfg(feature = "defmt")]
       if core1_wedged {
         defmt::error!("watchdog: core-1 wedged mid-motion ({=u32} ticks) — withholding feed to force reset", core1_frozen_ticks);
@@ -3432,6 +3467,13 @@ pub async fn watchdog_feed(rtc: &'static mut esp_hal::rtc_cntl::Rtc<'static>) ->
     // Healthy, idle, or host-absent: pet the dog. The whole loop body is a handful of atomic ops + one await, so it
     // can never delay the feed past the 8 s timeout.
     rtc.rwdt.feed();
+    // Fix #3/H2: a wedge recorded on a PRIOR iteration whose condition has since cleared (frozen counters reset → we
+    // reached this feed path) left a stale breadcrumb; erase it AFTER the feed — the feed cancels the pending reset, so
+    // clearing after it is safe even on a knife-edge RWDT expiry (clearing BEFORE could boot UNLOCKED). `clear_withhold_if`
+    // is a CAS that no-ops unless the word still holds exactly that reason, so it never clobbers another writer.
+    if let Some(reason) = withheld.take() {
+      crate::crash::clear_withhold_if(reason);
+    }
     #[cfg(feature = "defmt")]
     {
       if core1_frozen_ticks > 0 {

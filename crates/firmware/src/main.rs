@@ -521,12 +521,16 @@ async fn main(spawner: Spawner) {
   // required) when homing is enabled — a host must `$H`/`$X` before streaming — else boots Idle. The boot
   // `ALARM:N` push is emitted after the banner below so a sender detects the locked state on connect.
   comms::init_control_state(homing_enabled);
-  // Design A (§20): if the PRIOR reset was the production stall detector's `core0-executor-stall` wedge (the
-  // breadcrumb read above names it), OVERRIDE the default boot state with the fail-safe wedge alarm so the board comes
-  // up LOCKED — never a silent resume in a now-suspect position. Homing ENABLED is already `ALARM:11` (idempotent);
-  // homing DISABLED overrides the default `Idle` with `ALARM:3` (position lost). The breadcrumb is the discriminator
-  // vs any ordinary reset. The named cause also appears in the `[MSG:CRASH core0-executor-stall …]` boot dump below.
-  if crash::withhold_was_executor_stall(breadcrumb.withhold) {
+  // Fix #1 (Option A fail-safe): if the PRIOR reset was ANY watchdog-withheld wedge (core-1 motion, core-0 comms, the
+  // dead-zone backstop, or the core-0 executor stall — the breadcrumb read above names the class), OVERRIDE the default
+  // boot state with the fail-safe wedge alarm so the board comes up LOCKED — never a silent resume in a now-suspect
+  // position. Every wedge class deliberately starved the dog because forward progress stopped, so position is suspect
+  // for ALL of them, not just the executor stall. Homing ENABLED is already `ALARM:11` (idempotent); homing DISABLED
+  // overrides the default `Idle` with `ALARM:3` (position lost). The recovery-clear (Fix #3/H2) erases the breadcrumb
+  // on any DETECTED-then-RECOVERED wedge, so a word still set at reset time provably means "this run wedged and did NOT
+  // recover" — no `reset_was_watchdog` guard is needed (it would wrongly suppress a real wedge that coincides with a
+  // non-watchdog reset). The named cause also appears in the `[MSG:CRASH …]` boot dump below.
+  if crash::withhold_was_wedge(breadcrumb.withhold) {
     comms::force_wedge_alarm(homing_enabled);
   }
   // Seed the `$21` hard-limit-enable mirror so the core-1 executor's hard-limit check reads the persisted state

@@ -156,6 +156,11 @@ static RX_IDLE: AtomicU32 = AtomicU32::new(RX_ACTIVE_TICKS);
 /// cleared), so a fresh wedge captures again. `1` = a withhold is in progress and the breadcrumb is already written.
 static WITHHOLD_LATCHED: AtomicU32 = AtomicU32::new(0);
 
+/// The [`crate::crash::WithholdReason`] value [`capture_withhold`] last recorded (as its `u8`, `0` = none captured
+/// yet), so the healthy `None` branch can erase exactly that breadcrumb on recovery (Fix #3/H2). This ISR is the SOLE
+/// withhold writer in the capture-reset build, so there is no cross-writer contention on the recovery CAS.
+static LAST_CAPTURED_WITHHOLD: AtomicU32 = AtomicU32::new(0);
+
 /// Free-running count of ISR fires since boot, used ONLY by the `force-withhold` positive-control build to trigger a
 /// deterministic withhold after a fixed delay. Plain `Relaxed` RMW — the ISR is the sole writer.
 #[cfg(feature = "force-withhold")]
@@ -304,6 +309,13 @@ fn fire() {
         feed_swd_raw();
       }
       WITHHOLD_LATCHED.store(0, Ordering::Relaxed);
+      // Fix #3/H2 recovery-clear: after the raw feeds cancel any pending reset, erase a breadcrumb captured on a PRIOR
+      // fire whose wedge has since cleared, so a later unrelated reset does not spuriously boot LOCKED. Ordered AFTER
+      // the feeds (a knife-edge dog expiry still boots locked); this ISR is the sole withhold writer, so the CAS never
+      // contends. `swap(0)` reads-and-resets the tracked reason so the clear runs at most once per recovery.
+      if let Some(reason) = last_captured_reason(LAST_CAPTURED_WITHHOLD.swap(0, Ordering::Relaxed)) {
+        crate::crash::clear_withhold_if(reason);
+      }
     }
     Some(reason) => {
       // A wedge: do NOT feed (both dogs run out → reset). Capture the breadcrumb EXACTLY ONCE per withhold
@@ -356,6 +368,20 @@ fn bump_or_reset(slot: &AtomicU32, frozen: bool) -> u32 {
 /// published (so even a hard Signature-B lock that never reached the K-escape carries its last-known state) and the
 /// windowed stall count. All three usb_tx words are republished by `usb_tx` on every write timeout, so they hold the
 /// freshest stall snapshot available — the ISR just copies them into the breadcrumb words.
+/// Reconstruct the [`crate::crash::WithholdReason`] a prior [`capture_withhold`] stored in [`LAST_CAPTURED_WITHHOLD`]
+/// (as its `u8` discriminant), so the recovery-clear can name the exact word to erase. `0` / any unknown value → `None`
+/// (nothing to clear). Local to this capture-reset-only module, so it is never dead code in the production build.
+fn last_captured_reason(value: u32) -> Option<crate::crash::WithholdReason> {
+  use crate::crash::WithholdReason;
+  match value {
+    1 => Some(WithholdReason::Core1Motion),
+    2 => Some(WithholdReason::Core0Comms),
+    3 => Some(WithholdReason::DeadZone),
+    4 => Some(WithholdReason::Core0ExecutorStall),
+    _ => None,
+  }
+}
+
 fn capture_withhold(reason: firmware_core::diag::WithholdKind) {
   use firmware_core::diag::WithholdKind;
   let withhold = match reason {
@@ -365,6 +391,9 @@ fn capture_withhold(reason: firmware_core::diag::WithholdKind) {
     WithholdKind::DeadZone => crate::crash::WithholdReason::DeadZone,
   };
   crate::crash::record_withhold(withhold);
+  // Track the reason we just recorded so the healthy `None` branch can erase exactly this breadcrumb if the wedge
+  // later clears before the dogs reset (Fix #3/H2).
+  LAST_CAPTURED_WITHHOLD.store(withhold as u8 as u32, Ordering::Relaxed);
   // The packed `UsbTxStall` word + response length usb_tx last published on a write timeout. `0`/untagged decodes as
   // "no usb_tx stall this run" (the pure decoder rejects it) — correct for a pure core-1/comms wedge with no usb_tx
   // stall. `record_usb_tx_stall` stores the packed word verbatim, so the boot dump's verdict still classifies it.
