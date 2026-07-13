@@ -82,6 +82,13 @@ mod survivable_watchdog;
 mod stall_detector;
 mod tmc;
 
+// The two executor-stall inducers both spawn the pool-size-1 `provoke_executor_stall` task (~10 s after boot), so
+// enabling both would spawn it twice and the second spawn would panic at boot (a pool-exhausted spawn). They are
+// contradictory by design anyway — `provoke-stall-bare` is a production build with no survivable ISR, while
+// `provoke-executor-stall` pulls in `capture-reset`. Turn the boot-time double-spawn panic into a clear compile error.
+#[cfg(all(feature = "provoke-stall-bare", feature = "provoke-executor-stall"))]
+compile_error!("provoke-stall-bare and provoke-executor-stall are mutually exclusive diagnostic builds (both stall the executor ~10s after boot); enable exactly one.");
+
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// Custom panic handler (replacing esp-backtrace's default `interrupt_free(|| loop {})`, which halts FOREVER with
@@ -549,8 +556,12 @@ async fn main(spawner: Spawner) {
   //    their RMT channels / pins live for the program's lifetime (the motion task borrows the sink `'static`).
   // A-STEP (RMT ch3) pin selection. PRODUCTION: GPIO18 (DOC-00 spare 4th axis; PROVISIONAL, DOC-10 Phase 5). The
   // DIAGNOSTIC `capture-reset` build instead hands GPIO18 to the survivable-watchdog scope heartbeat (below), so the
-  // never-driven A-STEP channel binds to `NoPin` (nothing) here — inert, since the A axis is bench-unverified and
-  // never transmits in this build. `motion::init` is generic in the 4th step pin, so no `cfg` leaks into `motion.rs`.
+  // A-STEP channel binds to `NoPin` (nothing) here. Consequence: a 4-axis job run on a capture-reset image emits NO
+  // physical A pulses — RMT ch3 still transmits to `NoPin`, so block timing / axis coordination are preserved (X/Y/Z
+  // stay correct), only the A stepper output is silently dropped. This is ACCEPTED, not guarded at runtime: the A axis
+  // is bench-unverified on EVERY build, and capture-reset is a diagnostic image that never runs production cut jobs, so
+  // a runtime reject/warn is not justified and would only add risk to the motion path. `motion::init` is generic in the
+  // 4th step pin, so no `cfg` leaks into `motion.rs`.
   #[cfg(not(feature = "capture-reset"))]
   let a_step_pin = peripherals.GPIO18;
   #[cfg(feature = "capture-reset")]

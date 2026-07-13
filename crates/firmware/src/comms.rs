@@ -1179,10 +1179,10 @@ fn format_rmt_hang_report(hang: &crate::crash::RmtHang) -> Option<Response> {
 /// esp-hal-side lost USB TX-done wake, §11.4 H-A), `core1-wedged` (core 1 froze mid-block — the USB stall is
 /// downstream of a core-1 wedge, §11.4 H-B), or `ambiguous`. The raw signals back the verdict and split the H-A
 /// sub-flavor: `free` (host drained), `empty` (int_raw TX-empty event), `iena` (int_ena still armed ⇒ the ISR never
-/// ran; both `empty`/`iena` clear ⇒ the ISR ran but the embassy re-poll was lost), `wstg` (the final stall was at the
-/// `write_all` stage vs the flush stage — `wstg=1` is the Signature-A lost wake the flush-stage-only recovery cannot
-/// catch, recorded directly rather than inferred from `iena`), `mov`/`exec` (core-1 health),
-/// `rdepth` (RESPONSE backlog). `rmt_to` is the run's RMT-wait-timeout count: `n>=K && rmt_to=0` POSITIVELY excludes
+/// ran; both `empty`/`iena` clear ⇒ the ISR ran but the embassy re-poll was lost), `mov`/`exec` (core-1 health),
+/// `rdepth` (RESPONSE backlog). (The former `wstg` write-vs-flush-stage field is retired: §18/§19 collapsed `usb_tx`
+/// to a poll path with no separate write/flush await stage, so it was always `0`.) `rmt_to` is the run's
+/// RMT-wait-timeout count: `n>=K && rmt_to=0` POSITIVELY excludes
 /// the RMT theory for the drumbeat (§11.1) by evidence, not inference. `wnd` is the WINDOWED stall count (§13.8): a
 /// high `wnd` with a low consecutive `n` means the link was ALTERNATING-degraded (recoveries kept resetting the K
 /// counter) rather than purely stuck — a distinct Signature class. Its own line so it stays under [`RESPONSE_CAPACITY`].
@@ -1200,12 +1200,11 @@ fn format_usb_tx_stall_report(
   // could truncate (write_async parks between 64 B chunks). `rdepth` stays the (clamped-nibble) channel occupancy.
   let _ = write!(
     inner,
-    "CRASH usbtx: {} free={} empty={} iena={} wstg={} mov={} exec={} rdepth={} rlen={} n={} rmt_to={} wnd={}",
+    "CRASH usbtx: {} free={} empty={} iena={} mov={} exec={} rdepth={} rlen={} n={} rmt_to={} wnd={}",
     verdict,
     stall.data_free as u8,
     stall.serial_in_empty as u8,
     stall.int_ena_armed as u8,
-    stall.write_stage_stall as u8,
     stall.motion_advancing as u8,
     stall.executor_running as u8,
     stall.response_depth,
@@ -1710,10 +1709,6 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
           int_ena_armed: int_ena.serial_in_empty().bit_is_set(),
           motion_advancing: MOTION_LIVENESS.load(Ordering::Relaxed) != motion_before,
           executor_running: EXECUTOR_RUNNING.load(Ordering::Acquire),
-          // With the poll-based write there is no write-vs-flush await stage: a `Stalled` here is a FIFO that stayed
-          // full past the deadline = the host is not draining (`data_free == false` above). Record `false` — the
-          // Signature-A write-stage-lost-wake distinction no longer exists (§18/§19 eliminated the await path).
-          write_stage_stall: false,
           response_depth: RESPONSE.len().min(u8::MAX as usize) as u8,
           timeout_count: stall.count().saturating_add(1),
         };
@@ -1739,8 +1734,7 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
       // host-not-draining wedge (or a PARTIAL fix where a wake still slips through). The TIER 2/3 split
       // (`capture-reset`, §17) decides what happens here:
       // - DIAGNOSTIC build (`--features capture-reset`): capture the discriminator + `software_reset()` so the next
-      //   boot emits `[MSG:CRASH usbtx: ...]` (RTC_FAST survives the CoreSw reset). `stall_at_write_stage` records
-      //   whether the final tripping stall was at `write_all` (the Signature-A flavor) vs flush; `resp.len()` is the
+      //   boot emits `[MSG:CRASH usbtx: ...]` (RTC_FAST survives the CoreSw reset); `resp.len()` is the
       //   single-chunk-widening discriminator. This is the open-investigation capture channel (#20/#21).
       // - PRODUCTION build (default): raise the LOCKED `ALARM:17` (MotorFault) — feed-hold + require re-home — and
       //   reset the local stall run so usb_tx keeps serving the alarm/banner traffic. NEVER a silent reset the host
@@ -1749,10 +1743,8 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
       // can reset the board is the survivable-watchdog ISR's WITHHELD dog. In the first force-withhold run the usb_tx
       // K-escape (`CoreSw`, `n=3 host-not-reading`) software-reset the board and MASKED whether a dog bites at all —
       // this build removes that confound, so a self-reset can ONLY be a dog (read `[MSG:RESET super-WDT|...rtc-WDT]`).
-      // `write_stage_stall` is now always `false` (the poll path has no write-vs-flush await stage; a stall is a
-      // host-not-reading FIFO-full past the deadline). Kept in the signature for the breadcrumb's field layout.
       #[cfg(not(feature = "force-withhold"))]
-      handle_usb_tx_wedge(motion_before, stall.count(), false, resp.len());
+      handle_usb_tx_wedge(motion_before, stall.count(), resp.len());
       // Production (non-capture) AND the force-withhold dog-isolation build both fall through here (in force-withhold
       // `handle_usb_tx_wedge` is not called, so usb_tx must keep serving); clear the stall run so a single residual
       // wedge does not immediately re-trip. Only the plain `capture-reset` build diverges inside the helper (reset).
@@ -1774,13 +1766,13 @@ pub async fn usb_tx(mut tx: UsbSerialJtagTx<'static, Async>) -> ! {
 // Not compiled under `force-withhold` (§17.16 dog-isolation): there the K-escape call site is cfg'd out so usb_tx
 // never software-resets, leaving the ISR's withheld dog as the sole resetter.
 #[cfg(all(feature = "capture-reset", not(feature = "force-withhold")))]
-fn handle_usb_tx_wedge(motion_before: u32, timeout_count: u16, write_stage_stall: bool, response_len: usize) -> ! {
-  capture_usb_tx_stall_and_reset(motion_before, timeout_count, write_stage_stall, response_len);
+fn handle_usb_tx_wedge(motion_before: u32, timeout_count: u16, response_len: usize) -> ! {
+  capture_usb_tx_stall_and_reset(motion_before, timeout_count, response_len);
 }
 
 /// Production variant: raise the motion-fault alarm instead of resetting. See the `capture-reset` variant above.
 #[cfg(not(feature = "capture-reset"))]
-fn handle_usb_tx_wedge(_motion_before: u32, _timeout_count: u16, _write_stage_stall: bool, _response_len: usize) {
+fn handle_usb_tx_wedge(_motion_before: u32, _timeout_count: u16, _response_len: usize) {
   // A residual unrecoverable USB-TX wedge: the host is not draining (or a lost wake slipped past TIER 1). Halt the
   // program into the LOCKED `ALARM:17` and force a re-home — the executor's motion-fault path and this share the one
   // alarm. The consumer (the planner owner) services `MOTION_FAULT`, flushes the queue, and emits the alarm; usb_tx
@@ -1804,7 +1796,7 @@ fn handle_usb_tx_wedge(_motion_before: u32, _timeout_count: u16, _write_stage_st
 /// task), mirroring `motion.rs`'s `capture_rmt_hang`. `software_reset()` is `CoreSw`, which preserves RTC_FAST.
 /// `-> !`: this never returns (it resets the chip). Not compiled under `force-withhold` (dog-isolation, §17.16).
 #[cfg(all(feature = "capture-reset", not(feature = "force-withhold")))]
-fn capture_usb_tx_stall_and_reset(motion_before: u32, timeout_count: u16, write_stage_stall: bool, response_len: usize) -> ! {
+fn capture_usb_tx_stall_and_reset(motion_before: u32, timeout_count: u16, response_len: usize) -> ! {
   let usb = esp_hal::peripherals::USB_DEVICE::regs();
   let ep1 = usb.ep1_conf().read();
   let int_raw = usb.int_raw().read();
@@ -1816,9 +1808,6 @@ fn capture_usb_tx_stall_and_reset(motion_before: u32, timeout_count: u16, write_
     // Core 1 advanced across the stall window ⇒ still scheduling (favors a lost USB wake, not a core-1 wedge).
     motion_advancing: MOTION_LIVENESS.load(Ordering::Relaxed) != motion_before,
     executor_running: EXECUTOR_RUNNING.load(Ordering::Acquire),
-    // Whether the final tripping stall was at the `write_all` stage (Signature A) vs the flush stage — recorded by
-    // the caller so the boot dump's `wstg` field is a direct fact, not inferred from `int_ena`.
-    write_stage_stall,
     // The depth-8 RESPONSE channel's current occupancy; clamps into the nibble in the packer.
     response_depth: RESPONSE.len().min(u8::MAX as usize) as u8,
     timeout_count,

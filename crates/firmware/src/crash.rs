@@ -149,6 +149,13 @@ mod idx {
   /// NOT a power-cycle — so on a dead-zone hang that the new backstop converts into a reset, this distinguishes B-1 vs
   /// B-2. (The former `RECOVERED_COUNT` slot at `+3` was retired with the §18/§19 poll-based `usb_tx`, which eliminated
   /// the lost-wake CLASS — there are no recovered lost-wakes to count; the following slots renumbered down by one.)
+  /// CROSS-VERSION CAVEAT: this word — and the other UNTAGGED companion words (`stall_len`, `stall_window`, and
+  /// `rmt_wait_count`) — carries no per-word build stamp, so a reflash to a DIFFERENT image (RTC_FAST survives an
+  /// `espflash` flash) can decode a prior image's bytes here for exactly ONE boot. That is COSMETIC and self-clearing:
+  /// [`take_breadcrumb`] clears the whole breadcrumb every boot, so the stale value never survives past the first dump,
+  /// and the TAGGED primary ([`super::USB_TX_STALL`], carrying its own `USB_TX_STALL_TAG`) still decodes correctly —
+  /// only these untagged secondary numerics can read garbled for that one boot. No validity gate is added (a
+  /// whole-breadcrumb build-id gate would break the documented cross-version `[MSG:CRASH usbtx: ...]` REPLAY contract).
   pub const WATCHDOG_HEARTBEAT: usize = PANIC_BUILD_ID + 3;
   /// The byte length of the response whose write stalled at the K-escape (the §13.1 single-chunk-widening
   /// discriminator). Carried in its OWN word because the packed [`super::USB_TX_STALL`] bit-word is full; the boot
