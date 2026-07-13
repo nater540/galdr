@@ -514,6 +514,19 @@ pub fn withhold_was_wedge(packed: u32) -> bool {
   withhold_tag_ok(packed) && (packed & 0xFF) != 0
 }
 
+/// Whether the prior reset left the machine's POSITION suspect — the single fail-safe question the boot path asks to
+/// decide the Option-A lock (`main.rs`). A SEMANTIC alias over [`withhold_was_wedge`]: EVERY wedge class deliberately
+/// starved the dog because forward progress stopped, so position is suspect for ALL of them (not just the executor
+/// stall). Naming the boot decision for the SAFETY question it answers — "is position suspect?" — rather than the
+/// mechanism ("is a wedge reason recorded?") keeps the boot path a single question, with the wedge-class encoding as
+/// the SINGLE source of truth: there is no second stored bit to drift out of sync, and the cross-version replay
+/// contract is preserved (a tagged nonzero reason from ANY image version locks; a cold-boot / garbage word does not —
+/// see [`withhold_was_wedge`] and the `firmware_core::diag` cross-version breadcrumb note). The boot path calls THIS;
+/// the wedge-class detail stays in the predicate it delegates to.
+pub fn position_suspect(packed: u32) -> bool {
+  withhold_was_wedge(packed)
+}
+
 /// Tag in the high half of the [`idx::RMT_FLAGS`] word, marking a real RMT-hang capture vs cold-boot garbage.
 const RMT_SNAPSHOT_TAG: u32 = 0x524D_0000; // "RM".
 

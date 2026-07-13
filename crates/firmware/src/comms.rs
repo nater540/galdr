@@ -1271,9 +1271,10 @@ pub async fn send_boot_alarm() {
   }
 }
 
-/// Force the machine into the fail-safe wedge-reset alarm (Design A, §20 / Fix #1), called at boot by `main` when the
-/// prior reset was ANY watchdog-withheld wedge (`crate::crash::withhold_was_wedge` — core-1 motion, core-0 comms, the
-/// dead-zone backstop, or the core-0 executor stall; all leave the position suspect, not just the executor stall).
+/// Force the machine into the fail-safe wedge-reset alarm (Design A, §20 / Fix #1), called at boot by `main` when
+/// [`crate::crash::position_suspect`] is true — i.e. the prior reset was ANY watchdog-withheld wedge (core-1 motion,
+/// core-0 comms, the dead-zone backstop, or the core-0 executor stall; all leave the position suspect, not just the
+/// executor stall).
 /// Overrides the default boot state so the board comes up LOCKED and can NEVER silently resume in a now-suspect
 /// position: homing ENABLED ⇒ `ALARM:11` (re-home) — usually already the boot state, so this is idempotent; homing
 /// DISABLED ⇒ `ALARM:3` (position lost, reset/`$X` + re-zero) instead of the default `Idle` — the gap this closes.
