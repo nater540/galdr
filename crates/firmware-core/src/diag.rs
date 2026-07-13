@@ -106,27 +106,31 @@ pub fn usb_tx_poll_action(made_progress: bool, deadline_exceeded: bool) -> PollA
   }
 }
 
-/// A pure model of one response's poll-write, so the stall-vs-complete POLICY is host-testable end-to-end without
-/// hardware (the firmware loop feeds live `write_byte_nb`/`flush_tx_nb` results through [`usb_tx_poll_action`]; this
-/// reducer feeds a scripted sequence of the same observations). `total_ops` is the number of write/flush ops that must
-/// each make progress for the response to complete (in the firmware that is bytes + one commit per chunk; in tests it
-/// is any convenient count). Each [`step`](Self::step) returns `Some` once the write terminates.
+/// A pure TEST-ONLY model of one response's poll-write, used solely by this module's unit tests to exercise the
+/// stall-vs-complete POLICY end-to-end without hardware. It is NOT the live loop's source of truth (finding #12): the
+/// firmware's `write_response_polled` drives its own byte/commit loop and, after the §18/§19 poll rewrite, chooses
+/// `Advance` DIRECTLY on progress — routing only the non-progress case through [`usb_tx_poll_action`] (the genuinely
+/// shared policy). This reducer feeds a scripted sequence of the same observations so the tests can assert the
+/// terminating outcome; it is `#[cfg(test)]` because nothing ships against it. `total_ops` is the number of ops that
+/// must each make progress for the response to complete. Each [`step`](Self::step) returns `Some` once it terminates.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PollWriteProgress {
+struct PollWriteProgress {
   ops_remaining: u32,
 }
 
+#[cfg(test)]
 impl PollWriteProgress {
   /// A reducer for a response requiring `total_ops` successful ops. `0` completes on the first `step` (nothing to
   /// send — never happens on the wire, but defined for totality).
-  pub fn new(total_ops: u32) -> Self {
+  fn new(total_ops: u32) -> Self {
     PollWriteProgress { ops_remaining: total_ops }
   }
 
   /// Feed one poll observation. Returns `Some(Completed)` once all ops have progressed, `Some(Stalled)` on a
   /// deadline-exceeded `WouldBlock`, or `None` while more polls are needed (a progress that is not the last op, or a
   /// yield). A yield does NOT consume an op — the same op is retried next poll.
-  pub fn step(&mut self, made_progress: bool, deadline_exceeded: bool) -> Option<WriteOutcome> {
+  fn step(&mut self, made_progress: bool, deadline_exceeded: bool) -> Option<WriteOutcome> {
     if self.ops_remaining == 0 {
       return Some(WriteOutcome::Completed);
     }
