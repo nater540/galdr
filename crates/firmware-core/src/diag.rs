@@ -484,6 +484,73 @@ pub fn watchdog_decision(inputs: WatchdogInputs) -> WatchdogDecision {
   WatchdogDecision { feed_rwdt: feed, feed_swd: feed, withhold_reason }
 }
 
+/// The result of one [`ExecutorFreezeTracker::observe`] sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutorFreezeSample {
+  /// Whether THIS sample was frozen: the beat did not advance AND the boot guard has passed (`alive != 0`).
+  pub frozen: bool,
+  /// Consecutive frozen samples INCLUDING this one (`0` when this sample advanced). Feed this straight into
+  /// [`WatchdogInputs::executor_alive_frozen_ticks`] — it is exactly the counter both ISRs maintain by hand today.
+  pub frozen_ticks: u32,
+  /// Whether `frozen_ticks` has reached the stall threshold this sample — the executor-stall declaration (the edge
+  /// AND every sample thereafter while it stays frozen). Equals [`watchdog_decision`]'s `executor_stalled` test, so
+  /// the caller applies its OWN record-once latch (record the breadcrumb, or withhold + reset + GPIO).
+  pub crossed: bool,
+}
+
+/// The pure, host-testable core-0 EXECUTOR-LIVENESS freeze reducer shared (in intent) by the two TIMG1 ISRs — the
+/// production detector-only `stall_detector` and the `capture-reset` `survivable_watchdog` — both of which hand-roll
+/// the SAME seed → boot-guard → frozen-tick → threshold-cross state machine over the ungated `EXECUTOR_ALIVE` beat.
+/// Extracting it here gives that machine host-test coverage and ONE authoritative definition; each ISR still supplies
+/// its own ACTION on a crossing. It is NOT yet wired into the ISRs (bench-gated on the unverified capture-reset
+/// survivable path, `docs/homing-bench-checklist.md` §10) — it is the verified drop-in target for that later dedup, so
+/// it mirrors the ISRs' behavior EXACTLY (including the benign boot quirk noted below) rather than "improving" it.
+///
+/// State machine (identical to both ISRs today):
+/// - **Seed:** the first `observe` seeds `last` from the sample, so the first delta reads as "no change" rather than a
+///   spurious move from the `u32::MAX` sentinel. (Consequence: the very first sample with `alive != 0` counts as one
+///   frozen tick — benign, since a stall needs [`EXECUTOR_STALL_TICKS`] = 16 consecutive and a healthy beat advances by
+///   the next sample, resetting the count. This mirrors the ISRs' `seed_swap` + `alive == last` on the first fire.)
+/// - **Boot guard:** a sample is frozen ONLY once the beat has advanced past its initial `0` (`alive != 0`), so the
+///   pre-first-bump zero — before the core-0 heartbeat task is even scheduled — cannot accrue a false stall at boot.
+/// - **Count:** consecutive frozen samples accumulate (saturating, so a long genuine freeze never wraps below the
+///   threshold); ANY advance resets the count to `0`.
+/// - **Cross:** `frozen_ticks >= stall_ticks` (with `stall_ticks > 0`) declares the stall — the caller latches it.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecutorFreezeTracker {
+  /// Last-sampled beat; `u32::MAX` = unseeded (mirrors the ISRs' `LAST_EXECUTOR_ALIVE` sentinel).
+  last: u32,
+  /// Consecutive frozen samples so far (mirrors the ISRs' `EXECUTOR_ALIVE_FROZEN`).
+  frozen_ticks: u32,
+}
+
+impl ExecutorFreezeTracker {
+  /// A fresh, unseeded tracker: `last == u32::MAX`, zero frozen ticks — matching the ISR statics' initial values.
+  pub const fn new() -> Self {
+    Self { last: u32::MAX, frozen_ticks: 0 }
+  }
+
+  /// Observe one `alive` sample against `stall_ticks` and advance the machine. `stall_ticks == 0` disables the
+  /// crossing (a build that does not wire the beat), matching [`watchdog_decision`]'s `executor_stall_ticks == 0`
+  /// guard — a permanently-frozen count then never reports `crossed`.
+  pub fn observe(&mut self, alive: u32, stall_ticks: u32) -> ExecutorFreezeSample {
+    // Seed on the first sample so the first delta is "no change" rather than a spurious move from the sentinel.
+    let last = if self.last == u32::MAX { alive } else { self.last };
+    self.last = alive;
+    // Boot guard: only a beat that has advanced past 0 can be "frozen"; the pre-first-bump zero never accrues.
+    let frozen = alive != 0 && alive == last;
+    self.frozen_ticks = if frozen { self.frozen_ticks.saturating_add(1) } else { 0 };
+    let crossed = stall_ticks > 0 && self.frozen_ticks >= stall_ticks;
+    ExecutorFreezeSample { frozen, frozen_ticks: self.frozen_ticks, crossed }
+  }
+}
+
+impl Default for ExecutorFreezeTracker {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 /// The length of the sliding window (in feed intervals) the [`WindowedStallCounter`] ages over. A `usb_tx` write
 /// timeout seen now stays counted for this many subsequent intervals before it ages out, so the window measures
 /// "how degraded was the link over the recent past" rather than the instantaneous state. 16 intervals at the ISR's
@@ -1024,5 +1091,121 @@ mod tests {
     assert_eq!(w.count(), 0, "a full window of clean intervals ages the count back to zero");
     // ...and it stays at 0 (saturating subtract, never underflows).
     assert_eq!(w.record(false), 0, "ageing a zero window stays at zero, never wraps");
+  }
+
+  #[test]
+  fn freeze_tracker_boot_guard_holds_the_pre_first_bump_zero() {
+    // Before the core-0 heartbeat task is scheduled the beat is a flat 0. That must NEVER accrue a stall, no matter
+    // how many samples elapse — the `alive != 0` boot guard is the whole point (else a board boots straight to a
+    // false executor-stall breadcrumb).
+    let mut t = ExecutorFreezeTracker::new();
+    for _ in 0..(EXECUTOR_STALL_TICKS + 5) {
+      let s = t.observe(0, EXECUTOR_STALL_TICKS);
+      assert!(!s.frozen, "a flat-zero beat is never frozen (boot guard)");
+      assert_eq!(s.frozen_ticks, 0);
+      assert!(!s.crossed);
+    }
+  }
+
+  #[test]
+  fn freeze_tracker_first_nonzero_sample_counts_one_frozen_tick() {
+    // Faithful mirror of the ISRs' seed: the first sample seeds `last` from the value, so `alive == last` reads as
+    // frozen when `alive != 0`. This is the documented benign quirk — one tick, far below the threshold, cleared by
+    // the next advance. Locked here so a future ISR rewire against this reducer preserves it rather than "fixing" it.
+    let mut t = ExecutorFreezeTracker::new();
+    let s = t.observe(5, EXECUTOR_STALL_TICKS);
+    assert!(s.frozen, "first nonzero sample reads frozen (seed = no-change)");
+    assert_eq!(s.frozen_ticks, 1);
+    assert!(!s.crossed, "one tick is far below the threshold");
+  }
+
+  #[test]
+  fn freeze_tracker_advancing_beat_never_freezes() {
+    // A healthy, monotonically advancing beat resets the frozen count to 0 every sample. Seed at the boot-zero the
+    // real beat starts from (not frozen, boot guard) so the first-nonzero-sample seed quirk does not apply.
+    let mut t = ExecutorFreezeTracker::new();
+    assert!(!t.observe(0, EXECUTOR_STALL_TICKS).frozen); // boot-zero seed: boot guard holds, last := 0.
+    for beat in 1..=(EXECUTOR_STALL_TICKS + 10) {
+      let s = t.observe(beat, EXECUTOR_STALL_TICKS);
+      assert!(!s.frozen, "an advancing beat is not frozen");
+      assert_eq!(s.frozen_ticks, 0);
+      assert!(!s.crossed);
+    }
+  }
+
+  #[test]
+  fn freeze_tracker_crosses_at_exactly_the_threshold_and_holds() {
+    // Model the real boot sequence: seed at the boot-zero, let the beat advance once (0 -> 1, establishing last := 1
+    // WITHOUT the first-sample quirk pre-loading a tick), THEN hold it frozen at 1.
+    let mut t = ExecutorFreezeTracker::new();
+    assert!(!t.observe(0, EXECUTOR_STALL_TICKS).frozen); // boot-zero seed.
+    assert!(!t.observe(1, EXECUTOR_STALL_TICKS).frozen); // beat advances 0 -> 1: not frozen, last := 1.
+    // The beat is now stuck at 1. It takes EXECUTOR_STALL_TICKS consecutive frozen samples to cross.
+    for tick in 1..EXECUTOR_STALL_TICKS {
+      let s = t.observe(1, EXECUTOR_STALL_TICKS);
+      assert!(s.frozen);
+      assert_eq!(s.frozen_ticks, tick);
+      assert!(!s.crossed, "must not cross before the threshold ({tick} < {EXECUTOR_STALL_TICKS})");
+    }
+    let s = t.observe(1, EXECUTOR_STALL_TICKS);
+    assert_eq!(s.frozen_ticks, EXECUTOR_STALL_TICKS);
+    assert!(s.crossed, "crosses at exactly the threshold");
+    // And it STAYS crossed while the beat remains frozen (the caller's own latch makes the ACTION once).
+    let s = t.observe(1, EXECUTOR_STALL_TICKS);
+    assert!(s.crossed && s.frozen_ticks == EXECUTOR_STALL_TICKS + 1, "stays crossed past the threshold");
+  }
+
+  #[test]
+  fn freeze_tracker_advance_mid_run_resets_and_must_re_accrue() {
+    // A recovery partway through a frozen run drops the count to 0; a subsequent freeze must climb from scratch.
+    let mut t = ExecutorFreezeTracker::new();
+    t.observe(1, EXECUTOR_STALL_TICKS); // seed.
+    for _ in 0..(EXECUTOR_STALL_TICKS - 1) {
+      t.observe(1, EXECUTOR_STALL_TICKS); // climb to threshold - 1.
+    }
+    let recovered = t.observe(2, EXECUTOR_STALL_TICKS); // the executor advanced.
+    assert!(!recovered.frozen && recovered.frozen_ticks == 0 && !recovered.crossed, "recovery resets the count");
+    let s = t.observe(2, EXECUTOR_STALL_TICKS); // frozen again at the NEW value.
+    assert_eq!(s.frozen_ticks, 1, "the next freeze re-accrues from zero, not from the pre-recovery count");
+  }
+
+  #[test]
+  fn freeze_tracker_zero_threshold_disables_the_crossing() {
+    // A build that does not wire the beat passes stall_ticks == 0; a permanently-frozen count then never crosses —
+    // matching `watchdog_decision`'s `executor_stall_ticks == 0` guard.
+    let mut t = ExecutorFreezeTracker::new();
+    t.observe(1, 0); // seed.
+    for _ in 0..100 {
+      let s = t.observe(1, 0);
+      assert!(s.frozen, "the beat is genuinely frozen");
+      assert!(!s.crossed, "but a zero threshold never declares a stall");
+    }
+  }
+
+  #[test]
+  fn freeze_tracker_crossed_matches_watchdog_decision() {
+    // The reducer is a drop-in for what the ISR feeds `watchdog_decision`: routing `frozen_ticks` through the pure
+    // decision must declare Core0ExecutorStall on exactly the sample the tracker reports `crossed` (with the other
+    // detectors quiescent). This ties the extracted SM to the decision it will feed once the ISRs are rewired.
+    let mut t = ExecutorFreezeTracker::new();
+    t.observe(1, EXECUTOR_STALL_TICKS); // seed on an advance.
+    let quiescent = WatchdogInputs {
+      core1_frozen_ticks: 0,
+      comms_frozen_ticks: 0,
+      tx_complete_frozen_ticks: 0,
+      executor_alive_frozen_ticks: 0,
+      executor_stall_ticks: EXECUTOR_STALL_TICKS,
+      response_depth: 0,
+      block_in_flight: false,
+      host_active: false,
+      core1_stall_ticks: CORE1_STALL_TICKS,
+      comms_stall_ticks: COMMS_STALL_TICKS,
+    };
+    for _ in 0..(EXECUTOR_STALL_TICKS * 2) {
+      let s = t.observe(1, EXECUTOR_STALL_TICKS);
+      let decision = watchdog_decision(WatchdogInputs { executor_alive_frozen_ticks: s.frozen_ticks, ..quiescent });
+      let declared = decision.withhold_reason == Some(WithholdKind::Core0ExecutorStall);
+      assert_eq!(s.crossed, declared, "tracker.crossed must agree with watchdog_decision's executor-stall verdict");
+    }
   }
 }
