@@ -312,9 +312,13 @@ fn fire() {
       // Fix #3/H2 recovery-clear: after the raw feeds cancel any pending reset, erase a breadcrumb captured on a PRIOR
       // fire whose wedge has since cleared, so a later unrelated reset does not spuriously boot LOCKED. Ordered AFTER
       // the feeds (a knife-edge dog expiry still boots locked); this ISR is the sole withhold writer, so the CAS never
-      // contends. `swap(0)` reads-and-resets the tracked reason so the clear runs at most once per recovery.
-      if let Some(reason) = crate::crash::WithholdReason::from_u8(LAST_CAPTURED_WITHHOLD.swap(0, Ordering::Relaxed) as u8) {
-        crate::crash::clear_withhold_if(reason);
+      // contends. LOAD first and only `swap` when a reason was actually captured — the common never-wedged path is then
+      // a plain read, not an atomic RMW, on every healthy fire (this ISR runs for the life of the board). The `swap(0)`
+      // reads-and-resets so the clear still runs at most once per recovery.
+      if LAST_CAPTURED_WITHHOLD.load(Ordering::Relaxed) != 0 {
+        if let Some(reason) = crate::crash::WithholdReason::from_u8(LAST_CAPTURED_WITHHOLD.swap(0, Ordering::Relaxed) as u8) {
+          crate::crash::clear_withhold_if(reason);
+        }
       }
     }
     Some(reason) => {

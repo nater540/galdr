@@ -11,6 +11,14 @@ being flashed; no A or B fix ships until a capture confirms A's mechanism (`wstg
 (B-1 dead-zone / B-2 executor-death / B-4 brownout / re-enum-failure). This document is the running record so the
 investigation can be resumed cold.
 
+**UPDATE 2026-07-13 — the `wstg=` boot-dump field has been RETIRED (branch `fix/streaming-safety-pr1`, commit
+`6d18549`).** The §18/§19 poll-based `usb_tx` rewrite eliminated the write-vs-flush await stage entirely, so
+`write_stage_stall` was permanently `false`; it and its `wstg=` breadcrumb field/packed bit were removed as dead
+plumbing. Any procedure below that reads `wstg=1` to CONFIRM Signature A is therefore OBSOLETE — the write-stage
+lost-wake CLASS was structurally eliminated by the poll path, not merely observed. The many `wstg=` references
+below are kept as-is for the historical record; read them as pre-§18/§19 context. (The packed `UsbTxStall` bit 5 is
+left reserved so a cross-version breadcrumb still decodes depth/count — see `firmware-core/src/diag.rs`.)
+
 **UPDATE 2026-06-28 — Signature A (lost USB-TX wake) FIXED + hardware-confirmed (TIER 1, §17.6, commit `225d4a4`).
 Signature B (the hard silent Mode-C wedge) is the OPEN FRONTIER and REPRODUCED on the capture build (§17.7, pass 3).
 CRUX RESOLVED to a paradox + a plan (§17.8/§17.9): the RWDT genuinely did NOT fire over >60 s (proven by >1 min of
