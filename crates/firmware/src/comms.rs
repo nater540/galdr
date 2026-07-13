@@ -1587,11 +1587,16 @@ const USB_TX_PACKET_BYTES: usize = 64;
 /// source (see `docs/streaming-lockup-investigation.md` §18). The per-poll decision is the host-tested
 /// [`firmware_core::diag::usb_tx_poll_action`].
 ///
-/// The stall deadline is PER CHUNK (Fix #2): each ≤64 B chunk — its byte-push AND its commit — gets a fresh
-/// [`USB_TX_TIMEOUT`] budget, reset at chunk start (NOT per byte, so partial progress does not extend it). This restores
-/// per-stage tolerance (the final chunk's flush no longer inherits a budget drained by earlier bytes) while keeping the
-/// worst case bounded at nchunks × [`USB_TX_TIMEOUT`]; single-chunk flow-control responses are unaffected. A `WouldBlock`
-/// that persists past that per-chunk deadline is a genuine host-not-reading stall → [`WriteOutcome::Stalled`]
+/// The stall deadline is PROGRESS-RESET (Fix #1, medium review — supersedes the per-chunk budget of the original
+/// Fix #2): ONE deadline spans the whole response and is re-armed from a fresh `now` on every observed progress event
+/// (a byte pushed OR a commit registered), so it measures only CONTINUOUS idle. It trips after [`USB_TX_TIMEOUT`] of
+/// UNBROKEN no-progress, which bounds the total stall-detection latency at [`USB_TX_TIMEOUT`] regardless of how many
+/// ≤64 B chunks the response spans (the per-chunk budget let a degraded-but-still-draining host that dripped one packet
+/// per timeout drag detection out to nchunks × [`USB_TX_TIMEOUT`]). The §13 lazy clock is preserved intact: progress
+/// CLEARS the deadline without reading the clock (the happy path still pays for no timestamp), and `Instant::now()` is
+/// read only on a no-progress poll — the exact same clock-read cost as the per-chunk version, not the extra per-progress
+/// read the deferral note anticipated. A `WouldBlock` that persists past that deadline is a genuine host-not-reading
+/// stall → [`WriteOutcome::Stalled`]
 /// (drop-and-continue + the K-escape). Flow-control integrity: the flow-control-critical responses (`ok` / `error:N`)
 /// are ≤64 B = a SINGLE packet, so a stall either sends the whole line or none of it — they are never truncated (the
 /// first `write_byte_nb` blocks on a full FIFO before any byte is committed). A mid-response stall on a MULTI-chunk
@@ -1605,30 +1610,36 @@ async fn write_response_polled(
   bytes: &[u8],
 ) -> firmware_core::diag::WriteOutcome {
   use firmware_core::diag::{PollAction, WriteOutcome};
-  // Fix #5: the per-poll decision shared by the byte-push and commit loops below. On progress take `Advance` DIRECTLY
-  // (no clock read — the §13 lazy-clock: the happy path never pays for a timestamp); otherwise consult this chunk's
-  // `deadline` via the host-tested `usb_tx_poll_action`. A nested fn so the two loops are byte-for-byte identical and
-  // the stall-vs-yield policy has one source. Self-contained `use` so it does not depend on the enclosing imports.
-  fn step(progressed: bool, deadline: Instant) -> PollAction {
+  // Fix #5/#1: the per-poll decision shared by the byte-push and commit loops below. On progress CLEAR the deadline and
+  // take `Advance` DIRECTLY (no clock read — the §13 lazy-clock: the happy path never pays for a timestamp); otherwise
+  // arm-or-check the shared `deadline` via the host-tested `usb_tx_poll_action`. `deadline` is `None` until the first
+  // no-progress poll arms it from a fresh `now`, and every progress event resets it to `None` — so it measures only
+  // CONTINUOUS idle and re-arms lazily. A nested fn so the two loops are byte-for-byte identical and the stall-vs-yield
+  // policy has one source. Self-contained `use` so it does not depend on the enclosing imports.
+  fn step(progressed: bool, deadline: &mut Option<Instant>) -> PollAction {
     use firmware_core::diag::{PollAction, usb_tx_poll_action};
     if progressed {
+      *deadline = None;
       PollAction::Advance
     } else {
-      usb_tx_poll_action(false, Instant::now() >= deadline)
+      // ONE clock read per no-progress poll (same cost as the per-chunk version): reused to both arm the deadline on
+      // its first firing and to test it thereafter, so `now >= d` cannot drift from the value that was inserted.
+      let now = Instant::now();
+      let d = *deadline.get_or_insert(now + USB_TX_TIMEOUT);
+      usb_tx_poll_action(false, now >= d)
     }
   }
+  // Fix #1: ONE progress-reset deadline for the WHOLE response (spanning every chunk), armed lazily on the first
+  // stalled poll and cleared by `step` on each observed progress event. This bounds total stall-detection latency at
+  // `USB_TX_TIMEOUT` of unbroken no-progress instead of the per-chunk budget's nchunks × `USB_TX_TIMEOUT` worst case;
+  // single-chunk flow-control responses (`ok`/`error:N`, ≤64 B) still trip at exactly `USB_TX_TIMEOUT` of no drain.
+  let mut deadline: Option<Instant> = None;
   for chunk in bytes.chunks(USB_TX_PACKET_BYTES) {
-    // Fix #2/#13: a FRESH stall deadline PER CHUNK, reset at chunk START (not per byte). Each ≤64 B chunk — its bytes
-    // AND its commit — gets a full `USB_TX_TIMEOUT` budget, so the final chunk's flush never inherits a budget drained
-    // by earlier bytes. The budget is NOT extended by per-byte progress, so a chunk that cannot push+commit within the
-    // timeout still trips at the timeout; worst case is bounded at nchunks × `USB_TX_TIMEOUT`, and flow-control
-    // responses (`ok`/`error:N`, ≤64 B) are a single chunk = behaviorally identical to a single whole-response budget.
-    let deadline = Instant::now() + USB_TX_TIMEOUT;
     // Fill the FIFO with this chunk's bytes. `write_byte_nb` writes IFF `serial_in_ep_data_free` (room); a `WouldBlock`
     // means the FIFO is full because the host has not drained the previous packet yet — yield and re-poll.
     for &byte in chunk {
       loop {
-        match step(tx.write_byte_nb(byte).is_ok(), deadline) {
+        match step(tx.write_byte_nb(byte).is_ok(), &mut deadline) {
           PollAction::Advance => break,
           PollAction::Stall => return WriteOutcome::Stalled,
           PollAction::Yield => yield_now().await,
@@ -1644,9 +1655,10 @@ async fn write_response_polled(
     // keeps the byte stream faithful to esp-hal's tested sequencing.
     if tx.flush_tx_nb().is_err() {
       loop {
-        // Commit budget shares this chunk's fresh deadline (Fix #2); `step` reads the clock only when not yet committed.
+        // The commit poll shares the response-wide progress-reset deadline (Fix #1): a commit that registers clears it
+        // and advances; `step` reads the clock only while still uncommitted, and any earlier progress already reset it.
         let committed = (esp_hal::peripherals::USB_DEVICE::regs().ep1_conf().read().bits() & 0b011) != 0;
-        match step(committed, deadline) {
+        match step(committed, &mut deadline) {
           PollAction::Advance => break,
           PollAction::Stall => return WriteOutcome::Stalled,
           PollAction::Yield => yield_now().await,
