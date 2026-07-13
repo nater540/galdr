@@ -101,10 +101,38 @@ Do this with motors disabled or power to drivers off; you're only reading pins.
 - [ ] Confirm the per-burst overshoot at the locate rate is below your repeatability target — this is the
       one quantitative open item from the research (depends on `$100-102` steps/mm and burst length).
 
+## 10. Streaming-safety boot-lock (Fix #1, Option A fail-safe) — verification
+> Compile-checked only until run here. The wedge→reset→breadcrumb→next-boot-lock chain and the `$22` alarm
+> branch are exercised with the diagnostic provoke builds. Cross-ref `docs/streaming-lockup-investigation.md`
+> §14.3 / §17.2 (the grbl feed-hold→ALARM→re-home contract Galdr adopted) and the four `WithholdReason`
+> classes in `crash.rs` (`Core1Motion` / `Core0Comms` / `DeadZone` / `Core0ExecutorStall`).
+
+- [ ] **Boot-lock, homing ENABLED (`$22=1`):** flash `--features provoke-stall-bare` (a production build that
+      self-stalls the core-0 executor ~10 s after boot). The unfed RWDT resets at ~8 s and `stall_detector`
+      records the `core0-executor-stall` breadcrumb. Confirm the NEXT boot comes up **LOCKED in `ALARM:11`**
+      (not Idle), emits `[MSG:CRASH … core0-executor-stall]`, and refuses to stream until `$H`/`$X`.
+- [ ] **Boot-lock, homing DISABLED (`$22=0`):** repeat with `$22=0`. Confirm the next boot comes up **LOCKED
+      in `ALARM:3`** (position lost) rather than the default Idle. Restore `$22` afterward.
+- [ ] **All four classes share this boot path:** `force_wedge_alarm` is gated on `withhold_was_wedge`, which is
+      true for ANY tagged reason, so a locked boot for the executor-stall class proves the lock composition for
+      all four — the classes differ ONLY in the decoded `[MSG:CRASH]` label. Spot-check a SECOND class with
+      `--features force-withhold` (an unconditional withhold → RWDT reset → breadcrumb) and confirm the next
+      boot is likewise LOCKED and carries a withhold label. (A per-class deterministic inducer does not exist
+      for `Core1Motion` / `Core0Comms` / `DeadZone`; their boot-lock is the same code path, verified above.)
+
+- [ ] **GAP-4 — no-step-loss on a RECOVERED withhold:** construct a `Core1Motion` withhold that RECOVERS before
+      the ~8 s RWDT fires (the beat un-freezes in time), so `watchdog_feed` falls through to `feed()` and keeps
+      cutting — grbl-consistent (§14.3/§17.2), since a genuine recovery here loses no steps. With a dial
+      indicator (or a return-to-zero probe), confirm **zero position error** across the recovered wedge.
+      ⚠️ If a recovery CAN follow REAL step loss, this fails — then the `watchdog_feed` recovery branch MUST be
+      wired to a MOTION_FAULT (feed-hold + `ALARM:17` + require re-home) instead of falling through to `feed()`.
+
 ## Sign-off
 - [ ] All §3 limit senses + fail-safe correct.
 - [ ] `$H` completes, ends clear of switches, sets correct MPos, 5× repeatable.
 - [ ] `ALARM:1` / `ALARM:2` / `ALARM:8` / `ALARM:11` all behave and recover.
+- [ ] §10 boot-lock verified: `$22=1`→`ALARM:11`, `$22=0`→`ALARM:3` after a provoked wedge; GAP-4 no-step-loss
+      confirmed on a recovered `Core1Motion` withhold (or the recovery branch re-wired to MOTION_FAULT).
 - [ ] Note any setting changes made at the bench back into the persisted defaults.
 
 > After sign-off, the remaining DOC-06 deferral is concurrent intra-group (X+Y) homing
