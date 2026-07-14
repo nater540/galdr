@@ -20,6 +20,18 @@
 use crate::gcode::CoolantState;
 use crate::hal_traits::{DigitalOut, DigitalOutError};
 
+/// Bit for mist (M7) in the packed coolant `u8` bitmask (see [`coolant_mask`]). The firmware publishes this mask
+/// through an atomic that the coolant task re-reads, so the encoding is a firmware↔task contract single-sourced here.
+pub const COOLANT_BIT_MIST: u8 = 0b01;
+/// Bit for flood (M8) in the packed coolant `u8` bitmask (see [`coolant_mask`]).
+pub const COOLANT_BIT_FLOOD: u8 = 0b10;
+
+/// Pack a [`CoolantState`] into the `u8` coolant bitmask (`bit0 = mist`, `bit1 = flood`). The firmware stores the
+/// result in the atomic the coolant task reads; the inverse unpack lives in the firmware wiring.
+pub fn coolant_mask(coolant: CoolantState) -> u8 {
+  (if coolant.mist { COOLANT_BIT_MIST } else { 0 }) | (if coolant.flood { COOLANT_BIT_FLOOD } else { 0 })
+}
+
 /// An error driving the coolant outputs. Wraps the underlying [`DigitalOut`] error per circuit so the firmware
 /// task can surface a hardware fault rather than panicking, per the firmware-core no-`unwrap` rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,5 +184,16 @@ mod tests {
     let mut c = CoolantController::new(RecordingOut::default(), FailingOut);
     let err = c.apply(CoolantState { mist: false, flood: true }).expect_err("flood fails");
     assert_eq!(err, CoolantError::Flood(DigitalOutError::Transport));
+  }
+
+  #[test]
+  fn coolant_mask_packs_every_flood_mist_combination() {
+    assert_eq!(coolant_mask(CoolantState::off()), 0);
+    assert_eq!(coolant_mask(CoolantState { mist: true, flood: false }), COOLANT_BIT_MIST);
+    assert_eq!(coolant_mask(CoolantState { mist: false, flood: true }), COOLANT_BIT_FLOOD);
+    assert_eq!(
+      coolant_mask(CoolantState { mist: true, flood: true }),
+      COOLANT_BIT_MIST | COOLANT_BIT_FLOOD,
+    );
   }
 }

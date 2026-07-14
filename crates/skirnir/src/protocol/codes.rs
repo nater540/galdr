@@ -75,15 +75,20 @@ fn error_static(code: u32) -> (&'static str, &'static str) {
       "More than one G-code command from the same modal group was found in the block.",
     ),
     22 => ("Undefined feed rate", "Feed rate has not yet been set or is undefined."),
-    // Grbl text for 23 is kept as a reasonable gloss; the firmware emits 21/26 instead, so it is never enriched.
-    23 => ("Invalid g-code ID:23", "A G-code command requires an integer value but a fractional one was found."),
+    // Matches the firmware's `$EE` text verbatim (grbl_codes_lock test enforces it) so the static fallback and
+    // a `$EE` Refresh read identically for the codes this firmware declares.
+    23 => (
+      "Invalid g-code ID:23",
+      "A G-code command value, such as a tool number (T), must be a non-negative integer within range.",
+    ),
     26 => (
       "No axis words in block",
       "A G-code command (or the current modal state) requires axis words, but none were found in the block.",
     ),
     33 => (
       "Invalid target",
-      "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled).",
+      "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled, \
+or a rotary axis word in a G38.x probe, which is linear-only).",
     ),
     _ => ("G-code error", "The stream is halted until reset or a '$' command clears it."),
   }
@@ -258,8 +263,9 @@ mod tests {
 
   #[test]
   fn the_firmware_emitted_error_descriptions_match_verbatim() {
-    // These eleven codes are emitted by the firmware's `$EE`; the static text MUST equal the enrichment text or
-    // the banner/console wording shifts after a Refresh. Full-string equality so any drift fails the build.
+    // These codes are emitted by the firmware's `$EE`; the static text MUST equal the enrichment text or the
+    // banner/console wording shifts after a Refresh. This is a fast local change-detector on skirnir's own
+    // literals; the authoritative pin to the firmware's actual table is the cross-crate `grbl_codes_lock` test.
     assert_eq!(error_text(1).description, "G-code words consist of a letter and a value. Letter was not found.");
     assert_eq!(error_text(2).description, "Numeric value format is not valid or missing an expected value.");
     assert_eq!(error_text(3).description, "Grbl '$' system command was not recognized or supported.");
@@ -281,7 +287,8 @@ mod tests {
     );
     assert_eq!(
       error_text(33).description,
-      "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled)."
+      "A G-code motion command has an invalid target (for example, arc geometry that cannot be reconciled, \
+or a rotary axis word in a G38.x probe, which is linear-only)."
     );
   }
 
