@@ -9,6 +9,7 @@ edition = "2024"
 [dependencies]
 cnc-kinematics    = { path = "../cnc-kinematics", default-features = false }
 galdr-proto       = { path = "../galdr-proto", default-features = false }
+grbl-codes        = { path = "../grbl-codes" }
 heapless          = "0.9"
 libm              = "0.2"
 defmt             = { version = "1", optional = true }

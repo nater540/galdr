@@ -1,0 +1,11 @@
+[package]
+name = "grbl-codes"
+version = "0.1.0"
+edition = "2024"
+
+# Shared, no_std, dependency-free grblHAL wire vocabulary. Consumed by BOTH the firmware side
+# (firmware-core, the status-report emitter) and skirnir (the host status parser) so the run-state
+# token strings are single-sourced and cannot drift between emitter and parser. Deliberately tiny and
+# dependency-free so both a no_std Xtensa build and a native host build can share it. See
+# docs/architecture-refactor.md (D1) for why this exists and what stays crate-local.
+[dependencies]

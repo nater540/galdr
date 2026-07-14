@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/cnc-kinematics", "crates/firmware-core", "crates/firmware", "crates/skirnir", "crates/galdr-proto"]
+members = ["crates/cnc-kinematics", "crates/firmware-core", "crates/firmware", "crates/skirnir", "crates/galdr-proto", "crates/grbl-codes"]
 # `firmware` targets Xtensa (esp-hal) and cannot compile on the host. Excluding it from
 # `default-members` means a plain `cargo build`/`cargo test` at the repo root operates only on the
 # host-buildable crates (firmware-core + skirnir) and never tries to compile esp-hal for the host.
@@ -7,7 +7,7 @@ members = ["crates/cnc-kinematics", "crates/firmware-core", "crates/firmware", "
 # NOTE: `--workspace`/`--all` override `default-members` and WILL try to build firmware on the host
 # (which fails); from the repo root use `--exclude firmware` with those flags, or build firmware on
 # its own from within crates/firmware.
-default-members = ["crates/cnc-kinematics", "crates/firmware-core", "crates/skirnir", "crates/galdr-proto"]
+default-members = ["crates/cnc-kinematics", "crates/firmware-core", "crates/skirnir", "crates/galdr-proto", "crates/grbl-codes"]
 resolver = "2"
 
 # esp-hal firmware at opt-level 0 is large and slow: unoptimized debug builds can overflow IRAM and

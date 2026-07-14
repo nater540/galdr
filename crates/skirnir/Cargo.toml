@@ -31,6 +31,9 @@ serial = ["dep:tokio-serial"]
 # `sim` feature pulls in the host-side `simulate` driver (it allocates); `default-features = false` skips the
 # firmware-only `defmt`.
 cnc-kinematics = { path = "../cnc-kinematics", default-features = false, features = ["sim"] }
+# The shared grblHAL wire vocabulary (the run-state token set). Single-sourced with the firmware emitter so
+# the host status parser can never drift on a state token's spelling. Tiny, no_std, dependency-free.
+grbl-codes = { path = "../grbl-codes" }
 # Async runtime + primitives for the engine's driver task and the UI<->engine channels. We keep the feature
 # set tight: the multi-threaded runtime, the proc-macros, async I/O helpers, sync channels, timers, and the
 # `signal` handler the headless `--cli` harness uses for a clean Ctrl-C (soft-reset + disconnect) abort.
@@ -94,3 +97,8 @@ egui_kittest = { version = "0.35", default-features = false, features = ["wgpu",
 # The current-thread runtime + test macro are enough to drive the async engine tests; paused-time helpers
 # come from the `time` feature already enabled above.
 tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "io-util", "time", "test-util"] }
+# Dev-only: the firmware's authoritative grblHAL code tables, for the cross-crate lock test
+# (`tests/grbl_codes_lock.rs`). This is the ONLY link from skirnir to firmware-core, and it exists purely so a
+# test can assert skirnir's static error/alarm fallback text and run-state token set stay consistent with the
+# firmware authority. It does not enter the shipped binary. See docs/architecture-refactor.md (D1).
+firmware-core = { path = "../firmware-core", default-features = false }

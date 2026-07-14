@@ -33,19 +33,28 @@ pub enum MachineState {
 
 impl MachineState {
   /// The grblHAL status-report state token, written as the first field of a `<...>` report. Substates
-  /// (`Hold:0`/`Hold:1`, `Alarm:<code>`) are appended by the status formatter, not encoded here.
+  /// (`Hold:0`/`Hold:1`, `Alarm:<code>`) are appended by the status formatter, not encoded here. The token
+  /// *strings* live in the shared [`grbl_codes`] wire vocabulary so the firmware emitter and the host parser
+  /// cannot drift — this maps each (possibly payload-carrying) variant to its shared, payload-free run-state.
   pub(crate) fn token(self) -> &'static str {
+    self.run_state().as_token()
+  }
+
+  /// The payload-free shared run-state this maps to. The firmware's [`MachineState`] carries hold/alarm
+  /// substates that the bare token drops; the shared [`grbl_codes::RunState`] is the wire vocabulary both the
+  /// emitter (here) and the host parser (`skirnir`) key off, so the token spellings are single-sourced.
+  fn run_state(self) -> grbl_codes::RunState {
     match self {
-      MachineState::Idle => "Idle",
-      MachineState::Run => "Run",
-      MachineState::Hold(_) => "Hold",
-      MachineState::Jog => "Jog",
-      MachineState::Alarm(_) => "Alarm",
-      MachineState::Door => "Door",
-      MachineState::Check => "Check",
-      MachineState::Home => "Home",
-      MachineState::Sleep => "Sleep",
-      MachineState::Tool => "Tool",
+      MachineState::Idle => grbl_codes::RunState::Idle,
+      MachineState::Run => grbl_codes::RunState::Run,
+      MachineState::Hold(_) => grbl_codes::RunState::Hold,
+      MachineState::Jog => grbl_codes::RunState::Jog,
+      MachineState::Alarm(_) => grbl_codes::RunState::Alarm,
+      MachineState::Door => grbl_codes::RunState::Door,
+      MachineState::Check => grbl_codes::RunState::Check,
+      MachineState::Home => grbl_codes::RunState::Home,
+      MachineState::Sleep => grbl_codes::RunState::Sleep,
+      MachineState::Tool => grbl_codes::RunState::Tool,
     }
   }
 }

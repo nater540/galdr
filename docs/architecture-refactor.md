@@ -28,7 +28,7 @@ Severity/scope reflect the adversarial corrections (some findings were downgrade
 | A3 | Split `skirnir/src/app/views.rs` (~4,229 prod lines, 93 fns) into `views/` | **done** |
 | A2 | Split `firmware-core/src/protocol.rs` (~2,721 prod lines) into `protocol/` (TMC-diag stays as `protocol/diag_types.rs` — see A2 plan) | **done** |
 | A4 | Split `skirnir/src/app/shell.rs` (~2,663 prod lines, 73 methods) into `shell/` impl blocks | **done** |
-| D1 | Extract grblHAL error/alarm/run-state constant tables into a shared `no_std` crate consumed by both `firmware-core` and `skirnir` | Not started |
+| D1 | Shared `grbl-codes` crate for the run-state token vocabulary + a cross-crate lock test for the error/alarm overlap (see D1 plan — the tables themselves are intentionally divergent and NOT merged) | **done** |
 | C1 | `protocol.rs:1488/1509` call the existing `write_axes_csv` helper instead of inlining the loop | Not started |
 | B1 | Decompose `comms.rs plan_gcode_line` (181 lines → gate/drive_modal/dispatch) | **done** (with A1 Step 14) |
 | A6/B2 | Decompose `main.rs main()` (369 lines) into per-phase init fns | Not started |
@@ -546,3 +546,39 @@ the struct/types/consts/aliases. Verified byte-identical to the pre-split `shell
 non-blank multiset diff vs `HEAD` (zero original lines lost; only new scaffolding added) and a 1:1 line-coverage check.
 Tests: **785 lib + 3 bin + 1 doctest**, identical to the pre-split baseline (0 new, 0 lost). `cargo build -p skirnir`,
 `cargo build -p skirnir --features gui`, and `cargo test -p skirnir` all green; no file outside `app/shell/` was edited.
+
+---
+
+## D1 — shared run-state vocabulary + cross-crate code lock — DONE
+
+**Scope correction (recon-driven, user-approved).** The original framing ("merge the error/alarm/run-state
+tables into one shared crate") was partly wrong: recon showed the error/alarm tables are **intentionally
+divergent**, not a clean duplication. `firmware-core`'s tables are exactly the codes THIS controller emits (its
+`$EE`/`$EA` authority: errors `{1,2,3,5,8,9,15,20,21,22,23,26,33}`, alarms `{1,2,3,4,5,8,10,11,17}`);
+`skirnir`'s are a broader **fallback** for any grbl-ish controller (missing `8`; alarms add generic `6,7,9`, drop
+`17`), with the runtime `$EE`/`$EA` CodeBook as the real source of truth. Merging them would drop skirnir's
+generic-grbl fallback or make the firmware carry codes it never emits — a behavior change, which the initiative
+forbids. So D1 was rescoped (user chose "shared run-state + lock test") to share only what is genuinely a fixed,
+identical wire vocabulary and to LOCK the rest by test rather than merge it.
+
+**What shipped:**
+- **New crate `crates/grbl-codes`** (`no_std`, dependency-free): `RunState` — the 10 grblHAL run-state tokens
+  (`Idle/Run/Hold/Jog/Alarm/Door/Check/Home/Sleep/Tool`) with `as_token`/`from_token`/`ALL`. Added to workspace
+  `members` + `default-members`. This is the single source for the token spellings.
+- **`firmware-core`** depends on it; `MachineState::token()` now maps each (payload-carrying) variant to
+  `grbl_codes::RunState` and returns `as_token()` — byte-identical wire output (351 tests unchanged, incl. the
+  status-report format tests).
+- **`skirnir`** depends on it; `RunState::from_token` delegates to `grbl_codes::RunState::from_token` (+ a
+  `From<grbl_codes::RunState>` impl), so the emitter's and parser's token sets can't drift.
+- **Cross-crate lock test** (`skirnir/src/protocol/grbl_codes_lock.rs`, a `#[cfg(test)]` unit module; `skirnir`
+  gains `firmware-core` as a **dev-dependency** only): asserts that for every code the firmware declares in
+  `ERROR_CODES`/`AlarmCode::ALL`, skirnir's static fallback (where it has a specific row) matches the firmware's
+  name+description, and that skirnir recognises every shared run-state token. This is the real firmware↔skirnir
+  pin the nemesis found MISSING (the old "verbatim match" tests compared skirnir's copy against its own literals).
+- **Reconciled 2 drifted error descriptions** in skirnir (`error:23`, `error:33`) to the firmware authority — the
+  only overlap mismatches the lock surfaced (alarms were already fully consistent). Updated the redundant
+  intra-skirnir change-detector's stale `33` literal to match.
+
+**Verification:** `cargo test -p grbl-codes` (2) · `-p firmware-core` (351, unchanged) · `-p skirnir` (788 lib =
+785 baseline + 3 lock tests) all green under `-D warnings`; `cargo build -p skirnir --features gui`, host
+workspace `cargo build`, and **`just build` (Xtensa)** all green — `grbl-codes` compiles no_std on the ESP target.

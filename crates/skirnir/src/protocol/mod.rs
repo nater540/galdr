@@ -7,6 +7,9 @@
 
 pub mod codes;
 pub mod core;
+/// Cross-crate lock test pinning skirnir's grbl fallback tables + run-state vocabulary to the firmware authority.
+#[cfg(test)]
+mod grbl_codes_lock;
 pub mod flow;
 pub mod lifecycle;
 pub mod parser_state;

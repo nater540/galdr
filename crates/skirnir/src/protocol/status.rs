@@ -51,20 +51,29 @@ pub fn peek_run_state(body: &str) -> RunState {
 }
 
 impl RunState {
-  /// Map the leading state token (already split off any `:substate`) to a [`RunState`].
+  /// Map the leading state token (already split off any `:substate`) to a [`RunState`]. The token spellings are
+  /// single-sourced in the shared [`grbl_codes`] wire vocabulary (the same set the firmware emits), so an
+  /// unrecognised token maps to [`RunState::Unknown`] rather than being dropped.
   fn from_token(token: &str) -> Self {
-    match token {
-      "Idle" => RunState::Idle,
-      "Run" => RunState::Run,
-      "Hold" => RunState::Hold,
-      "Jog" => RunState::Jog,
-      "Alarm" => RunState::Alarm,
-      "Door" => RunState::Door,
-      "Check" => RunState::Check,
-      "Home" => RunState::Home,
-      "Sleep" => RunState::Sleep,
-      "Tool" => RunState::Tool,
-      _ => RunState::Unknown,
+    grbl_codes::RunState::from_token(token).map_or(RunState::Unknown, RunState::from)
+  }
+}
+
+impl From<grbl_codes::RunState> for RunState {
+  /// Lift a shared wire run-state into the host's richer [`RunState`] (which additionally carries
+  /// [`Unknown`](RunState::Unknown) for tokens outside the shared set).
+  fn from(state: grbl_codes::RunState) -> Self {
+    match state {
+      grbl_codes::RunState::Idle => RunState::Idle,
+      grbl_codes::RunState::Run => RunState::Run,
+      grbl_codes::RunState::Hold => RunState::Hold,
+      grbl_codes::RunState::Jog => RunState::Jog,
+      grbl_codes::RunState::Alarm => RunState::Alarm,
+      grbl_codes::RunState::Door => RunState::Door,
+      grbl_codes::RunState::Check => RunState::Check,
+      grbl_codes::RunState::Home => RunState::Home,
+      grbl_codes::RunState::Sleep => RunState::Sleep,
+      grbl_codes::RunState::Tool => RunState::Tool,
     }
   }
 }
