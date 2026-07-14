@@ -27,7 +27,7 @@ Severity/scope reflect the adversarial corrections (some findings were downgrade
 | A1 | Split `firmware/src/comms.rs` (5,383 lines, **0 tests**) into a `comms/` module dir | **done** |
 | A3 | Split `skirnir/src/app/views.rs` (~4,229 prod lines, 93 fns) into `views/` | **done** |
 | A2 | Split `firmware-core/src/protocol.rs` (~2,721 prod lines) into `protocol/` (TMC-diag stays as `protocol/diag_types.rs` — see A2 plan) | **done** |
-| A4 | Split `skirnir/src/app/shell.rs` (~2,663 prod lines, 73 methods) into `shell/` impl blocks | Not started |
+| A4 | Split `skirnir/src/app/shell.rs` (~2,663 prod lines, 73 methods) into `shell/` impl blocks | **done** |
 | D1 | Extract grblHAL error/alarm/run-state constant tables into a shared `no_std` crate consumed by both `firmware-core` and `skirnir` | Not started |
 | C1 | `protocol.rs:1488/1509` call the existing `write_axes_csv` helper instead of inlining the loop | Not started |
 | B1 | Decompose `comms.rs plan_gcode_line` (181 lines → gate/drive_modal/dispatch) | **done** (with A1 Step 14) |
@@ -493,3 +493,56 @@ DOC-07 caution: preserve every formatter byte-for-byte (the wire format is a hos
     the heavy `firmware_core::protocol::` consumer resolves with zero consumer edits (no file outside `protocol.rs`→`protocol/`
     was touched). No trailing whitespace, no missing final newlines, no double-blank runs; the only >120-char lines are
     pre-existing verbatim content (em-dash/table byte-length), carried unchanged.
+
+---
+
+## A4 — `skirnir/src/app/shell.rs` split plan
+
+Target: split `shell.rs` (4,823 lines; ~2,663 production, tests from 2664) into an `app/shell/` module dir. Host-tested
+→ gate each step on `cargo build -p skirnir` + `cargo test -p skirnir` (+ `--features gui` at the end).
+
+**Structural difference vs A1/A2/A3:** shell.rs is ONE giant `impl SkirnirApp { ~71 methods }` (lines 299–2364) plus
+`impl eframe::App for SkirnirApp` (2365–2547), with the struct + 8 supporting types up top. The split uses Rust's
+**multiple `impl SkirnirApp` blocks across files** — each `shell/<concern>.rs` holds one `impl SkirnirApp { … }`. The
+struct definition stays in `shell/mod.rs`.
+
+**Two mechanical rules:**
+1. **Method visibility.** `SkirnirApp` methods call each other across clusters. A private method's impl in a child file
+   is only module-visible, so any method called from a DIFFERENT child must widen to `pub(crate)` (compiler-driven; let
+   it flag each). Harmless — the crate's only external shell surface is `SkirnirApp` + `run` (`app/mod.rs:72`).
+2. **`super` rescoping** (same as A3). shell.rs is under `app`, so moved code's `super::X` (app-level; recon: 18 kinds,
+   ZERO `super::super`) → `crate::app::X`. View-level names resolve via each child's `use super::*;` from `shell/mod.rs`.
+
+External API to keep stable (via `pub use` + struct in mod.rs): `shell::{SkirnirApp, run}` (`app/mod.rs:72`), plus
+`SkirnirApp::eta_qualifier`/`new` etc. reached only through the struct. No file outside `app/shell/` should need editing.
+
+Planned layout (`app/shell/`):
+
+| File | Contents | Status |
+|------|----------|--------|
+| `mod.rs` | consts (`REPAINT_INTERVAL`, `JOG_STREAM_*`) + `struct SkirnirApp` + the 8 supporting types (`JogStream`, `ProbeOpSlot`, `MeshProbeRun`, `SweepRun`, `RotaryCenterRun`, `DatumRun`, `TouchFallback`, `PendingZeroZProbe`) + free fns (`dir_word`, `is_probe_cycle_state`, `size_trace`, `run`, `apply_appearance`, `apply_ui_defaults`) + `mod`/`pub use` wiring + the `#[cfg(test)]` module | **done** |
+| `lifecycle.rs` | `impl SkirnirApp {` new, pump_events, badge_is_live, on_engine_dropped, pump_reconnect, track_stream_clock, pump_hotkeys, handle_intent, set_language, mark_appearance_changed `}` + `impl eframe::App for SkirnirApp {…}` | **done** |
+| `connection.rs` | connect, connect_inner, disconnect, refresh_ports, identify_port | **done** |
+| `streaming.rs` | open_program, start_stream, warn_on_wcs_mismatch, resolve_stream_program, invalidate_autolevel, simulate, clear_simulation, run_or_resume, send_line, send_command, notice, stream_time, eta_qualifier | **done** |
+| `controls.rs` | set_override, request_settings, write_setting, save_settings, jog, jog_start, jog_stop, clear_jog_stream, pump_jog_stream | **done** |
+| `wizards.rs` | pump_probe, probe_z/pump_probe_z, rotary_center_* + apply_saved_rotary_center, pump_wizard, datum_* + verify_probe_clear + pump_datum, mesh_* + pump_mesh + finish_mesh_probe + mesh_clear + apply_saved_mesh, cancel_probe_ops_except, flip_verify_*, runout_start, sweep_* + pump_sweep (the big ~900-line probe/wizard cluster — may split further if clean; this is the C5 region but do NOT do the C5 trait unification here, pure relocation only) | **done** |
+| `persistence.rs` | save_config, reload_config, save_profile, snapshot_prefs, persist_profile, save_rotary_center | **done** |
+
+Order: `mod.rs` scaffolding (struct + types + free fns + tests) → peel off one `impl SkirnirApp` concern block at a
+time, `cargo build`+`cargo test -p skirnir` green after each. Pure relocation — no behavior/UI change. Do NOT fold in
+C5 (wizard `trait ProbeWizard`) — that's a separate Tier-2 item.
+
+**A4 COMPLETE.** `shell.rs` (4,823 lines) → `app/shell/` (7 files, 4,864 lines incl. per-child scaffolding):
+`mod.rs` 2,582 (struct + 8 supporting types + consts + 6 free fns + `mod` wiring + both `#[cfg(test)]` modules whole),
+`lifecycle.rs` 654 (10 methods + the `impl eframe::App` block), `connection.rs` 141, `streaming.rs` 263, `controls.rs`
+164, `wizards.rs` 958, `persistence.rs` 102. The 71 methods split across **6 `impl SkirnirApp` blocks** (one per child,
+plus the eframe impl in `lifecycle.rs`); the struct + types + free fns stayed in `mod.rs`. `wizards.rs` was kept as one
+file (the optional further split was deferred — pure relocation only, no C5 trait). Mechanical rules applied: (1)
+**method visibility** — 62 methods called across files (or from the tests module) were widened to `pub(crate)` exactly as
+the compiler's E0624s demanded; genuinely file-local methods stayed private. (2) **`super::`→`crate::app::` rescope** on
+all moved bodies (the header/free-fn/test code left in `mod.rs` keeps `super::`); the 3 pre-existing `crate::app::` paths
+were idempotent under it, and there were zero `super::super::` in the moved region. Each child does `use super::*;` for
+the struct/types/consts/aliases. Verified byte-identical to the pre-split `shell.rs` modulo those transforms via a
+non-blank multiset diff vs `HEAD` (zero original lines lost; only new scaffolding added) and a 1:1 line-coverage check.
+Tests: **785 lib + 3 bin + 1 doctest**, identical to the pre-split baseline (0 new, 0 lost). `cargo build -p skirnir`,
+`cargo build -p skirnir --features gui`, and `cargo test -p skirnir` all green; no file outside `app/shell/` was edited.
