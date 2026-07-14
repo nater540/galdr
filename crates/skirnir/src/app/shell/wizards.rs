@@ -802,68 +802,38 @@ trait ProbeWizard {
   fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback>;
 }
 
-impl ProbeWizard for RotaryCenterRun {
-  fn is_probing(&self) -> bool {
-    self.state.is_probing()
-  }
-  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
-    crate::app::view_state::ProbeKind::RotaryCenter
-  }
-  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
-    self.state.on_probe_result(outcome);
-  }
-  fn abort(&mut self, reason: String) {
-    self.state.abort(reason);
-  }
-  fn touch_fallback(&self) -> &Option<TouchFallback> {
-    &self.touch_fallback
-  }
-  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
-    &mut self.touch_fallback
-  }
+/// Implement [`ProbeWizard`] for a run struct whose touch lifecycle lives in a `self.state` pure state machine and
+/// whose latch always carries a single fixed [`ProbeKind`]. The three single-kind wizards differ only by that one
+/// constant, so this collapses their otherwise byte-identical delegations. (`SweepRun` is hand-written below: it
+/// delegates to `self.sweep` and reports the run-carried `self.kind` rather than a constant.)
+macro_rules! impl_state_probe_wizard {
+  ($run:ty, $kind:ident) => {
+    impl ProbeWizard for $run {
+      fn is_probing(&self) -> bool {
+        self.state.is_probing()
+      }
+      fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
+        crate::app::view_state::ProbeKind::$kind
+      }
+      fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
+        self.state.on_probe_result(outcome);
+      }
+      fn abort(&mut self, reason: String) {
+        self.state.abort(reason);
+      }
+      fn touch_fallback(&self) -> &Option<TouchFallback> {
+        &self.touch_fallback
+      }
+      fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
+        &mut self.touch_fallback
+      }
+    }
+  };
 }
 
-impl ProbeWizard for DatumRun {
-  fn is_probing(&self) -> bool {
-    self.state.is_probing()
-  }
-  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
-    crate::app::view_state::ProbeKind::Datum
-  }
-  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
-    self.state.on_probe_result(outcome);
-  }
-  fn abort(&mut self, reason: String) {
-    self.state.abort(reason);
-  }
-  fn touch_fallback(&self) -> &Option<TouchFallback> {
-    &self.touch_fallback
-  }
-  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
-    &mut self.touch_fallback
-  }
-}
-
-impl ProbeWizard for MeshProbeRun {
-  fn is_probing(&self) -> bool {
-    self.state.is_probing()
-  }
-  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
-    crate::app::view_state::ProbeKind::Mesh
-  }
-  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
-    self.state.on_probe_result(outcome);
-  }
-  fn abort(&mut self, reason: String) {
-    self.state.abort(reason);
-  }
-  fn touch_fallback(&self) -> &Option<TouchFallback> {
-    &self.touch_fallback
-  }
-  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
-    &mut self.touch_fallback
-  }
-}
+impl_state_probe_wizard!(RotaryCenterRun, RotaryCenter);
+impl_state_probe_wizard!(DatumRun, Datum);
+impl_state_probe_wizard!(MeshProbeRun, Mesh);
 
 impl ProbeWizard for SweepRun {
   fn is_probing(&self) -> bool {
