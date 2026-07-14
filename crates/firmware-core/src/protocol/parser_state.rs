@@ -201,3 +201,84 @@ impl ParserSnapshot {
     }
   }
 }
+
+/// Translate the gcode parser's [`ModalState`](crate::gcode::ModalState) into this [`ParserSnapshot`] for `$G`
+/// formatting. This is the one place the modal GCode enums are bridged to the protocol's rendering enums, keeping
+/// the `$G` renderer free of any GCode-parsing coupling.
+pub fn parser_snapshot(state: &crate::gcode::ModalState) -> ParserSnapshot {
+  use crate::gcode::{DistanceMode, FeedMode, MotionMode, Plane, SpindleState, Units};
+  ParserSnapshot {
+    motion: match state.motion {
+      MotionMode::Rapid => ParserMotion::Rapid,
+      MotionMode::Linear => ParserMotion::Linear,
+      MotionMode::ArcCw => ParserMotion::ArcCw,
+      MotionMode::ArcCcw => ParserMotion::ArcCcw,
+    },
+    units: match state.units {
+      Units::Inch => ParserUnits::Inch,
+      Units::Millimeter => ParserUnits::Millimeter,
+    },
+    distance: match state.distance {
+      DistanceMode::Absolute => ParserDistance::Absolute,
+      DistanceMode::Incremental => ParserDistance::Incremental,
+    },
+    feed_mode: match state.feed_mode {
+      FeedMode::InverseTime => ParserFeedMode::InverseTime,
+      FeedMode::UnitsPerMin => ParserFeedMode::UnitsPerMin,
+    },
+    wcs: state.wcs,
+    tlo_active: state.tlo_active,
+    feed: state.feed,
+    spindle: match state.spindle {
+      SpindleState::Clockwise => ParserSpindle::Clockwise,
+      SpindleState::CounterClockwise => ParserSpindle::CounterClockwise,
+      SpindleState::Stop => ParserSpindle::Stop,
+    },
+    // The parser tracks spindle speed as f32 RPM; the snapshot reports whole RPM (grbl's `$G` S word).
+    spindle_rpm: state.spindle_speed.max(0.0) as u16,
+    plane: match state.plane {
+      Plane::XY => ParserPlane::XY,
+      Plane::ZX => ParserPlane::ZX,
+      Plane::YZ => ParserPlane::YZ,
+    },
+    coolant: ParserCoolant { mist: state.coolant.mist, flood: state.coolant.flood },
+    // The CURRENT (active) tool, committed by M6; reported as `T<n>` in `$G` (`T0` = none).
+    tool: state.current_tool,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::gcode::{DistanceMode, FeedMode, ModalState, MotionMode, Plane, SpindleState, Units};
+
+  #[test]
+  fn parser_snapshot_maps_power_on_modal_defaults() {
+    let snapshot = parser_snapshot(&ModalState::default());
+    assert_eq!(snapshot, ParserSnapshot::power_on());
+  }
+
+  #[test]
+  fn parser_snapshot_bridges_a_representative_non_default_state() {
+    let mut state = ModalState::default();
+    state.motion = MotionMode::ArcCw;
+    state.units = Units::Inch;
+    state.distance = DistanceMode::Incremental;
+    state.feed_mode = FeedMode::InverseTime;
+    state.plane = Plane::ZX;
+    state.spindle = SpindleState::CounterClockwise;
+    state.spindle_speed = 12000.4;
+    state.coolant.flood = true;
+    state.current_tool = 3;
+    let snapshot = parser_snapshot(&state);
+    assert_eq!(snapshot.motion, ParserMotion::ArcCw);
+    assert_eq!(snapshot.units, ParserUnits::Inch);
+    assert_eq!(snapshot.distance, ParserDistance::Incremental);
+    assert_eq!(snapshot.feed_mode, ParserFeedMode::InverseTime);
+    assert_eq!(snapshot.plane, ParserPlane::ZX);
+    assert_eq!(snapshot.spindle, ParserSpindle::CounterClockwise);
+    assert_eq!(snapshot.spindle_rpm, 12000);
+    assert_eq!(snapshot.coolant, ParserCoolant { mist: false, flood: true });
+    assert_eq!(snapshot.tool, 3);
+  }
+}

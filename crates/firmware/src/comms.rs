@@ -49,16 +49,14 @@ use embassy_futures::select::{select, select4, Either, Either4};
 use firmware_core::coords;
 use firmware_core::homing::{HomingConfig, HomingError};
 use firmware_core::gcode::{
-  CoordinateOp, DistanceMode as GcodeDistance, FeedMode as GcodeFeedMode, ModalState, MotionMode, Parser,
-  SpindleState, Units as GcodeUnits,
+  CoordinateOp, DistanceMode as GcodeDistance, ModalState, Parser, SpindleState, Units as GcodeUnits,
 };
 use firmware_core::motion::steps_to_mm;
 use firmware_core::planner::{Planner, PlannerError, PlannerOutcome, SoftLimits, SpinUpGate, AXES};
 use firmware_core::spindle::SpindleAction;
 use firmware_core::protocol::{
   probe_response, AlarmCode, CheckToggle, ControlState, CoordinateReport, LastProbe, MachineSnapshot,
-  MachineState, Overrides, ParserCoolant, ParserDistance, ParserFeedMode, ParserMotion,
-  ParserPlane, ParserSnapshot, ParserSpindle, ParserUnits,
+  MachineState, Overrides,
   PinReport, ProbeResponse, ResponseWriter, SystemCommand, UnlockOutcome,
   ERROR_CODES, ERROR_HOMING_DISABLED, ERROR_NOT_IDLE, ERROR_UNSUPPORTED_COMMAND, NGC_PARAMETER_LINES,
   RESPONSE_CAPACITY,
@@ -67,6 +65,13 @@ use firmware_core::settings::{self, PbChunkResult, PbReceiver, SettingError, Set
 
 use crate::spindle;
 use crate::storage::{FlashRecordStore, SharedFlash};
+
+// E1 (architecture-refactor): these four genuinely-pure helpers moved to the host-tested `firmware-core` so they
+// gain unit coverage and honor the DOC-09 layering rule. Re-exported `pub(crate)` here so the existing call sites
+// across the `comms/` submodules keep resolving unchanged via their `use super::*` globs, at the new core paths.
+pub(crate) use firmware_core::coolant::coolant_mask;
+pub(crate) use firmware_core::coords::{axis_values_mm, units_scale};
+pub(crate) use firmware_core::protocol::parser_snapshot;
 
 mod state;
 pub(crate) use state::*;
@@ -278,15 +283,6 @@ async fn program_running() -> bool {
   }
   let guard = PLANNER.lock().await;
   guard.as_ref().map(|p| !p.is_empty()).unwrap_or(false)
-}
-
-/// The mm-per-unit scale for a [`GcodeUnits`] value (1 for mm, 25.4 for inch). Coordinate words arrive in the
-/// active units; the coordinate model stores everything in mm, so the consumer scales at the boundary.
-pub(crate) fn units_scale(units: GcodeUnits) -> f32 {
-  match units {
-    GcodeUnits::Millimeter => 1.0,
-    GcodeUnits::Inch => firmware_core::planner::MM_PER_INCH,
-  }
 }
 
 /// Queue a `[MSG:<text>]` push message (e.g. `[MSG:Caution: Unlocked]`, `[MSG:Enabled]`).

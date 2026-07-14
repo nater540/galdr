@@ -45,11 +45,6 @@ pub(crate) fn sync_coolant_from_modal(modal: &ModalState, state: &mut ConsumerSt
   }
 }
 
-/// Pack a [`CoolantState`](firmware_core::gcode::CoolantState) into the [`COOLANT_STATE`] bitmask.
-fn coolant_mask(coolant: firmware_core::gcode::CoolantState) -> u8 {
-  (if coolant.mist { COOLANT_BIT_MIST } else { 0 }) | (if coolant.flood { COOLANT_BIT_FLOOD } else { 0 })
-}
-
 /// Unpack the live [`COOLANT_STATE`] bitmask into a [`CoolantState`](firmware_core::gcode::CoolantState), for the
 /// [`coolant`] task. An `Acquire` load pairs with the consumer's `Release` store.
 pub fn commanded_coolant() -> firmware_core::gcode::CoolantState {

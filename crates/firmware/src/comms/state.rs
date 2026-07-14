@@ -559,10 +559,9 @@ pub static SPINDLE_ESTOP: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// the (hardware-gated) coolant outputs. `Release`/`Acquire` orders it ahead of the [`COOLANT_UPDATE`] wake that
 /// always follows a store. Mirrors [`SPINDLE_DIRECTION`].
 pub static COOLANT_STATE: AtomicU8 = AtomicU8::new(0);
-/// [`COOLANT_STATE`] bit for mist (M7).
-pub const COOLANT_BIT_MIST: u8 = 0b01;
-/// [`COOLANT_STATE`] bit for flood (M8).
-pub const COOLANT_BIT_FLOOD: u8 = 0b10;
+// The `COOLANT_STATE` bit vocabulary is single-sourced in `firmware-core::coolant` alongside the host-tested
+// `coolant_mask` packer (E1). Re-exported so `crate::comms::COOLANT_BIT_*` keeps resolving unchanged.
+pub use firmware_core::coolant::{COOLANT_BIT_FLOOD, COOLANT_BIT_MIST};
 
 /// Wakes the [`coolant`] task to RE-APPLY the coolant outputs from the current [`COOLANT_STATE`]. Coalesced (a
 /// `Signal`): the task always re-reads the live state after a wake, so a missed-and-coalesced wake loses nothing.

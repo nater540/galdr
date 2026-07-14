@@ -976,29 +976,6 @@ pub(crate) async fn sync_active_wcs(parser_wcs: usize) {
   mark_coordinates_dirty();
 }
 
-/// Resolve a line's [`AxisWords`] into an mm value array plus a per-axis "present" mask, scaling inch words to mm.
-/// Absent axes carry `0.0` with `present = false` so a mutator writes only the mentioned axes. The full [`AXES`]
-/// word set is read (X/Y/Z AND the rotary A) — omitting A previously indexed a 3-element array at axis 3 and
-/// PANICKED on a G92/G10 L2/L20 line carrying an A word (`AXES == 4`). Per the DOC-10.1 rotary convention a word on
-/// a ROTARY axis (per the live `$376` `rotary_mask`) is in DEGREES and is NEVER inch-scaled — a `G20 ... A90` is 90
-/// degrees, not 90 × 25.4 — matching [`Planner::resolve_target`]'s per-axis scale fork, so a WCS/G92 offset on a
-/// rotary A stores degrees. `rotary_mask` is the live `$376` value; bit N set marks axis N angular.
-fn axis_values_mm(axes: &firmware_core::gcode::AxisWords, units: GcodeUnits, rotary_mask: u8) -> ([f32; AXES], [bool; AXES]) {
-  let linear_scale = units_scale(units);
-  let words = [axes.x, axes.y, axes.z, axes.a];
-  let mut values = [0.0f32; AXES];
-  let mut present = [false; AXES];
-  for axis in 0..AXES {
-    if let Some(value) = words[axis] {
-      // A rotary axis word is degrees — never inch-scaled (its scale is 1.0); a linear word scales mm/inch.
-      let scale = if rotary_mask & (1 << axis) != 0 { 1.0 } else { linear_scale };
-      values[axis] = value * scale;
-      present[axis] = true;
-    }
-  }
-  (values, present)
-}
-
 /// Persist the live PERSISTENT coordinate subset (G54-G59 / G28 / G30 / active WCS) to flash IF a change is
 /// pending, clearing [`COORDINATES_DIRTY`]. The coordinate analogue of [`flush_settings`]: callers mark dirty
 /// per persistent op, and this performs the actual flash append once per burst (queue-empty), on the safety

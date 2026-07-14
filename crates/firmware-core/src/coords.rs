@@ -32,8 +32,9 @@
 //! shared `Cell` snapshot pattern exactly like [`crate::protocol::ControlState`]. Every mutator
 //! finite-guards its inputs so a NaN/inf word from a malformed line can never poison the offset set.
 
+use crate::gcode::{AxisWords, Units};
 use crate::hal_traits::{RecordStore, StoreError};
-use crate::planner::AXES;
+use crate::planner::{AXES, MM_PER_INCH};
 
 // The coordinate-system cardinalities are GCode-protocol facts owned by the shared parser
 // (`G54`–`G59` work systems, `G28`/`G30` predefined positions). Re-export them so this module's
@@ -422,6 +423,38 @@ pub mod wire {
   // The G54-G59 / G28-G30 field maps above assume the canonical counts; fail loudly if they change.
   const _: () = assert!(WCS_COUNT == 6, "coordinate wire conversions assume 6 work coordinate systems");
   const _: () = assert!(PREDEFINED_COUNT == 2, "coordinate wire conversions assume 2 predefined positions");
+}
+
+/// The mm-per-unit scale for a [`Units`] value (1 for mm, [`MM_PER_INCH`] for inch). Coordinate words arrive in
+/// the active units; the coordinate model stores everything in mm, so the firmware scales at the boundary.
+pub fn units_scale(units: Units) -> f32 {
+  match units {
+    Units::Millimeter => 1.0,
+    Units::Inch => MM_PER_INCH,
+  }
+}
+
+/// Resolve a line's [`AxisWords`] into an mm value array plus a per-axis "present" mask, scaling inch words to mm.
+/// Absent axes carry `0.0` with `present = false` so a mutator writes only the mentioned axes. The full [`AXES`]
+/// word set is read (X/Y/Z AND the rotary A) — omitting A previously indexed a 3-element array at axis 3 and
+/// PANICKED on a G92/G10 L2/L20 line carrying an A word (`AXES == 4`). Per the DOC-10.1 rotary convention a word on
+/// a ROTARY axis (per the live `$376` `rotary_mask`) is in DEGREES and is NEVER inch-scaled — a `G20 ... A90` is 90
+/// degrees, not 90 × 25.4 — matching [`crate::planner::Planner::resolve_target`]'s per-axis scale fork, so a WCS/G92
+/// offset on a rotary A stores degrees. `rotary_mask` is the live `$376` value; bit N set marks axis N angular.
+pub fn axis_values_mm(axes: &AxisWords, units: Units, rotary_mask: u8) -> ([f32; AXES], [bool; AXES]) {
+  let linear_scale = units_scale(units);
+  let words = [axes.x, axes.y, axes.z, axes.a];
+  let mut values = [0.0f32; AXES];
+  let mut present = [false; AXES];
+  for axis in 0..AXES {
+    if let Some(value) = words[axis] {
+      // A rotary axis word is degrees — never inch-scaled (its scale is 1.0); a linear word scales mm/inch.
+      let scale = if rotary_mask & (1 << axis) != 0 { 1.0 } else { linear_scale };
+      values[axis] = value * scale;
+      present[axis] = true;
+    }
+  }
+  (values, present)
 }
 
 #[cfg(test)]
@@ -842,5 +875,31 @@ mod tests {
     assert_eq!(cs.tlo(), 0.0);
     approx(cs.machine_to_work([0.0, 0.0, probe_machine_z, 0.0]), [0.0, 0.0, plate_thickness, 0.0]);
     approx(cs.machine_to_work([0.0, 0.0, probe_machine_z - plate_thickness, 0.0]), [0.0, 0.0, 0.0, 0.0]);
+  }
+
+  #[test]
+  fn units_scale_is_identity_for_mm_and_inch_conversion() {
+    assert_eq!(units_scale(Units::Millimeter), 1.0);
+    assert_eq!(units_scale(Units::Inch), MM_PER_INCH);
+  }
+
+  #[test]
+  fn axis_values_mm_scales_only_present_words_and_masks_absent_axes() {
+    // Only X and Z present; Y and A absent must read 0.0 with present = false so a mutator skips them.
+    let words = AxisWords { x: Some(2.0), y: None, z: Some(-3.0), a: None };
+    let (values, present) = axis_values_mm(&words, Units::Millimeter, 0);
+    assert_eq!(values, [2.0, 0.0, -3.0, 0.0]);
+    assert_eq!(present, [true, false, true, false]);
+  }
+
+  #[test]
+  fn axis_values_mm_inch_scales_linear_words_but_not_a_rotary_axis() {
+    // Under G20 the linear X word scales by 25.4; a rotary A (bit 3 set in `$376`) is degrees, never inch-scaled.
+    let words = AxisWords { x: Some(1.0), y: None, z: None, a: Some(90.0) };
+    let rotary_mask = 1 << 3;
+    let (values, present) = axis_values_mm(&words, Units::Inch, rotary_mask);
+    assert_eq!(values[0], MM_PER_INCH);
+    assert_eq!(values[3], 90.0);
+    assert_eq!(present, [true, false, false, true]);
   }
 }

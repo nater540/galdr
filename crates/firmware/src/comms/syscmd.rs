@@ -7,7 +7,7 @@
 //! module and staying code, so they remain in `comms.rs` and are reached via the re-export. `comms.rs` re-exports this
 //! module (`pub(crate) use syscmd::*;`) so the consumer's `handle_line` call to `handle_system_command` still resolves.
 
-use firmware_core::gcode::{DistanceMode as GcodeDistance, ModalState, Parser, Units as GcodeUnits};
+use firmware_core::gcode::Parser;
 use firmware_core::protocol::{AlarmCode, ControlState, ResponseWriter, SystemCommand, ERROR_UNSUPPORTED_COMMAND};
 
 // `use super::*` supplies the wide parent surface the moved handlers touch: the state accessors + statics, the
@@ -725,49 +725,5 @@ async fn send_parser_state(parser: &Parser) {
   let mut s = Response::new();
   if ResponseWriter::parser_state(&mut s, &parser_snapshot(parser.state())).is_ok() {
     enqueue(s).await;
-  }
-}
-
-/// Translate the gcode parser's [`ModalState`] into the protocol layer's [`ParserSnapshot`] for `$G`
-/// formatting. This is the one place the firmware bin bridges the parser's modal enums to the protocol's
-/// rendering enums, keeping `firmware-core::protocol` free of any GCode-parsing coupling.
-fn parser_snapshot(state: &ModalState) -> ParserSnapshot {
-  ParserSnapshot {
-    motion: match state.motion {
-      MotionMode::Rapid => ParserMotion::Rapid,
-      MotionMode::Linear => ParserMotion::Linear,
-      MotionMode::ArcCw => ParserMotion::ArcCw,
-      MotionMode::ArcCcw => ParserMotion::ArcCcw,
-    },
-    units: match state.units {
-      GcodeUnits::Inch => ParserUnits::Inch,
-      GcodeUnits::Millimeter => ParserUnits::Millimeter,
-    },
-    distance: match state.distance {
-      GcodeDistance::Absolute => ParserDistance::Absolute,
-      GcodeDistance::Incremental => ParserDistance::Incremental,
-    },
-    feed_mode: match state.feed_mode {
-      GcodeFeedMode::InverseTime => ParserFeedMode::InverseTime,
-      GcodeFeedMode::UnitsPerMin => ParserFeedMode::UnitsPerMin,
-    },
-    wcs: state.wcs,
-    tlo_active: state.tlo_active,
-    feed: state.feed,
-    spindle: match state.spindle {
-      SpindleState::Clockwise => ParserSpindle::Clockwise,
-      SpindleState::CounterClockwise => ParserSpindle::CounterClockwise,
-      SpindleState::Stop => ParserSpindle::Stop,
-    },
-    // The parser tracks spindle speed as f32 RPM; the snapshot reports whole RPM (grbl's `$G` S word).
-    spindle_rpm: state.spindle_speed.max(0.0) as u16,
-    plane: match state.plane {
-      firmware_core::gcode::Plane::XY => ParserPlane::XY,
-      firmware_core::gcode::Plane::ZX => ParserPlane::ZX,
-      firmware_core::gcode::Plane::YZ => ParserPlane::YZ,
-    },
-    coolant: ParserCoolant { mist: state.coolant.mist, flood: state.coolant.flood },
-    // The CURRENT (active) tool, committed by M6; reported as `T<n>` in `$G` (`T0` = none).
-    tool: state.current_tool,
   }
 }

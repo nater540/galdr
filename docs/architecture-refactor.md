@@ -29,7 +29,7 @@ Severity/scope reflect the adversarial corrections (some findings were downgrade
 | A2 | Split `firmware-core/src/protocol.rs` (~2,721 prod lines) into `protocol/` (TMC-diag stays as `protocol/diag_types.rs` — see A2 plan) | **done** |
 | A4 | Split `skirnir/src/app/shell.rs` (~2,663 prod lines, 73 methods) into `shell/` impl blocks | **done** |
 | D1 | Shared `grbl-codes` crate for the run-state token vocabulary + a cross-crate lock test for the error/alarm overlap (see D1 plan — the tables themselves are intentionally divergent and NOT merged) | **done** |
-| C1 | `protocol.rs:1488/1509` call the existing `write_axes_csv` helper instead of inlining the loop | Not started |
+| C1 | `status_report` (now `protocol/response.rs`) calls `write_axes_csv` instead of inlining the loop twice | **done** |
 | B1 | Decompose `comms.rs plan_gcode_line` (181 lines → gate/drive_modal/dispatch) | **done** (with A1 Step 14) |
 | A6/B2 | Decompose `main.rs main()` (369 lines) into per-phase init fns | Not started |
 | B4 | Extract `handle_soft_reset`/`handle_override` from `dispatch_realtime` | **done** (with A1 Step 5) |
@@ -41,11 +41,11 @@ Severity/scope reflect the adversarial corrections (some findings were downgrade
 | C5 | skirnir wizard `pump_*` glue — `trait ProbeWizard`/effect-return (4 pumps, ~150 lines; `pump_probe_z` excluded) | Not started |
 | C6 | skirnir `views.rs` egui idiom helpers (`dim_label`/`full_width_button`/`gated_action_button`/`param_row`) | Not started |
 | C2 | `comms.rs` `enumerate_*`/`send_setting_description` loop family → generic (exclude `dump_settings`) | **done** (with A1 Step 6) |
-| C4 | `settings.rs` fold parse/format into `SETTING_DESCRIPTORS` (4-way coupling) | Not started |
-| B5 | `gcode.rs apply_g_word`/`apply_m_word` extract `set_plane/units/distance/feed_mode` | Not started |
+| C4 | `settings.rs` fold parse/format into `SETTING_DESCRIPTORS` (4-way coupling) | **declined** — each arm is `Field::X => settings.field_x = parse_TYPE(value)?` (setting-specific parse fn + target field); folding it in just relocates 60 match arms into 60 `fn`-pointer fields in a `const` table (4-way→3-way coupling, same total logic) while trading readable explicit matches for fn-ptr indirection in a critical, well-tested settings/wire/flash path. Marginal gain, real risk. Nemesis: "design-taste, not a clear win." |
+| B5 | `gcode.rs apply_g_word`/`apply_m_word` extract `set_plane/units/distance/feed_mode` | **declined** — arms are already 2 lines (`guard.claim(Group::X)?; next_state.field = Y;`) where `claim()` is the shared helper; extracting per-group setters is net-neutral on size and hides the direct `G17→Plane::XY` mapping. Lowest-value per nemesis; not worth the indirection. |
 | C7 | `comms.rs` `cell_update` helper for `BlockingMutex<Cell<T>>` idiom (~14 sites) | Not started (A1 done without it; standalone follow-up) |
 | D2 | CI/host round-trip test: `SETTING_DESCRIPTORS` ↔ `settings.proto` lock-step | Not started |
-| E1 | Move the **4 truly-pure** helpers (`axis_values_mm`, `units_scale`, `coolant_mask`, `parser_snapshot`) to firmware-core | Not started |
+| E1 | Move the **4 truly-pure** helpers (`axis_values_mm`, `units_scale`, `coolant_mask`, `parser_snapshot`) to firmware-core | **done** (4 of 4) |
 
 ### Explicitly NOT doing (nemesis rejections / cautions)
 
@@ -582,3 +582,46 @@ identical wire vocabulary and to LOCK the rest by test rather than merge it.
 **Verification:** `cargo test -p grbl-codes` (2) · `-p firmware-core` (351, unchanged) · `-p skirnir` (788 lib =
 785 baseline + 3 lock tests) all green under `-D warnings`; `cargo build -p skirnir --features gui`, host
 workspace `cargo build`, and **`just build` (Xtensa)** all green — `grbl-codes` compiles no_std on the ESP target.
+
+---
+
+## E1 — move the 4 truly-pure helpers to firmware-core — DONE
+
+The four helpers the nemesis pass confirmed pure (they touch only `firmware_core`/`cnc_kinematics` types + primitives,
+never `embassy_*`/esp-hal/`crate::crash`/`crate::comms::` statics) moved out of the `firmware` crate's `comms/` wiring
+into the host-tested core, gaining unit coverage and honoring the DOC-09 layering rule. **All 4 of 4 moved** — each was
+re-verified pure before relocation, and the body was relocated byte-identically (logic unchanged, only made `pub` +
+tested).
+
+**What moved, and where:**
+- `units_scale` (was `comms.rs`) → `firmware_core::coords::units_scale` — `Units` → mm/inch scale.
+- `axis_values_mm` (was `comms/consumer.rs`) → `firmware_core::coords::axis_values_mm` — `AxisWords` → `[f32; AXES]`
+  values + present mask, with the DOC-10.1 rotary-degrees (never inch-scaled) fork intact.
+- `coolant_mask` (was `comms/spindle_coolant.rs`) → `firmware_core::coolant::coolant_mask` — `CoolantState` → `u8`
+  bitmask. Its bit vocabulary `COOLANT_BIT_MIST`/`COOLANT_BIT_FLOOD` (previously defined in `comms/state.rs`) moved
+  with it to `firmware_core::coolant` as the single canonical source; `comms/state.rs` now **re-exports** them
+  (`pub use firmware_core::coolant::{COOLANT_BIT_FLOOD, COOLANT_BIT_MIST};`) so `crate::comms::COOLANT_BIT_*` and the
+  firmware-side unpack (`commanded_coolant`) resolve unchanged. This supporting move keeps the encoder and its bit
+  vocabulary single-sourced rather than duplicated across the crate boundary (drift risk).
+- `parser_snapshot` (was `comms/syscmd.rs`) → `firmware_core::protocol::parser_snapshot` — `gcode::ModalState` →
+  `protocol::ParserSnapshot`, the one place the modal GCode enums bridge to the `$G` rendering enums.
+
+**Call sites edited (firmware crate).** The four are now `pub` on firmware-core and re-exported `pub(crate)` from
+`comms.rs` (`use firmware_core::coolant::coolant_mask; use firmware_core::coords::{axis_values_mm, units_scale}; use
+firmware_core::protocol::parser_snapshot;`), so the existing call sites across the `comms/` submodules
+(`probe.rs`/`consumer.rs` for `units_scale`, `consumer.rs` ×3 for `axis_values_mm`, `spindle_coolant.rs` for
+`coolant_mask`, `syscmd.rs` for `parser_snapshot`) keep resolving byte-identically via their `use super::*;` globs — a
+trivially behavior-preserving routing. Pruned the now-orphaned imports the moved code left behind: `MotionMode` +
+`FeedMode as GcodeFeedMode` and the 8 `Parser*` DTOs from `comms.rs` (used only by `parser_snapshot`), and
+`DistanceMode as GcodeDistance`/`ModalState`/`Units as GcodeUnits` from `syscmd.rs`'s gcode import.
+
+**Tests added (firmware-core, +6).** `coords`: `units_scale_is_identity_for_mm_and_inch_conversion`,
+`axis_values_mm_scales_only_present_words_and_masks_absent_axes`,
+`axis_values_mm_inch_scales_linear_words_but_not_a_rotary_axis`. `coolant`:
+`coolant_mask_packs_every_flood_mist_combination`. `protocol::parser_state`:
+`parser_snapshot_maps_power_on_modal_defaults`, `parser_snapshot_bridges_a_representative_non_default_state`.
+
+**Verification.** `cargo test -p firmware-core` **357 passed** / 0 failed / 1 ignored (baseline 351 + 6 new) under
+`RUSTFLAGS="-D warnings"`; host workspace `cargo build` green under `-D warnings`; **`just build` (Xtensa firmware)
+green** — confirming the call-site path changes compile. firmware-core stays `no_std` + esp-hal/embassy-free (all four
+helpers are pure, so no non-`no_std` dependency was pulled in).
