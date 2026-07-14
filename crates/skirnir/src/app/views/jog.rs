@@ -89,7 +89,7 @@ pub fn jog(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut 
       step_selector(ui, state);
       ui.add_space(6.0);
       ui.horizontal(|ui| {
-        ui.label(RichText::new(crate::tr!("lbl-feed")).size(11.0).color(palette.text_dim));
+        dim_label(ui, palette, crate::tr!("lbl-feed"));
         ui.add(egui::DragValue::new(&mut state.jog_feed).speed(10.0).range(1.0..=10_000.0).suffix(" mm/min"));
       });
     });

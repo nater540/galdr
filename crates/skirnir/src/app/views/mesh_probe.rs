@@ -11,12 +11,11 @@ pub fn mesh_probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   run: Option<&crate::app::autolevel::MeshProbeState>, has_saved_mesh: bool, sink: &mut IntentSink) {
   use crate::app::autolevel::MeshProbeStep;
   let palette = state.style.palette;
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+  right_panel(ui, |ui| {
     let idle = view.connection == ConnectionState::Idle;
     let Some(w) = run else {
       // No run: collect the grid bounds + spacing and offer Start (and a Clear for a persisted mesh).
-      ui.label(RichText::new(crate::tr!("mesh-intro")).size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, crate::tr!("mesh-intro"));
       ui.add_space(4.0);
       egui::Grid::new("mesh_setup").num_columns(3).show(ui, |ui| {
         ui.label(crate::tr!("lbl-mesh-min"));
@@ -34,19 +33,16 @@ pub fn mesh_probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       // Auto-fill the bounds from the loaded program's XY extents (the toolpath-bounds scan). Read the bounds into
       // an owned Option first so the immutable borrow is released before the click mutates the min/max fields.
       let program_bounds = state.program_xy_bounds();
-      ui.add_enabled_ui(program_bounds.is_some(), |ui| {
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-auto-bounds"))).clicked()
-          && let Some((min, max)) = program_bounds
-        {
-          state.mesh_min = min;
-          state.mesh_max = max;
-        }
-      });
+      if gated_action_button(ui, program_bounds.is_some(), crate::tr!("btn-mesh-auto-bounds")).clicked()
+        && let Some((min, max)) = program_bounds
+      {
+        state.mesh_min = min;
+        state.mesh_max = max;
+      }
       // The derived grid size (ceil(range/spacing)+1, min 2 per axis) so the operator sees the point count before
       // committing — this is exactly what `Mesh::from_spacing` will build.
       let (nx, ny) = grid_point_counts(state.mesh_min, state.mesh_max, state.mesh_spacing);
-      ui.label(RichText::new(crate::tr!("mesh-grid-size", { nx: nx.to_string(), ny: ny.to_string() }))
-        .size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, crate::tr!("mesh-grid-size", { nx: nx.to_string(), ny: ny.to_string() }));
       mesh_bench_params(ui, state);
       // Correction option (affects the STREAM, not acquisition): whether autolevel Z-corrects G0 rapids. Emits an
       // intent on change so the shell invalidates the corrected-program cache.
@@ -55,25 +51,23 @@ pub fn mesh_probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
         sink.push(Intent::SetCorrectRapids(correct_rapids));
       }
       ui.add_space(4.0);
-      ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-start"))).clicked() {
-          sink.push(Intent::MeshProbeStart {
-            params: state.mesh_bench,
-            min: state.mesh_min,
-            max: state.mesh_max,
-            spacing: (state.mesh_spacing, state.mesh_spacing),
-          });
-        }
-      });
+      if gated_action_button(ui, idle, crate::tr!("btn-mesh-start")).clicked() {
+        sink.push(Intent::MeshProbeStart {
+          params: state.mesh_bench,
+          min: state.mesh_min,
+          max: state.mesh_max,
+          spacing: (state.mesh_spacing, state.mesh_spacing),
+        });
+      }
       if has_saved_mesh {
         ui.add_space(4.0);
         ui.label(RichText::new(crate::tr!("mesh-saved")).size(11.0).color(palette.state_run));
         // Apply the saved mesh (arm autolevel against it) or clear it.
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-apply"))).clicked() {
+        if full_width_button(ui, crate::tr!("btn-mesh-apply")).clicked() {
           sink.push(Intent::ApplySavedMesh);
         }
         ui.add_space(2.0);
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-clear"))).clicked() {
+        if full_width_button(ui, crate::tr!("btn-mesh-clear")).clicked() {
           sink.push(Intent::MeshClear);
         }
       }
@@ -90,15 +84,13 @@ pub fn mesh_probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
     let probing = w.is_probing();
     match w.step {
       MeshProbeStep::Ready => {
-        ui.label(RichText::new(crate::tr!("mesh-step-ready")).size(11.0).color(palette.text_dim));
-        ui.add_enabled_ui(idle && !probing, |ui| {
-          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-mesh-probe"))).clicked() {
-            sink.push(Intent::MeshProbeNext);
-          }
-        });
+        dim_label(ui, palette, crate::tr!("mesh-step-ready"));
+        if gated_action_button(ui, idle && !probing, crate::tr!("btn-mesh-probe")).clicked() {
+          sink.push(Intent::MeshProbeNext);
+        }
       }
       MeshProbeStep::Probing => {
-        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
+        dim_label(ui, palette, crate::tr!("msg-probing-awaiting-dot"));
       }
       MeshProbeStep::Done => {
         ui.label(RichText::new(crate::tr!("mesh-done", { n: total.to_string() })).size(11.0).color(palette.state_run));
@@ -109,7 +101,7 @@ pub fn mesh_probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       }
     }
     ui.add_space(4.0);
-    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
+    if full_width_button(ui, crate::tr!("btn-cancel-wizard")).clicked() {
       sink.push(Intent::MeshProbeCancel);
     }
   });
@@ -184,15 +176,9 @@ fn mesh_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
     .id_salt("mesh_bench_params")
     .show(ui, |ui| {
       egui::Grid::new("mesh_bench").num_columns(2).show(ui, |ui| {
-        ui.label(crate::tr!("lbl-mesh-clearance"));
-        ui.add(egui::DragValue::new(&mut p.clearance_z).speed(0.1).range(-300.0..=0.0).suffix(" mm"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-mesh-feed"));
-        ui.add(egui::DragValue::new(&mut p.probe_feed).speed(5.0).range(1.0..=5000.0).suffix(" mm/min"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-mesh-depth"));
-        ui.add(egui::DragValue::new(&mut p.probe_depth).speed(0.5).range(0.1..=200.0).suffix(" mm"));
-        ui.end_row();
+        param_row(ui, crate::tr!("lbl-mesh-clearance"), &mut p.clearance_z, 0.1, -300.0..=0.0, " mm");
+        param_row(ui, crate::tr!("lbl-mesh-feed"), &mut p.probe_feed, 5.0, 1.0..=5000.0, " mm/min");
+        param_row(ui, crate::tr!("lbl-mesh-depth"), &mut p.probe_depth, 0.5, 0.1..=200.0, " mm");
       });
     });
 }

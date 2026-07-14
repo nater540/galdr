@@ -5,25 +5,18 @@ use super::*;
 /// Render the probe panel: depth/feed/plate inputs and a "Probe Z" action that the shell sequences.
 pub fn probe(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink: &mut IntentSink) {
   let palette = state.style.palette;
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    ui.label(RichText::new(crate::tr!("probe-intro")).size(11.0).color(palette.text_dim));
+  right_panel(ui, |ui| {
+    dim_label(ui, palette, crate::tr!("probe-intro"));
     ui.add_space(4.0);
     let enabled = view.connection == ConnectionState::Idle;
     ui.add_enabled_ui(enabled, |ui| {
       egui::Grid::new("probe").num_columns(2).show(ui, |ui| {
-        ui.label(crate::tr!("lbl-depth"));
-        ui.add(egui::DragValue::new(&mut state.probe_depth).speed(0.5).range(0.1..=200.0).suffix(" mm"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-feed"));
-        ui.add(egui::DragValue::new(&mut state.probe_feed).speed(5.0).range(1.0..=500.0).suffix(" mm/min"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-plate"));
-        ui.add(egui::DragValue::new(&mut state.plate_thickness).speed(0.05).range(0.0..=20.0).suffix(" mm"));
-        ui.end_row();
+        param_row(ui, crate::tr!("lbl-depth"), &mut state.probe_depth, 0.5, 0.1..=200.0, " mm");
+        param_row(ui, crate::tr!("lbl-feed"), &mut state.probe_feed, 5.0, 1.0..=500.0, " mm/min");
+        param_row(ui, crate::tr!("lbl-plate"), &mut state.plate_thickness, 0.05, 0.0..=20.0, " mm");
       });
       // The primary probe action is a full-width button, per the design's right-column treatment.
-      let probe_button = egui::Button::new(crate::tr!("btn-probe-z"));
-      if ui.add_sized(Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0), probe_button).clicked() {
+      if full_width_button(ui, crate::tr!("btn-probe-z")).clicked() {
         sink.push(Intent::ProbeZ {
           depth: state.probe_depth,
           feed: state.probe_feed,
@@ -51,7 +44,7 @@ fn probe_result(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
   };
   ui.add_space(6.0);
   if op.awaiting {
-    ui.label(RichText::new(crate::tr!("msg-probing-awaiting")).size(11.0).color(palette.text_dim));
+    dim_label(ui, palette, crate::tr!("msg-probing-awaiting"));
     return;
   }
   match op.last.as_ref() {
@@ -60,12 +53,12 @@ fn probe_result(ui: &mut egui::Ui, palette: Palette, view: &ViewState) {
       // precision. A short green confirmation reads as "done" without re-reading the console.
       let coords = position.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", ");
       ui.label(RichText::new(crate::tr!("probe-contact", { coords: coords })).size(11.0).color(palette.state_run));
-      ui.label(RichText::new(crate::tr!("probe-work-z-set")).size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, crate::tr!("probe-work-z-set"));
     }
     Some(ProbeOutcome::Failure { reason }) => {
       ui.label(RichText::new(crate::tr!("probe-failed", { reason: reason.clone() })).size(11.0)
         .color(palette.state_alarm));
-      ui.label(RichText::new(crate::tr!("probe-work-z-unchanged")).size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, crate::tr!("probe-work-z-unchanged"));
     }
     // Resolved but no outcome recorded — unreachable in practice (resolving always sets `last`), but render
     // nothing rather than assume.

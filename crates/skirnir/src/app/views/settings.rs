@@ -128,13 +128,13 @@ pub fn settings_tooltip_ui(
   };
   ui.label(RichText::new(heading).size(11.5).color(palette.text).strong());
   for line in meta_lines {
-    ui.label(RichText::new(line).size(11.0).color(palette.text_dim));
+    dim_label(ui, palette, line);
   }
   // The curated explanation, when the number is in the loaded set. Separated from the metadata by a thin rule so
   // the "what it does" prose reads distinctly from the "$ES says" facts above it.
   if let Some(desc) = descriptions.description(number) {
     ui.separator();
-    ui.label(RichText::new(desc).size(11.0).color(palette.text_dim));
+    dim_label(ui, palette, desc);
   }
 }
 
@@ -147,7 +147,7 @@ pub fn settings_tooltip_ui(
 fn settings_list(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState) {
   let palette = state.style.palette;
   if view.settings.is_empty() {
-    ui.label(RichText::new(crate::tr!("settings-none")).size(11.0).color(palette.text_dim));
+    dim_label(ui, palette, crate::tr!("settings-none"));
     return;
   }
   // The staged edit (if any) is applied after the row loop so we never mutate `editing_setting` mid-borrow.

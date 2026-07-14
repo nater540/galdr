@@ -147,8 +147,8 @@ pub fn shell_panels(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, da
 pub(crate) fn setup_menu(ui: &mut egui::Ui, state: &mut UiState, running: SetupRunning) {
   let palette = state.style.palette;
   section_header(ui, palette, &crate::tr!("hdr-setup"));
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    ui.label(RichText::new(crate::tr!("setup-intro")).size(11.0).color(palette.text_dim));
+  right_panel(ui, |ui| {
+    dim_label(ui, palette, crate::tr!("setup-intro"));
     ui.add_space(8.0);
     // The five entries in workflow order: touch-off first, then the setup wizards. `hdr-*` keys double as both
     // the button label and the dialog title (see [`setup_dialog_windows`]).

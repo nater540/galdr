@@ -11,12 +11,11 @@ pub fn datum_finder(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   datum: Option<&crate::app::datum::DatumState>, sink: &mut IntentSink) {
   use crate::app::datum::{Corner, DatumStep, DatumTarget};
   let palette = state.style.palette;
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+  right_panel(ui, |ui| {
     let idle = view.connection == ConnectionState::Idle;
     let Some(w) = datum else {
       // No run: offer the corner picker and the single-edge picker, plus the bench params, and a Start for each.
-      ui.label(RichText::new(crate::tr!("datum-intro")).size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, crate::tr!("datum-intro"));
       ui.add_space(4.0);
 
       // ── Corner ──
@@ -36,11 +35,9 @@ pub fn datum_finder(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       if ui.checkbox(&mut inside_toggle, RichText::new(crate::tr!("datum-inside")).size(11.0)).changed() {
         state.datum_corner.inside = inside_toggle;
       }
-      ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-find-corner"))).clicked() {
-          sink.push(Intent::DatumCornerStart { corner: state.datum_corner, params: state.datum_bench });
-        }
-      });
+      if gated_action_button(ui, idle, crate::tr!("btn-find-corner")).clicked() {
+        sink.push(Intent::DatumCornerStart { corner: state.datum_corner, params: state.datum_bench });
+      }
 
       ui.separator();
 
@@ -68,15 +65,13 @@ pub fn datum_finder(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
         });
         ui.end_row();
       });
-      ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-find-edge"))).clicked() {
-          sink.push(Intent::DatumEdgeStart {
-            axis: state.datum_edge_axis,
-            dir: state.datum_edge_dir,
-            params: state.datum_bench,
-          });
-        }
-      });
+      if gated_action_button(ui, idle, crate::tr!("btn-find-edge")).clicked() {
+        sink.push(Intent::DatumEdgeStart {
+          axis: state.datum_edge_axis,
+          dir: state.datum_edge_dir,
+          params: state.datum_bench,
+        });
+      }
 
       datum_bench_params(ui, state);
       return;
@@ -88,34 +83,28 @@ pub fn datum_finder(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       DatumTarget::Corner(_) => crate::tr!("datum-target-corner-out"),
       DatumTarget::Edge { axis, .. } => crate::tr!("datum-target-edge", { axis: axis.letter().to_string() }),
     };
-    ui.label(RichText::new(target).size(11.0).color(palette.text_dim));
+    dim_label(ui, palette, target);
     datum_run_readings(ui, palette, w);
     ui.add_space(6.0);
     let probing = w.is_probing();
     match w.step {
       DatumStep::EnterParams => {
-        ui.label(RichText::new(crate::tr!("datum-step-enter")).size(11.0).color(palette.text_dim));
-        ui.add_enabled_ui(idle && !probing, |ui| {
-          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-datum-probe"))).clicked() {
-            sink.push(Intent::DatumProbeNext);
-          }
-        });
+        dim_label(ui, palette, crate::tr!("datum-step-enter"));
+        if gated_action_button(ui, idle && !probing, crate::tr!("btn-datum-probe")).clicked() {
+          sink.push(Intent::DatumProbeNext);
+        }
       }
       DatumStep::ReadyFaceY => {
-        ui.label(RichText::new(crate::tr!("datum-step-ready-y")).size(11.0).color(palette.text_dim));
-        ui.add_enabled_ui(idle && !probing, |ui| {
-          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-datum-probe-y"))).clicked() {
-            sink.push(Intent::DatumProbeNext);
-          }
-        });
+        dim_label(ui, palette, crate::tr!("datum-step-ready-y"));
+        if gated_action_button(ui, idle && !probing, crate::tr!("btn-datum-probe-y")).clicked() {
+          sink.push(Intent::DatumProbeNext);
+        }
       }
       DatumStep::Review => {
         ui.label(RichText::new(crate::tr!("datum-step-review")).size(11.0).color(palette.state_run));
-        ui.add_enabled_ui(idle, |ui| {
-          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-datum-write"))).clicked() {
-            sink.push(Intent::DatumWriteWcs);
-          }
-        });
+        if gated_action_button(ui, idle, crate::tr!("btn-datum-write")).clicked() {
+          sink.push(Intent::DatumWriteWcs);
+        }
       }
       DatumStep::Aborted => {
         let reason = w.abort_reason.clone().unwrap_or_else(|| crate::tr!("reason-cancelled"));
@@ -123,11 +112,11 @@ pub fn datum_finder(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
       }
       // The probing steps await a result; only Cancel is offered.
       DatumStep::ProbeEdge | DatumStep::ProbeFaceX | DatumStep::ProbeFaceY => {
-        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
+        dim_label(ui, palette, crate::tr!("msg-probing-awaiting-dot"));
       }
     }
     ui.add_space(4.0);
-    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
+    if full_width_button(ui, crate::tr!("btn-cancel-wizard")).clicked() {
       sink.push(Intent::DatumCancel);
     }
   });
@@ -175,27 +164,13 @@ fn datum_bench_params(ui: &mut egui::Ui, state: &mut UiState) {
     .id_salt("datum_bench_params")
     .show(ui, |ui| {
       egui::Grid::new("datum_bench").num_columns(2).show(ui, |ui| {
-        ui.label(crate::tr!("lbl-tip-dia"));
-        ui.add(egui::DragValue::new(&mut p.probe_diameter).speed(0.01).range(0.0..=50.0).suffix(" mm"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-xy-clearance"));
-        ui.add(egui::DragValue::new(&mut p.xy_clearance).speed(0.1).range(0.0..=100.0).suffix(" mm"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-probe-distance"));
-        ui.add(egui::DragValue::new(&mut p.probe_distance).speed(0.5).range(0.1..=200.0).suffix(" mm"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-latch-distance"));
-        ui.add(egui::DragValue::new(&mut p.latch_distance).speed(0.1).range(0.1..=50.0).suffix(" mm"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-datum-probe-feed"));
-        ui.add(egui::DragValue::new(&mut p.probe_feed).speed(5.0).range(1.0..=5000.0).suffix(" mm/min"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-latch-feed"));
-        ui.add(egui::DragValue::new(&mut p.latch_feed).speed(1.0).range(1.0..=2000.0).suffix(" mm/min"));
-        ui.end_row();
-        ui.label(crate::tr!("lbl-corner-offset"));
-        ui.add(egui::DragValue::new(&mut p.offset).speed(0.1).range(0.0..=100.0).suffix(" mm"));
-        ui.end_row();
+        param_row(ui, crate::tr!("lbl-tip-dia"), &mut p.probe_diameter, 0.01, 0.0..=50.0, " mm");
+        param_row(ui, crate::tr!("lbl-xy-clearance"), &mut p.xy_clearance, 0.1, 0.0..=100.0, " mm");
+        param_row(ui, crate::tr!("lbl-probe-distance"), &mut p.probe_distance, 0.5, 0.1..=200.0, " mm");
+        param_row(ui, crate::tr!("lbl-latch-distance"), &mut p.latch_distance, 0.1, 0.1..=50.0, " mm");
+        param_row(ui, crate::tr!("lbl-datum-probe-feed"), &mut p.probe_feed, 5.0, 1.0..=5000.0, " mm/min");
+        param_row(ui, crate::tr!("lbl-latch-feed"), &mut p.latch_feed, 1.0, 1.0..=2000.0, " mm/min");
+        param_row(ui, crate::tr!("lbl-corner-offset"), &mut p.offset, 0.1, 0.0..=100.0, " mm");
       });
     });
 }

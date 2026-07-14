@@ -185,6 +185,50 @@ pub(crate) fn toolbar_divider(ui: &mut egui::Ui, palette: Palette, compact: bool
   ui.painter().vline(center.x, (center.y - half)..=(center.y + half), egui::Stroke::new(1.0, palette.divider));
 }
 
+/// Draw a dim secondary label in the recurring 11px `text_dim` treatment — the one spelling for the wizard
+/// intros, step hints, and readings that repeat across the right-column panels. Returns the label's
+/// [`egui::Response`] so callers can still hover/inspect it. Sites that use a DIFFERENT size or colour
+/// (`state_run`/`state_alarm`/`text`) stay inline — this helper is only the dominant `text_dim` form.
+pub(crate) fn dim_label(ui: &mut egui::Ui, palette: Palette, text: impl Into<String>) -> egui::Response {
+  ui.label(RichText::new(text).size(11.0).color(palette.text_dim))
+}
+
+/// Add a full-width panel action button at the design's right-column size — the panel's available width by
+/// [`Metrics::PANEL_CONTROL_H`]` + 6.0` — returning its [`egui::Response`]. The width is measured at call time,
+/// which equals the value the per-panel `let full = …` captured (these panels lay out top-down, where adding a
+/// row advances the cursor down without changing the column width), so the rendered button is identical.
+pub(crate) fn full_width_button(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) -> egui::Response {
+  let size = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+  ui.add_sized(size, egui::Button::new(label))
+}
+
+/// Add an enabled-gated full-width action button: a [`full_width_button`] wrapped in an `add_enabled_ui(gate)`
+/// scope so it greys out and stops responding when `gate` is false, returning the button's [`egui::Response`].
+/// This is the exact `add_enabled_ui(gate, |ui| if button.clicked() … )` idiom the wizard steps repeat, and the
+/// enclosing scope (hence the widget id) is preserved. Sites that gate MORE than one button in a single scope
+/// keep their own `add_enabled_ui` and call [`full_width_button`] inside it, so the shared scope is not split.
+pub(crate) fn gated_action_button(ui: &mut egui::Ui, gate: bool, label: impl Into<egui::WidgetText>) -> egui::Response {
+  ui.add_enabled_ui(gate, |ui| full_width_button(ui, label)).inner
+}
+
+/// Add a labelled `DragValue` row inside a two-column bench-param [`egui::Grid`]: the left label, a `speed`/
+/// `range`/`suffix` drag field bound to `value`, then `end_row`. This is the dominant bench-param row; rows that
+/// chain extra behaviour (an `.on_hover_text`, a `.changed()` side effect, or a second value in the row) stay
+/// inline so their extra wiring is not hidden behind the helper.
+pub(crate) fn param_row(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>, value: &mut f64, speed: f64,
+  range: std::ops::RangeInclusive<f64>, suffix: &str) {
+  ui.label(label);
+  ui.add(egui::DragValue::new(value).speed(speed).range(range).suffix(suffix));
+  ui.end_row();
+}
+
+/// Wrap `content` in the right column's panel [`egui::Frame`] — the design's `RIGHT_PAD` inner margin — matching
+/// the frame every right-side view opens with. Behaviourally identical to the inline
+/// `Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, …)` it replaces.
+pub(crate) fn right_panel<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> egui::InnerResponse<R> {
+  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, content)
+}
+
 /// Paint a small filled circle inline (a state dot), advancing the cursor by its diameter.
 pub(crate) fn dot(ui: &mut egui::Ui, color: Color32, diameter: f32) {
   let (rect, _) = ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::hover());

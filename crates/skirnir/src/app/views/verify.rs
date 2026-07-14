@@ -13,26 +13,24 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
   use crate::app::angle_sweep::SweepStep;
   use crate::app::intent::{Axis, Dir};
   use crate::app::view_state::ProbeKind;
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
-    let full = Vec2::new(ui.available_width(), Metrics::PANEL_CONTROL_H + 6.0);
+  right_panel(ui, |ui| {
     let idle = view.connection == ConnectionState::Idle;
     let Some((s, kind)) = sweep else {
       // No run: collect the shared start angle + (for runout) N, and offer both Start actions.
-      ui.label(RichText::new(crate::tr!("verify-intro")).size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, crate::tr!("verify-intro"));
       ui.add_space(4.0);
       egui::Grid::new("verify_setup").num_columns(2).show(ui, |ui| {
-        ui.label(crate::tr!("lbl-start-a"));
-        ui.add(egui::DragValue::new(&mut state.verify_start_angle).speed(1.0).range(-360.0..=360.0).suffix(" °"));
-        ui.end_row();
+        param_row(ui, crate::tr!("lbl-start-a"), &mut state.verify_start_angle, 1.0, -360.0..=360.0, " °");
         ui.label(crate::tr!("lbl-runout-n"));
         ui.add(egui::DragValue::new(&mut state.verify_runout_n).range(2..=36));
         ui.end_row();
       });
+      // Both Start actions share ONE enabled scope, so the buttons keep their in-scope widget ids.
       ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-start-flip"))).clicked() {
+        if full_width_button(ui, crate::tr!("btn-start-flip")).clicked() {
           sink.push(Intent::FlipVerifyStart { angle_deg: state.verify_start_angle, axis: Axis::Y, dir: Dir::Neg });
         }
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-start-runout"))).clicked() {
+        if full_width_button(ui, crate::tr!("btn-start-runout")).clicked() {
           sink.push(Intent::RunoutStart {
             n: state.verify_runout_n,
             start_deg: state.verify_start_angle,
@@ -54,26 +52,23 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
     ui.add_space(6.0);
     match s.step() {
       SweepStep::Ready => {
-        ui.label(RichText::new(crate::tr!("verify-ready",
-          { current: s.current_touch_number() as i64, total: s.total_touches() as i64 }))
-          .size(11.0).color(palette.text_dim));
-        ui.add_enabled_ui(idle, |ui| {
-          if ui.add_sized(full, egui::Button::new(crate::tr!("btn-probe-angle"))).clicked() {
-            sink.push(Intent::SweepProbe);
-          }
-        });
+        dim_label(ui, palette, crate::tr!("verify-ready",
+          { current: s.current_touch_number() as i64, total: s.total_touches() as i64 }));
+        if gated_action_button(ui, idle, crate::tr!("btn-probe-angle")).clicked() {
+          sink.push(Intent::SweepProbe);
+        }
       }
       SweepStep::Probing => {
-        ui.label(RichText::new(crate::tr!("msg-probing-awaiting-dot")).size(11.0).color(palette.text_dim));
+        dim_label(ui, palette, crate::tr!("msg-probing-awaiting-dot"));
       }
-      SweepStep::Done => verify_done(ui, state, s, kind, idle, full, sink),
+      SweepStep::Done => verify_done(ui, state, s, kind, idle, sink),
       SweepStep::Aborted => {
         let reason = s.abort_reason().map(String::from).unwrap_or_else(|| crate::tr!("reason-cancelled"));
         ui.label(RichText::new(crate::tr!("msg-aborted", { reason: reason })).size(11.0).color(palette.state_alarm));
       }
     }
     ui.add_space(4.0);
-    if ui.add_sized(full, egui::Button::new(crate::tr!("btn-cancel-wizard"))).clicked() {
+    if full_width_button(ui, crate::tr!("btn-cancel-wizard")).clicked() {
       sink.push(Intent::SweepCancel);
     }
   });
@@ -82,7 +77,7 @@ pub fn verify_measure(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState,
 /// Render the completed-sweep result: the flip-verify residual + `G10` correction offer, or the read-only runout
 /// TIR / eccentricity. Pure render of the computed values over the sweep's readings.
 fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &crate::app::angle_sweep::AngleSweep,
-  kind: crate::app::view_state::ProbeKind, idle: bool, full: Vec2, sink: &mut IntentSink) {
+  kind: crate::app::view_state::ProbeKind, idle: bool, sink: &mut IntentSink) {
   let palette = _state.style.palette;
   use crate::app::flip_verify::FlipResult;
   use crate::app::runout::RunoutReport;
@@ -95,19 +90,17 @@ fn verify_done(ui: &mut egui::Ui, _state: &mut UiState, s: &crate::app::angle_sw
       };
       ui.label(RichText::new(crate::tr!("verify-residual", { mm: format!("{:.3}", result.error()) }))
         .size(11.0).color(palette.state_run));
-      ui.label(RichText::new(crate::tr!("verify-apply-desc")).size(11.0).color(palette.text_dim));
-      ui.add_enabled_ui(idle, |ui| {
-        if ui.add_sized(full, egui::Button::new(crate::tr!("btn-apply-correction"))).clicked() {
-          sink.push(Intent::FlipVerifyWriteCorrection);
-        }
-      });
+      dim_label(ui, palette, crate::tr!("verify-apply-desc"));
+      if gated_action_button(ui, idle, crate::tr!("btn-apply-correction")).clicked() {
+        sink.push(Intent::FlipVerifyWriteCorrection);
+      }
     }
     ProbeKind::Runout => match RunoutReport::from_readings(s.readings()) {
       Some(r) => {
         ui.label(RichText::new(crate::tr!("verify-runout-result",
           { tir: format!("{:.3}", r.tir), ecc: format!("{:.3}", r.eccentricity), count: r.count as i64 }))
           .size(11.0).color(palette.state_run));
-        ui.label(RichText::new(crate::tr!("verify-runout-readonly")).size(11.0).color(palette.text_dim));
+        dim_label(ui, palette, crate::tr!("verify-runout-readonly"));
       }
       None => {
         ui.label(RichText::new(crate::tr!("verify-runout-need-two")).size(11.0).color(palette.state_alarm));
@@ -126,6 +119,6 @@ fn verify_readings_table(ui: &mut egui::Ui, palette: Palette, s: &crate::app::an
       Some(r) => format!("A{angle:.1}°  →  {r:.3}"),
       None => format!("A{angle:.1}°  →  —"),
     };
-    ui.label(RichText::new(text).size(11.0).color(palette.text_dim));
+    dim_label(ui, palette, text);
   }
 }

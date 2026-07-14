@@ -39,12 +39,12 @@ Severity/scope reflect the adversarial corrections (some findings were downgrade
 | ID | Item | Status |
 |----|------|--------|
 | C5 | skirnir wizard `pump_*` glue — `trait ProbeWizard`/effect-return (4 pumps, ~150 lines; `pump_probe_z` excluded) | Not started |
-| C6 | skirnir `views.rs` egui idiom helpers (`dim_label`/`full_width_button`/`gated_action_button`/`param_row`) | Not started |
+| C6 | skirnir `views.rs` egui idiom helpers (`dim_label`/`full_width_button`/`gated_action_button`/`param_row`) | **done** |
 | C2 | `comms.rs` `enumerate_*`/`send_setting_description` loop family → generic (exclude `dump_settings`) | **done** (with A1 Step 6) |
 | C4 | `settings.rs` fold parse/format into `SETTING_DESCRIPTORS` (4-way coupling) | **declined** — each arm is `Field::X => settings.field_x = parse_TYPE(value)?` (setting-specific parse fn + target field); folding it in just relocates 60 match arms into 60 `fn`-pointer fields in a `const` table (4-way→3-way coupling, same total logic) while trading readable explicit matches for fn-ptr indirection in a critical, well-tested settings/wire/flash path. Marginal gain, real risk. Nemesis: "design-taste, not a clear win." |
 | B5 | `gcode.rs apply_g_word`/`apply_m_word` extract `set_plane/units/distance/feed_mode` | **declined** — arms are already 2 lines (`guard.claim(Group::X)?; next_state.field = Y;`) where `claim()` is the shared helper; extracting per-group setters is net-neutral on size and hides the direct `G17→Plane::XY` mapping. Lowest-value per nemesis; not worth the indirection. |
-| C7 | `comms.rs` `cell_update` helper for `BlockingMutex<Cell<T>>` idiom (~14 sites) | Not started (A1 done without it; standalone follow-up) |
-| D2 | CI/host round-trip test: `SETTING_DESCRIPTORS` ↔ `settings.proto` lock-step | Not started |
+| C7 | `comms.rs` `cell_update` helper for `BlockingMutex<Cell<T>>` idiom (~14 sites) | **declined** — on inspection nearly all ~20 sites are already minimal idiomatic one-liners (`X.lock(\|c\| c.get())` / `c.set(v)` / `c.take())`); only 2 (the WCO/OV reporters) are read-modify-write. A helper would swap the standard embassy `BlockingMutex<Cell>` idiom for a project-specific one across 20 sites + 4 files with no real gain. Nemesis: LOW/cosmetic. |
+| D2 | Host round-trip lock test: every `Settings` field is wired through `to_proto`/`from_proto` (full struct literal — adding a field breaks the test until wired) | **done** |
 | E1 | Move the **4 truly-pure** helpers (`axis_values_mm`, `units_scale`, `coolant_mask`, `parser_snapshot`) to firmware-core | **done** (4 of 4) |
 
 ### Explicitly NOT doing (nemesis rejections / cautions)
@@ -625,3 +625,54 @@ trivially behavior-preserving routing. Pruned the now-orphaned imports the moved
 `RUSTFLAGS="-D warnings"`; host workspace `cargo build` green under `-D warnings`; **`just build` (Xtensa firmware)
 green** — confirming the call-site path changes compile. firmware-core stays `no_std` + esp-hal/embassy-free (all four
 helpers are pure, so no non-`no_std` dependency was pulled in).
+
+---
+
+## C6 — skirnir `views/` egui idiom helpers
+
+Five DRY helpers added to the existing shared-helpers module `crates/skirnir/src/app/views/widgets.rs`, collapsing
+the repeated egui idioms the review verified across the A3 one-view-per-file split. Pure readability/DRY pass — the
+rendered UI is pixel-identical (each helper emits the same `Vec2`/size/colour/`Sense`/`Response` as the code it
+replaces), so no committed snapshot baseline changed.
+
+Helpers (all `pub(crate)`, `///`-documented):
+- `dim_label(ui, palette, text: impl Into<String>) -> Response` — the dominant `ui.label(RichText::new(t).size(11.0)
+  .color(palette.text_dim))` dim secondary label.
+- `full_width_button(ui, label) -> Response` — the right-column `add_sized(Vec2::new(available_width(),
+  PANEL_CONTROL_H + 6.0), Button::new(label))` panel button.
+- `gated_action_button(ui, gate, label) -> Response` — a `full_width_button` wrapped in `add_enabled_ui(gate)`; keeps
+  the enclosing scope so the widget id is preserved (equals the inline single-button `add_enabled_ui` idiom exactly).
+- `param_row(ui, label, &mut f64, speed, range, suffix)` — a labelled `DragValue` bench-param grid row + `end_row`.
+- `right_panel(ui, |ui| …) -> InnerResponse<R>` — the `Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, …)`
+  right-column panel frame.
+
+Call sites collapsed: `dim_label` ×35, `gated_action_button` ×17, `param_row` ×16 rows, `full_width_button` ×9,
+`right_panel` ×7 — 84 sites across `datum_finder`/`mesh_probe`/`rotary_center`/`verify`/`probe`/`overrides`/`jog`/
+`settings`/`shell_panels`. Removing the now-fully-consumed per-panel `let full = Vec2::new(…)` captures (datum, mesh,
+rotary, verify) and dropping `verify_done`'s `full: Vec2` param fell out of the button conversions.
+
+**Deliberately left inline** (varying from the dominant form, per the brief — not forced through a helper):
+- The 3 `CollapsingHeader::new(RichText::new(…).size(11.0).color(text_dim))` bench-section titles — a `RichText` fed to
+  a `CollapsingHeader`, not a `ui.label`.
+- Non-`text_dim` / non-11.0 labels: `state_run`/`state_alarm`/`text` step/result lines, the 11.5px settings heading,
+  the monospace DRO/percent/`$n` values.
+- `DragValue` rows that chain extra behaviour: `rotary_bench_params`' 4 `.on_hover_text` rows, the crash-risk
+  `side-probe-z` row (`.on_hover_text` + `.changed()` side effect), the integer `verify_runout_n` (no suffix), and the
+  two-value-per-row `mesh_setup` min/max fields.
+- Multi-widget `add_enabled_ui` scopes (probe grid+button, jog/dro/overrides/settings clusters) keep their own
+  `add_enabled_ui`; where such a scope contained a single full-width button the inner button still became
+  `full_width_button`, and `verify`'s two-Start scope kept ONE `add_enabled_ui` with two `full_width_button` calls so
+  its shared scope (and the buttons' ids) was not split.
+- Nemesis B8 honoured: `toolbar_content_fingerprint` (the width-cache key) left entirely untouched.
+
+Net **−32 lines** across `views/` (the +44-line helper block in `widgets.rs` is outweighed by ~76 lines shed at the
+call sites).
+
+**Verification.** `cargo test -p skirnir` **788 passed** / 0 failed / 28 ignored (identical to the pre-refactor
+baseline) + the 3 bin + 1 doctest; `cargo build -p skirnir --features gui` and `cargo build -p skirnir` both green —
+all under `RUSTFLAGS="-D warnings"`.
+
+### Progress log
+
+- 2026-07-14 — **C6 DONE.** Added the five `widgets.rs` helpers and collapsed 84 call sites (see above). No behaviour
+  or visual change; 788 skirnir tests green (unchanged baseline), gui + non-gui builds green under `-D warnings`.

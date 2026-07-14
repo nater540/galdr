@@ -17,7 +17,7 @@ pub fn overrides(ui: &mut egui::Ui, view: &ViewState, state: &mut UiState, sink:
   // to act on it — so the whole panel is disabled until the board is connected and ready (Idle/Run/Hold/…).
   let enabled = view.connection.is_connected();
 
-  egui::Frame::new().inner_margin(Metrics::RIGHT_PAD).show(ui, |ui| {
+  right_panel(ui, |ui| {
     override_axis(ui, palette, &crate::tr!("lbl-feed"), OverrideAxis::Feed, feed, enabled,
       &mut state.feed_override_drag, sink,
       RealtimeCommand::FeedOverrideMinus1, RealtimeCommand::FeedOverrideMinus10, RealtimeCommand::FeedOverrideReset,
@@ -150,7 +150,7 @@ fn override_axis(ui: &mut egui::Ui, palette: Palette, label: &str, axis: crate::
   ui.add_enabled_ui(enabled, |ui| {
     // Row: dim label on the left, the filled track stretching across the middle, the live percent on the right.
     ui.horizontal(|ui| {
-      ui.label(RichText::new(label).size(11.0).color(palette.text_dim));
+      dim_label(ui, palette, label);
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         ui.label(RichText::new(format!("{value:>3}%")).monospace().size(11.5).color(palette.text));
         let slider = override_slider(ui, palette, &mut value, fill_color);
