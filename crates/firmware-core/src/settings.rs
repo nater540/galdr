@@ -2081,6 +2081,59 @@ mod tests {
   }
 
   #[test]
+  fn every_settings_field_is_wired_through_the_proto_mapping() {
+    // LOCK (D2): every field of `Settings` must be carried through BOTH `to_proto` and `from_proto`, or its value
+    // is silently dropped from the `$PBX` host-sync channel and the flash record while `$$`/`$x=val` still appear
+    // to work. This uses a FULL struct literal (no `..Default::default()`) with a distinct, in-range, non-default
+    // value in every field: adding a field to `Settings` breaks THIS test's compilation until it is given a value
+    // here, at which point the round-trip assertion below catches a `to_proto`/`from_proto` pair that forgot it.
+    // (`from_proto` is the raw mapping — `sanitized()` is applied separately — so in-range values survive exactly.)
+    let settings = Settings {
+      step_pulse_us: 7,
+      step_idle_delay_ms: 42,
+      step_invert_mask: 0b0000_0101,
+      dir_invert_mask: 0b0000_0010,
+      limit_invert: true,
+      probe_invert: true,
+      probe_pullup_disable: true,
+      status_report_mask: 0b0000_0011,
+      junction_deviation_mm: 0.0123,
+      arc_tolerance_mm: 0.0021,
+      soft_limits_enable: true,
+      hard_limit_flags: 0b0000_0011,
+      homing_flags: 0b0000_1001,
+      homing_dir_invert_mask: 0b0000_0100,
+      homing_feed_mm_min: 33.0,
+      homing_seek_mm_min: 777.0,
+      homing_debounce_ms: 55,
+      homing_pulloff_mm: 1.75,
+      spindle_rpm_max: 24_500.0,
+      spindle_rpm_min: 1_200.0,
+      spindle_on_delay_s: 1.5,
+      spindle_reverse_dwell_s: 0.75,
+      auto_report_interval_ms: 200,
+      steps_per_mm: [250.0, 251.0, 800.0, 8.889],
+      max_rate_mm_min: [5_100.0, 5_200.0, 900.0, 3_600.0],
+      accel_mm_s2: [110.0, 120.0, 30.0, 720.0],
+      max_travel_mm: [210.0, 220.0, 60.0, 360.0],
+      run_current_ma: [900, 910, 1_100, 800],
+      microsteps: [16, 16, 32, 8],
+      hold_current_ma: [400, 410, 500, 300],
+      tmc_ihold_delay: 6,
+      tmc_tpowerdown: 20,
+      tmc_tpwmthrs: 145,
+      tmc_send_delay: 2,
+      tmc_r_sense_ohms: 0.11,
+      rotary_mask: 0b0000_1000,
+    };
+    let restored = Settings::from_proto(&settings.to_proto());
+    assert_eq!(
+      restored, settings,
+      "a Settings field is not wired through to_proto/from_proto — it would silently drop from $PBX/flash",
+    );
+  }
+
+  #[test]
   fn wire_frame_byte_layout_is_stable_after_codec_extraction() {
     // The on-flash byte layout MUST be byte-for-byte identical to before the shared `storage_frame` codec was
     // extracted, so records already in flash still decode. Assert the canonical
