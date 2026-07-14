@@ -159,13 +159,7 @@ impl ResponseWriter {
     // Emit one comma-separated field per axis (grblHAL reports N axes: `MPos:x,y,z,a`). The A field is the
     // rotary position in degrees (DOC-10); the loop widens with `AXIS_COUNT`.
     write!(out, "|{label}:").map_err(|_| FmtError)?;
-    for (axis, value) in position.iter().enumerate() {
-      if axis == 0 {
-        write!(out, "{value:.3}").map_err(|_| FmtError)?;
-      } else {
-        write!(out, ",{value:.3}").map_err(|_| FmtError)?;
-      }
-    }
+    write_axes_csv(out, &position).map_err(|_| FmtError)?;
     write!(
       out,
       "|FS:{:.0},{}|Bf:{},{}",
@@ -180,13 +174,7 @@ impl ResponseWriter {
     }
     if snap.include_wco {
       out.push_str("|WCO:").map_err(|_| FmtError)?;
-      for (axis, value) in snap.wco_mm.iter().enumerate() {
-        if axis == 0 {
-          write!(out, "{value:.3}").map_err(|_| FmtError)?;
-        } else {
-          write!(out, ",{value:.3}").map_err(|_| FmtError)?;
-        }
-      }
+      write_axes_csv(out, &snap.wco_mm).map_err(|_| FmtError)?;
     }
     // `Ov:` — feed,rapid,spindle override percentages, on the change/periodic cadence (mirroring `WCO:`), so it
     // is not emitted in every report. Placed after `WCO:` per the documented grblHAL element order.
