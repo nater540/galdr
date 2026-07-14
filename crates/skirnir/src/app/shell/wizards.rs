@@ -311,24 +311,42 @@ impl SkirnirApp {
   /// instead of zeroing. Returns whether anything changed (for a prompt repaint). No-op when no wizard is running
   /// or it is not awaiting a touch.
   pub(crate) fn pump_wizard(&mut self) -> bool {
+    self.pump_probe_wizard(|app| &mut app.wizard, |_| {})
+  }
+
+  /// Drive ONE probe-wizard flow one frame — the shared glue behind [`Self::pump_wizard`], [`Self::pump_datum`],
+  /// [`Self::pump_mesh`], and [`Self::pump_sweep`]. `slot` re-borrows this flow's run slot each time it is touched
+  /// (so the borrow is released between the interleaved `self.view` / `self.send_line` side effects), and
+  /// `after_resolved` is a per-wizard post-resolve hook (mesh persists a completed grid; the others do nothing).
+  /// The flow-specific bits — the run slot, the state machine, and the latch [`ProbeKind`] — are supplied through
+  /// the [`ProbeWizard`] trait, so the latch/kind check, the resolve fold, and the completion-gated lost-push
+  /// fallback (`$#` poll, then give up) are written exactly once. Returns whether anything changed (for a prompt
+  /// repaint). No-op when the flow's run is absent or not awaiting a touch. Note `pump_probe_z` deliberately does
+  /// NOT use this path — it decides via `probe_flow::decide`/`ZeroZAction`, not `await_action`.
+  fn pump_probe_wizard<W: ProbeWizard>(
+    &mut self, slot: impl Fn(&mut Self) -> &mut Option<W>, after_resolved: impl FnOnce(&mut Self),
+  ) -> bool {
     use crate::app::probe_flow::{AwaitAction, await_action};
-    // Only act while a touch is in flight (a probing step). Copy the fallback stamps up front so the immutable
-    // borrow is released before the `seen_cycle` mutation below.
-    let (issued_at, polled_at) = match self.wizard.as_ref() {
-      Some(run) if run.state.is_probing() => match &run.touch_fallback {
-        Some(f) => (f.issued_at, f.polled_at),
+    // Only act while a touch is in flight (a probing step). Copy the fallback stamps + this flow's latch kind up
+    // front so the immutable borrow is released before the `seen_cycle` mutation below.
+    let (kind, issued_at, polled_at) = match slot(self).as_ref() {
+      Some(run) if run.is_probing() => {
         // Probing but no fallback stamp (e.g. a run restored mid-touch): nothing to pace; treat as just-issued.
-        None => (Instant::now(), None),
-      },
+        let (issued, polled) = match run.touch_fallback() {
+          Some(f) => (f.issued_at, f.polled_at),
+          None => (Instant::now(), None),
+        };
+        (run.probe_kind(), issued, polled)
+      }
       _ => return false,
     };
     // The latch must belong to THIS flow. Gone (disconnect) or another kind (a ZeroZ armed it) ⇒ abort the
     // wizard rather than wait forever or act on someone else's `[PRB:]`.
     match self.view.probe_op.as_ref() {
-      Some(op) if op.kind == crate::app::view_state::ProbeKind::RotaryCenter => {}
+      Some(op) if op.kind == kind => {}
       _ => {
-        if let Some(run) = self.wizard.as_mut() {
-          run.state.abort("probe latch lost");
+        if let Some(run) = slot(self).as_mut() {
+          run.abort("probe latch lost".to_string());
         }
         return true;
       }
@@ -336,21 +354,23 @@ impl SkirnirApp {
     // If the latch has resolved, fold the outcome into the wizard and finish the touch.
     let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
     if let Some(outcome) = resolved {
-      if let Some(run) = self.wizard.as_mut() {
-        run.state.on_probe_result(&outcome);
-        run.touch_fallback = None;
+      if let Some(run) = slot(self).as_mut() {
+        run.on_probe_result(&outcome);
+        *run.touch_fallback_mut() = None;
       }
       // Consume the latch so the result is fed exactly once (the next touch's `begin_probe` re-arms it).
       self.view.clear_probe_op();
+      // Per-wizard post-resolve hook (mesh persists a completed grid; a guarded no-op unless the run is done).
+      after_resolved(self);
       return true;
     }
     // Still awaiting: run the shared lost-push fallback, gated on the touch having demonstrably finished.
     let now = Instant::now();
     let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
-    if busy_now && let Some(run) = self.wizard.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+    if busy_now && let Some(run) = slot(self).as_mut() && let Some(f) = run.touch_fallback_mut().as_mut() {
       f.seen_cycle = true;
     }
-    let (polled, seen_cycle) = match self.wizard.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
+    let (polled, seen_cycle) = match slot(self).as_ref().and_then(|r| r.touch_fallback().as_ref()) {
       Some(f) => (f.polled, f.seen_cycle),
       None => return false,
     };
@@ -360,7 +380,7 @@ impl SkirnirApp {
     match await_action(polled, probe_finished, since_issue, since_poll) {
       AwaitAction::Wait => false,
       AwaitAction::Poll => {
-        if let Some(run) = self.wizard.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
+        if let Some(run) = slot(self).as_mut() && let Some(f) = run.touch_fallback_mut().as_mut() {
           f.polled = true;
           f.polled_at = Some(now);
         }
@@ -368,9 +388,9 @@ impl SkirnirApp {
         true
       }
       AwaitAction::GiveUp(reason) => {
-        if let Some(run) = self.wizard.as_mut() {
-          run.state.abort(reason.clone());
-          run.touch_fallback = None;
+        if let Some(run) = slot(self).as_mut() {
+          run.abort(reason.clone());
+          *run.touch_fallback_mut() = None;
         }
         self.view.fail_probe(reason);
         true
@@ -493,68 +513,7 @@ impl SkirnirApp {
   /// the wizard awaiting forever. Mirrors [`Self::pump_wizard`] but folds into the datum state machine. Returns
   /// whether anything changed (for a prompt repaint). No-op when no datum run is active or it is not awaiting.
   pub(crate) fn pump_datum(&mut self) -> bool {
-    use crate::app::probe_flow::{AwaitAction, await_action};
-    let (issued_at, polled_at) = match self.datum.as_ref() {
-      Some(run) if run.state.is_probing() => match &run.touch_fallback {
-        Some(f) => (f.issued_at, f.polled_at),
-        None => (Instant::now(), None),
-      },
-      _ => return false,
-    };
-    // The latch must belong to THIS flow. Gone (disconnect) or another kind ⇒ abort the wizard rather than wait
-    // forever or act on someone else's `[PRB:]`.
-    match self.view.probe_op.as_ref() {
-      Some(op) if op.kind == crate::app::view_state::ProbeKind::Datum => {}
-      _ => {
-        if let Some(run) = self.datum.as_mut() {
-          run.state.abort("probe latch lost");
-        }
-        return true;
-      }
-    }
-    // If the latch has resolved, fold the outcome into the wizard and finish the touch.
-    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
-    if let Some(outcome) = resolved {
-      if let Some(run) = self.datum.as_mut() {
-        run.state.on_probe_result(&outcome);
-        run.touch_fallback = None;
-      }
-      // Consume the latch so the result is fed exactly once (the next touch's `begin_probe` re-arms it).
-      self.view.clear_probe_op();
-      return true;
-    }
-    // Still awaiting: run the shared lost-push fallback, gated on the touch having demonstrably finished.
-    let now = Instant::now();
-    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
-    if busy_now && let Some(run) = self.datum.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
-      f.seen_cycle = true;
-    }
-    let (polled, seen_cycle) = match self.datum.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
-      Some(f) => (f.polled, f.seen_cycle),
-      None => return false,
-    };
-    let probe_finished = seen_cycle && !busy_now;
-    let since_issue = now.duration_since(issued_at);
-    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
-    match await_action(polled, probe_finished, since_issue, since_poll) {
-      AwaitAction::Wait => false,
-      AwaitAction::Poll => {
-        if let Some(run) = self.datum.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
-          f.polled = true;
-          f.polled_at = Some(now);
-        }
-        self.send_line("$#".to_string());
-        true
-      }
-      AwaitAction::GiveUp(reason) => {
-        if let Some(run) = self.datum.as_mut() {
-          run.state.abort(reason.clone());
-          run.touch_fallback = None;
-        }
-        self.view.fail_probe(reason);
-        true
-      }
-    }
+    self.pump_probe_wizard(|app| &mut app.datum, |_| {})
   }
 
   /// Start a height-map acquisition run over the grid `[min, max]` at `spacing` (work-mm) with `params`. Guarded by
@@ -625,76 +584,7 @@ impl SkirnirApp {
   /// finished mesh on completion), or run the shared lost-push fallback. Mirrors [`Self::pump_datum`]. Returns
   /// whether anything changed. No-op when no run is active or it is not awaiting a point.
   pub(crate) fn pump_mesh(&mut self) -> bool {
-    use crate::app::probe_flow::{AwaitAction, await_action};
-    let (issued_at, polled_at) = match self.mesh_probe.as_ref() {
-      Some(run) if run.state.is_probing() => match &run.touch_fallback {
-        Some(f) => (f.issued_at, f.polled_at),
-        None => (Instant::now(), None),
-      },
-      _ => return false,
-    };
-    // The latch must belong to THIS flow. Gone or another kind ⇒ abort rather than act on someone else's `[PRB:]`.
-    match self.view.probe_op.as_ref() {
-      Some(op) if op.kind == crate::app::view_state::ProbeKind::Mesh => {}
-      _ => {
-        if let Some(run) = self.mesh_probe.as_mut() {
-          run.state.abort("probe latch lost");
-        }
-        return true;
-      }
-    }
-    // Resolved ⇒ fold the Z into the mesh; if that completed the grid, persist it.
-    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
-    if let Some(outcome) = resolved {
-      let mut just_done = false;
-      if let Some(run) = self.mesh_probe.as_mut() {
-        run.state.on_probe_result(&outcome);
-        run.touch_fallback = None;
-        just_done = run.state.is_done();
-      }
-      self.view.clear_probe_op();
-      if just_done {
-        self.finish_mesh_probe();
-      }
-      return true;
-    }
-    // Still awaiting ⇒ shared lost-push fallback, gated on the point having demonstrably finished.
-    let now = Instant::now();
-    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
-    if busy_now
-      && let Some(run) = self.mesh_probe.as_mut()
-      && let Some(f) = run.touch_fallback.as_mut()
-    {
-      f.seen_cycle = true;
-    }
-    let (polled, seen_cycle) = match self.mesh_probe.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
-      Some(f) => (f.polled, f.seen_cycle),
-      None => return false,
-    };
-    let probe_finished = seen_cycle && !busy_now;
-    let since_issue = now.duration_since(issued_at);
-    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
-    match await_action(polled, probe_finished, since_issue, since_poll) {
-      AwaitAction::Wait => false,
-      AwaitAction::Poll => {
-        if let Some(run) = self.mesh_probe.as_mut()
-          && let Some(f) = run.touch_fallback.as_mut()
-        {
-          f.polled = true;
-          f.polled_at = Some(now);
-        }
-        self.send_line("$#".to_string());
-        true
-      }
-      AwaitAction::GiveUp(reason) => {
-        if let Some(run) = self.mesh_probe.as_mut() {
-          run.state.abort(reason.clone());
-          run.touch_fallback = None;
-        }
-        self.view.fail_probe(reason);
-        true
-      }
-    }
+    self.pump_probe_wizard(|app| &mut app.mesh_probe, |app| app.finish_mesh_probe())
   }
 
   /// Persist a completed height-map: snapshot the filled mesh into [`crate::profile::Profile::mesh`], invalidate
@@ -889,70 +779,109 @@ impl SkirnirApp {
   /// to THIS sweep's kind (FlipVerify/Runout). Returns whether anything changed. The single pump for both Phase 2
   /// wizards — they differ only in the post-completion compute, which the view/`flip_verify_write_correction` do.
   pub(crate) fn pump_sweep(&mut self) -> bool {
-    use crate::app::probe_flow::{AwaitAction, await_action};
-    // Only act while a touch is in flight; copy the fallback stamps up front to release the borrow before mutating.
-    let (kind, issued_at, polled_at) = match self.sweep.as_ref() {
-      Some(run) if run.sweep.is_probing() => {
-        let (issued, polled) = match &run.touch_fallback {
-          Some(f) => (f.issued_at, f.polled_at),
-          None => (Instant::now(), None),
-        };
-        (run.kind, issued, polled)
-      }
-      _ => return false,
-    };
-    // The latch must belong to THIS sweep's kind. Gone or another kind ⇒ abort the sweep rather than act on
-    // someone else's `[PRB:]`.
-    match self.view.probe_op.as_ref() {
-      Some(op) if op.kind == kind => {}
-      _ => {
-        if let Some(run) = self.sweep.as_mut() {
-          run.sweep.abort("probe latch lost");
-        }
-        return true;
-      }
-    }
-    // Resolved ⇒ fold the outcome into the engine and finish the touch.
-    let resolved = self.view.probe_op.as_ref().filter(|op| !op.awaiting).and_then(|op| op.last.clone());
-    if let Some(outcome) = resolved {
-      if let Some(run) = self.sweep.as_mut() {
-        run.sweep.on_probe_result(&outcome);
-        run.touch_fallback = None;
-      }
-      self.view.clear_probe_op();
-      return true;
-    }
-    // Still awaiting ⇒ shared lost-push fallback, gated on the touch having demonstrably finished.
-    let now = Instant::now();
-    let busy_now = self.view.status.as_ref().is_some_and(|s| is_probe_cycle_state(s.machine_state.state));
-    if busy_now && let Some(run) = self.sweep.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
-      f.seen_cycle = true;
-    }
-    let (polled, seen_cycle) = match self.sweep.as_ref().and_then(|r| r.touch_fallback.as_ref()) {
-      Some(f) => (f.polled, f.seen_cycle),
-      None => return false,
-    };
-    let probe_finished = seen_cycle && !busy_now;
-    let since_issue = now.duration_since(issued_at);
-    let since_poll = polled_at.map(|at| now.duration_since(at)).unwrap_or(Duration::ZERO);
-    match await_action(polled, probe_finished, since_issue, since_poll) {
-      AwaitAction::Wait => false,
-      AwaitAction::Poll => {
-        if let Some(run) = self.sweep.as_mut() && let Some(f) = run.touch_fallback.as_mut() {
-          f.polled = true;
-          f.polled_at = Some(now);
-        }
-        self.send_line("$#".to_string());
-        true
-      }
-      AwaitAction::GiveUp(reason) => {
-        if let Some(run) = self.sweep.as_mut() {
-          run.sweep.abort(reason.clone());
-          run.touch_fallback = None;
-        }
-        self.view.fail_probe(reason);
-        true
-      }
-    }
+    self.pump_probe_wizard(|app| &mut app.sweep, |_| {})
+  }
+}
+
+/// The per-wizard interface [`SkirnirApp::pump_probe_wizard`] drives: the pure state machine's touch lifecycle
+/// (`is_probing`/`on_probe_result`/`abort`), this flow's latch [`ProbeKind`], and the run's current-touch
+/// lost-push fallback. Implemented by each run-state struct so the shared pump glue (latch/kind check, resolve
+/// fold, completion-gated `$#` fallback) is written once. Behaviour-preserving over the four hand-written pumps.
+trait ProbeWizard {
+  /// Whether a touch is currently in flight (a probing step), delegating to the pure state machine.
+  fn is_probing(&self) -> bool;
+  /// The [`ProbeKind`] this flow's latch is expected to carry — a constant for most flows, `self.kind` for sweep.
+  fn probe_kind(&self) -> crate::app::view_state::ProbeKind;
+  /// Fold a resolved `[PRB:]` outcome into the pure state machine, advancing it to the next touch or completion.
+  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome);
+  /// Abort the run with a human-readable reason (a lost/foreign latch, or the fallback giving up).
+  fn abort(&mut self, reason: String);
+  /// The current touch's lost-push fallback (read), `None` between touches.
+  fn touch_fallback(&self) -> &Option<TouchFallback>;
+  /// The current touch's lost-push fallback (mutable), for stamping `seen_cycle`/`polled` or clearing on resolve.
+  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback>;
+}
+
+impl ProbeWizard for RotaryCenterRun {
+  fn is_probing(&self) -> bool {
+    self.state.is_probing()
+  }
+  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
+    crate::app::view_state::ProbeKind::RotaryCenter
+  }
+  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
+    self.state.on_probe_result(outcome);
+  }
+  fn abort(&mut self, reason: String) {
+    self.state.abort(reason);
+  }
+  fn touch_fallback(&self) -> &Option<TouchFallback> {
+    &self.touch_fallback
+  }
+  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
+    &mut self.touch_fallback
+  }
+}
+
+impl ProbeWizard for DatumRun {
+  fn is_probing(&self) -> bool {
+    self.state.is_probing()
+  }
+  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
+    crate::app::view_state::ProbeKind::Datum
+  }
+  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
+    self.state.on_probe_result(outcome);
+  }
+  fn abort(&mut self, reason: String) {
+    self.state.abort(reason);
+  }
+  fn touch_fallback(&self) -> &Option<TouchFallback> {
+    &self.touch_fallback
+  }
+  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
+    &mut self.touch_fallback
+  }
+}
+
+impl ProbeWizard for MeshProbeRun {
+  fn is_probing(&self) -> bool {
+    self.state.is_probing()
+  }
+  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
+    crate::app::view_state::ProbeKind::Mesh
+  }
+  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
+    self.state.on_probe_result(outcome);
+  }
+  fn abort(&mut self, reason: String) {
+    self.state.abort(reason);
+  }
+  fn touch_fallback(&self) -> &Option<TouchFallback> {
+    &self.touch_fallback
+  }
+  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
+    &mut self.touch_fallback
+  }
+}
+
+impl ProbeWizard for SweepRun {
+  fn is_probing(&self) -> bool {
+    self.sweep.is_probing()
+  }
+  fn probe_kind(&self) -> crate::app::view_state::ProbeKind {
+    self.kind
+  }
+  fn on_probe_result(&mut self, outcome: &crate::app::view_state::ProbeOutcome) {
+    self.sweep.on_probe_result(outcome);
+  }
+  fn abort(&mut self, reason: String) {
+    self.sweep.abort(reason);
+  }
+  fn touch_fallback(&self) -> &Option<TouchFallback> {
+    &self.touch_fallback
+  }
+  fn touch_fallback_mut(&mut self) -> &mut Option<TouchFallback> {
+    &mut self.touch_fallback
   }
 }

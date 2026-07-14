@@ -38,7 +38,7 @@ Severity/scope reflect the adversarial corrections (some findings were downgrade
 
 | ID | Item | Status |
 |----|------|--------|
-| C5 | skirnir wizard `pump_*` glue — `trait ProbeWizard`/effect-return (4 pumps, ~150 lines; `pump_probe_z` excluded) | Not started |
+| C5 | skirnir wizard `pump_*` glue — `trait ProbeWizard`/effect-return (4 pumps, ~150 lines; `pump_probe_z` excluded) | **done** — chose the `trait ProbeWizard` + one generic `pump_probe_wizard<W>` (slot-accessor closure + post-resolve hook closure) over the effect-enum; `pump_wizard`/`pump_datum`/`pump_mesh`/`pump_sweep` are now 3-line wrappers, the subtle latch/kind-check + resolve-fold + completion-gated `$#` fallback lives once. `pump_probe_z` left untouched (`probe_flow::decide`/`ZeroZAction`, different path). Net −71 lines in `wizards.rs` (216−145); 788 tests unchanged. |
 | C6 | skirnir `views.rs` egui idiom helpers (`dim_label`/`full_width_button`/`gated_action_button`/`param_row`) | **done** |
 | C2 | `comms.rs` `enumerate_*`/`send_setting_description` loop family → generic (exclude `dump_settings`) | **done** (with A1 Step 6) |
 | C4 | `settings.rs` fold parse/format into `SETTING_DESCRIPTORS` (4-way coupling) | **declined** — each arm is `Field::X => settings.field_x = parse_TYPE(value)?` (setting-specific parse fn + target field); folding it in just relocates 60 match arms into 60 `fn`-pointer fields in a `const` table (4-way→3-way coupling, same total logic) while trading readable explicit matches for fn-ptr indirection in a critical, well-tested settings/wire/flash path. Marginal gain, real risk. Nemesis: "design-taste, not a clear win." |
@@ -676,3 +676,52 @@ all under `RUSTFLAGS="-D warnings"`.
 
 - 2026-07-14 — **C6 DONE.** Added the five `widgets.rs` helpers and collapsed 84 call sites (see above). No behaviour
   or visual change; 788 skirnir tests green (unchanged baseline), gui + non-gui builds green under `-D warnings`.
+
+## C5 — skirnir wizard `pump_*` glue unified behind `trait ProbeWizard`
+
+Four near-verbatim probe-wizard pumps in `crates/skirnir/src/app/shell/wizards.rs` — `pump_wizard` (rotary-center),
+`pump_datum`, `pump_mesh`, `pump_sweep` — shared a subtle ~55-line skeleton: (1) bail unless a touch is in flight;
+(2) verify the latched `probe_op.kind` belongs to this flow, else abort with "probe latch lost"; (3) on a resolved
+latch, fold the outcome in + clear the fallback + consume the latch; (4) else run the shared completion-gated
+lost-push fallback (`await_action`: wait / `$#` poll / give up). They differed only in the run slot
+(`wizard`/`datum`/`mesh_probe`/`sweep`), the latch `ProbeKind` (constant for three, `run.kind` for sweep), the
+inner state field name (`state` vs `sweep`), and one hook (`pump_mesh` alone persists the grid via
+`finish_mesh_probe`). Keeping four bit-identical copies of an interleaved borrow-dance + timeout state machine in
+lockstep is exactly the drift hazard C5 targeted.
+
+**Design chosen — `trait ProbeWizard` + one generic driver (option a), not the effect-enum (option b).** The
+skeleton interleaves `self.<slot>`, `self.view`, and `self.send_line`, so a method on the run-object alone cannot
+reach those side effects. The generic `SkirnirApp::pump_probe_wizard<W: ProbeWizard>` takes a `slot` accessor
+closure (`impl Fn(&mut Self) -> &mut Option<W>`, re-borrowed at each touch so the borrow is released between the
+`self.view`/`send_line` side effects — mirroring the original `self.wizard.as_mut()` pattern) and an
+`after_resolved` post-resolve hook closure (`|app| app.finish_mesh_probe()` for mesh; `|_| {}` for the other
+three — `finish_mesh_probe` is already a guarded no-op unless the run is done, so calling it unconditionally after
+the resolve fold is behaviour-identical). `trait ProbeWizard` (impl'd on the four run-state structs) exposes the
+per-wizard bits: `is_probing`/`on_probe_result`/`abort` (trivial one-line delegations to `self.state`/`self.sweep`),
+`probe_kind` (constant or `self.kind`), and `touch_fallback`/`touch_fallback_mut`. The effect-enum was rejected: it
+would still need the same slot re-borrow to *apply* the effects, adding an enum + a match without removing the
+borrow plumbing. `pump_wizard`/`pump_datum`/`pump_mesh`/`pump_sweep` are now 3-line wrappers over the generic,
+keeping their doc comments and all seven call sites unchanged.
+
+**`pump_probe_z` deliberately left untouched** — it decides via `probe_flow::decide`/`ZeroZAction` (Zero/Fail), not
+the `await_action`/`AwaitAction` path, so it does not fit `ProbeWizard`. This is 4 pumps unified, not 5. The shared
+pure logic in `probe_flow` (`await_action`/`decide`) and the per-wizard `*_start`/`*_probe_next`/`*_write_wcs`
+methods (they genuinely differ) were not touched.
+
+**Anti-over-engineering guard — not tripped.** Net **−71 lines** in `wizards.rs` (145 inserted, 216 deleted). More
+to the point, the load-bearing logic — the latch/kind check, resolve fold, and completion-gated fallback — went
+from four hand-maintained copies to one; the trait impls that replace the other three are trivial pure-delegation
+accessors with zero decision logic. That is a clear simplification of the subtle part, not a net-neutral
+abstraction, so the guard did not fire.
+
+**Verification.** `cargo test -p skirnir` **788 passed** / 0 failed / 28 ignored (identical to the pre-refactor
+baseline) + 3 bin + 1 doctest; the existing wizard tests (datum/mesh/rotary/sweep refuse-when-probing, latch
+handling, full-sequence writes) all pass unchanged. `cargo build -p skirnir --features gui` and
+`cargo build -p skirnir` both green; `cargo clippy -p skirnir` clean — all under `RUSTFLAGS="-D warnings"`.
+
+### Progress log
+
+- 2026-07-14 — **C5 DONE.** Unified the four `pump_*` bodies behind `trait ProbeWizard` + the generic
+  `pump_probe_wizard<W>` (slot-accessor + post-resolve-hook closures); `pump_probe_z` left on its separate
+  `ZeroZAction` path. Behaviour-preserving; net −71 lines in `wizards.rs`; 788 skirnir tests green (unchanged
+  baseline), gui + non-gui builds + clippy green under `-D warnings`.
